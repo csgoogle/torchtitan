@@ -1,0 +1,51 @@
+{
+  "_name_or_path": "clip-micro",
+  "architectures": [
+    "CLIPModel"
+  ],
+  "initializer_factor": 1.0,
+  "logit_scale_init_value": 2.6592,
+  "model_type": "clip",
+  "projection_dim": 64,
+  "text_config": {
+    "architectures": [
+      "CLIPTextModel"
+    ],
+    "hidden_size": 64,
+    "intermediate_size": 256,
+    "max_position_embeddings": 77,
+    "model_type": "clip_text_model",
+    "num_attention_heads": 4,
+    "num_hidden_layers": 1,
+    "projection_dim": 64,
+    "vocab_size": 49408
+  },
+  "text_config_dict": {
+    "hidden_size": 64,
+    "intermediate_size": 256,
+    "num_attention_heads": 4,
+    "num_hidden_layers": 1,
+    "projection_dim": 64
+  },
+  "vision_config": {
+    "architectures": [
+      "CLIPVisionModel"
+    ],
+    "hidden_size": 64,
+    "image_size": 224,
+    "intermediate_size": 256,
+    "model_type": "clip_vision_model",
+    "num_attention_heads": 4,
+    "num_hidden_layers": 1,
+    "patch_size": 14,
+    "projection_dim": 64
+  },
+  "vision_config_dict": {
+    "hidden_size": 64,
+    "intermediate_size": 256,
+    "num_attention_heads": 4,
+    "num_hidden_layers": 1,
+    "patch_size": 14,
+    "projection_dim": 64
+  }
+}
