@@ -13,7 +13,7 @@ enable_tensorboard = false
 save_tb_folder = "tb"
 
 [model]
-name = "qwen3"
+name = "qwen3_tpu"
 flavor = "30B-A3B"
 hf_assets_path = "./assets/hf/Qwen3-30B-A3B"
 # converters = ["float8"]

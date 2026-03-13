@@ -5,7 +5,7 @@ from torch.nn.attention import sdpa_kernel
 from torch.utils._python_dispatch import TorchDispatchMode
 
 
-def attention_sdpa_forward_dtensor_workaround(sdpa_backends, q, k, v, scale=None):
+def attention_sdpa_forward_dtensor_workaround(sdpa_backends, q, k, v, scale=None, is_causal=True, enable_gqa=False):
     """
     Unwraps DTensor to prevent SDPA sharding propogation errors (b/482035664)
     Used in torchtitan.models.attention.ScaledDotProductAttentionWrapper
@@ -21,7 +21,7 @@ def attention_sdpa_forward_dtensor_workaround(sdpa_backends, q, k, v, scale=None
 
     with sdpa_kernel(sdpa_backends, set_priority=True):
         output_local = F.scaled_dot_product_attention(
-            q_in, k_in, v_in, scale=scale, is_causal=True
+            q_in, k_in, v_in, scale=scale, is_causal=is_causal, enable_gqa=enable_gqa
         )
 
     # rewrap to original sharding

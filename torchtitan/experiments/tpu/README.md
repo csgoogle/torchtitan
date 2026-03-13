@@ -93,7 +93,7 @@ gcloud auth application-default login
 pip install --pre --index-url --no-deps "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" --no-deps torch_tpu
 
 pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
-pip install libtpu==0.0.34 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install libtpu==0.0.37 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
 ```
 

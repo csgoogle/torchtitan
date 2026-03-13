@@ -177,6 +177,19 @@ class ScaledDotProductAttentionWrapper(torch.nn.Module):
                 SDPBackend.MATH,
             ]
 
+        # Only use overrideable SDP on when TPU backend is available.
+        try:
+            tpu_mod = torch.get_device_module("tpu")
+            is_tpu = tpu_mod is not None and tpu_mod.is_available()
+        except (RuntimeError, ValueError, ImportError):
+            is_tpu = False
+
+        if is_tpu:
+            self.sdpa_backends = [
+                SDPBackend.OVERRIDEABLE,
+                SDPBackend.MATH,
+            ]
+
     def forward(
         self,
         q: torch.Tensor,
@@ -186,12 +199,13 @@ class ScaledDotProductAttentionWrapper(torch.nn.Module):
         scale: float | None = None,
         enable_gqa: bool = False,
     ) -> torch.Tensor:
+
         if isinstance(q, torch.distributed.tensor.DTensor):
             # Workaround for SDPA sharding propagation failures with DTensor.
             # This happens when flattening batch (replicated) and head (sharded) dims.
             # See b/482035664.
             return tpu_workarounds.attention_sdpa_forward_dtensor_workaround(
-                self.sdpa_backends, q, k, v, scale
+                self.sdpa_backends, q, k, v, scale=scale, is_causal=True, enable_gqa=enable_gqa
             )
 
         # original SDPA logic

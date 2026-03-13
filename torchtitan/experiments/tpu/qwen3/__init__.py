@@ -145,6 +145,7 @@ qwen3_args = {
             route_norm=True,
             route_scale=1.0,
             score_before_experts=False,
+            use_grouped_mm=False, # Disable grouped_mm default for now b/492243699
         ),
     ),
     "30B-A3B": Qwen3ModelArgs(
@@ -168,6 +169,7 @@ qwen3_args = {
             route_norm=True,
             route_scale=1.0,
             score_before_experts=False,
+            use_grouped_mm=False,  # Disable grouped_mm default for now b/492243699
         ),
     ),
     "235B-A22B": Qwen3ModelArgs(
@@ -191,6 +193,7 @@ qwen3_args = {
             route_norm=True,
             route_scale=1.0,  # not needed, need double check
             score_before_experts=False,
+            use_grouped_mm=False,  # Disable grouped_mm default for now b/492243699
         ),
     ),
 }

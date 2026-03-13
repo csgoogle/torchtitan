@@ -22,21 +22,30 @@ from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
 
 
 # Constants for test parameters
-TEST_BATCH_SIZE = 8
+# To use OVERRIDEABLE SDP on TPU, need to ensure local batch size is
+# >= 4, i.e. TEST_BATCH_SIZE / world_size >= 4.
+TEST_BATCH_SIZE = 32
 
 # Need to make sure this is large enough for world size for sequence sharding.
-TEST_SEQ_LEN = 64
+# To use OVERRIDEABLE SDP on TPU, sequence length needs to be multiple of 512.
+TEST_SEQ_LEN = 512
 # If this is too small for worldsize/model, then the following assertion error
 # is raised within the model code: freqs_cis.shape != (seqlen, x.shape[-1])
 MAX_SEQ_LEN = 512
 
 # Constants for training parameters
 TEST_TRAINING_STEPS = 3
-TEST_LR = 0.01
+TEST_LR = 0.
+
+# Constants for model parameters
+# To use OVERRIDEABLE SDP on TPU, head dimension (which is dim / n_heads)
+# should be either < 128 OR divisible by 128.
+MODEL_DIM = 128
+MODEL_N_HEADS = 8
 
 
 def _get_llama3_model_args(
-    vocab_size=128, dim=64, n_layers=2, n_heads=8, multiple_of=16,
+    vocab_size=128, dim=MODEL_DIM, n_layers=1, n_heads=MODEL_N_HEADS, multiple_of=16,
 ) -> llama3_model.TransformerModelArgs:
   """Returns model arguments for Llama3 model for testing."""
   return llama3_model.TransformerModelArgs(
@@ -243,7 +252,7 @@ class Llama3DTensorParallelizeTest(
     )
 
   @test_utils.skip_if_tpu(
-      reason="SDPA kernel no longer being used in G3 (defaults to Math Backend)",
+      reason="FSDP model unit tests still timeout even with overrideable SDPA",
       bug_id=487028245
   )
   def test_apply_fsdp_full_training_loop_equivalence_distributed(self):

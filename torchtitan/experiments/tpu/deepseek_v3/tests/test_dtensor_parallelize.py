@@ -17,21 +17,30 @@ from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
 
 
 # Constants for test parameters
-TEST_BATCH_SIZE = 8
+# To use OVERRIDEABLE SDP on TPU, need to ensure local batch size is
+# >= 4, i.e. TEST_BATCH_SIZE / world_size >= 4.
+TEST_BATCH_SIZE = 32
 
 # Need to make sure this is large enough for world size for sequence sharding.
-TEST_SEQ_LEN = 64
+# To use OVERRIDEABLE SDP on TPU, sequence length needs to be multiple of 512.
+TEST_SEQ_LEN = 512
 # If this is too small for worldsize/model, then the following assertion error
 # is raised within the model code: rope_cache.shape != (seqlen, head_dim * 2)
-MAX_SEQ_LEN = 64
+MAX_SEQ_LEN = 512
 
 # Constants for training parameters
 TEST_TRAINING_STEPS = 3
 TEST_LR = 0.01
 
+# Constants for model parameters
+# To use OVERRIDEABLE SDP on TPU, head dimension (which is dim / n_heads)
+# should be either < 128 OR divisible by 128.
+MODEL_DIM = 128
+MODEL_N_HEADS = 8
+
 
 def _get_deepseek_v3_model_args(
-    vocab_size=128, dim=64, n_layers=2, n_heads=8
+    vocab_size=128, dim=MODEL_DIM, n_layers=2, n_heads=MODEL_N_HEADS
 ) -> DeepSeekV3ModelArgs:
   """Returns model arguments for DeepSeekV3 model for testing."""
   args = DeepSeekV3ModelArgs(
@@ -192,6 +201,12 @@ class DeepSeekV3DTensorParallelizeTest(
         "Distributed DTensor TP backward numerical equivalence test finished."
     )
 
+  @test_utils.skip_if_tpu(
+      reason="FSDP model unit tests still timeout even with overrideable SDPA",
+      # NOTE: DeepseekV3 does not trigger overrideable SDPA since it uses custom scaling factor.
+      # TODO(tbajpai): Check if custom scaling factor is the same as standard scaling factor.
+      bug_id=487028245
+  )
   def test_apply_fsdp_full_training_loop_equivalence_distributed(self):
     """Verifies numerical equivalence of a full training loop with FSDP."""
     logging.info(

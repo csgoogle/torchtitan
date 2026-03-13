@@ -9,7 +9,7 @@ from torch import nn
 import torchtitan.config
 import torchtitan.distributed
 from torchtitan.experiments.tpu import tpu_job_config
-from torchtitan.experiments.tpu.qwen3.infra import dtensor_parallelize
+from torchtitan.models.qwen3.infra import parallelize as dtensor_parallelize
 from torchtitan.experiments.tpu.qwen3.infra import fairscale_parallelize
 
 

@@ -64,10 +64,6 @@ class TrainDistributedTest(
           use_fairscale=False,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          skip_devices=[
-              # b/487028245 - SDPA defaulting to Math Backend
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
       dict(
           testcase_name="llama3_fsdp_dtensor_compile",
@@ -77,8 +73,17 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
+      ),
+      dict(
+          testcase_name="llama3_fsdp_dtensor_checkpoint",
+          model_name="llama3",
+          config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          checkpoint_enabled=True,
           skip_devices=[
-              # b/487028245 - SDPA defaulting to Math Backend
+              # b/489217116 - DCP not supported due to gather() unimplemented.
               device_type.AcceleratorDeviceType.TPU,
           ],
       ),
@@ -107,10 +112,6 @@ class TrainDistributedTest(
           use_fairscale=False,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          skip_devices=[
-              # b/487028245 - SDPA defaulting to Math Backend
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
       dict(
           testcase_name="qwen3_fsdp_dtensor_compile",
@@ -120,10 +121,6 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
-          skip_devices=[
-              # b/487028245 - SDPA defaulting to Math Backend
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
       dict(
           testcase_name="deepseek_v3_tp_dtensor",
@@ -162,7 +159,7 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
-              # b/487028245 - SDPA defaulting to Math Backend
+              # b/487028245 - Timing out w/Math Backend
               device_type.AcceleratorDeviceType.TPU,
           ],
       ),
@@ -175,7 +172,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           enable_compile=True,
           skip_devices=[
-              # b/487028245 - SDPA defaulting to Math Backend
+              # b/487028245 - Timing out w/Math Backend
               device_type.AcceleratorDeviceType.TPU,
           ],
       ),
@@ -232,6 +229,7 @@ class TrainDistributedTest(
       skip_devices=None,
       optimizer_implementation="foreach",
       enable_compile=False,
+      checkpoint_enabled=False,
       dataset_path="third_party/py/torchtitan/tests/assets/c4_test",
       dataset="c4_test",
       ):
@@ -252,6 +250,11 @@ class TrainDistributedTest(
       args.extend([
           "--encoder.t5_encoder=third_party/py/torchtitan/tests/assets/flux_test_encoders/t5-micro",
           "--encoder.clip_encoder=third_party/py/torchtitan/tests/assets/flux_test_encoders/clip-micro",
+      ])
+    if checkpoint_enabled:
+      args.extend([
+          "--checkpoint.enable",
+          "--checkpoint.interval=2",
       ])
 
     self._test_train_distributed(
