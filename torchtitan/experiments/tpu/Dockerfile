@@ -8,7 +8,8 @@ RUN pip install --no-deps ./torch_tpu-0.1.0.dev0-cp312-cp312-manylinux_2_31_x86_
 
 COPY torchtitan/requirements.txt .
 RUN pip install -r requirements.txt
-RUN pip install -r ./.ci/docker/requirements-flux.txt
+COPY torchtitan/.ci/docker/requirements-flux.txt .
+RUN pip install -r requirements-flux.txt
 
 COPY torchtitan ./torchtitan
 WORKDIR ./torchtitan
