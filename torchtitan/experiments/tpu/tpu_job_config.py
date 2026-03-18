@@ -8,6 +8,8 @@ import torchtitan.config
 class TPUConfig:
   use_fairscale: bool = False
   apply_rope_complex_workaround: bool = False
+  use_loss_kernel: bool = False
+  use_splash_attention_kernel: bool = False
 
 
 @dataclasses.dataclass

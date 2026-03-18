@@ -45,6 +45,7 @@ def start_trainer(config: tpu_job_config_module.TPUJobConfig):
 
   try:
     trainer = trainer_cls(config)
+    config.maybe_log()
 
     if config.checkpoint.create_seed_checkpoint:
       assert int(os.environ["WORLD_SIZE"]) == 1, (

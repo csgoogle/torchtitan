@@ -10,6 +10,7 @@ import torch.distributed.pipelining.schedules
 import torchtitan.config
 import torchtitan.distributed
 from torchtitan.experiments.tpu import tpu_job_config
+from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.llama3.infra import dtensor_parallelize
 from torchtitan.experiments.tpu.llama3.infra import fairscale_parallelize
 
@@ -37,6 +38,16 @@ def parallelize_llama(
   Returns:
     The parallelized nn.Module.
   """
+  if (
+      isinstance(job_config, tpu_job_config.TPUJobConfig)
+      and job_config.tpu_config.use_splash_attention_kernel
+  ):
+    workarounds.use_splash_attention_patch(model)
+  if (
+      isinstance(job_config, tpu_job_config.TPUJobConfig)
+      and job_config.tpu_config.use_loss_kernel
+  ):
+    workarounds.use_output_projection_patch(model)
   if tpu_job_config.use_fairscale(job_config):
     rank = torch.distributed.get_rank()
     fairscale_parallelize.parallelize_llama(

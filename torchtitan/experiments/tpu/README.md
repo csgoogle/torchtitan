@@ -83,6 +83,17 @@ python3.12 -m venv venv; source venv/bin/activate
 
 #### Install a prebuilt wheel
 
+Install dependencies. Some dependencies have to be installed before
+TorchTPU.
+
+```bash
+# Package installation sequence matters here due to: https://github.com/openxla/tokamax/issues/240
+pip install "jax[tpu]==0.9.1" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install git+https://github.com/openxla/tokamax.git@8cba6a6a1e52e9efbb7ff8facb66f18f0bfcbe4c
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+pip install libtpu==0.0.37 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
 In order to install prebuilt TorchTPU wheel, you need to authenticate first.
 
 ```bash
@@ -91,10 +102,6 @@ gcloud auth login
 gcloud auth application-default login
 
 pip install --pre --index-url --no-deps "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" --no-deps torch_tpu
-
-pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
-pip install libtpu==0.0.37 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-
 ```
 
 ### Install TorchTitan and its dependencies
@@ -103,7 +110,7 @@ pip install libtpu==0.0.37 -f https://storage.googleapis.com/jax-releases/libtpu
 git clone https://github.com/google-pytorch/torchtitan   # This repository will be available at a later date.
 cd torchtitan
 pip install -r requirements.txt
-
+pip install -r .ci/docker/requirements-flux.txt
 pip install portpicker absl-py numpy gcsfs frozendict triton fairscale
 
 ```

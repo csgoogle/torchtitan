@@ -24,6 +24,36 @@ class TrainDistributedTest(
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
+      dict(
+          testcase_name="llama3_tpu_fsdp_use_splash_attention_kernel",
+          model_name="llama3_tpu",
+          config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--tpu_config.use_splash_attention_kernel"],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="llama3_tpu_fsdp_use_loss_kernel",
+          model_name="llama3_tpu",
+          config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--training.dtype=bfloat16",
+              "--tpu_config.use_loss_kernel",
+              "--training.seq_len=1024"
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
       # qwen3_tpu (with local fairscale implementation)
       dict(
           testcase_name="qwen3_tpu_tp_fairscale",
@@ -35,6 +65,36 @@ class TrainDistributedTest(
           skip_devices=[
               # b/480969610 - Issue with matmul shapes
               device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_tpu_fsdp_use_splash_attention_kernel",
+          model_name="qwen3_tpu",
+          config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--tpu_config.use_splash_attention_kernel"],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_tpu_fsdp_use_loss_kernel",
+          model_name="qwen3_tpu",
+          config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--training.dtype=bfloat16",
+              "--tpu_config.use_loss_kernel",
+              "--training.seq_len=1024"
+          ],
+          skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],
@@ -218,7 +278,7 @@ class TrainDistributedTest(
           dataset="cc12m-test",
           enable_compile=True,
       ),
-      ])
+  ])
   def test_train_distributed(
       self,
       model_name,
@@ -232,8 +292,9 @@ class TrainDistributedTest(
       checkpoint_enabled=False,
       dataset_path="third_party/py/torchtitan/tests/assets/c4_test",
       dataset="c4_test",
-      ):
-    args = [
+      args: list[str] | None = None,
+  ):
+    default_args = [
         f"--model.name={model_name}",
         f"--job.config_file={config_file}",
         f"--optimizer.implementation={optimizer_implementation}",
@@ -246,26 +307,35 @@ class TrainDistributedTest(
         "--training.mixed_precision_reduce=float32",
         f"--training.local_batch_size={1 if model_name == 'flux' else 4}",
     ]
+    if not args:
+      args = []
+
+    # Combined args: default args first, then test case specific args.
+    # This allows test cases to override default arguments.
+    combined_args = default_args + args
+
     if model_name == "flux":
-      args.extend([
+      combined_args.extend([
           "--encoder.t5_encoder=third_party/py/torchtitan/tests/assets/flux_test_encoders/t5-micro",
           "--encoder.clip_encoder=third_party/py/torchtitan/tests/assets/flux_test_encoders/clip-micro",
       ])
     if checkpoint_enabled:
-      args.extend([
+      combined_args.extend([
           "--checkpoint.enable",
           "--checkpoint.interval=2",
       ])
 
     self._test_train_distributed(
-        args,
+        combined_args,
         use_fairscale,
         data_parallel_shard_degree,
         tensor_parallel_degree,
         skip_devices,
         torchtitan.experiments.tpu.train.start_trainer,
         run_init_process_group=False,
-        enable_compile=enable_compile)
+        enable_compile=enable_compile,
+    )
+
 
 if __name__ == "__main__":
   mp.set_start_method("spawn")

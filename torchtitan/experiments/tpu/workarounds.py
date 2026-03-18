@@ -3,7 +3,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel
 from torch.utils._python_dispatch import TorchDispatchMode
-
+from torchtitan.tools.logging import logger
+from torch import nn
 
 def attention_sdpa_forward_dtensor_workaround(sdpa_backends, q, k, v, scale=None, is_causal=True, enable_gqa=False):
     """
@@ -28,6 +29,65 @@ def attention_sdpa_forward_dtensor_workaround(sdpa_backends, q, k, v, scale=None
     return torch.distributed.tensor.DTensor.from_local(output_local, mesh, placements)
 
 
+def use_splash_attention_patch(
+    model: nn.Module,
+) -> None:
+  """Patches splash attention into the model."""
+  from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
+
+  def _splash_forward(
+      self, q, k, v, *, scale=None, enable_gqa=False, is_causal=True):
+      """Replace ScaledDotProductAttentionWrapper.forward with splash_sdpa."""
+      return splash_sdpa(
+          q, k, v,
+          scale=scale,
+          is_causal=is_causal,
+          enable_gqa=enable_gqa,
+      )
+
+  # Patch all attention modules in the model
+  _patched = 0
+  for _, module in model.named_modules():
+      cls_name = type(module).__name__
+      if "ScaledDotProductAttentionWrapper" in cls_name:
+          import types
+          module.forward = types.MethodType(_splash_forward, module)
+          _patched += 1
+  logger.info(
+      "Splash attention ENABLED: patched %d attention modules",
+      _patched)
+
+
+class PallasLossLinear(nn.Module):
+  """Wrapper for model.output to return (x, weight) for Pallas loss."""
+
+  def __init__(self, original_linear: nn.Linear):
+    super().__init__()
+    self.original_linear = original_linear
+    self.weight = original_linear.weight
+
+  def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return x, self.weight.t()
+
+
+def use_output_projection_patch(
+    model: nn.Module,
+) -> None:
+  """Replaces model.output with an identity-like module that returns (x, weight)."""
+  if hasattr(model, "output"):
+    if isinstance(model.output, nn.Linear):
+      model.output = PallasLossLinear(model.output)
+      logger.info("Patched model.output to return (x, weight) for Pallas loss")
+    elif model.output is None:
+      logger.warning("model.output is None, cannot wrap for Pallas loss")
+    else:
+      logger.warning(
+          "model.output is of type %s, not nn.Linear, "
+          "cannot wrap for Pallas loss",
+          type(model.output),
+      )
+  else:
+    logger.warning("model has no output attribute, cannot wrap for Pallas loss")
 
 
 class CPUSafeHistcMode(TorchDispatchMode):

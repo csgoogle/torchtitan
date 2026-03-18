@@ -39,7 +39,7 @@ _TPU_CHIP_TO_HOST_BOUNDS = frozendict.frozendict({
 
 
 def _maybe_init_distributed_on_gke(
-    slicebuilder_first_worker_port: int = 100000,
+    slicebuilder_first_worker_port: int = 10000,
     environ: dict[str, str] | None = None,
 ) -> bool:
   """Initializes environment variables for distributed TPU training on GKE.
