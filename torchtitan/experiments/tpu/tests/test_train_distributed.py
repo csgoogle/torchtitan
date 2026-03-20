@@ -98,7 +98,7 @@ class TrainDistributedTest(
           ],
       ),
       dict(
-          testcase_name="qwen3_tpu_fsdp_use_gmm_kernel_testmodel_moe",
+          testcase_name="qwen3_tpu_fsdp_use_gmm_without_fill_indices_kernel_testmodel_moe",
           model_name="qwen3_tpu",
           config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
           use_fairscale=False,
@@ -107,6 +107,23 @@ class TrainDistributedTest(
           args=[
               "--model.flavor=testmodel_moe",  # NOTE: this model has use_grouped_mm=True
               "--tpu_config.use_gmm_kernel",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_tpu_fsdp_use_gmm_kernel_testmodel_moe",
+          model_name="qwen3_tpu",
+          config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--model.flavor=testmodel_moe",
+              "--tpu_config.use_gmm_kernel",
+              "--tpu_config.use_fill_indices_kernel",
           ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,

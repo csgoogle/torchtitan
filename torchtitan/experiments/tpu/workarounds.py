@@ -142,6 +142,23 @@ def use_gmm_kernel_patch(
   torchtitan_moe._run_experts_grouped_mm = _custom_run_experts_grouped_mm
 
 
+def use_fill_indices_patch(
+    model: nn.Module,
+) -> None:
+  """Enables the fill indices kernel for MoE modules in the model.
+
+  This workload-specific monkey patch replaces the default implementations in
+  torchtitan.models.moe.kernels with our TPU-specific JAX implementation.
+  """
+  from torchtitan.experiments.tpu.kernels import fill_indices as tpu_fill_indices
+  from torchtitan.models.moe import kernels as moe_kernels
+
+  # Patch both because generate_permute_indices defaults to use_cpu=True
+  moe_kernels.fill_indices_wrapper = tpu_fill_indices.fill_indices
+  moe_kernels.fill_indices_cpu = tpu_fill_indices.fill_indices
+  logger.info("Patched MoE kernels to use TPU fill_indices")
+
+
 class CPUSafeHistcMode(TorchDispatchMode):
   """A global dispatcher that intercepts and casts calls to torch.histc.
 

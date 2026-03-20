@@ -11,6 +11,7 @@ class TPUConfig:
   use_loss_kernel: bool = False
   use_splash_attention_kernel: bool = False
   use_gmm_kernel: bool = False
+  use_fill_indices_kernel: bool = False
 
 
 @dataclasses.dataclass

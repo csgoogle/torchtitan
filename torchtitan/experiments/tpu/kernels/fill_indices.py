@@ -89,7 +89,7 @@ def fill_indices(
     )
 
   return _fill_indices_kernel_cache[cache_key](
-      tokens_per_expert_group,
-      start_index_values,
-      write_offsets,
+      tokens_per_expert_group.to(torch.int32),
+      start_index_values.to(torch.int32),
+      write_offsets.to(torch.int32),
   )

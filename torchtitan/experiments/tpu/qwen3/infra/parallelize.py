@@ -53,8 +53,13 @@ def parallelize_qwen3(
       isinstance(job_config, tpu_job_config.TPUJobConfig)
       and job_config.tpu_config.use_gmm_kernel
   ):
-    # Hijack the fallback python functions
     workarounds.use_gmm_kernel_patch(model)
+
+  if (
+      isinstance(job_config, tpu_job_config.TPUJobConfig)
+      and job_config.tpu_config.use_fill_indices_kernel
+  ):
+    workarounds.use_fill_indices_patch(model)
 
   if tpu_job_config.use_fairscale(job_config):
     rank = torch.distributed.get_rank()
