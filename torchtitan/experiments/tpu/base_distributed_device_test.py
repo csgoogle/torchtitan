@@ -479,7 +479,8 @@ def config_to_input_distribution(
     The determined InputDistribution based on the data parallel shard degree.
   """
   dp_degree = config.parallelism.data_parallel_shard_degree
-  if dp_degree > 1:
+  rep_degree = config.parallelism.data_parallel_replicate_degree
+  if dp_degree > 1 or rep_degree > 1:
     return InputDistribution.SPLIT_BATCH
   else:
     return InputDistribution.REPLICATE
@@ -582,6 +583,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       ] = None,
       run_init_process_group: bool = True,
       enable_compile: bool = False,
+      data_parallel_replicate_degree: int | None = None,
   ):
     """Tests the minimal distributed training setup for torchtitan models."""
     if skip_devices and self.accelerator_device_type in skip_devices:
@@ -609,6 +611,12 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
         data_parallel_shard_degree = self.num_devices
       config_args.append(
           f"--parallelism.data_parallel_shard_degree={data_parallel_shard_degree}"
+      )
+    if data_parallel_replicate_degree is not None:
+      if data_parallel_replicate_degree == -1:
+        data_parallel_replicate_degree = self.num_devices
+      config_args.append(
+          f"--parallelism.data_parallel_replicate_degree={data_parallel_replicate_degree}"
       )
 
     if use_fairscale:
@@ -642,6 +650,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       param_atol: float = 5e-3,
       param_rtol: float = 5e-3,
       enable_compile: bool = False,
+      data_parallel_replicate_degree: int | None = None,
   ):
     """Orchestrates a distributed parity test: Record Distributed -> Verify on CPU."""
     # Setup temporary file for data transfer.
@@ -662,6 +671,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
               output_path=temp_path
           ),
           enable_compile=enable_compile,
+          data_parallel_replicate_degree=data_parallel_replicate_degree,
       )
 
       # Load recorded data from the file (if non-empty; otherwise fail)
@@ -700,6 +710,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
     # Force overrides for single-device CPU execution
     cpu_config.parallelism.tensor_parallel_degree = 1
     cpu_config.parallelism.data_parallel_shard_degree = 1
+    cpu_config.parallelism.data_parallel_replicate_degree = 1
     cpu_config.compile.enable = False
 
     # Setup validator callback with the recorded history.

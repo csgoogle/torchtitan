@@ -15,7 +15,6 @@ class TrainDistributedTest(
   """Tests the distributed training setup."""
 
   @parameterized.named_parameters([
-      # llama3_tpu (with local fairscale implementation)
       dict(
           testcase_name="llama3_tpu_tp_fairscale",
           model_name="llama3_tpu",
@@ -47,14 +46,13 @@ class TrainDistributedTest(
           args=[
               "--training.dtype=bfloat16",
               "--tpu_config.use_loss_kernel",
-              "--training.seq_len=1024"
+              "--training.seq_len=1024",
           ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
-      # qwen3_tpu (with local fairscale implementation)
       dict(
           testcase_name="qwen3_tpu_tp_fairscale",
           model_name="qwen3_tpu",
@@ -92,14 +90,29 @@ class TrainDistributedTest(
           args=[
               "--training.dtype=bfloat16",
               "--tpu_config.use_loss_kernel",
-              "--training.seq_len=1024"
+              "--training.seq_len=1024",
           ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
-      # llama3 (with TT dtensor implementation)
+      dict(
+          testcase_name="qwen3_tpu_fsdp_use_gmm_kernel_testmodel_moe",
+          model_name="qwen3_tpu",
+          config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--model.flavor=testmodel_moe",  # NOTE: this model has use_grouped_mm=True
+              "--tpu_config.use_gmm_kernel",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
       dict(
           testcase_name="llama3_tp_dtensor",
           model_name="llama3",
@@ -147,7 +160,7 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.TPU,
           ],
       ),
-      # qwen3 (with TT dtensor implementation)
+      # qwen3
       dict(
           testcase_name="qwen3_tp_dtensor",
           model_name="qwen3",
@@ -278,6 +291,33 @@ class TrainDistributedTest(
           dataset="cc12m-test",
           enable_compile=True,
       ),
+      # redacted_tpu
+      dict(
+          testcase_name="redacted_tpu_fsdp_dtensor",
+          model_name="redacted_tpu",
+          config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+      ),
+      dict(
+          testcase_name="redacted_tpu_fsdp_dtensor_compile",
+          model_name="redacted_tpu",
+          config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+      ),
+      dict(
+          testcase_name="redacted_tpu_ddp_dtensor",
+          model_name="redacted_tpu",
+          config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=1,
+          data_parallel_replicate_degree=-1,
+      ),
   ])
   def test_train_distributed(
       self,
@@ -286,6 +326,7 @@ class TrainDistributedTest(
       use_fairscale,
       data_parallel_shard_degree,
       tensor_parallel_degree,
+      data_parallel_replicate_degree=None,
       skip_devices=None,
       optimizer_implementation="foreach",
       enable_compile=False,
@@ -326,12 +367,13 @@ class TrainDistributedTest(
       ])
 
     self._test_train_distributed(
-        combined_args,
-        use_fairscale,
-        data_parallel_shard_degree,
-        tensor_parallel_degree,
-        skip_devices,
-        torchtitan.experiments.tpu.train.start_trainer,
+        config_args=combined_args,
+        use_fairscale=use_fairscale,
+        data_parallel_shard_degree=data_parallel_shard_degree,
+        tensor_parallel_degree=tensor_parallel_degree,
+        data_parallel_replicate_degree=data_parallel_replicate_degree,
+        skip_devices=skip_devices,
+        start_trainer=torchtitan.experiments.tpu.train.start_trainer,
         run_init_process_group=False,
         enable_compile=enable_compile,
     )

@@ -9,6 +9,7 @@ from torch import nn
 import torchtitan.config
 import torchtitan.distributed
 from torchtitan.experiments.tpu import tpu_job_config
+from torchtitan.tools.logging import logger
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.qwen3.infra import fairscale_parallelize
 from torchtitan.models.qwen3.infra import parallelize as dtensor_parallelize
@@ -47,6 +48,13 @@ def parallelize_qwen3(
       and job_config.tpu_config.use_loss_kernel
   ):
     workarounds.use_output_projection_patch(model)
+
+  if (
+      isinstance(job_config, tpu_job_config.TPUJobConfig)
+      and job_config.tpu_config.use_gmm_kernel
+  ):
+    # Hijack the fallback python functions
+    workarounds.use_gmm_kernel_patch(model)
 
   if tpu_job_config.use_fairscale(job_config):
     rank = torch.distributed.get_rank()

@@ -21,6 +21,7 @@ from torchtitan.tools.logging import init_logger, logger
 import torchtitan.train
 
 from torchtitan.experiments.tpu import utils as tpu_utils
+import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration

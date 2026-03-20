@@ -134,6 +134,25 @@ def get_peak_flops(device_name: str) -> float:
     elif "l40s" in device_name:
         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
         return 362e12
+    elif device_name.startswith("tpu-"):
+        if "v4" in device_name:
+            # data from https://docs.cloud.google.com/tpu/docs/v4
+            return 275e12
+        elif "v5e" in device_name:
+            # data from https://docs.cloud.google.com/tpu/docs/v5e
+            return 197e12
+        elif "v5p" in device_name:
+            # data from https://docs.cloud.google.com/tpu/docs/v5p
+            # The quoted number is per chip. We use this number as we assume
+            # megacore is enabled for v5p.
+            return 459e12
+        elif "v6e" in device_name:
+            # data from https://docs.cloud.google.com/tpu/docs/v6e
+            return 918e12
+        elif "7x" in device_name:
+            # data from https://docs.cloud.google.com/tpu/docs/tpu7x
+            # The quoted number is per chip. We halve it for per-core FLOPS.
+            return 2307e12 / 2
 
     else:  # for other GPU types, assume A100
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")

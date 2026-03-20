@@ -15,6 +15,7 @@ from torch._utils import _get_device_module
 import torch.distributed as dist
 from torch.distributed.algorithms._checkpoint import checkpoint_wrapper
 from torchtitan.tools.logging import logger
+from torchtitan.experiments.tpu import local_tpu_device
 
 device_type = None
 device_module = None
@@ -133,9 +134,21 @@ def _get_tpu_module() -> torch.device:
   logger.warning("Using TPU device info")
   logger.warning("Patching torch.tpu module to support missing functions")
   _device_module = _get_device_module("tpu")
+  _cached_device_name = None
 
   def get_device_name(device=None):
-    return "tpu"
+    nonlocal _cached_device_name
+    if _cached_device_name is not None:
+      return _cached_device_name
+    _cached_device_name = "tpu"
+    try:
+      chip_type, _ = local_tpu_device.get_local_chips()
+      if chip_type:
+        _cached_device_name = f"tpu-{chip_type.value.name}"
+    except RuntimeError as e:
+      logger.warning(f"Error detecting local TPU chips: {e}")
+    return _cached_device_name
+
   setattr(_device_module, "get_device_name", get_device_name)
 
   def set_device(device=None):

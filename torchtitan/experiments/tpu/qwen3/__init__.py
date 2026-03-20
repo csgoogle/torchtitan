@@ -124,6 +124,31 @@ qwen3_args = {
         rope_theta=1000000,
     ),
     # Qwen3-MoE models
+    "testmodel_moe": Qwen3ModelArgs(
+        vocab_size=2048,
+        max_seq_len=128,
+        head_dim=16,
+        dim=128,
+        n_layers=3,
+        n_heads=8,
+        n_kv_heads=8,
+        qk_norm=True,
+        hidden_dim=256,
+        rope_theta=1000000,
+        enable_weight_tying=True,
+        moe_enabled=True,
+        moe_inter_dim=128,
+        moe_args=MoEArgs(
+            num_experts=8,
+            num_shared_experts=0,
+            top_k=2,
+            score_func="softmax",
+            route_norm=True,
+            route_scale=1.0,
+            score_before_experts=False,
+            use_grouped_mm=True,  # NOTE: Other MoE configs set this to False
+        ),
+    ),
     "debugmodel_moe": Qwen3ModelArgs(
         vocab_size=2048,
         max_seq_len=4096,
@@ -145,7 +170,7 @@ qwen3_args = {
             route_norm=True,
             route_scale=1.0,
             score_before_experts=False,
-            use_grouped_mm=False, # Disable grouped_mm default for now b/492243699
+            use_grouped_mm=False,  # Disable grouped_mm default for now b/492243699
         ),
     ),
     "30B-A3B": Qwen3ModelArgs(

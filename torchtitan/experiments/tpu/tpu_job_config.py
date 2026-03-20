@@ -10,6 +10,7 @@ class TPUConfig:
   apply_rope_complex_workaround: bool = False
   use_loss_kernel: bool = False
   use_splash_attention_kernel: bool = False
+  use_gmm_kernel: bool = False
 
 
 @dataclasses.dataclass

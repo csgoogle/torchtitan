@@ -11,8 +11,8 @@ import torchtitan.config
 import torchtitan.distributed
 from torchtitan.experiments.tpu import tpu_job_config
 from torchtitan.experiments.tpu import workarounds
-from torchtitan.experiments.tpu.llama3.infra import dtensor_parallelize
 from torchtitan.experiments.tpu.llama3.infra import fairscale_parallelize
+from torchtitan.models.llama3.infra import parallelize as dtensor_parallelize
 
 
 def parallelize_llama(

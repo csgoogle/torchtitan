@@ -33,12 +33,12 @@ def use_splash_attention_patch(
     model: nn.Module,
 ) -> None:
   """Patches splash attention into the model."""
-  from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
+  from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa  # pylint: disable=g-import-not-at-top
 
   def _splash_forward(
       self, q, k, v, *, scale=None, enable_gqa=False, is_causal=True):
-      """Replace ScaledDotProductAttentionWrapper.forward with splash_sdpa."""
-      return splash_sdpa(
+    """Replace ScaledDotProductAttentionWrapper.forward with splash_sdpa."""
+    return splash_sdpa(
           q, k, v,
           scale=scale,
           is_causal=is_causal,
@@ -48,11 +48,11 @@ def use_splash_attention_patch(
   # Patch all attention modules in the model
   _patched = 0
   for _, module in model.named_modules():
-      cls_name = type(module).__name__
-      if "ScaledDotProductAttentionWrapper" in cls_name:
-          import types
-          module.forward = types.MethodType(_splash_forward, module)
-          _patched += 1
+    cls_name = type(module).__name__
+    if "ScaledDotProductAttentionWrapper" in cls_name:
+      import types
+      module.forward = types.MethodType(_splash_forward, module)
+      _patched += 1
   logger.info(
       "Splash attention ENABLED: patched %d attention modules",
       _patched)
@@ -88,6 +88,58 @@ def use_output_projection_patch(
       )
   else:
     logger.warning("model has no output attribute, cannot wrap for Pallas loss")
+
+
+def use_gmm_kernel_patch(
+    model: nn.Module,
+) -> None:
+  """Enables the GMM kernel for GroupedExperts modules in the model.
+
+  This workload-specific monkey patch directly intercepts and overrides the
+  `_run_experts_grouped_mm` runner inside Torchtitan's MoE module. This allows
+  us to synchronously route execution to our locally compiled JAX/Pallas
+  kernel (`gmm.grouped_matrix_multiply`).
+  """
+  logger.info("Applying GMM Kernel patch to Torchtitan's MoE module.")
+  from torchtitan.experiments.tpu.kernels import gmm  # pylint: disable=g-import-not-at-top
+  import torch.nn.functional as F  # pytype: disable=import-error
+  import torchtitan.models.moe.moe as torchtitan_moe  # pytype: disable=import-error
+
+  # Explicitly intercept and rewrite the Torchtitan inner executor
+  # for `_run_experts_grouped_mm`. This is significantly more robust than
+  # hijacking PyTorch's ATen dispatch because it guarantees we call the custom
+  # Pallas kernel synchronously without torch._grouped_mm interfering.
+  def _custom_run_experts_grouped_mm(
+      w1: torch.Tensor,
+      w2: torch.Tensor,
+      w3: torch.Tensor,
+      x: torch.Tensor,
+      num_tokens_per_expert: torch.Tensor,
+  ) -> torch.Tensor:
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    h = F.silu(
+        gmm.grouped_matrix_multiply(
+            x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets
+        )
+    )
+    h = h * gmm.grouped_matrix_multiply(
+        x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
+    )
+    out = gmm.grouped_matrix_multiply(
+        h, w2.bfloat16().transpose(-2, -1), offs=offsets
+    ).type_as(x)
+    return out
+
+  # Bypass the Triton-based padding dependency that Torchtitan injects for
+  # non-EP setups. Pallas naturally handles the unpadded jagged offsets.
+  def bypassed_padding_wrapper(fn):
+    logger.info(
+        "indices_padding_wrapper bypassed since Pallas kernel handles padding."
+    )
+    return fn
+
+  torchtitan_moe.indices_padding_wrapper = bypassed_padding_wrapper
+  torchtitan_moe._run_experts_grouped_mm = _custom_run_experts_grouped_mm
 
 
 class CPUSafeHistcMode(TorchDispatchMode):

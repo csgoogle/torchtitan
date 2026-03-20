@@ -254,6 +254,12 @@ def maybe_enable_amp(
             )
             logger.info("Mixed precision training is disabled")
             return contextlib.nullcontext()
+        elif parallel_dims.dp_replicate_enabled and devicetype == "tpu":
+            # TODO b/494360665: remove this once torch.autocast is suppoted
+            logger.info(
+                "Mixed precision training is handled by fully_shard (TPU replicate)"
+            )
+            return contextlib.nullcontext()
         else:
             # the following code will only be executed for DDP or single-device training
             logger.info("Mixed precision training is handled by AMP")
@@ -261,7 +267,6 @@ def maybe_enable_amp(
                 devicetype,
                 dtype=TORCH_DTYPE_MAP[mixed_precision_param],
             )
-
 
 def init_fake_mode(world_size: int, comm_mode: str = "fake_backend"):
     """Initialize fake backend
