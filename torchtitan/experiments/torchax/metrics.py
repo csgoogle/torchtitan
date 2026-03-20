@@ -156,8 +156,9 @@ class TorchaxMetricsProcessor:
         mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
         tflops = self.num_flops_per_token * tps / 1e12
 
-        time_end_to_end = time_delta / self.job_config.metrics.log_freq
-        time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
+        actual_steps_since_last_log = max(1, len(self.data_loading_times))
+        time_end_to_end = time_delta / actual_steps_since_last_log
+        time_data_loading = sum(self.data_loading_times) / actual_steps_since_last_log
         time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
 
 

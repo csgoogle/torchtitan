@@ -1,9 +1,12 @@
+import collections
 import functools
+import re
 
 import jax
 import torch
 import torch_xla2
 import torch_xla2.train
+
 import torchtitan.distributed
 import torchtitan.tools.logging
 
@@ -126,7 +129,18 @@ def create_sharded_weights(model, mesh, sharding_map):
   res = {}
   env = torch_xla2.default_env()
   for name, weight_meta in model.state_dict().items():
-    sharding_spec = sharding_map.get(_process_sharding_name(name))
+    sharding_spec = None
+    processed_name = _process_sharding_name(name)
+    if processed_name in sharding_map:
+      sharding_spec = sharding_map[processed_name]
+    else:
+      for pattern, spec in sharding_map.items():
+        try:
+          if re.match(pattern, name) or re.match(pattern, processed_name):
+            sharding_spec = spec
+            break
+        except re.error:
+          pass
     if sharding_spec is None:
       logger.warning('Skipping weight: %s', name)
       continue
@@ -148,6 +162,86 @@ def create_sharded_weights(model, mesh, sharding_map):
         )
     )
   return res
+
+
+class redactedScannedModule(torch.nn.Module):
+  """A PyTorch module wrapper that executes a sequence of identical layers using jax.lax.scan.
+
+  This class takes a list of structurally identical PyTorch modules (e.g., Transformer layers),
+  stacks their weights into single tensors with an added leading dimension, and executes them
+  iteratively during the forward pass using jax.lax.scan through torch_xla2 interop.
+  This significantly reduces XLA compilation time and HLO size for large models.
+
+  Args:
+    module_list: A list of structurally identical PyTorch modules to be scanned.
+    checkpoint_policy: An optional jax.checkpoint_policies policy to control activation
+      rematerialization during the backward pass (e.g., nothing_saveable).
+  """
+
+  def __init__(self, module_list, checkpoint_policy=None):
+    super().__init__()
+    assert module_list
+    self.c = torch_xla2.train.Container()
+    self.c.one_mod = module_list[0]
+    self.checkpoint_policy = checkpoint_policy
+    weights = self._stack_layer_weights(module_list)
+    self.layer_weights_keys = list(self.c.one_mod.state_dict().keys())
+    self.params = torch.nn.ParameterDict(
+        {self._param_name_new(k): v for k, v in weights.items()}
+    )
+
+  def _stack_layer_weights(self, module_list):
+
+    temp = collections.defaultdict(list)
+    for m in module_list:
+      for k, v in m.state_dict().items():
+        temp[k].append(v)
+    return {k: torch.stack(v) for k, v in temp.items()}
+
+  def _param_name_new(self, old):
+    return '___'.join(old.split('.'))
+
+  def forward(self, input_tensor, **kwargs):
+    weights = {
+        k: self.params[self._param_name_new(k)] for k in self.layer_weights_keys
+    }
+    scan = torch_xla2.interop.torch_view(jax.lax.scan)
+
+    def eval_one_layer(args, weight):
+      (h,) = args
+      newh = torch.func.functional_call(self.c.one_mod, weight, (h,), kwargs)
+      return (newh,), None
+
+    _eval_one_layer = torch_xla2.interop.gradient_checkpoint(
+        eval_one_layer,
+        kwargs={'policy': self.checkpoint_policy},
+    )
+    (result,), _ = scan(_eval_one_layer, (input_tensor,), weights)
+    return result
+
+
+class SegmentWithScanWrapper(torch.nn.Module):
+  """A wrapper that combines a scanned segment of layers with an optional final layer.
+
+  This is useful when a sequence of layers cannot be fully scanned because the final
+  layer has a different structure or output shape. It smoothly executes the scanned
+  layers followed immediately by the unscanned final layer.
+
+  Args:
+    scanned_layers: A module (e.g., redactedScannedModule) representing the scanned layers.
+    last_layer: An optional PyTorch module to execute after the scanned layers.
+  """
+
+  def __init__(self, scanned_layers, last_layer=None):
+    super().__init__()
+    self.scanned = scanned_layers
+    self.last = last_layer
+
+  def forward(self, input_tensor, **kwargs):
+    out = self.scanned(input_tensor, **kwargs)
+    if self.last is not None:
+      out = self.last(out, **kwargs)
+    return out
 
 
 class ModelWithScan(torch.nn.Module):

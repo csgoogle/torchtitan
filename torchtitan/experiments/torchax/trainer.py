@@ -1,5 +1,6 @@
 """Minimal trainer for torch titan experiments."""
 
+import collections
 import time
 import typing
 
@@ -12,6 +13,7 @@ from torch_xla2.interop import JittableModule
 from torch_xla2.interop import torch_view
 import torch_xla2.train
 from torchtitan.components.dataloader import DataloaderExhaustedError
+from torchtitan.experiments.torchax import redacted as torchax_redacted
 from torchtitan.experiments.torchax import data_utils
 from torchtitan.experiments.torchax import deepseek_v3 as torchax_dsv3
 from torchtitan.experiments.torchax import distributed
@@ -34,6 +36,8 @@ def is_moe_model(job_config) -> bool:
     job_config: The job configuration object.
   """
   if job_config.model.name == 'llama3':
+    return False
+  elif job_config.model.name == 'redacted':
     return False
   elif job_config.model.name == 'qwen3':
     # Naming convention for qwen3 moe model seems to be xB-AyB,
@@ -66,12 +70,28 @@ class TorchaxTrainer:
     self.replicated = jax.sharding.NamedSharding(self.mesh, P())
 
     self.job_config = job_config
+
     self.train_spec = torchtitan.protocols.train_spec.get_train_spec(
         job_config.model.name
     )
 
   def setup_dataloader(self, job_config):
     """Sets up the dataloader."""
+    # TorchAx uses a single controller for all devices, so the single
+    # DataLoader must fetch the data for all replicas globally.
+    # Torchtitan defines `local_batch_size` as the PER CHIP batch size.
+    # So we temporarily override `local_batch_size` to be the global batch size.
+    expected_global_batch_size = job_config.training.global_batch_size
+    if expected_global_batch_size <= 0:
+      expected_global_batch_size = (
+          job_config.training.local_batch_size
+          * self.parallel_dims.dp_shard
+          * self.parallel_dims.dp_replicate
+      )
+
+    original_local_batch_size = job_config.training.local_batch_size
+    job_config.training.local_batch_size = expected_global_batch_size
+
     if (
         job_config.training.dataset is None
         or job_config.training.dataset.startswith('fake')
@@ -91,12 +111,15 @@ class TorchaxTrainer:
           if self.train_spec.build_tokenizer_fn is not None
           else None,
       )
+
       train_loader = self.train_spec.build_dataloader_fn(
           dp_world_size=1,
           dp_rank=0,
           tokenizer=tokenizer,
           job_config=job_config,
       )
+
+    job_config.training.local_batch_size = original_local_batch_size
     return tokenizer, train_loader
 
   def setup_model(self, job_config):
@@ -111,6 +134,8 @@ class TorchaxTrainer:
       torchax_model = torchax_qwen3
     elif job_config.model.name == 'deepseek_v3':
       torchax_model = torchax_dsv3
+    elif job_config.model.name == 'redacted':
+      torchax_model = torchax_redacted
     else:
       raise ValueError(f'Unsupported model: {job_config.model.name}')
 
@@ -118,6 +143,10 @@ class TorchaxTrainer:
       # using scan the individial weights will have shape (num_layers, w, h)
       if is_moe_model(job_config):
         sharding_map = torchax_model.sharding_map_scan_moe
+      elif 'lora' in job_config.model.flavor and hasattr(
+          torchax_model, 'sharding_map_scan_lora'
+      ):
+        sharding_map = torchax_model.sharding_map_scan_lora
       else:
         sharding_map = torchax_model.sharding_map_scan
     else:
@@ -134,14 +163,18 @@ class TorchaxTrainer:
     self.model_args = model_args
 
     if job_config.torchax_config.model_layer_override is not None:
+      current_layers = getattr(
+          model_args, 'n_layers', getattr(model_args, 'num_layers', None)
+      )
       logger.warning(
           'Overriding layer from %s to %s for debug',
-          model_args.n_layers,
+          current_layers,
           job_config.torchax_config.model_layer_override,
       )
-      model_args.n_layers = (
-          job_config.torchax_config.model_layer_override
-      )
+      if hasattr(model_args, 'n_layers'):
+        model_args.n_layers = job_config.torchax_config.model_layer_override
+      elif hasattr(model_args, 'num_layers'):
+        model_args.num_layers = job_config.torchax_config.model_layer_override
     if hasattr(model_args, 'use_flex_attn'):
       logger.info(
           'Setting model_args.use_flex_attn to False since we are using'
@@ -173,6 +206,9 @@ class TorchaxTrainer:
         from torchtitan.models.deepseek_v3.model.model import precompute_freqs_cis
         embedding_constants = precompute_freqs_cis(model_args)
         embedding_constants_key = 'freqs_cis'
+      elif job_config.model.name == 'redacted':
+        embedding_constants = None
+        embedding_constants_key = None
       else:
         raise ValueError(f'No embedding constant for: {job_config.model.name}')
 
@@ -180,7 +216,48 @@ class TorchaxTrainer:
     checkpoint_policy = jax.checkpoint_policies.nothing_saveable
 
     if job_config.torchax_config.use_scan:
-      if (
+      if job_config.model.name == 'redacted':
+        redacted_model = model.model
+        seg0 = redacted_model.layers.segment_0
+        seg0_layers = list(seg0.layers)
+        scanned_0 = distributed.redactedScannedModule(
+            seg0_layers[:-1], checkpoint_policy
+        )
+        new_modules = collections.OrderedDict()
+        new_side_keys = collections.defaultdict(list)
+        new_output_keys = {}
+
+        new_modules['scan_0'] = scanned_0
+        new_side_keys['scan_0'] = [('**kwargs', '**kwargs')]
+
+        new_modules['last_0'] = seg0_layers[-1]
+        last_name = list(seg0._named_layers_dict.keys())[-1]
+        new_side_keys['last_0'] = seg0.side_input_keys[last_name]
+        if last_name in seg0.side_output_keys:
+          new_output_keys['last_0'] = seg0.side_output_keys[last_name]
+
+        seg0._modules = new_modules
+        seg0._side_input_keys = new_side_keys
+        seg0._side_output_keys = new_output_keys
+
+        if hasattr(redacted_model.layers, 'segment_1'):
+          seg1 = redacted_model.layers.segment_1
+          seg1_layers = list(seg1.layers)
+          scanned_1 = distributed.redactedScannedModule(
+              seg1_layers, checkpoint_policy
+          )
+
+          new_modules_1 = collections.OrderedDict()
+          new_side_keys_1 = collections.defaultdict(list)
+          new_output_keys_1 = {}
+
+          new_modules_1['scan_1'] = scanned_1
+          new_side_keys_1['scan_1'] = [('**kwargs', '**kwargs')]
+
+          seg1._modules = new_modules_1
+          seg1._side_input_keys = new_side_keys_1
+          seg1._side_output_keys = new_output_keys_1
+      elif (
           job_config.training.enable_cpu_offload
           and job_config.torchax_config.offload_keys
       ):
@@ -194,18 +271,21 @@ class TorchaxTrainer:
                 offload_dst='pinned_host',
             )
         )
-      model = distributed.ModelWithScan(
-          model, checkpoint_policy, embedding_constants_key
-      )
+      if job_config.model.name != 'redacted':
+        model = distributed.ModelWithScan(
+            model, checkpoint_policy, embedding_constants_key
+        )
 
     state_dict = dict(model.state_dict())
-    state_dict.pop(embedding_constants_key)
+    if embedding_constants_key is not None:
+      state_dict.pop(embedding_constants_key)
     state_dict = distributed.create_sharded_weights(model, self.mesh, sharding_map)
     replicated = jax.sharding.NamedSharding(self.mesh, P())
 
-    state_dict[embedding_constants_key] = embedding_constants.to('jax').apply_jax(
-        jax.device_put, replicated
-    )
+    if embedding_constants_key is not None:
+      state_dict[embedding_constants_key] = embedding_constants.to(
+          'jax'
+      ).apply_jax(jax.device_put, replicated)
     model.load_state_dict(state_dict, assign=True)
     return model, checkpoint_policy
 
@@ -332,11 +412,15 @@ class TorchaxTrainer:
           )
       )
     else:
-      _, metrics_processor.num_flops_per_token = (
-          self.model_args.get_nparams_and_flops(
-              model, job_config.training.seq_len
-          )
-      )
+      if hasattr(self.model_args, 'get_nparams_and_flops'):
+        _, metrics_processor.num_flops_per_token = (
+            self.model_args.get_nparams_and_flops(
+                model, job_config.training.seq_len
+            )
+        )
+      else:
+        # Fallback if get_nparams_and_flops is not implemented (e.g., redacted)
+        metrics_processor.num_flops_per_token = 0
 
     train_step = torch_xla2.train.make_train_step(
         model_fn,
@@ -412,7 +496,7 @@ class TorchaxTrainer:
       # Ensure previous async ops are done before starting the next step
       jax.block_until_ready((jittable_mod.params, opt_state))
 
-      logger.debug(f'Model input shape: %s', inputs.shape)
+      logger.debug('Model input shape: %s', inputs.shape)
 
       loss, jittable_mod.params, opt_state = train_step(
           jittable_mod.params, jittable_mod.buffers, opt_state, inputs, labels
