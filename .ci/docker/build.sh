@@ -34,7 +34,6 @@ case "${IMAGE_NAME}" in
 esac
 
 docker build \
-  --no-cache \
   --progress=plain \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   --build-arg "OS_VERSION=${OS_VERSION}" \

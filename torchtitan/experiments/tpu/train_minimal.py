@@ -13,11 +13,11 @@ from absl import flags
 from absl.flags import argparse_flags
 import torch
 from torch import nn
-import torch.multiprocessing as mp
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.experiments.tpu import gmain
 from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
@@ -28,8 +28,6 @@ import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.tools import utils
 import torchtitan.tools.logging
 import torchtitan.tools.profiling
-
-from absl import app
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 JobConfig = torchtitan.config.JobConfig
@@ -334,14 +332,5 @@ def start_trainer(config: JobConfig):
     logger.info("Process group destroyed")
 
 
-def main(parsed_args: Tuple[argparse.Namespace, List[str]]):
-  args, remaining_args = parsed_args
-  config_manager = torchtitan.config.ConfigManager(TPUJobConfig)
-  config = config_manager.parse_args(remaining_args)
-
-  start_trainer(config)
-
-
 if __name__ == "__main__":
-  app.run(main, flags_parser=(
-      lambda args: (None, flags.FLAGS(args, known_only=True)[1:])))
+  gmain.handle_main(start_trainer)

@@ -64,7 +64,7 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
     --test_arg=--torchax_config.use_scan \
     --test_arg=--training.enable_cpu_offload
 ```
-redacted 3B Full FT on v6e-8 (53k TPS total, MFU ~20.2%):
+redacted 3B Full FT on v6e-8 (57k TPS total, MFU ~22%):
 ```
 bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_2x4 \
     --test_arg=-- \
@@ -75,11 +75,12 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
     --test_arg=--model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
     --test_arg=--training.seq_len=8192 \
     --test_arg=--training.global_batch_size=8 \
-    --test_arg=--training.steps=8 \
+    --test_arg=--training.steps=22 \
     --test_arg=--torchax_config.use_torchax \
-    --test_arg=--torchax_config.use_scan
+    --test_arg=--torchax_config.use_scan \
+    --test_arg=--activation_checkpoint.mode=full
 ```
-redacted 3B LoRA on v6e-8 (19.1k TPS total, MFU ~7.5%):
+redacted 3B LoRA on v6e-8 (51.5k TPS total, MFU ~20.3%):
 ```
 bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_2x4 \
     --test_arg=-- \
@@ -90,9 +91,25 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
     --test_arg=--model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
     --test_arg=--training.seq_len=8192 \
     --test_arg=--training.global_batch_size=8 \
-    --test_arg=--training.steps=8 \
+    --test_arg=--training.steps=22 \
     --test_arg=--torchax_config.use_torchax \
-    --test_arg=--torchax_config.use_scan
+    --test_arg=--torchax_config.use_scan \
+    --test_arg=--activation_checkpoint.mode=full
+```
+redacted 3B LoRA on 2xH100 GPU (3.9k TPS total, MFU ~5.8%):
+```
+bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_gpu_h100x2 \
+    --test_arg=-- \
+    --test_arg=--model.name=redacted \
+    --test_arg=--model.flavor=3B-lora \
+    --test_arg=--job.config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
+    --test_arg=--training.dataset=fake \
+    --test_arg=--training.seq_len=8192 \
+    --test_arg=--training.global_batch_size=2 \
+    --test_arg=--training.steps=12 \
+    --test_arg=--torchax_config.use_torchax \
+    --test_arg=--torchax_config.use_scan \
+    --test_arg=--activation_checkpoint.mode=full
 ```
 Deepseek_v3 16B (override layer from 27 to 11, so ~6.3B-A1.3B, MFU ~23%):
 ```
@@ -112,23 +129,24 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
     --test_arg=--torchax_config.use_scan \
     --test_arg=--training.enable_cpu_offload
 ```
-Run it with launcher:
-```
+Run it with launcher (xm/240480403):
+```bash
 launcher launch third_party/py/torchtitan/launcher/xm_launch.py -- \
     --xm_resource_alloc=cloud-dynamic/cmcs-xm \
     --target=//third_party/py/torchtitan/experiments/torchax:train_minimal  \
-    --platform=vl=4x2 \
+    --platform=glp=2x4 \
     -- \
-    --model.name=llama3 \
-    --model.flavor=8B \
+    --model.name=redacted \
+    --model.flavor=3B-lora \
+    --job.config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
     --training.dataset=fake \
-    --training.seq_len=4096 \
+    --model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
+    --training.seq_len=8192 \
     --training.global_batch_size=8 \
-    --training.steps=25 \
-    --parallelism.tensor_parallel_degree=2 \
+    --training.steps=22 \
     --torchax_config.use_torchax \
     --torchax_config.use_scan \
-    --training.enable_cpu_offload
+    --activation_checkpoint.mode=full
 ```
 """
 
@@ -173,6 +191,8 @@ def _get_accelerator_short_name(device_kind: str) -> str:
     return 'h100'
   if 'a100' in device_lower:
     return 'a100'
+  if 'cpu' in device_lower:
+    return 'cpu'
   raise RuntimeError(
       f'Could not determine accelerator type from JAX device_kind: {device_kind}'
   )

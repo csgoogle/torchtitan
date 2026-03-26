@@ -213,7 +213,30 @@ class TorchaxTrainer:
         raise ValueError(f'No embedding constant for: {job_config.model.name}')
 
     # Remat: default to recompute everything inside transformer block
-    checkpoint_policy = jax.checkpoint_policies.nothing_saveable
+    if job_config.activation_checkpoint.mode == 'full':
+        checkpoint_policy = jax.checkpoint_policies.nothing_saveable
+    elif job_config.activation_checkpoint.mode == 'selective':
+        checkpoint_policy = jax.checkpoint_policies.dots_saveable
+    elif job_config.activation_checkpoint.mode == 'everything':
+        checkpoint_policy = jax.checkpoint_policies.everything_saveable
+    elif job_config.activation_checkpoint.mode == 'offload_dot':
+        checkpoint_policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
+    elif job_config.activation_checkpoint.mode == 'nothing':
+        checkpoint_policy = None
+    else:
+        checkpoint_policy = jax.checkpoint_policies.nothing_saveable
+
+    if job_config.training.enable_cpu_offload and job_config.torchax_config.offload_keys:
+        offload_keys = job_config.torchax_config.offload_keys.split('|')
+        logger.info('Offloading keys: %s to host.', offload_keys)
+        checkpoint_policy = (
+            jax.checkpoint_policies.save_and_offload_only_these_names(
+                names_which_can_be_saved=[],
+                names_which_can_be_offloaded=offload_keys,
+                offload_src='device',
+                offload_dst='pinned_host',
+            )
+        )
 
     if job_config.torchax_config.use_scan:
       if job_config.model.name == 'redacted':
@@ -257,20 +280,6 @@ class TorchaxTrainer:
           seg1._modules = new_modules_1
           seg1._side_input_keys = new_side_keys_1
           seg1._side_output_keys = new_output_keys_1
-      elif (
-          job_config.training.enable_cpu_offload
-          and job_config.torchax_config.offload_keys
-      ):
-        offload_keys = job_config.torchax_config.offload_keys.split('|')
-        logger.info('Offloading keys: %s to host.', offload_keys)
-        checkpoint_policy = (
-            jax.checkpoint_policies.save_and_offload_only_these_names(
-                names_which_can_be_saved=[],
-                names_which_can_be_offloaded=offload_keys,
-                offload_src='device',
-                offload_dst='pinned_host',
-            )
-        )
       if job_config.model.name != 'redacted':
         model = distributed.ModelWithScan(
             model, checkpoint_policy, embedding_constants_key
@@ -426,8 +435,7 @@ class TorchaxTrainer:
         model_fn,
         loss_fn,
         jax_optimizer,
-        remat_policy=checkpoint_policy
-        or jax.checkpoint_policies.nothing_saveable,
+        remat_policy=checkpoint_policy,
     )
 
     logger.info(
@@ -493,27 +501,37 @@ class TorchaxTrainer:
             self.mesh,
         )
 
-      # Ensure previous async ops are done before starting the next step
-      jax.block_until_ready((jittable_mod.params, opt_state))
+      # (Removed jax.block_until_ready here to allow async overlap)
 
       logger.debug('Model input shape: %s', inputs.shape)
 
       loss, jittable_mod.params, opt_state = train_step(
           jittable_mod.params, jittable_mod.buffers, opt_state, inputs, labels
       )
-      # wait for iteration to finish to measure time
-      torch_xla2.interop.call_jax(
-          jax.block_until_ready, (loss, jittable_mod.params)
-      )
 
-      metrics_processor.log(
-          step + 1,
-          loss.item(),
-          loss.item(),
-          grad_norm = -1.0,  # grad_norm is not supported for now
-      )
+      # Only block and log periodically to avoid stalling the TPU hardware pipeline.
+      if metrics_processor.should_log(step + 1):
+        # wait for iteration to finish to measure time
+        torch_xla2.interop.call_jax(
+            jax.block_until_ready, (loss, jittable_mod.params)
+        )
+
+        # Torchtitan cross entropy returns the sum across all tokens.
+        # Normalize by token count for log readability (loss ~10 rather than ~700k).
+        norm_loss = loss.item() / ntokens_batch
+
+        metrics_processor.log(
+            step + 1,
+            norm_loss,
+            norm_loss,
+            grad_norm = -1.0,  # grad_norm is not supported for now
+        )
 
       if step >= job_config.training.steps - 1:
+        # Prevent premature exit before the last step finishes
+        torch_xla2.interop.call_jax(
+            jax.block_until_ready, (loss, jittable_mod.params)
+        )
         break
 
     if job_config.profiling.enable_profiling:

@@ -144,9 +144,34 @@ def set_determinism(
     if seed is None:
         # Extract the seed for torch's main generator on rank 0 and standardizes on using that to build
         # seeds for unique SPMD groups
-        seed_tensor = torch.get_rng_state()[:8].to(device)
-        torch.distributed.broadcast(seed_tensor, src=0)
-        seed = seed_tensor.to("cpu").view(torch.uint64).item()
+        # Broadcast the seed as a Python object (via gloo pickle transport)
+        # rather than as a device tensor. This avoids triggering an early
+        # XLA/CUDA graph compilation for this trivial synchronization and
+        # also sidesteps device-specific dispatch issues (e.g. torch_tpu's
+        # __torch_dispatch__ hook which requires TPU tensors for collectives).
+        seed_val = [torch.get_rng_state()[:8].view(torch.uint64)[0].item()]
+        if device.type == "tpu":
+            # On XLA devices (TPU), ops are deferred and compiled lazily.
+            # init_process_group may accumulate XLA ops (including collectives)
+            # in each rank's deferred queue. Flush them first so all ranks start
+            # the seed broadcast with empty queues and symmetric compilation cost.
+            torch.zeros(1, device=device).item()
+            # broadcast_object_list does not call .item() on the src rank (0),
+            # so the broadcast ops stay deferred and rank 0 races into train_step,
+            # hitting dist_sum.item() with a mismatched collective queue → deadlock.
+            # Fix: use a plain tensor broadcast so ALL ranks call .item() and block
+            # symmetrically until the broadcast completes.
+            # seed_val[0] is uint64 from rng_state; mask to int64 range.
+            # Use all_reduce(MAX) to share rank 0's seed: symmetric across all
+            # ranks (no src/dst), so all ranks call .item() and block together.
+            seed_tensor = torch.zeros(1, dtype=torch.int64, device=device)
+            if torch.distributed.get_rank() == 0:
+                seed_tensor[0] = seed_val[0] & 0x7FFFFFFFFFFFFFFF
+            torch.distributed.all_reduce(seed_tensor, op=torch.distributed.ReduceOp.SUM)
+            seed = int(seed_tensor.item())
+        else:
+            torch.distributed.broadcast_object_list(seed_val, src=0)
+            seed = int(seed_val[0])
     assert isinstance(seed, int)
 
     # Set distinct seed for each rank in mesh dimensions, with dimension names provided by `distinct_seed_mesh_dims`

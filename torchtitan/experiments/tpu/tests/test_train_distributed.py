@@ -98,7 +98,7 @@ class TrainDistributedTest(
           ],
       ),
       dict(
-          testcase_name="qwen3_tpu_fsdp_use_gmm_without_fill_indices_kernel_testmodel_moe",
+          testcase_name="qwen3_tpu_fsdp_moe_use_gmm_kernel",
           model_name="qwen3_tpu",
           config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
           use_fairscale=False,
@@ -114,14 +114,14 @@ class TrainDistributedTest(
           ],
       ),
       dict(
-          testcase_name="qwen3_tpu_fsdp_use_gmm_kernel_testmodel_moe",
+          testcase_name="qwen3_tpu_fsdp_moe_use_gmm_and_fill_indices_kernels",
           model_name="qwen3_tpu",
           config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
           use_fairscale=False,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
-              "--model.flavor=testmodel_moe",
+              "--model.flavor=testmodel_moe",  # NOTE: this model has use_grouped_mm=True
               "--tpu_config.use_gmm_kernel",
               "--tpu_config.use_fill_indices_kernel",
           ],
@@ -334,6 +334,15 @@ class TrainDistributedTest(
           data_parallel_shard_degree=1,
           tensor_parallel_degree=1,
           data_parallel_replicate_degree=-1,
+      ),
+      # redacted_tpu
+      dict(
+          testcase_name="redacted_tpu_fsdp_dtensor",
+          model_name="redacted_tpu",
+          config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          use_fairscale=False,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
       ),
   ])
   def test_train_distributed(

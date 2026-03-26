@@ -113,13 +113,13 @@ def _verify_fairscale_qwen3_fsdp_training_loop_worker(
       use_fairscale=True,
   )
 
-  for _ in range(TEST_TRAINING_STEPS):
-    runner.run_backward_parity(
-        TEST_BATCH_SIZE,
-        TEST_SEQ_LEN,
-        atol_loss=5e-3,
-        rtol_loss=5e-3,
-    )
+  runner.run_backward_parity(
+      num_steps=TEST_TRAINING_STEPS,
+      batch_size=TEST_BATCH_SIZE,
+      seq_len=TEST_SEQ_LEN,
+      atol_loss=5e-3,
+      rtol_loss=5e-3,
+  )
 
 
 class Qwen3FairscaleParallelizeTest(

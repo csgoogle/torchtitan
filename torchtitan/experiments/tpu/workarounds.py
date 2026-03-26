@@ -34,6 +34,7 @@ def use_splash_attention_patch(
 ) -> None:
   """Patches splash attention into the model."""
   from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa  # pylint: disable=g-import-not-at-top
+  import types
 
   def _splash_forward(
       self, q, k, v, *, scale=None, enable_gqa=False, is_causal=True):
@@ -45,14 +46,46 @@ def use_splash_attention_patch(
           enable_gqa=enable_gqa,
       )
 
+  def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
+    """Replaces [redacted]'s native SDPA with splash_sdpa.
+
+    This function replaces ScaledDotProductAttention._sdpa_native_torch with
+    `splash_sdpa`. [redacted]'s attention layer requires special handling because
+    unlike torchtitan's wrapper which works with shape (B, H, S, D),
+    it expects inputs of shape (B, S, H, D) and handles GQA by tiling
+    k/v heads before SDPA. This wrapper mimics [redacted]'s GQA handling,
+    transposes inputs to (B, H, S, D) for splash_sdpa, and transposes
+    the output back to (B, S, H, D).
+    """
+    query, key, value = self._maybe_tile_qkv_for_gqa(query, key, value)
+    # Transpose from (B, S, H, D) to (B, H, S, D).
+    query = query.transpose(-3, -2)
+    key = key.transpose(-3, -2)
+    value = value.transpose(-3, -2)
+
+    # splash_sdpa expects enable_gqa=False as heads are already tiled.
+    out = splash_sdpa(
+        query,
+        key,
+        value,
+        scale=scale,
+        is_causal=True,
+        enable_gqa=False,
+    )
+    # Transpose back to match [redacted]'s expected layout
+    return out.transpose(-3, -2)
+
   # Patch all attention modules in the model
   _patched = 0
   for _, module in model.named_modules():
     cls_name = type(module).__name__
     if "ScaledDotProductAttentionWrapper" in cls_name:
-      import types
       module.forward = types.MethodType(_splash_forward, module)
       _patched += 1
+    elif cls_name == "ScaledDotProductAttention":
+      module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
+      _patched += 1
+
   logger.info(
       "Splash attention ENABLED: patched %d attention modules",
       _patched)
@@ -74,7 +107,7 @@ def use_output_projection_patch(
     model: nn.Module,
 ) -> None:
   """Replaces model.output with an identity-like module that returns (x, weight)."""
-  if hasattr(model, "output"):
+  if hasattr(model, "output") or hasattr(model, "output_transform"):
     if isinstance(model.output, nn.Linear):
       model.output = PallasLossLinear(model.output)
       logger.info("Patched model.output to return (x, weight) for Pallas loss")

@@ -641,7 +641,7 @@ class Checkpoint:
 
 @dataclass
 class ActivationCheckpoint:
-    mode: Literal["selective", "full", "memory_budget", "none"] = "selective"
+    mode: Literal["selective", "full", "memory_budget", "none", "everything", "offload_dot", "nothing"] = "selective"
     """Type of activation checkpointing to use"""
 
     selective_ac_option: str = "2"

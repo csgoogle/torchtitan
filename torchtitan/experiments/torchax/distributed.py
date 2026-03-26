@@ -107,9 +107,9 @@ def _make_weight_shard(weight_meta, slice_index):
 
   # 4. Generate directly on the device using JAX
   # This allocates ONLY the memory needed for the shard, directly on XLA/TPU
-  # Reduce the std to 0.01 to avoid blow up the range of activations.
+  # Reduce the std to 0.001 to avoid blow up the range of activations.
   # TODO(jialeic): better weight initialization like glorot_normal.
-  return jax.random.normal(key, shard_meta.shape, dtype=jax_dtype) * 0.01
+  return jax.random.normal(key, shard_meta.shape, dtype=jax_dtype) * 0.001
 
 
 def create_sharded_weights(model, mesh, sharding_map):
@@ -212,10 +212,13 @@ class redactedScannedModule(torch.nn.Module):
       newh = torch.func.functional_call(self.c.one_mod, weight, (h,), kwargs)
       return (newh,), None
 
-    _eval_one_layer = torch_xla2.interop.gradient_checkpoint(
-        eval_one_layer,
-        kwargs={'policy': self.checkpoint_policy},
-    )
+    if self.checkpoint_policy is None:
+      _eval_one_layer = eval_one_layer
+    else:
+      _eval_one_layer = torch_xla2.interop.gradient_checkpoint(
+          eval_one_layer,
+          kwargs={'policy': self.checkpoint_policy},
+      )
     (result,), _ = scan(_eval_one_layer, (input_tensor,), weights)
     return result
 

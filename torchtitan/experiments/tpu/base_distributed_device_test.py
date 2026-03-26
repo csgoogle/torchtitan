@@ -15,7 +15,6 @@ from torch.distributed.tensor import DTensor
 from torch.google import distributed as gdist
 import torchtitan.config
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
-from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu import distributed_utils
 from torchtitan.experiments.tpu import numerical_validation
 from torchtitan.experiments.tpu import test_utils
@@ -98,23 +97,19 @@ def _gather_distributed_tensor(
     world_size: int,
     use_fairscale: bool = False,
 ) -> torch.Tensor:
-  """Unshards a tensor (DTensor or Fairscale) to CPU."""
+  """Unshards a tensor (DTensor or Fairscale) purely on device."""
 
   # Handle Fairscale (manual stitching)
   if use_fairscale:
-    return (
-        _gather_fairscale_weights(model, tensor, name, world_size)
-        .detach()
-        .cpu()
-    )
+    return _gather_fairscale_weights(model, tensor, name, world_size).detach()
 
   # Handle DTensor (automatic stitching)
   if isinstance(tensor, DTensor):
-    return tensor.full_tensor().detach().cpu()
+    return tensor.full_tensor().detach()
 
   # Should be one of the above, otherwise its a standard tensor and
   # replicated shard so we can just take local copy.
-  return tensor.detach().cpu()
+  return tensor.detach()
 
 
 class DistributedUnitTestRunner:
@@ -127,7 +122,14 @@ class DistributedUnitTestRunner:
   - Creating parallelized device model to test against reference.
   - Ensuring test/ref models start with identical weights.
   - Applying arbitrary parallelization transforms.
-  - Running synchronized Forward/Backward/Step checks.
+  - Running Forward/Backward/Step checks.
+    - For forward checks, we run the reference model on Rank 0 and the
+      parallel model on all ranks and compare outputs.
+    - For backward/step checks, Rank 0 pre-computes the reference model's
+      loss and gradients for all steps, and then all ranks synchronize and
+      compare against the cached values. This is to avoid potential
+      deadlocks from running the reference model in lockstep with the
+      parallel model.
   """
 
   def __init__(
@@ -210,67 +212,117 @@ class DistributedUnitTestRunner:
       )
       logging.info("[Rank %s] Forward parity passed.", self.rank)
 
+  def _run_reference_model_pre_run(self, batches, num_steps):
+    """Executes the reference model steps on CPU and caches artifacts."""
+    reference_records = []
+    logging.info(
+        "[Rank 0]: Executing %d step Reference Model Pre-run...", num_steps
+    )
+    for step in range(num_steps):
+      inputs_global, targets_global = batches[step]
+      _, reference_loss = self._run_step(
+          self.reference_model, inputs_global, targets_global, backward=True
+      )
+
+      ref_grads = {}
+      for name, param in self.reference_model.named_parameters():
+        if param.grad is not None:
+          ref_grads[name] = param.grad.clone()
+
+      reference_records.append({
+          "loss": (
+              reference_loss.detach().clone()
+              if reference_loss is not None
+              else None
+          ),
+          "grads": ref_grads,
+      })
+    logging.info("[Rank 0]: Reference Model sequence compiled natively.")
+    return reference_records
+
   def run_backward_parity(
       self,
-      batch_size: int,
-      seq_len: int,
+      num_steps: int = 1,
+      batch_size: int = 1,
+      seq_len: int = 1,
       atol_loss: float = 1e-3,
       rtol_loss: float = 1e-3,
       atol_grad: float = 1e-3,
       rtol_grad: float = 1e-3,
   ):
-    """Verifies the reference and parallel models produce identical loss and gradients."""
+    """Verifies equivalence of loss and gradients across models."""
     if self.reference_model is None:
       raise ValueError(
           "Reference model not initialized. To run test, call "
           "`apply_parallelism`to parallelize the device model "
           "and create a reference on CPU."
       )
-    inputs_global, targets_global = self._generate_global_batch(
-        batch_size, seq_len
-    )
-    inputs_local, targets_local = self._get_local_batch_view(
-        inputs_global, targets_global
-    )
-    inputs_device = inputs_local.to(self.device)
-    targets_device = targets_local.to(self.device)
 
-    reference_loss = None
-    # Run reference model (Rank 0 only)
+    logging.info(
+        "[Rank %d]: Generating all %d shared batches upfront.",
+        self.rank, num_steps
+    )
+    start_step = self.current_step
+    batches = []
+    for step in range(num_steps):
+      self.current_step = start_step + step
+      batches.append(self._generate_global_batch(batch_size, seq_len))
+
+    # CPU Pre-Run: Rank 0 completely pre-computes the reference evaluation
+    reference_records = []
     if self.rank == 0:
-      _, reference_loss = self._run_step(
-          self.reference_model, inputs_global, targets_global, backward=True
+      reference_records = self._run_reference_model_pre_run(batches, num_steps)
+
+    # Universal barrier to ensure Rank 0 has cached everything correctly
+    dist.barrier()
+
+    for step in range(num_steps):
+      self.current_step = start_step + step
+      inputs_global, targets_global = batches[step]
+      inputs_local, targets_local = self._get_local_batch_view(
+          inputs_global, targets_global
+      )
+      inputs_device = inputs_local.to(self.device)
+      targets_device = targets_local.to(self.device)
+
+      _, parallel_loss = self._run_step(
+          self.parallel_model, inputs_device, targets_device, backward=True
       )
 
-    # Run parallel model (all ranks)
-    _, parallel_loss = self._run_step(
-        self.parallel_model, inputs_device, targets_device, backward=True
-    )
+      # If we split the batch, the local loss is just a slice. We must
+      # average across ranks to match the global reference loss.
+      if self.input_distribution == InputDistribution.SPLIT_BATCH:
+        loss_to_check = parallel_loss.detach().clone()
+        dist.all_reduce(loss_to_check, op=dist.ReduceOp.AVG)
+      else:
+        loss_to_check = parallel_loss
 
-    # If we split the batch, local loss is just a slice. We must average across
-    # ranks to match the global reference loss.
-    if self.input_distribution == InputDistribution.SPLIT_BATCH:
-      loss_to_check = parallel_loss.detach().clone()
-      dist.all_reduce(loss_to_check, op=dist.ReduceOp.AVG)
-    else:
-      loss_to_check = parallel_loss
+      # Force ALL ranks to extract `.cpu()` identically here.
+      loss_to_check_cpu = loss_to_check.cpu()
 
-    # Compare Loss
-    if self.rank == 0:
-      test_utils.check_equivalence(
-          tensor_test=loss_to_check.cpu(),
-          tensor_reference=reference_loss,
-          check_name=f"Backward Loss (Rank {self.rank})",
-          step=self.current_step,
-          atol=atol_loss, rtol=rtol_loss,
-          test_label="Parallel",
-          ref_label="Single Device",
+      if self.rank == 0:
+        test_utils.check_equivalence(
+            tensor_test=loss_to_check_cpu,
+            tensor_reference=reference_records[step]["loss"],
+            check_name=f"Backward Loss (Rank {self.rank})",
+            step=step,
+            atol=atol_loss,
+            rtol=rtol_loss,
+            test_label="Parallel",
+            ref_label="Single Device",
+        )
+
+      self._check_gradients_against_recorded(
+          reference_records[step]["grads"] if self.rank == 0 else {},
+          atol_grad,
+          rtol_grad,
       )
 
-    self._check_gradients(atol_grad, rtol_grad)
+      dist.barrier()
 
     logging.info("[Rank %s] Backward parity passed.", self.rank)
-    self.current_step += 1
+
+    self.current_step = start_step + num_steps
 
   def _create_parallel_model(self, func: Callable[[nn.Module], None]):
     """Creates a parallel model and applies the parallelism function."""
@@ -300,7 +352,7 @@ class DistributedUnitTestRunner:
 
     with torch.no_grad():
       for key, param in parallel_state.items():
-        cpu_state_dict[key] = self._gather_weights_to_cpu_wrapper(param, key)
+        cpu_state_dict[key] = self._gather_weights_wrapper(param, key).cpu()
 
     self.reference_model.load_state_dict(cpu_state_dict)
     # Ensure gradients are enabled on reference model params.
@@ -363,27 +415,42 @@ class DistributedUnitTestRunner:
 
     return output, loss
 
-  def _check_gradients(self, atol, rtol):
+  def _check_gradients_against_recorded(
+      self, reference_grads_recorded, atol, rtol
+  ):
     """Standard DTensor gradient check."""
-    ref_map = {}
-    if self.rank == 0:
-      ref_map = dict(self.reference_model.named_parameters())
+    gathered_gradients = {}
 
+    # Pass 1: Enqueue all collectives asynchronously without calling `.cpu()` yet.
     for name, par_param in self.parallel_model.named_parameters():
       if par_param.grad is None:
         continue
 
-      full_grad = self._gather_weights_to_cpu_wrapper(par_param.grad, name)
+      # Gather unshard natively on device without implicit `.cpu()`
+      gathered_gradients[name] = self._gather_weights_wrapper(
+          par_param.grad, name
+      )
 
-      if self.rank == 0 and name in ref_map and ref_map[name].grad is not None:
-        test_utils.check_equivalence(
-            tensor_test=full_grad,
-            tensor_reference=ref_map[name].grad,
-            atol=atol,
-            rtol=rtol,
-            check_name=f"Gradient {name}",
-            step=self.current_step,
-        )
+    # Force synchronization by evaluating a scalar dependent on all gathered gradients.
+    if gathered_gradients:
+      dummy_sync = sum(t.view(-1)[0] for t in gathered_gradients.values())
+      _ = dummy_sync.cpu()
+
+    dist.barrier()
+
+    # Pass 2: Rank 0 fetches the fully evaluated tensors to CPU for checking.
+    if self.rank == 0:
+      for name, par_tensor in gathered_gradients.items():
+        if name in reference_grads_recorded:
+          full_grad = par_tensor.cpu()
+          test_utils.check_equivalence(
+              tensor_test=full_grad,
+              tensor_reference=reference_grads_recorded[name],
+              atol=atol,
+              rtol=rtol,
+              check_name=f"Gradient {name}",
+              step=self.current_step,
+          )
 
   def _gather_output_to_cpu(
       self,
@@ -400,10 +467,8 @@ class DistributedUnitTestRunner:
     # Not needed currently since Fairscale implements pure TP.
     return output.cpu()
 
-  def _gather_weights_to_cpu_wrapper(
-      self,
-      tensor: torch.Tensor | DTensor,
-      name: str
+  def _gather_weights_wrapper(
+      self, tensor: torch.Tensor | DTensor, name: str
   ) -> torch.Tensor:
     """Wraps module-level gather function with instance config."""
     # Fairscale logic: Only gather manually if we are in TP (Replicate) mode.
@@ -418,7 +483,7 @@ class DistributedUnitTestRunner:
         tensor,
         name,
         self.world_size,
-        use_fairscale=pass_fairscale,
+        pass_fairscale,
     )
 
 
@@ -561,7 +626,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       seed = 0
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)  # safe to call even if not using GPU
-    print(f"Torch initial seed: {torch.initial_seed()}")
+    logging.info("Torch initial seed: %d", torch.initial_seed())
 
   def test_gpu_available(self):
     if self.accelerator_device_type == "cuda":
