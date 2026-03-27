@@ -838,10 +838,6 @@ class TrainMLPDTensorTest(
         acc_type,
     )
 
-  @test_utils.skip_if_tpu(
-      reason="SIGABRT - Check failed: result_buf.element_type() == tensor_element_type (13 vs. 15)",
-      bug_id=489119669
-  )
   def test_fsdp_complex_bf16_mismatch(self):
     distributed.run_distributed(
         self.num_devices,

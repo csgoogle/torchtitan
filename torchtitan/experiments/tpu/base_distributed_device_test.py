@@ -23,14 +23,6 @@ import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools import utils
 
 
-# Make Fairscale optional since we are not using it in all tests.
-try:
-  from fairscale.nn import model_parallel
-  from fairscale.nn.model_parallel import layers as fairscale_layers
-  HAS_FAIRSCALE = True
-except ImportError:
-  HAS_FAIRSCALE = False
-
 ParallelismFunc = Callable[[nn.Module], nn.Module | None]
 
 
@@ -42,66 +34,10 @@ class InputDistribution(enum.Enum):
 
 # Gathering helper functions (shared by unit test runner and training state
 # validator)
-def _gather_fairscale_weights(
-    model: nn.Module, tensor: torch.Tensor, name: str, world_size: int
-) -> torch.Tensor:
-  """Helper to manually all-gather a Fairscale param/grad."""
-  if not HAS_FAIRSCALE:
-    raise ImportError("use_fairscale=True but fairscale is not installed.")
-
-  # Gather all shards
-  # We assume the default model parallel group setup by Fairscale
-  try:
-    group = model_parallel.initialize.get_model_parallel_group()
-  except (ImportError, AttributeError):
-    # Fallback if initialization hasn't happened
-    group = dist.group.WORLD
-
-  gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-  dist.all_gather(gathered, tensor, group=group)
-
-  # Identify module type
-  module_name = name.rsplit(".", 1)[0]
-
-  # Use get_submodule for safer lookup
-  try:
-    parent = model.get_submodule(module_name)
-  except AttributeError:
-    modules = dict(model.named_modules())
-    parent = modules.get(module_name, None)
-
-  if parent is None:
-    # Assume replicated as fallback
-    return gathered[0]
-
-  # Stitch based on type
-  if isinstance(parent, fairscale_layers.ColumnParallelLinear):
-    return torch.cat(gathered, dim=0)  # Shards Output (Dim 0)
-
-  elif isinstance(parent, fairscale_layers.RowParallelLinear):
-    if "weight" in name:
-      return torch.cat(gathered, dim=1)  # Shards Input (Dim 1)
-    return gathered[0]  # Bias is replicated
-
-  elif isinstance(parent, fairscale_layers.ParallelEmbedding):
-    return torch.cat(gathered, dim=1)  # Shards Dim 1 (Hidden)
-
-  # Default/Replicated
-  return gathered[0]
-
-
 def _gather_distributed_tensor(
-    model: nn.Module,
     tensor: torch.Tensor | DTensor,
-    name: str,
-    world_size: int,
-    use_fairscale: bool = False,
 ) -> torch.Tensor:
-  """Unshards a tensor (DTensor or Fairscale) purely on device."""
-
-  # Handle Fairscale (manual stitching)
-  if use_fairscale:
-    return _gather_fairscale_weights(model, tensor, name, world_size).detach()
+  """Unshards a tensor (DTensor) purely on device."""
 
   # Handle DTensor (automatic stitching)
   if isinstance(tensor, DTensor):
@@ -115,7 +51,7 @@ def _gather_distributed_tensor(
 class DistributedUnitTestRunner:
   """Runs distributed parity tests between a Single-Device CPU model and a Parallel Device model.
 
-  Works with DTensor- or Fairscale-based parallelism set ups
+  Works with DTensor-based parallelism set ups
 
   This class manages:
   - Creating single-device CPU model as a reference.
@@ -142,7 +78,6 @@ class DistributedUnitTestRunner:
       parallelism_func: ParallelismFunc,
       input_distribution: InputDistribution = InputDistribution.REPLICATE,
       use_meta_init: bool = True,
-      use_fairscale: bool = False,
   ):
     self.device = device
     self.rank = rank
@@ -151,7 +86,6 @@ class DistributedUnitTestRunner:
     self.model_args = model_args
     self.input_distribution = input_distribution
     self.use_meta_init = use_meta_init
-    self.use_fairscale = use_fairscale
 
     # Apply parallelism to the model.
     self.parallel_model = None
@@ -352,7 +286,7 @@ class DistributedUnitTestRunner:
 
     with torch.no_grad():
       for key, param in parallel_state.items():
-        cpu_state_dict[key] = self._gather_weights_wrapper(param, key).cpu()
+        cpu_state_dict[key] = self._gather_weights_wrapper(param).cpu()
 
     self.reference_model.load_state_dict(cpu_state_dict)
     # Ensure gradients are enabled on reference model params.
@@ -428,7 +362,7 @@ class DistributedUnitTestRunner:
 
       # Gather unshard natively on device without implicit `.cpu()`
       gathered_gradients[name] = self._gather_weights_wrapper(
-          par_param.grad, name
+          par_param.grad
       )
 
     # Force synchronization by evaluating a scalar dependent on all gathered gradients.
@@ -464,34 +398,19 @@ class DistributedUnitTestRunner:
     # If it's local tensor, behavior depends on the test
     # If TP output is sharded on sequence dim (SP) but is not DTensor,
     # we might need manual gathering logic here.
-    # Not needed currently since Fairscale implements pure TP.
     return output.cpu()
 
   def _gather_weights_wrapper(
-      self, tensor: torch.Tensor | DTensor, name: str
+      self, tensor: torch.Tensor | DTensor
   ) -> torch.Tensor:
     """Wraps module-level gather function with instance config."""
-    # Fairscale logic: Only gather manually if we are in TP (Replicate) mode.
-    # If FSDP (split batch), Fairscale state_dict handles it automatically,
-    # so we pass use_fairscale=False to the helper to skip manual gathering.
-    pass_fairscale = self.use_fairscale and (
-        self.input_distribution == InputDistribution.REPLICATE
-    )
-
-    return _gather_distributed_tensor(
-        self.parallel_model,
-        tensor,
-        name,
-        self.world_size,
-        pass_fairscale,
-    )
+    return _gather_distributed_tensor(tensor)
 
 
 def _capture_distributed_state(
     model: nn.Module,
     loss: torch.Tensor,
     world_size: int,
-    use_fairscale: bool,
     input_distribution: InputDistribution = InputDistribution.REPLICATE,
 ) -> Dict[str, Any]:
   """Captures a static snapshot of the distributed model's parameters, gradients, and loss."""
@@ -520,14 +439,10 @@ def _capture_distributed_state(
   }
 
   for name, param in model.named_parameters():
-    state["params"][name] = _gather_distributed_tensor(
-        model, param, name, world_size, use_fairscale
-    )
+    state["params"][name] = _gather_distributed_tensor(param)
 
     if param.grad is not None:
-      state["grads"][name] = _gather_distributed_tensor(
-          model, param.grad, name, world_size, use_fairscale
-      )
+      state["grads"][name] = _gather_distributed_tensor(param.grad)
 
   return state
 
@@ -562,15 +477,12 @@ class DistributedTrainWithRecorder:
 
   def __call__(self, device, rank, world_size, config):
 
-    use_fairscale = (
-        hasattr(config, "tpu_config") and config.tpu_config.use_fairscale
-    )
     dist_type = config_to_input_distribution(config)
 
     # Define how to capture state in current distributed context
     def dist_capture_fn(model, loss):
       return _capture_distributed_state(
-          model, loss, world_size, use_fairscale, dist_type
+          model, loss, world_size, dist_type
       )
 
     # Setup recorder callback
@@ -636,7 +548,6 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
   def _test_train_distributed(
       self,
       config_args: list[str],
-      use_fairscale: bool,
       data_parallel_shard_degree: int | None = None,
       tensor_parallel_degree: int | None = None,
       skip_devices: list[device_type.AcceleratorDeviceType] | None = None,
@@ -684,9 +595,6 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
           f"--parallelism.data_parallel_replicate_degree={data_parallel_replicate_degree}"
       )
 
-    if use_fairscale:
-      config_args.append("--tpu_config.use_fairscale")
-
     config_manager = torchtitan.config.ConfigManager(
         tpu_job_config_module.TPUJobConfig
     )
@@ -704,7 +612,6 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
   def _run_trainer_distributed_parity_test(
       self,
       config_args: list[str],
-      use_fairscale: bool,
       tensor_parallel_degree: int | None = None,
       data_parallel_shard_degree: int | None = None,
       skip_devices: list[device_type.AcceleratorDeviceType] | None = None,
@@ -728,7 +635,6 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       # Use wrapper class to run the trainer and record the state to the file.
       self._test_train_distributed(
           config_args=config_args,
-          use_fairscale=use_fairscale,
           data_parallel_shard_degree=data_parallel_shard_degree,
           tensor_parallel_degree=tensor_parallel_degree,
           skip_devices=skip_devices,

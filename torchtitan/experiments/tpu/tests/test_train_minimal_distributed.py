@@ -15,36 +15,12 @@ class TrainMinimalDistributedTest(
   """Tests the minimal distributed training setup."""
 
   @parameterized.named_parameters([
-      # llama3_tpu (with local fairscale implementation)
-      dict(
-          testcase_name="llama3_tpu_tp_fairscale",
-          model_name="llama3_tpu",
-          config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
-          use_fairscale=True,
-          data_parallel_shard_degree=1,
-          tensor_parallel_degree=-1,
-      ),
-      # qwen3_tpu (with local fairscale implementation)
-      dict(
-          testcase_name="qwen3_tpu_tp_fairscale",
-          model_name="qwen3_tpu",
-          config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
-          use_fairscale=True,
-          data_parallel_shard_degree=1,
-          tensor_parallel_degree=-1,
-          skip_devices=[
-              # b/480969610 - Issue with matmul shapes
-              device_type.AcceleratorDeviceType.TPU,
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-          ],
-      ),
+
       # llama3 (with TT dtensor implementation)
       dict(
           testcase_name="llama3_tp_dtensor",
           model_name="llama3",
           config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
@@ -52,7 +28,6 @@ class TrainMinimalDistributedTest(
           testcase_name="llama3_tp_dtensor_compile",
           model_name="llama3",
           config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
@@ -61,7 +36,6 @@ class TrainMinimalDistributedTest(
           testcase_name="llama3_fsdp_dtensor",
           model_name="llama3",
           config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
       ),
@@ -69,7 +43,6 @@ class TrainMinimalDistributedTest(
           testcase_name="llama3_fsdp_dtensor_compile",
           model_name="llama3",
           config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
@@ -79,7 +52,6 @@ class TrainMinimalDistributedTest(
           testcase_name="qwen3_tp_dtensor",
           model_name="qwen3",
           config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
@@ -87,7 +59,6 @@ class TrainMinimalDistributedTest(
           testcase_name="qwen3_tp_dtensor_compile",
           model_name="qwen3",
           config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
@@ -96,7 +67,6 @@ class TrainMinimalDistributedTest(
           testcase_name="qwen3_fsdp_dtensor",
           model_name="qwen3",
           config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
       ),
@@ -104,7 +74,6 @@ class TrainMinimalDistributedTest(
           testcase_name="qwen3_fsdp_dtensor_compile",
           model_name="qwen3",
           config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
@@ -114,7 +83,6 @@ class TrainMinimalDistributedTest(
           testcase_name="deepseek_v3_tp_dtensor",
           model_name="deepseek_v3",
           config_file="third_party/py/torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           skip_devices=[
@@ -128,7 +96,6 @@ class TrainMinimalDistributedTest(
           testcase_name="deepseek_v3_fsdp_dtensor",
           model_name="deepseek_v3",
           config_file="third_party/py/torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
-          use_fairscale=False,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
       ),
@@ -137,7 +104,6 @@ class TrainMinimalDistributedTest(
       self,
       model_name,
       config_file,
-      use_fairscale,
       data_parallel_shard_degree,
       tensor_parallel_degree,
       skip_devices=None,
@@ -159,7 +125,6 @@ class TrainMinimalDistributedTest(
             "--training.mixed_precision_reduce=float32",
             "--training.local_batch_size=4",
         ],
-        use_fairscale,
         data_parallel_shard_degree,
         tensor_parallel_degree,
         skip_devices,
