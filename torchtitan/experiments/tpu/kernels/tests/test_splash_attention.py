@@ -80,6 +80,41 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
         "MQA/GQA Parity test passed. Output shape: %s", actual_out.shape
     )
 
+  def test_block_sizes_parity(self):
+    device = self.accelerator_device
+    b, n_heads, seq_len, head_dim = 2, 8, 256, 64
+
+    # Generate on CPU first
+    q = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
+    k = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
+    v = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
+
+    # Move to TPU
+    q_tpu, k_tpu, v_tpu = q.to(device), k.to(device), v.to(device)
+
+    # Reference Math SDPA on TPU
+    with attention.sdpa_kernel([attention.SDPBackend.MATH]):
+      expected_out = F.scaled_dot_product_attention(
+          q_tpu, k_tpu, v_tpu, is_causal=True
+      )
+
+    # TPU Splash SDPA with explicit block sizes
+    actual_out = splash_sdpa(
+        q_tpu,
+        k_tpu,
+        v_tpu,
+        is_causal=True,
+        enable_gqa=False,
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+    )
+
+    torch.testing.assert_close(
+        actual_out.cpu(), expected_out.cpu(), rtol=5e-2, atol=5e-2
+    )
+    logging.info("Block sizes parity test passed.")
+
   def test_mha_backward(self):
     """Gradients from splash attention backward match reference SDPA."""
     device = self.accelerator_device

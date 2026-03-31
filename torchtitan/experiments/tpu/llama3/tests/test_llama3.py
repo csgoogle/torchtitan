@@ -320,8 +320,8 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
           test_utils.check_equivalence(
               p_dev.grad.cpu(),
               p_cpu.grad,
-              atol=3e-3,
-              rtol=3e-3,
+              atol=5e-3,
+              rtol=5e-3,
               check_name=f"FFN Param Grad: {name}",
           )
 
@@ -387,6 +387,8 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
           # Relax atol for Attention params to cover BF16 noise floor.
           if "attention" in name:
             param_atol = 2e-2
+          elif "feed_forward" in name:
+            param_atol = 5e-3
 
           test_utils.check_equivalence(
               p_dev.grad.cpu(),

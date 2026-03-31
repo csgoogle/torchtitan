@@ -5,6 +5,7 @@ Uses torch_tpu._internal.pallas.custom_jax_kernel() to bridge JAX -> PyTorch.
 """
 
 import math
+import os
 import typing
 from typing import Optional
 
@@ -12,6 +13,7 @@ from typing import Optional
 import jax
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_kernel import QKVLayout
 import jax.numpy as jnp
 import torch
 # torch_tpu Pallas bridge
@@ -33,7 +35,12 @@ def _make_splash_attention_fn(
     block_q_dkv: int = 512,
     block_kv_dkv: int = 512,
     block_kv_dkv_compute: int = 512,
+    block_q_dq: int | None = None,
+    block_kv_dq: int | None = None,
     use_fused_bwd_kernel: bool = True,
+    q_layout: str = "HEAD_DIM_MINOR",
+    k_layout: str = "HEAD_DIM_MINOR",
+    v_layout: str = "HEAD_DIM_MINOR",
 ):
   """Create JAX splash attention forward and backward functions.
 
@@ -43,6 +50,14 @@ def _make_splash_attention_fn(
       grad_out) returning (grad_q, grad_k, grad_v) WITHOUT re-running the
       forward (uses saved residuals to call the backward kernel directly).
   """
+  def _get_layout(layout_str):
+    if layout_str == "HEAD_DIM_MINOR":
+      return QKVLayout.HEAD_DIM_MINOR
+    elif layout_str == "SEQ_MINOR":
+      return QKVLayout.SEQ_MINOR
+    else:
+      raise ValueError(f"Unknown layout: {layout_str}")
+
   block_sizes = splash_attention_kernel.BlockSizes(
       block_q=min(block_q, seq_len),
       block_kv=min(block_kv, seq_len),
@@ -50,7 +65,16 @@ def _make_splash_attention_fn(
       block_q_dkv=min(block_q_dkv, seq_len),
       block_kv_dkv=min(block_kv_dkv, seq_len),
       block_kv_dkv_compute=min(block_kv_dkv_compute, seq_len),
+      block_q_dq=min(block_q_dq, seq_len)
+      if not use_fused_bwd_kernel and block_q_dq is not None
+      else None,
+      block_kv_dq=min(block_kv_dq, seq_len)
+      if not use_fused_bwd_kernel and block_kv_dq is not None
+      else None,
       use_fused_bwd_kernel=use_fused_bwd_kernel,
+      q_layout=_get_layout(q_layout),
+      k_layout=_get_layout(k_layout),
+      v_layout=_get_layout(v_layout),
   )
 
   mask_shape = (seq_len, seq_len)
@@ -245,6 +269,16 @@ def splash_sdpa(
     block_q: int = 512,
     block_kv: int = 512,
     block_dkv: int = 512,
+    block_kv_compute: int = 512,
+    block_q_dkv: int = 512,
+    block_kv_dkv: int = 512,
+    block_kv_dkv_compute: int = 512,
+    block_q_dq: Optional[int] = None,
+    block_kv_dq: Optional[int] = None,
+    use_fused_bwd_kernel: bool = True,
+    q_layout: str = "HEAD_DIM_MINOR",
+    k_layout: str = "HEAD_DIM_MINOR",
+    v_layout: str = "HEAD_DIM_MINOR",
 ) -> torch.Tensor:
   """Replacement for F.scaled_dot_product_attention using splash attention.
 
@@ -257,6 +291,10 @@ def splash_sdpa(
       reduce the XLA program size (enabling larger batch sizes) at a small
       efficiency cost. Default 512 matches block_kv; use 256 for large batches.
   """
+
+  block_q = int(os.environ.get("SPLASH_BLOCK_Q", block_q))
+  block_kv = int(os.environ.get("SPLASH_BLOCK_KV", block_kv))
+  block_dkv = int(os.environ.get("SPLASH_BLOCK_DKV", block_dkv))
 
   batch, n_heads, seq_len, head_dim = q.shape
   n_kv_heads = k.shape[1]
@@ -277,6 +315,16 @@ def splash_sdpa(
       block_q,
       block_kv,
       block_dkv,
+      block_kv_compute,
+      block_q_dkv,
+      block_kv_dkv,
+      block_kv_dkv_compute,
+      block_q_dq,
+      block_kv_dq,
+      use_fused_bwd_kernel,
+      q_layout,
+      k_layout,
+      v_layout,
   )
 
   if cache_key not in _splash_cache:
@@ -287,10 +335,16 @@ def splash_sdpa(
         is_causal=is_causal,
         block_q=block_q,
         block_kv=block_kv,
-        block_kv_compute=block_kv,
-        block_q_dkv=block_q,
-        block_kv_dkv=block_kv,
-        block_kv_dkv_compute=block_kv,
+        block_kv_compute=block_kv_compute,
+        block_q_dkv=block_q_dkv,
+        block_kv_dkv=block_kv_dkv,
+        block_kv_dkv_compute=block_kv_dkv_compute,
+        block_q_dq=block_q_dq,
+        block_kv_dq=block_kv_dq,
+        use_fused_bwd_kernel=use_fused_bwd_kernel,
+        q_layout=q_layout,
+        k_layout=k_layout,
+        v_layout=v_layout,
     )
     torch_fwd_fn = custom_jax_kernel(splash_fn, name="splash_attention")
     torch_bwd_fn = custom_jax_kernel(splash_bwd_fn, name="splash_attention_bwd")

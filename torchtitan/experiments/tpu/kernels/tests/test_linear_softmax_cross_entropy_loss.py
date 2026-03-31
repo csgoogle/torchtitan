@@ -30,12 +30,16 @@ class LinearSoftmaxCrossEntropyLossTest(
   """Tests for LinearSoftmaxCrossEntropyLoss."""
 
   @parameterized.parameters(
-      (torch.float32, "sum", 1e-4, 1e-5),
-      (torch.float32, "mean", 1e-4, 1e-5),
-      (torch.bfloat16, "sum", 1.6e-2, 1e-5),
-      (torch.bfloat16, "mean", 1.6e-2, 1e-5),
+      (torch.float32, "sum", "mosaic_tpu", 1e-4, 1e-5),
+      (torch.float32, "sum", "xla", 1e-4, 1e-5),
+      (torch.float32, "mean", "mosaic_tpu", 1e-4, 1e-5),
+      (torch.float32, "mean", "xla", 1e-4, 1e-5),
+      (torch.bfloat16, "sum", "mosaic_tpu", 1.6e-2, 1e-5),
+      (torch.bfloat16, "sum", "xla", 1.6e-2, 1e-5),
+      (torch.bfloat16, "mean", "mosaic_tpu", 1.6e-2, 1e-5),
+      (torch.bfloat16, "mean", "xla", 1.6e-2, 1e-5),
   )
-  def test_parity(self, dtype, reduction, rtol, atol):
+  def test_parity(self, dtype, reduction, implementation, rtol, atol):
     device = self.accelerator_device
     b, s, h, v = 32, 32, 128, 1024  # Batch, SeqLen, Hidden, Vocab
 
@@ -72,7 +76,11 @@ class LinearSoftmaxCrossEntropyLossTest(
 
     actual_out = (
         linear_softmax_cross_entropy_loss.linear_softmax_cross_entropy_loss(
-            x_flat, labels_flat, weights_tpu, reduction=reduction
+            x_flat,
+            labels_flat,
+            weights_tpu,
+            reduction=reduction,
+            implementation=implementation,
         )
     )
 
@@ -88,13 +96,24 @@ class LinearSoftmaxCrossEntropyLossTest(
     )
 
   @parameterized.parameters(
-      (torch.float32, "sum", 1e-4, 1e-5, 1e-2, 1e-2),
-      (torch.float32, "mean", 1e-4, 1e-5, 1e-2, 1e-2),
-      (torch.bfloat16, "sum", 1.6e-2, 1e-5, 5e-2, 0.5),
-      (torch.bfloat16, "mean", 1.6e-2, 1e-5, 5e-2, 1e-2),
+      (torch.float32, "sum", "mosaic_tpu", 1e-4, 1e-5, 1e-2, 1e-2),
+      (torch.float32, "sum", "xla", 1e-4, 1e-5, 1e-2, 1e-2),
+      (torch.float32, "mean", "mosaic_tpu", 1e-4, 1e-5, 1e-2, 1e-2),
+      (torch.float32, "mean", "xla", 1e-4, 1e-5, 1e-2, 1e-2),
+      (torch.bfloat16, "sum", "mosaic_tpu", 1.6e-2, 1e-5, 5e-2, 0.5),
+      (torch.bfloat16, "sum", "xla", 1.6e-2, 1e-5, 2.0, 1.0),
+      (torch.bfloat16, "mean", "mosaic_tpu", 1.6e-2, 1e-5, 5e-2, 1e-2),
+      (torch.bfloat16, "mean", "xla", 1.6e-2, 1e-5, 5e-2, 1e-2),
   )
   def test_gradient_new(
-      self, dtype, reduction, loss_rtol, loss_atol, grad_rtol, grad_atol
+      self,
+      dtype,
+      reduction,
+      implementation,
+      loss_rtol,
+      loss_atol,
+      grad_rtol,
+      grad_atol,
   ):
     device = self.accelerator_device
 
@@ -127,7 +146,13 @@ class LinearSoftmaxCrossEntropyLossTest(
     def run_custom(x, l, w):
       return (
           linear_softmax_cross_entropy_loss.linear_softmax_cross_entropy_loss(
-              x, l, w, reduction=reduction
+              x,
+              l,
+              w,
+              reduction=reduction,
+              implementation=implementation,
+              b_block_size=128,
+              v_block_size=128,
           )
       )
 

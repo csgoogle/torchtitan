@@ -40,37 +40,78 @@ import torch
 from torch_tpu._internal.pallas import pallas
 
 
-def _my_fwd(x, labels, weights, reduction, implementation):
-  return tokamax.linear_softmax_cross_entropy_loss(
+def _my_fwd(
+    x,
+    labels,
+    weights,
+    reduction,
+    implementation,
+    b_block_size,
+    h_block_size,
+    v_block_size,
+):
+  if implementation == "xla":
+    from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference  # pylint: disable=g-import-not-at-top
+
+    loss, lse = reference.linear_softmax_cross_entropy_loss_fwd_reference(
+        x, labels, weights, reduction=reduction
+    )
+    return loss, lse
+
+  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel
+
+  loss, lse = kernel.linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
       x,
       labels,
       weights,
+      b_block_size=b_block_size,
+      h_block_size=h_block_size,
+      v_block_size=v_block_size,
       reduction=reduction,
-      implementation=implementation,
   )
+  return loss, lse
 
 
-def _my_grad_xw(
-    dout, x, labels, weights, reduction, implementation
+def _my_bwd(
+    dout,
+    lse,
+    x,
+    labels,
+    weights,
+    reduction,
+    implementation,
+    b_block_size,
+    h_block_size,
+    v_block_size,
 ):
-  def loss_fn(x, weights):
-    return tokamax.linear_softmax_cross_entropy_loss(
-        x,
-        labels,
-        weights,
-        reduction=reduction,
-        implementation=implementation,
-    )
+  if implementation == "xla":
+    from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference  # pylint: disable=g-import-not-at-top
 
-  _, vjp_fn = jax.vjp(loss_fn, x, weights)
-  grad_x, grad_w = vjp_fn(dout)  # type: ignore
+    grad_x, grad_w = reference.linear_softmax_cross_entropy_loss_bwd_reference(
+        dout, lse, x, labels, weights, reduction=reduction
+    )
+    return grad_x, grad_w
+
+  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel  # pylint: disable=g-import-not-at-top
+
+  grad_x, grad_w = (
+      kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+          dout,
+          lse,
+          x,
+          labels,
+          weights,
+          b_block_size=b_block_size,
+          h_block_size=h_block_size,
+          v_block_size=v_block_size,
+          reduction=reduction,
+      )
+  )
   return grad_x, grad_w
 
 
-compiled_fwd = pallas.custom_jax_kernel(_my_fwd, static_argnums=(3, 4))
-compiled_grad_xw = pallas.custom_jax_kernel(
-    _my_grad_xw, static_argnums=(4, 5)
-)
+compiled_fwd = pallas.custom_jax_kernel(_my_fwd, static_argnums=(3, 4, 5, 6, 7))
+compiled_bwd = pallas.custom_jax_kernel(_my_bwd, static_argnums=(5, 6, 7, 8, 9))
 
 
 class TorchLinearLoss(torch.autograd.Function):
@@ -84,30 +125,54 @@ class TorchLinearLoss(torch.autograd.Function):
       weights,
       reduction="sum",
       implementation="mosaic_tpu",
+      b_block_size=1024,
+      h_block_size=512,
+      v_block_size=2048,
   ):
-    ctx.save_for_backward(x, labels.to(torch.int32), weights)
-    ctx.reduction = reduction
-    ctx.implementation = implementation
+    labels_int32 = labels.to(torch.int32)
 
-    return compiled_fwd(  # type: ignore
+    loss, lse = compiled_fwd(  # type: ignore
         x,
-        labels.to(torch.int32),
+        labels_int32,
         weights,
         reduction,
         implementation,
+        b_block_size,
+        h_block_size,
+        v_block_size,
     )
+    ctx.save_for_backward(x, labels_int32, weights, lse)
+    ctx.reduction = reduction
+    ctx.implementation = implementation
+    ctx.b_block_size = b_block_size
+    ctx.h_block_size = h_block_size
+    ctx.v_block_size = v_block_size
+
+    return loss
 
   @staticmethod
   def backward(ctx, grad_output):
-    x, labels, weights = ctx.saved_tensors
+    x, labels, weights, lse = ctx.saved_tensors
     reduction = ctx.reduction
     implementation = ctx.implementation
+    b_block_size = ctx.b_block_size
+    h_block_size = ctx.h_block_size
+    v_block_size = ctx.v_block_size
 
-    grad_x, grad_w = compiled_grad_xw(  # type: ignore
-        grad_output, x, labels, weights, reduction, implementation
+    grad_x, grad_w = compiled_bwd(  # type: ignore
+        grad_output,
+        lse,
+        x,
+        labels,
+        weights,
+        reduction,
+        implementation,
+        b_block_size,
+        h_block_size,
+        v_block_size,
     )
 
-    return grad_x, None, grad_w, None, None, None
+    return grad_x, None, grad_w, None, None, None, None, None
 
 
 def linear_softmax_cross_entropy_loss(
@@ -116,6 +181,9 @@ def linear_softmax_cross_entropy_loss(
     weights: torch.Tensor,
     reduction: str = "sum",
     implementation: str = "mosaic_tpu",
+    b_block_size: int = 1024,
+    h_block_size: int = 512,
+    v_block_size: int = 2048,
 ) -> torch.Tensor:
   """Linear Softmax Cross-Entropy Loss.
 
@@ -129,6 +197,9 @@ def linear_softmax_cross_entropy_loss(
         "sum" or "mean" explicitly.
       implementation: By default "None" will be used to pick the best available
         backend. Can be set to "xla" or "mosaic_tpu" explicitly.
+      b_block_size: Block size for batch dimension.
+      h_block_size: Block size for hidden dimension.
+      v_block_size: Block size for vocab dimension.
 
   Returns:
       The Cross-Entropy loss.
@@ -139,4 +210,7 @@ def linear_softmax_cross_entropy_loss(
       weights,
       reduction,
       implementation,
+      b_block_size,
+      h_block_size,
+      v_block_size,
   )

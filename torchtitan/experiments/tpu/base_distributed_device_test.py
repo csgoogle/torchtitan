@@ -439,10 +439,10 @@ def _capture_distributed_state(
   }
 
   for name, param in model.named_parameters():
-    state["params"][name] = _gather_distributed_tensor(param)
+    state["params"][name] = _gather_distributed_tensor(param).cpu()
 
     if param.grad is not None:
-      state["grads"][name] = _gather_distributed_tensor(param.grad)
+      state["grads"][name] = _gather_distributed_tensor(param.grad).cpu()
 
   return state
 
@@ -474,8 +474,15 @@ class DistributedTrainWithRecorder:
 
   def __init__(self, output_path: str):
     self.output_path = output_path
+    self.__name__ = "DistributedTrainWithRecorder"
+    self.__qualname__ = "DistributedTrainWithRecorder"
 
-  def __call__(self, device, rank, world_size, config):
+  def __call__(self, config):
+    from torchtitan.experiments.tpu import utils as tpu_utils
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    device = tpu_utils.get_device()
 
     dist_type = config_to_input_distribution(config)
 

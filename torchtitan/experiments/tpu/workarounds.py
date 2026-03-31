@@ -31,20 +31,55 @@ def attention_sdpa_forward_dtensor_workaround(sdpa_backends, q, k, v, scale=None
 
 def use_splash_attention_patch(
     model: nn.Module,
+    block_q: int | None = None,
+    block_kv: int | None = None,
+    block_dkv: int | None = None,
+    block_kv_compute: int | None = None,
+    block_q_dkv: int | None = None,
+    block_kv_dkv: int | None = None,
+    block_kv_dkv_compute: int | None = None,
+    block_q_dq: int | None = None,
+    block_kv_dq: int | None = None,
+    use_fused_bwd_kernel: bool | None = None,
+    q_layout: str | None = None,
+    k_layout: str | None = None,
+    v_layout: str | None = None,
 ) -> None:
   """Patches splash attention into the model."""
   from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa  # pylint: disable=g-import-not-at-top
   import types
 
+  # Helper to filter out None values so we don't override defaults in splash_sdpa
+  def _get_kwargs(**kwargs):
+    return {k: v for k, v in kwargs.items() if v is not None}
+
   def _splash_forward(
       self, q, k, v, *, scale=None, enable_gqa=False, is_causal=True):
     """Replace ScaledDotProductAttentionWrapper.forward with splash_sdpa."""
+    kwargs = _get_kwargs(
+        block_q=block_q,
+        block_kv=block_kv,
+        block_dkv=block_dkv,
+        block_kv_compute=block_kv_compute,
+        block_q_dkv=block_q_dkv,
+        block_kv_dkv=block_kv_dkv,
+        block_kv_dkv_compute=block_kv_dkv_compute,
+        block_q_dq=block_q_dq,
+        block_kv_dq=block_kv_dq,
+        use_fused_bwd_kernel=use_fused_bwd_kernel,
+        q_layout=q_layout,
+        k_layout=k_layout,
+        v_layout=v_layout,
+    )
     return splash_sdpa(
-          q, k, v,
-          scale=scale,
-          is_causal=is_causal,
-          enable_gqa=enable_gqa,
-      )
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=is_causal,
+        enable_gqa=enable_gqa,
+        **kwargs,
+    )
 
   def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
     """Replaces [redacted]'s native SDPA with splash_sdpa.
@@ -63,6 +98,21 @@ def use_splash_attention_patch(
     key = key.transpose(-3, -2)
     value = value.transpose(-3, -2)
 
+    call_kwargs = _get_kwargs(
+        block_q=block_q,
+        block_kv=block_kv,
+        block_dkv=block_dkv,
+        block_kv_compute=block_kv_compute,
+        block_q_dkv=block_q_dkv,
+        block_kv_dkv=block_kv_dkv,
+        block_kv_dkv_compute=block_kv_dkv_compute,
+        block_q_dq=block_q_dq,
+        block_kv_dq=block_kv_dq,
+        use_fused_bwd_kernel=use_fused_bwd_kernel,
+        q_layout=q_layout,
+        k_layout=k_layout,
+        v_layout=v_layout,
+    )
     # splash_sdpa expects enable_gqa=False as heads are already tiled.
     out = splash_sdpa(
         query,
@@ -71,6 +121,7 @@ def use_splash_attention_patch(
         scale=scale,
         is_causal=True,
         enable_gqa=False,
+        **call_kwargs,
     )
     # Transpose back to match [redacted]'s expected layout
     return out.transpose(-3, -2)
