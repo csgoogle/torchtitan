@@ -129,12 +129,17 @@ def start_trainer(config: tpu_job_config_module.TPUJobConfig):
     )
     config.optimizer.implementation = "foreach"
 
-  if hasattr(config, "tpu_config") and config.tpu_config.use_jax_profiler:
-    from torchtitan.experiments.tpu import jax_profiling
-    logger.info("JAX profiler enabled by config, patching torchtitan.train.maybe_enable_profiling...")
-    torchtitan.train.maybe_enable_profiling = (
-        jax_profiling.maybe_enable_profiling
-    )
+  if hasattr(config, "tpu_config"):
+    if config.tpu_config.use_jax_profiler:
+      from torchtitan.experiments.tpu import jax_profiling
+
+      logger.info(
+          "JAX profiler enabled by config, patching"
+          " torchtitan.train.maybe_enable_profiling..."
+      )
+      torchtitan.train.maybe_enable_profiling = (
+          jax_profiling.maybe_enable_profiling
+      )
 
   trainer: Optional[torchtitan.train.Trainer] = None
   if config.model.name == "flux":
