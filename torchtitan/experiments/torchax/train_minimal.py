@@ -282,7 +282,7 @@ def main_train_loop(job_config: Any):
 
   if platform == 'tpu':
     logger.info('Setup TPU-specific kernel overrides.')
-    splash_attn.declare_splash_attention(env, mesh)
+    splash_attn.declare_splash_attention(env, mesh, job_config.torchax_config)
     gmm.declare_gmm_kernel(env, mesh)
 
   with mesh:

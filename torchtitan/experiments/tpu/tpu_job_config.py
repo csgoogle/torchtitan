@@ -28,6 +28,7 @@ class TPUConfig:
   # Disable Automatic Mixed Precision (AMP), so all training is done in uniform
   # precision.
   enable_amp: bool = True
+  enable_manual_ddp: bool = False
   log_freq: int = 10
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512

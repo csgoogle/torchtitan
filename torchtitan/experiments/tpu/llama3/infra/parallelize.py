@@ -32,11 +32,47 @@ def parallelize_llama(
   Returns:
     The parallelized nn.Module.
   """
+
+  # TODO b/499075866: re-enable CPU offload for TPU torchtitan run.
+  if job_config.training.enable_cpu_offload:
+    logger.warning(
+        "CPU offload is not supported for TPU torchtitan run, setting it to"
+        " False."
+    )
+    job_config.training.enable_cpu_offload = False
+
   if (
       isinstance(job_config, tpu_job_config.TPUJobConfig)
       and job_config.tpu_config.use_splash_attention_kernel
   ):
-    workarounds.use_splash_attention_patch(model)
+    logger.info(
+        "Applying Splash Attention patch with custom block sizes:"
+        f" q={job_config.tpu_config.sa_block_q},"
+        f" kv={job_config.tpu_config.sa_block_kv},"
+        f" dkv={job_config.tpu_config.sa_block_dkv},"
+        f" kv_compute={job_config.tpu_config.sa_block_kv_compute},"
+        f" q_dkv={job_config.tpu_config.sa_block_q_dkv},"
+        f" kv_dkv={job_config.tpu_config.sa_block_kv_dkv},"
+        f" kv_dkv_compute={job_config.tpu_config.sa_block_kv_dkv_compute},"
+        f" q_dq={job_config.tpu_config.sa_block_q_dq},"
+        f" kv_dq={job_config.tpu_config.sa_block_kv_dq}"
+    )
+    workarounds.use_splash_attention_patch(
+        model,
+        block_q=job_config.tpu_config.sa_block_q,
+        block_kv=job_config.tpu_config.sa_block_kv,
+        block_dkv=job_config.tpu_config.sa_block_dkv,
+        block_kv_compute=job_config.tpu_config.sa_block_kv_compute,
+        block_q_dkv=job_config.tpu_config.sa_block_q_dkv,
+        block_kv_dkv=job_config.tpu_config.sa_block_kv_dkv,
+        block_kv_dkv_compute=job_config.tpu_config.sa_block_kv_dkv_compute,
+        block_q_dq=job_config.tpu_config.sa_block_q_dq,
+        block_kv_dq=job_config.tpu_config.sa_block_kv_dq,
+        use_fused_bwd_kernel=job_config.tpu_config.sa_use_fused_bwd_kernel,
+        q_layout=job_config.tpu_config.sa_q_layout,
+        k_layout=job_config.tpu_config.sa_k_layout,
+        v_layout=job_config.tpu_config.sa_v_layout,
+    )
   if (
       isinstance(job_config, tpu_job_config.TPUJobConfig)
       and job_config.tpu_config.use_loss_kernel

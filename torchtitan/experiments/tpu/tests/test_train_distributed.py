@@ -175,10 +175,6 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           checkpoint_enabled=True,
-          skip_devices=[
-              # b/489217116 - DCP not supported due to gather() unimplemented.
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
       dict(
           testcase_name="llama3_fsdp_use_loss_kernel",
@@ -233,6 +229,10 @@ class TrainDistributedTest(
           config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+          # b/499068024 - Skipping on TPU due to FSDP tied weights validation error.
+          skip_devices=[
+              device_type.AcceleratorDeviceType.TPU,
+          ],
       ),
       dict(
           testcase_name="qwen3_fsdp_compile",
@@ -241,6 +241,10 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
+          skip_devices=[
+              # b/499068024 - Skipping on TPU due to FSDP tied weights validation error.
+              device_type.AcceleratorDeviceType.TPU,
+          ],
       ),
       dict(
           testcase_name="qwen3_fsdp_use_loss_kernel",
@@ -259,6 +263,8 @@ class TrainDistributedTest(
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
+              # b/499068024 - Skipping on TPU due to FSDP tied weights validation error.
+              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
       dict(
@@ -271,6 +277,8 @@ class TrainDistributedTest(
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
+              # b/499068024 - Skipping on TPU due to FSDP tied weights validation error.
+              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
       dict(
@@ -286,6 +294,8 @@ class TrainDistributedTest(
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
+              # b/499068024 - Skipping on TPU due to FSDP tied weights validation error.
+              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
       dict(
@@ -302,6 +312,8 @@ class TrainDistributedTest(
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
+              # b/499068024 - Skipping on TPU due to FSDP tied weights validation error.
+              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
   ])

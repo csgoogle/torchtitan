@@ -166,6 +166,10 @@ class TrainMinimalDistributedTest(
           grad_rtol=5e-2,
           param_atol=5e1,
           param_rtol=5e-2,
+          skip_devices=[
+              # b/499068024 - Skipping on TPU due to FSDP tied weights validation error.
+              device_type.AcceleratorDeviceType.TPU,
+          ],
       ),
   ])
   def test_train_minimal_distributed_parity(

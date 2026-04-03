@@ -86,6 +86,7 @@ class TorchaxMetricsProcessor:
     color: utils.NoColor | utils.Color
 
     gpu_peak_flops: int
+    num_global_devices: int
     ntokens_since_last_log: int
     data_loading_times: list[float]
     time_last_log: float
@@ -119,6 +120,7 @@ class TorchaxMetricsProcessor:
             num_global_devices,
             job_config.torchax_config.tpu_megacore,
         )
+        self.num_global_devices = num_global_devices
         self.ntokens_since_last_log = 0
         self.data_loading_times = []
         self.time_last_log = time.perf_counter()
@@ -150,6 +152,7 @@ class TorchaxMetricsProcessor:
         tps = self.ntokens_since_last_log / (
             time_delta * self.parallel_dims.non_data_parallel_size
         )
+        per_device_tps = tps / self.num_global_devices
         # model FLOPS utilization
         # For its definition and calculation, please refer to the PaLM paper:
         # https://arxiv.org/abs/2204.02311
@@ -167,6 +170,7 @@ class TorchaxMetricsProcessor:
             "loss_metrics/global_max_loss": global_max_loss,
             "grad_norm": grad_norm,
             "throughput(tps)": tps,
+            "throughput(per_device_tps)": per_device_tps,
             "tflops": tflops,
             "mfu(%)": mfu,
             "time_metrics/end_to_end(s)": time_end_to_end,
@@ -183,6 +187,7 @@ class TorchaxMetricsProcessor:
             f"{color.green}loss: {global_avg_loss:7.4f}  "
             f"{color.orange}step_time: {time_end_to_end:7.4f}  "
             f"{color.blue}tps: {round(tps):,}  "
+            f"per_device_tps: {round(per_device_tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
             f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
         )
