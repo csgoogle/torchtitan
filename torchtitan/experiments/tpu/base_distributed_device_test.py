@@ -28,8 +28,11 @@ ParallelismFunc = Callable[[nn.Module], nn.Module | None]
 
 class InputDistribution(enum.Enum):
   """Input distribution for distributed tests."""
-  REPLICATE = "replicate"   # All ranks see all data (e.g. TP)
-  SPLIT_BATCH = "split_batch"  # Rank i only sees batch[i::world_size] (e.g. FSDP)
+
+  REPLICATE = "replicate"  # All ranks see all data (e.g. TP)
+  SPLIT_BATCH = (  # Rank i only sees batch[i::world_size] (e.g. FSDP)
+      "split_batch"
+  )
 
 
 # Gathering helper functions (shared by unit test runner and training state
@@ -103,13 +106,15 @@ class DistributedUnitTestRunner:
       batch_size: int,
       seq_len: int,
       atol: float = 1e-3,
-      rtol: float = 1e-3
+      rtol: float = 1e-3,
   ):
     """Verifies that reference and parallel model produce equivalent outputs on forward pass."""
     if self.reference_model is None:
-      raise ValueError("Reference model not initialized. To run test, call "
-                       "`apply_parallelism`to parallelize the device model "
-                       "and create a reference on CPU.")
+      raise ValueError(
+          "Reference model not initialized. To run test, call "
+          "`apply_parallelism`to parallelize the device model "
+          "and create a reference on CPU."
+      )
 
     global_input, global_target = self._generate_global_batch(
         batch_size, seq_len
@@ -194,7 +199,8 @@ class DistributedUnitTestRunner:
 
     logging.info(
         "[Rank %d]: Generating all %d shared batches upfront.",
-        self.rank, num_steps
+        self.rank,
+        num_steps,
     )
     start_step = self.current_step
     batches = []
@@ -334,7 +340,7 @@ class DistributedUnitTestRunner:
       model: nn.Module,
       inputs: torch.Tensor,
       targets: torch.Tensor = None,
-      backward: bool = False
+      backward: bool = False,
   ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Runs a forward pass and optionally a backward pass."""
     if backward:
@@ -361,9 +367,7 @@ class DistributedUnitTestRunner:
         continue
 
       # Gather unshard natively on device without implicit `.cpu()`
-      gathered_gradients[name] = self._gather_weights_wrapper(
-          par_param.grad
-      )
+      gathered_gradients[name] = self._gather_weights_wrapper(par_param.grad)
 
     # Force synchronization by evaluating a scalar dependent on all gathered gradients.
     if gathered_gradients:
@@ -488,12 +492,12 @@ class DistributedTrainWithRecorder:
 
     # Define how to capture state in current distributed context
     def dist_capture_fn(model, loss):
-      return _capture_distributed_state(
-          model, loss, world_size, dist_type
-      )
+      return _capture_distributed_state(model, loss, world_size, dist_type)
 
     # Setup recorder callback
-    recorder = numerical_validation.StateRecorderCallback(capture_fn=dist_capture_fn)
+    recorder = numerical_validation.StateRecorderCallback(
+        capture_fn=dist_capture_fn
+    )
 
     trainer = train_minimal.TrainerMinimal(
         device=device,
@@ -514,6 +518,10 @@ class DistributedTrainWithRecorder:
 
     if rank == 0:
       torch.save(recorder.get_history(), self.output_path)
+
+    # Final cleanup inside the spawned process
+    if dist.is_initialized():
+      dist.destroy_process_group()
 
 
 class BaseDistributedDeviceTest(parameterized.TestCase):
@@ -637,7 +645,9 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       temp_path = tmp_file.name
 
     try:
-      logging.info("[Phase 1] Running Distributed Training on device (Recording)...")
+      logging.info(
+          "[Phase 1] Running Distributed Training on device (Recording)..."
+      )
 
       # Use wrapper class to run the trainer and record the state to the file.
       self._test_train_distributed(
@@ -645,9 +655,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
           data_parallel_shard_degree=data_parallel_shard_degree,
           tensor_parallel_degree=tensor_parallel_degree,
           skip_devices=skip_devices,
-          start_trainer=DistributedTrainWithRecorder(
-              output_path=temp_path
-          ),
+          start_trainer=DistributedTrainWithRecorder(output_path=temp_path),
           enable_compile=enable_compile,
           data_parallel_replicate_degree=data_parallel_replicate_degree,
       )
@@ -695,9 +703,12 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
     validator = numerical_validation.StateValidatorCallback(
         recorded_history=recorded_history,
         capture_fn=numerical_validation.capture_local_state,
-        loss_atol=loss_atol, loss_rtol=loss_rtol,
-        grad_atol=grad_atol, grad_rtol=grad_rtol,
-        param_atol=param_atol, param_rtol=param_rtol,
+        loss_atol=loss_atol,
+        loss_rtol=loss_rtol,
+        grad_atol=grad_atol,
+        grad_rtol=grad_rtol,
+        param_atol=param_atol,
+        param_rtol=param_rtol,
     )
 
     with validator:

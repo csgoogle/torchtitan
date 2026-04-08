@@ -333,168 +333,194 @@ def apply_fsdp(
     edp_mesh: DeviceMesh | None = None,
     gradient_divide_factor: int | None = None,
 ):
-    """
-    Apply data parallelism (via FSDP2) to the model.
+  """Apply data parallelism (via FSDP2) to the model.
 
-    Args:
-        model (nn.Module): The model to apply data parallelism to.
-        dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
-        param_dtype (torch.dtype): The data type to use for model parameters.
-        reduce_dtype (torch.dtype): The data type to use for reduction operations.
-        pp_enabled (bool): Whether pipeline parallelism is enabled.
-        cpu_offload (bool, optional): Whether to offload model parameters to CPU. Defaults to False.
-        reshard_after_forward_policy (str, optional): The policy to use for resharding after forward pass. Defaults to "default".
-            Other options: "never", "always".
-            - "default" applies default resharding behavior, implementing "smart defaults" for known optimal scenarios.
-            - "always" will enable `reshard_after_forward` for all forward passes.
-            - "never" will disable `reshard_after_forward` for all forward passes.
+  Args:
+      model (nn.Module): The model to apply data parallelism to.
+      dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
+      param_dtype (torch.dtype): The data type to use for model parameters.
+      reduce_dtype (torch.dtype): The data type to use for reduction operations.
+      pp_enabled (bool): Whether pipeline parallelism is enabled.
+      cpu_offload (bool, optional): Whether to offload model parameters to CPU.
+        Defaults to False.
+      reshard_after_forward_policy (str, optional): The policy to use for
+        resharding after forward pass. Defaults to "default". Other options:
+        "never", "always". - "default" applies default resharding behavior,
+        implementing "smart defaults" for known optimal scenarios. - "always"
+        will enable `reshard_after_forward` for all forward passes. - "never"
+        will disable `reshard_after_forward` for all forward passes.
+  """
+  mp_policy = MixedPrecisionPolicy(
+      param_dtype=param_dtype, reduce_dtype=reduce_dtype
+  )
+  fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
+  if cpu_offload:
+    fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    """
-    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-    fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
-    if cpu_offload:
-        fsdp_config["offload_policy"] = CPUOffloadPolicy()
+  match reshard_after_forward_policy:
+    case "always":
+      reshard_after_forward = True
+    case "never":
+      reshard_after_forward = False
+    case "default":
+      # For PP, by default do not reshard after forward to avoid per-microbatch
+      # all-gathers, which can be expensive and non-overlapped
+      reshard_after_forward = not pp_enabled
+    case _:
+      raise ValueError(
+          "Invalid reshard_after_forward_policy:"
+          f" {reshard_after_forward_policy}."
+      )
 
-    match reshard_after_forward_policy:
-        case "always":
-            reshard_after_forward = True
-        case "never":
-            reshard_after_forward = False
-        case "default":
-            # For PP, by default do not reshard after forward to avoid per-microbatch
-            # all-gathers, which can be expensive and non-overlapped
-            reshard_after_forward = not pp_enabled
-        case _:
-            raise ValueError(
-                f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
-            )
-
+  # NOTE: Added to address error caused by Pytorch 2.11 update b/499068024
+  # Mimics changes made at TorchTitan OSS head (https://github.com/pytorch/torchtitan/blob/main/torchtitan/models/llama4/parallelize.py#L356)
+  # Not added to g3 copybara since pull from OSS should correctly overwrite these changes.
+  if getattr(model, "enable_weight_tying", False):
+    modules = [
+        m
+        for m in (model.tok_embeddings, model.norm, model.output)
+        if m is not None
+    ]
+    # pyrefly: ignore [no-matching-overload]
+    fully_shard(
+        modules,
+        **fsdp_config,
+        reshard_after_forward=reshard_after_forward_policy == "always",
+    )
+  else:
     if model.tok_embeddings is not None:
-        # pyrefly: ignore [no-matching-overload]
-        fully_shard(
-            model.tok_embeddings,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
-        )
-
-    # pyrefly: ignore [missing-attribute]
-    for layer_id, transformer_block in model.layers.items():
-        # NOTE: When EP is enabled, In an MoE layer, we use the following FSDP wrapping
-        # - the router and the shared experts are sharded together with the TransformerBlock
-        # - the routed experts are sharded with the remaining edp_mesh
-        if transformer_block.moe_enabled and ep_degree > 1:
-            fsdp_mod_ep_config = fsdp_config.copy()
-            fsdp_mod_ep_config["mesh"] = edp_mesh
-
-            # NOTE: EP alreadys shards the routed experts on dim 0 (num_experts).
-            #       When dp_mod_ep * ep > num_experts, FSDP default dim-0 sharding
-            #       causes inefficiency, so we choose to do FSDP sharding on dim-1.
-            #       Even when EP is not used, we may still want to shard the experts
-            #       on non-0 dim. For now it may not be worth the complexity to support
-            #       shard_placement_fn on the outer TransformerBlock-level FSDP.
-            _experts_shard_placement_fn = None
-            assert edp_mesh is not None
-            assert hasattr(transformer_block, "moe")
-            if (
-                edp_mesh["efsdp"].size() * ep_degree
-                > transformer_block.moe.experts.num_experts
-            ):
-                _experts_shard_placement_fn = lambda param: Shard(1)
-
-            fully_shard(
-                transformer_block.moe.experts,
-                **fsdp_mod_ep_config,
-                reshard_after_forward=reshard_after_forward,
-                shard_placement_fn=_experts_shard_placement_fn,
-            )
-
-        fully_shard(
-            transformer_block,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
-        )
-
-    # As an optimization, do not reshard_after_forward the last layers by default
-    # since FSDP would prefetch them immediately after the forward pass
+      # pyrefly: ignore [no-matching-overload]
+      fully_shard(
+          model.tok_embeddings,
+          **fsdp_config,
+          reshard_after_forward=reshard_after_forward,
+      )
     if model.norm is not None and model.output is not None:
-        # pyrefly: ignore [no-matching-overload]
-        fully_shard(
-            [model.norm, model.output],
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward_policy == "always",
+      # As an optimization, do not reshard_after_forward the last layers by default
+      # since FSDP would prefetch them immediately after the forward pass
+      # pyrefly: ignore [no-matching-overload]
+      fully_shard(
+          [model.norm, model.output],
+          **fsdp_config,
+          reshard_after_forward=reshard_after_forward_policy == "always",
+      )
+
+  # pyrefly: ignore [missing-attribute]
+  for layer_id, transformer_block in model.layers.items():
+    # NOTE: When EP is enabled, In an MoE layer, we use the following FSDP wrapping
+    # - the router and the shared experts are sharded together with the TransformerBlock
+    # - the routed experts are sharded with the remaining edp_mesh
+    if transformer_block.moe_enabled and ep_degree > 1:
+      fsdp_mod_ep_config = fsdp_config.copy()
+      fsdp_mod_ep_config["mesh"] = edp_mesh
+
+      # NOTE: EP alreadys shards the routed experts on dim 0 (num_experts).
+      #       When dp_mod_ep * ep > num_experts, FSDP default dim-0 sharding
+      #       causes inefficiency, so we choose to do FSDP sharding on dim-1.
+      #       Even when EP is not used, we may still want to shard the experts
+      #       on non-0 dim. For now it may not be worth the complexity to support
+      #       shard_placement_fn on the outer TransformerBlock-level FSDP.
+      _experts_shard_placement_fn = None
+      assert edp_mesh is not None
+      assert hasattr(transformer_block, "moe")
+      if (
+          edp_mesh["efsdp"].size() * ep_degree
+          > transformer_block.moe.experts.num_experts
+      ):
+        _experts_shard_placement_fn = lambda param: Shard(1)
+
+      fully_shard(
+          transformer_block.moe.experts,
+          **fsdp_mod_ep_config,
+          reshard_after_forward=reshard_after_forward,
+          shard_placement_fn=_experts_shard_placement_fn,
+      )
+
+    fully_shard(
+        transformer_block,
+        **fsdp_config,
+        reshard_after_forward=reshard_after_forward,
+    )
+
+  fully_shard(model, **fsdp_config)
+
+  # Disable FSDP's automatic gradient division for all FSDP modules
+  disable_fsdp_gradient_division(model)
+
+  # NOTE: set up explicit prefetching when EP is enabled, as D2H syncs
+  # in EP could interfere with implicit prefetching in FSDP
+  if ep_degree == 1:
+    return
+
+  # forward
+  # pyrefly: ignore [not-callable]
+  transformer_blocks = list(model.layers.values())
+  next_transformer_blocks = transformer_blocks[1:] + [None]
+
+  # pyrefly: ignore [bad-argument-type]
+  if model.tok_embeddings is not None and len(model.layers) > 0:
+    # pyrefly: ignore [missing-attribute]
+    model.tok_embeddings.set_modules_to_forward_prefetch(
+        [transformer_blocks[0]]
+    )
+
+  for transformer_block, next_transformer_block in zip(
+      transformer_blocks, next_transformer_blocks
+  ):
+    if next_transformer_block is not None:
+      # pyrefly: ignore [missing-attribute]
+      if next_transformer_block.moe_enabled:
+        # pyrefly: ignore [missing-attribute]
+        transformer_block.set_modules_to_forward_prefetch(
+            # pyrefly: ignore [missing-attribute]
+            [next_transformer_block, next_transformer_block.moe.experts]
         )
-
-    fully_shard(model, **fsdp_config)
-
-    # Disable FSDP's automatic gradient division for all FSDP modules
-    disable_fsdp_gradient_division(model)
-
-    # NOTE: set up explicit prefetching when EP is enabled, as D2H syncs
-    # in EP could interfere with implicit prefetching in FSDP
-    if ep_degree == 1:
-        return
-
-    # forward
-    # pyrefly: ignore [not-callable]
-    transformer_blocks = list(model.layers.values())
-    next_transformer_blocks = transformer_blocks[1:] + [None]
-
-    # pyrefly: ignore [bad-argument-type]
-    if model.tok_embeddings is not None and len(model.layers) > 0:
+      else:
         # pyrefly: ignore [missing-attribute]
-        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
+        transformer_block.set_modules_to_forward_prefetch(
+            [next_transformer_block]
+        )
+    elif model.norm is not None and model.output is not None:
+      # pyrefly: ignore [missing-attribute]
+      transformer_block.set_modules_to_forward_prefetch(
+          [model.norm, model.output]
+      )
 
-    for transformer_block, next_transformer_block in zip(
-        transformer_blocks, next_transformer_blocks
-    ):
-        if next_transformer_block is not None:
-            # pyrefly: ignore [missing-attribute]
-            if next_transformer_block.moe_enabled:
-                # pyrefly: ignore [missing-attribute]
-                transformer_block.set_modules_to_forward_prefetch(
-                    # pyrefly: ignore [missing-attribute]
-                    [next_transformer_block, next_transformer_block.moe.experts]
-                )
-            else:
-                # pyrefly: ignore [missing-attribute]
-                transformer_block.set_modules_to_forward_prefetch(
-                    [next_transformer_block]
-                )
-        elif model.norm is not None and model.output is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_forward_prefetch(
-                [model.norm, model.output]
-            )
+  # backward
+  # pyrefly: ignore [not-callable]
+  reversed_transformer_blocks = list(reversed(model.layers.values()))
+  prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
-    # backward
-    # pyrefly: ignore [not-callable]
-    reversed_transformer_blocks = list(reversed(model.layers.values()))
-    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+  # pyrefly: ignore [bad-argument-type]
+  if (
+      model.norm is not None
+      and model.output is not None
+      and len(model.layers) > 0
+  ):
+    # pyrefly: ignore [missing-attribute]
+    model.output.set_modules_to_backward_prefetch(
+        [reversed_transformer_blocks[0]]
+    )
 
-    # pyrefly: ignore [bad-argument-type]
-    if model.norm is not None and model.output is not None and len(model.layers) > 0:
+  for transformer_block, prev_transformer_block in zip(
+      reversed_transformer_blocks, prev_transformer_blocks
+  ):
+    if prev_transformer_block is not None:
+      # pyrefly: ignore [missing-attribute]
+      if prev_transformer_block.moe_enabled:
         # pyrefly: ignore [missing-attribute]
-        model.output.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
-
-    for transformer_block, prev_transformer_block in zip(
-        reversed_transformer_blocks, prev_transformer_blocks
-    ):
-        if prev_transformer_block is not None:
+        transformer_block.set_modules_to_backward_prefetch(
             # pyrefly: ignore [missing-attribute]
-            if prev_transformer_block.moe_enabled:
-                # pyrefly: ignore [missing-attribute]
-                transformer_block.set_modules_to_backward_prefetch(
-                    # pyrefly: ignore [missing-attribute]
-                    [prev_transformer_block, prev_transformer_block.moe.experts]
-                )
-            else:
-                # pyrefly: ignore [missing-attribute]
-                transformer_block.set_modules_to_backward_prefetch(
-                    [prev_transformer_block]
-                )
-        elif model.tok_embeddings is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
+            [prev_transformer_block, prev_transformer_block.moe.experts]
+        )
+      else:
+        # pyrefly: ignore [missing-attribute]
+        transformer_block.set_modules_to_backward_prefetch(
+            [prev_transformer_block]
+        )
+    elif model.tok_embeddings is not None:
+      # pyrefly: ignore [missing-attribute]
+      transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
 
 
 def apply_moe_ep_tp(

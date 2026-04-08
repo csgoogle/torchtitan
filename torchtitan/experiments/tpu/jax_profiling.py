@@ -67,34 +67,38 @@ def maybe_enable_profiling(
         active phase and stopped at the end.
         """
         self.step_num += 1
-        cycle_step = self.step_num % profile_freq
-        wait = profile_freq - warmup - active
 
         # Active phase starts
-        if cycle_step == wait + warmup:
+        if self.step_num > 0 and (self.step_num + warmup) % profile_freq == 0:
           curr_trace_dir_name = f"iteration_{self.step_num}"
           self.curr_trace_dir = os.path.join(
               trace_dir, curr_trace_dir_name, f"rank_{rank}", leaf_folder
           )
           if local_rank == 0:
             logger.info(
-                "Starting JAX profiler trace at step %s", self.step_num
+                "Starting JAX profiler warmup at step %d with trace"
+                " starting at step %d",
+                self.step_num,
+                self.step_num + warmup,
             )
             os.makedirs(self.curr_trace_dir, exist_ok=True)
             jax.profiler.start_trace(self.curr_trace_dir)
           self.tracing = True
-
         # Active phase ends
         elif (
             self.tracing
-            and cycle_step == (wait + warmup + active) % profile_freq
+            and (self.step_num - active) % profile_freq == 0
         ):
           if local_rank == 0:
             logger.info(
-                "Stopping JAX profiler trace at step %s", self.step_num
+                "Stopping JAX profiler before step %d", self.step_num
             )
             jax.profiler.stop_trace()
           self.tracing = False
+
+      def is_tracing(self) -> bool:
+        """Returns whether the profiler is tracing."""
+        return self.tracing
 
     logger.info("JAX Profiling active. Traces will be saved at %s", trace_dir)
 

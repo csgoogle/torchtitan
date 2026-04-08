@@ -8,6 +8,11 @@ import torchtitan.config
 class TPUConfig:
   use_simple_fsdp: bool = False
   compile_mode: str = 'layer'
+  # Whether to enable LoRA.
+  use_lora: bool = False
+  lora_rank: int = 16
+  lora_alpha: float = 16.0
+  lora_dtype: str = 'bfloat16'
   # Whether to force LoRA parameters to use DDP (replicated) instead of FSDP
   # (sharded).
   force_lora_parameter_ddp: bool = True

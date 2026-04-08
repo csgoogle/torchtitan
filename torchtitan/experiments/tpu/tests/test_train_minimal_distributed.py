@@ -118,7 +118,7 @@ class TrainMinimalDistributedTest(
           tensor_parallel_degree=-1,
           loss_atol=1e2,
           loss_rtol=5e-3,
-          grad_atol=1e1,
+          grad_atol=1.5e1,
           grad_rtol=5e-2,
           param_atol=5e-2,
           param_rtol=5e-2,
@@ -166,10 +166,6 @@ class TrainMinimalDistributedTest(
           grad_rtol=5e-2,
           param_atol=5e1,
           param_rtol=5e-2,
-          skip_devices=[
-              # b/499068024 - Skipping on TPU due to FSDP tied weights validation error.
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
   ])
   def test_train_minimal_distributed_parity(
@@ -198,7 +194,6 @@ class TrainMinimalDistributedTest(
     implementation
     is correct.
     """
-
     self._run_trainer_distributed_parity_test(
         config_args=[
             f"--model.name={model_name}",

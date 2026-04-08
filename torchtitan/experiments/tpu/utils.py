@@ -205,16 +205,14 @@ def get_device() -> torch.device:
   """Determines and returns the device based on the available device type."""
   _device_type = get_device_type()
   if _device_type == "cuda" and torch.cuda.is_available():
-    return torch.device(
-        f"{device_type}:{int(os.getenv('LOCAL_RANK', 0))}"
-    )
-  elif device_type == "tpu":
+    return torch.device(f"{_device_type}:{int(os.getenv('LOCAL_RANK', 0))}")
+  elif _device_type == "tpu":
     from torch_tpu import api  # pylint: disable=g-import-not-at-top
     import torchtitan.experiments.tpu.distributed_utils as tpu_dist_utils  # pylint: disable=g-import-not-at-top
     tpu_dist_utils.maybe_init_distributed()
     return api.tpu_device()  # Initialize TPU device.
   else:
-    return torch.device(device_type)
+    return torch.device(_device_type)
 
 
 def ptd_checkpoint_wrapper_with_early_stop(

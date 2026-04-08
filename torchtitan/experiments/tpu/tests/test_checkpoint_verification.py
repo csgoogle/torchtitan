@@ -1,0 +1,159 @@
+"""Tests for checkpoint verification in Llama3 models."""
+
+import os
+import tempfile
+
+from absl import logging
+from absl.testing import absltest
+import torch
+import torch.multiprocessing as mp
+from torchtitan.experiments.tpu import accelerator_device_type as device_type
+from torchtitan.experiments.tpu import base_distributed_device_test
+import torchtitan.experiments.tpu.train
+from torchtitan.experiments.tpu.train import TPUTrainer, start_trainer
+
+from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
+
+
+class StartTrainerWithLossCapture:
+
+  def __init__(self, output_path: str):
+    self.output_path = output_path
+    self.__name__ = "StartTrainerWithLossCapture"
+    self.__qualname__ = "StartTrainerWithLossCapture"
+
+  def __call__(self, config):
+    losses = []
+
+    original_init = TPUTrainer.__init__
+
+    def patched_init(this, job_config):
+      original_init(this, job_config)
+      original_log = this.metrics_processor.log
+
+      def patched_log(step, global_avg_loss, *args, **kwargs):
+        original_log(step, global_avg_loss, *args, **kwargs)
+        losses.append((step, global_avg_loss))
+
+      this.metrics_processor.log = patched_log
+
+    TPUTrainer.__init__ = patched_init
+
+    start_trainer(config)
+
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+      torch.save(losses, self.output_path)
+
+
+class TrainCheckpointVerificationTest(
+    base_distributed_device_test.BaseDistributedDeviceTest
+):
+  """Tests the checkpoint verification.
+
+  The test verifies that checkpointing produces identical loss to a continuous
+  run. Specifically, the test runs:
+  1. A continuous run for 5 steps.
+  2. A checkpointed run, saving every 2 steps, for 2 steps. Then another
+  checkpointed run, loading from the previous checkpoint, and running for
+  additional 3 steps (total 5 steps).
+
+  The test then compares the losses from the continuous run to the
+  checkpointed run, and asserts that they are almost equal.
+  """
+
+  def test_llama3_fsdp_checkpoint_verification(self):
+    """Verifies that checkpointing produces identical loss to a continuous run."""
+    if self.accelerator_device_type not in [
+        device_type.AcceleratorDeviceType.TPU,
+        device_type.AcceleratorDeviceType.CUDA,
+    ]:
+      self.skipTest("This test is specifically for TPU or GPU.")
+      return
+
+    test_tmp_dir = tempfile.mkdtemp()
+    continuous_output = os.path.join(test_tmp_dir, "continuous_losses.pt")
+    checkpointed_output = os.path.join(test_tmp_dir, "checkpointed_losses.pt")
+
+    base_args = [
+        "--model.name=llama3_tpu",
+        "--job.config_file=third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
+        "--training.dataset_path=third_party/py/torchtitan/tests/assets/c4_test",
+        "--training.dataset=c4_test",
+        "--model.hf_assets_path=third_party/py/torchtitan/tests/assets/tokenizer",
+        "--training.seq_len=128",
+        "--training.local_batch_size=4",
+        "--debug.deterministic",
+        "--debug.seed=42",
+    ]
+
+    # Step 1: Continuous Run (5 steps)
+    logging.info("Running Continuous Baseline")
+    continuous_args = base_args + ["--training.steps=5"]
+    self._test_train_distributed(
+        config_args=continuous_args,
+        data_parallel_shard_degree=-1,
+        tensor_parallel_degree=1,
+        start_trainer=StartTrainerWithLossCapture(continuous_output),
+        run_init_process_group=False,
+    )
+
+    # Step 2: Checkpointed Run - Save (2 steps)
+    logging.info("Running Checkpointed Save")
+    save_args = base_args + [
+        "--training.steps=2",
+        "--checkpoint.enable",
+        "--checkpoint.interval=2",
+        "--checkpoint.folder=test_verification_checkpoint",
+    ]
+
+    self._test_train_distributed(
+        config_args=save_args,
+        data_parallel_shard_degree=-1,
+        tensor_parallel_degree=1,
+        start_trainer=torchtitan.experiments.tpu.train.start_trainer,
+        run_init_process_group=False,
+    )
+
+    # Step 3: Checkpointed Run - Load & Resume (steps 3-5)
+    logging.info("Running Checkpointed Load & Resume")
+    load_args = base_args + [
+        "--training.steps=5",
+        "--checkpoint.enable",
+        "--checkpoint.interval=2",
+        "--checkpoint.folder=test_verification_checkpoint",
+    ]
+    self._test_train_distributed(
+        config_args=load_args,
+        data_parallel_shard_degree=-1,
+        tensor_parallel_degree=1,
+        start_trainer=StartTrainerWithLossCapture(checkpointed_output),
+        run_init_process_group=False,
+    )
+
+    # Step 4: Compare losses
+    continuous_losses = torch.load(continuous_output)
+    checkpointed_losses = torch.load(checkpointed_output)
+
+    logging.info(f"Continuous losses: {continuous_losses}")
+    logging.info(f"Checkpointed losses: {checkpointed_losses}")
+
+    cont_dict = {step: loss for step, loss in continuous_losses}
+    chk_dict = {step: loss for step, loss in checkpointed_losses}
+
+    for step in range(3, 6):
+      self.assertIn(step, cont_dict)
+      self.assertIn(step, chk_dict)
+      self.assertAlmostEqual(
+          cont_dict[step],
+          chk_dict[step],
+          places=4,
+          msg=f"Loss mismatch at step {step}",
+      )
+
+    logging.info("Checkpoint verification passed!")
+
+
+if __name__ == "__main__":
+  mp.set_start_method("spawn")
+  g3_multiprocessing.handle_test_main(absltest.main)
