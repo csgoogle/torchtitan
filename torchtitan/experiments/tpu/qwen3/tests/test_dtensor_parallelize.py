@@ -14,7 +14,7 @@ from torchtitan.models.qwen3.infra import parallelize as qwen3_dtensor_paralleli
 from torchtitan.models.qwen3.model.args import Qwen3ModelArgs
 from torchtitan.models.qwen3.model import model as qwen3_model
 
-from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
+
 
 
 # Constants for test parameters
@@ -208,4 +208,4 @@ class Qwen3DTensorParallelizeTest(
 
 
 if __name__ == "__main__":
-  g3_multiprocessing.handle_test_main(absltest.main)
+  absltest.main()

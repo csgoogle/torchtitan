@@ -20,7 +20,7 @@ from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import distributed
 import torch.compiler
 
-from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
+
 
 
 BATCH_SIZE = 2
@@ -848,4 +848,4 @@ class TrainMLPDTensorTest(
 
 if __name__ == "__main__":
   mp.set_start_method("spawn")
-  g3_multiprocessing.handle_test_main(absltest.main)
+  absltest.main()

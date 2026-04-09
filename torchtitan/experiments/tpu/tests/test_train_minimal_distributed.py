@@ -6,7 +6,7 @@ import torch.multiprocessing as mp
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
 
-from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
+
 
 
 class TrainMinimalDistributedTest(
@@ -18,7 +18,7 @@ class TrainMinimalDistributedTest(
       dict(
           testcase_name="redacted_ddp",
           model_name="redacted_tpu",
-          config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           data_parallel_replicate_degree=-1,
           tensor_parallel_degree=1,
@@ -27,7 +27,7 @@ class TrainMinimalDistributedTest(
       dict(
           testcase_name="redacted_fsdp",
           model_name="redacted_tpu",
-          config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=None,
@@ -49,8 +49,8 @@ class TrainMinimalDistributedTest(
     config_args = [
         f"--model.name={model_name}",
         f"--job.config_file={config_file}",
-        "--model.hf_assets_path=third_party/py/torchtitan/tests/assets/tokenizer",
-        "--training.dataset_path=third_party/py/torchtitan/tests/assets/c4_test",
+        "--model.hf_assets_path=tests/assets/tokenizer",
+        "--training.dataset_path=tests/assets/c4_test",
         "--training.seq_len=128",
         "--training.dataset=c4_test",
         "--training.steps=5",
@@ -73,7 +73,7 @@ class TrainMinimalDistributedTest(
       dict(
           testcase_name="deepseek_v3_tp",
           model_name="deepseek_v3",
-          config_file="third_party/py/torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           skip_devices=[
@@ -92,7 +92,7 @@ class TrainMinimalDistributedTest(
       dict(
           testcase_name="deepseek_v3_fsdp",
           model_name="deepseek_v3",
-          config_file="third_party/py/torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
@@ -113,7 +113,7 @@ class TrainMinimalDistributedTest(
       dict(
           testcase_name="llama3_tp",
           model_name="llama3_tpu",
-          config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
+          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           loss_atol=1e2,
@@ -126,7 +126,7 @@ class TrainMinimalDistributedTest(
       dict(
           testcase_name="llama3_fsdp",
           model_name="llama3_tpu",
-          config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
+          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           # b/495494788: Trainer/parallelize differences causing large
@@ -142,7 +142,7 @@ class TrainMinimalDistributedTest(
       dict(
           testcase_name="qwen3_tp",
           model_name="qwen3_tpu",
-          config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           loss_atol=1e2,
@@ -155,7 +155,7 @@ class TrainMinimalDistributedTest(
       dict(
           testcase_name="qwen3_fsdp",
           model_name="qwen3_tpu",
-          config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           # b/495494788: Trainer/parallelize differences causing large
@@ -199,8 +199,8 @@ class TrainMinimalDistributedTest(
             f"--model.name={model_name}",
             f"--job.config_file={config_file}",
             f"--optimizer.implementation={optimizer_implementation}",
-            "--model.hf_assets_path=third_party/py/torchtitan/tests/assets/tokenizer",
-            "--training.dataset_path=third_party/py/torchtitan/tests/assets/c4_test",
+            "--model.hf_assets_path=tests/assets/tokenizer",
+            "--training.dataset_path=tests/assets/c4_test",
             "--training.seq_len=128",
             "--training.dataset=c4_test",
             "--training.steps=3",
@@ -223,4 +223,4 @@ class TrainMinimalDistributedTest(
 
 if __name__ == "__main__":
   mp.set_start_method("spawn")
-  g3_multiprocessing.handle_test_main(absltest.main)
+  absltest.main()

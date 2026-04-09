@@ -20,7 +20,7 @@ import torchtitan.experiments.tpu.tpu_job_config
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.tools import utils
 
-from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
+
 
 
 def setup_logger():
@@ -138,14 +138,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       dict(
           testcase_name="llama3_tp_dtensor",
           model_name="llama3",
-          config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
+          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
       dict(
           testcase_name="llama3_tp_dtensor_compile",
           model_name="llama3",
-          config_file="third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
+          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
@@ -153,14 +153,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       dict(
           testcase_name="qwen3_tp_dtensor",
           model_name="qwen3",
-          config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
       dict(
           testcase_name="qwen3_tp_dtensor_compile",
           model_name="qwen3",
-          config_file="third_party/py/torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
@@ -168,14 +168,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       dict(
           testcase_name="deepseek_v3_tp_dtensor",
           model_name="deepseek_v3",
-          config_file="third_party/py/torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
       dict(
           testcase_name="deepseek_v3_tp_dtensor_compile",
           model_name="deepseek_v3",
-          config_file="third_party/py/torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
@@ -183,19 +183,19 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       dict(
           testcase_name="flux_tp_dtensor",
           model_name="flux",
-          config_file="third_party/py/torchtitan/experiments/tpu/flux/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/flux/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
-          dataset_path="third_party/py/torchtitan/tests/assets/cc12m_test",
+          dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
       ),
       dict(
           testcase_name="flux_tp_dtensor_compile",
           model_name="flux",
-          config_file="third_party/py/torchtitan/experiments/tpu/flux/train_configs/debug_model.toml",
+          config_file="torchtitan/experiments/tpu/flux/train_configs/debug_model.toml",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
-          dataset_path="third_party/py/torchtitan/tests/assets/cc12m_test",
+          dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
       ),
@@ -208,14 +208,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       tensor_parallel_degree,
       skip_devices=None,
       enable_compile=False,
-      dataset_path="third_party/py/torchtitan/tests/assets/c4_test",
+      dataset_path="tests/assets/c4_test",
       dataset="c4_test",
   ):
     args = [
         f"--model.name={model_name}",
         f"--job.config_file={config_file}",
         "--optimizer.implementation=foreach",
-        "--model.hf_assets_path=third_party/py/torchtitan/tests/assets/tokenizer",
+        "--model.hf_assets_path=tests/assets/tokenizer",
         f"--training.dataset_path={dataset_path}",
         f"--training.dataset={dataset}",
         "--training.seq_len=32",
@@ -224,8 +224,8 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
     ]
     if model_name == "flux":
       args.extend([
-          "--encoder.t5_encoder=third_party/py/torchtitan/tests/assets/flux_test_encoders/t5-micro",
-          "--encoder.clip_encoder=third_party/py/torchtitan/tests/assets/flux_test_encoders/clip-micro",
+          "--encoder.t5_encoder=tests/assets/flux_test_encoders/t5-micro",
+          "--encoder.clip_encoder=tests/assets/flux_test_encoders/clip-micro",
       ])
 
     self._test_train_distributed(
@@ -239,4 +239,4 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
 
 if __name__ == "__main__":
   mp.set_start_method("spawn")
-  g3_multiprocessing.handle_test_main(absltest.main)
+  absltest.main()

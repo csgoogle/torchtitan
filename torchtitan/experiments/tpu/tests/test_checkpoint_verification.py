@@ -12,7 +12,7 @@ from torchtitan.experiments.tpu import base_distributed_device_test
 import torchtitan.experiments.tpu.train
 from torchtitan.experiments.tpu.train import TPUTrainer, start_trainer
 
-from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
+
 
 
 class StartTrainerWithLossCapture:
@@ -77,10 +77,10 @@ class TrainCheckpointVerificationTest(
 
     base_args = [
         "--model.name=llama3_tpu",
-        "--job.config_file=third_party/py/torchtitan/models/llama3/train_configs/debug_model.toml",
-        "--training.dataset_path=third_party/py/torchtitan/tests/assets/c4_test",
+        "--job.config_file=torchtitan/models/llama3/train_configs/debug_model.toml",
+        "--training.dataset_path=tests/assets/c4_test",
         "--training.dataset=c4_test",
-        "--model.hf_assets_path=third_party/py/torchtitan/tests/assets/tokenizer",
+        "--model.hf_assets_path=tests/assets/tokenizer",
         "--training.seq_len=128",
         "--training.local_batch_size=4",
         "--debug.deterministic",
@@ -156,4 +156,4 @@ class TrainCheckpointVerificationTest(
 
 if __name__ == "__main__":
   mp.set_start_method("spawn")
-  g3_multiprocessing.handle_test_main(absltest.main)
+  absltest.main()

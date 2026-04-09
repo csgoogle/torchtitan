@@ -11,7 +11,7 @@ This is a simple example for using torchax to train llama3/qwen3 with:
 Run it with the bazel test hack:
 Llama3 8B training (yield MFU ~48%):
 ```
-bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_4x2x1 \
+bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_4x2x1 \
     --test_arg=-- \
     --test_arg=--model.name=llama3 \
     --test_arg=--model.flavor=8B \
@@ -19,8 +19,8 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
     --test_arg=--training.seq_len=2048 \
     --test_arg=--training.global_batch_size=8 \
     --test_arg=--training.steps=8 \
-    --test_arg=--model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
-    --test_arg=--training.dataset_path="third_party/py/torchtitan/tests/assets/c4_test" \
+    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
+    --test_arg=--training.dataset_path="tests/assets/c4_test" \
     --test_arg=--parallelism.tensor_parallel_degree=1 \
     --test_arg=--torchax_config.use_torchax \
     --test_arg=--torchax_config.use_scan \
@@ -28,7 +28,7 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
 ```
 Llama3 8B training on 2xH100 GPU (MFU ~26%):
 ```
-bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_gpu_h100x2 \
+bazel test //torchtitan/experiments/torchax:torchax_train_test_gpu_h100x2 \
     --test_arg=-- \
     --test_arg=--model.name=llama3 \
     --test_arg=--model.flavor=8B \
@@ -36,8 +36,8 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_gp
     --test_arg=--training.seq_len=2048 \
     --test_arg=--training.global_batch_size=2 \
     --test_arg=--training.steps=8 \
-    --test_arg=--model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
-    --test_arg=--training.dataset_path="third_party/py/torchtitan/tests/assets/c4_test" \
+    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
+    --test_arg=--training.dataset_path="tests/assets/c4_test" \
     --test_arg=--parallelism.tensor_parallel_degree=1 \
     --test_arg=--torchax_config.use_torchax \
     --test_arg=--torchax_config.use_scan \
@@ -45,7 +45,7 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_gp
 ```
 Qwen3 30B-A3B (override layer from 48 to 8, so ~5.5B-A1B, MFU ~25%):
 ```
-bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_4x2x1 \
+bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_4x2x1 \
     --test_arg=--alsologtostderr \
     --test_arg=--xprof_end_2_end_upload \
     --test_arg=--xprof_host_trace_level=2 \
@@ -56,8 +56,8 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
     --test_arg=--training.seq_len=8192 \
     --test_arg=--training.global_batch_size=8 \
     --test_arg=--training.steps=8 \
-    --test_arg=--model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
-    --test_arg=--training.dataset_path="third_party/py/torchtitan/tests/assets/c4_test" \
+    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
+    --test_arg=--training.dataset_path="tests/assets/c4_test" \
     --test_arg=--parallelism.tensor_parallel_degree=1 \
     --test_arg=--torchax_config.model_layer_override=8 \
     --test_arg=--torchax_config.use_torchax \
@@ -66,13 +66,13 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
 ```
 redacted 3B Full FT on v6e-8 (57k TPS total, MFU ~22%):
 ```
-bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_2x4 \
+bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_2x4 \
     --test_arg=-- \
     --test_arg=--model.name=redacted \
     --test_arg=--model.flavor=3B \
-    --test_arg=--job.config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/redacted_3b.toml" \
-    --test_arg=--training.dataset_path="third_party/py/torchtitan/tests/assets/c4_test" \
-    --test_arg=--model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
+    --test_arg=--job.config_file="torchtitan/experiments/tpu/redacted/train_configs/redacted_3b.toml" \
+    --test_arg=--training.dataset_path="tests/assets/c4_test" \
+    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
     --test_arg=--training.seq_len=8192 \
     --test_arg=--training.global_batch_size=8 \
     --test_arg=--training.steps=22 \
@@ -82,13 +82,13 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
 ```
 redacted 3B LoRA on v6e-8 (51.5k TPS total, MFU ~20.3%):
 ```
-bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_2x4 \
+bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_2x4 \
     --test_arg=-- \
     --test_arg=--model.name=redacted \
     --test_arg=--model.flavor=3B-lora \
-    --test_arg=--job.config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
-    --test_arg=--training.dataset_path="third_party/py/torchtitan/tests/assets/c4_test" \
-    --test_arg=--model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
+    --test_arg=--job.config_file="torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
+    --test_arg=--training.dataset_path="tests/assets/c4_test" \
+    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
     --test_arg=--training.seq_len=8192 \
     --test_arg=--training.global_batch_size=8 \
     --test_arg=--training.steps=22 \
@@ -98,11 +98,11 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
 ```
 redacted 3B LoRA on 2xH100 GPU (3.9k TPS total, MFU ~5.8%):
 ```
-bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_gpu_h100x2 \
+bazel test //torchtitan/experiments/torchax:torchax_train_test_gpu_h100x2 \
     --test_arg=-- \
     --test_arg=--model.name=redacted \
     --test_arg=--model.flavor=3B-lora \
-    --test_arg=--job.config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
+    --test_arg=--job.config_file="torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
     --test_arg=--training.dataset=fake \
     --test_arg=--training.seq_len=8192 \
     --test_arg=--training.global_batch_size=2 \
@@ -113,7 +113,7 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_gp
 ```
 Deepseek_v3 16B (override layer from 27 to 11, so ~6.3B-A1.3B, MFU ~23%):
 ```
-bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_4x2x1 \
+bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_4x2x1 \
     --test_arg=-- \
     --test_arg=--model.name=deepseek_v3 \
     --test_arg=--model.flavor=16B \
@@ -121,8 +121,8 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
     --test_arg=--training.seq_len=8192 \
     --test_arg=--training.global_batch_size=8 \
     --test_arg=--training.steps=8 \
-    --test_arg=--model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
-    --test_arg=--training.dataset_path="third_party/py/torchtitan/tests/assets/c4_test" \
+    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
+    --test_arg=--training.dataset_path="tests/assets/c4_test" \
     --test_arg=--parallelism.tensor_parallel_degree=1 \
     --test_arg=--torchax_config.model_layer_override=5 \
     --test_arg=--torchax_config.use_torchax \
@@ -131,16 +131,16 @@ bazel test //third_party/py/torchtitan/experiments/torchax:torchax_train_test_tp
 ```
 Run it with launcher (xm/240480403):
 ```bash
-launcher launch third_party/py/torchtitan/launcher/xm_launch.py -- \
+launcher launch torchtitan/launcher/xm_launch.py -- \
     --xm_resource_alloc=cloud-dynamic/cmcs-xm \
-    --target=//third_party/py/torchtitan/experiments/torchax:train_minimal  \
+    --target=//torchtitan/experiments/torchax:train_minimal  \
     --platform=glp=2x4 \
     -- \
     --model.name=redacted \
     --model.flavor=3B-lora \
-    --job.config_file="third_party/py/torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
+    --job.config_file="torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
     --training.dataset=fake \
-    --model.hf_assets_path="third_party/py/torchtitan/tests/assets/tokenizer" \
+    --model.hf_assets_path="tests/assets/tokenizer" \
     --training.seq_len=8192 \
     --training.global_batch_size=8 \
     --training.steps=22 \

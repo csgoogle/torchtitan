@@ -12,7 +12,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
-from torch.google import distributed as gdist
+from torchtitan.experiments.tpu import gdist
 import torchtitan.config
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import distributed_utils

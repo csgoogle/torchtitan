@@ -18,7 +18,7 @@ from torchtitan.experiments.tpu import test_utils
 from torchtitan.models.llama3.infra import parallelize as llama3_dtensor_parallelize
 from torchtitan.models.llama3.model import model as llama3_model
 
-from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
+
 
 
 # Constants for test parameters
@@ -267,4 +267,4 @@ class Llama3DTensorParallelizeTest(
     logging.info("Distributed FSDP training equivalence test finished.")
 
 if __name__ == "__main__":
-  g3_multiprocessing.handle_test_main(absltest.main)
+  absltest.main()

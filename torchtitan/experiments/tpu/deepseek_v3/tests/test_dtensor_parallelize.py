@@ -13,7 +13,7 @@ from torchtitan.experiments.tpu.deepseek_v3.model.args import DeepSeekV3ModelArg
 from torchtitan.models.deepseek_v3.infra import parallelize as deepseek_v3_dtensor_parallelize
 from torchtitan.models.deepseek_v3.model import model as deepseek_v3_model
 
-from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
+
 
 
 # Constants for test parameters
@@ -220,4 +220,4 @@ class DeepSeekV3DTensorParallelizeTest(
 
 
 if __name__ == "__main__":
-  g3_multiprocessing.handle_test_main(absltest.main)
+  absltest.main()

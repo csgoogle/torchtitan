@@ -148,7 +148,7 @@ class TorchaxMetricsProcessor:
 
         # system-wide tokens per second, abbreviated as tps
         # Note: We set the non_data_parallel_size to 1 to get the system-wide
-        # tps. See third_party/py/torchtitan/experiments/torchax/distributed.py
+        # tps. See torchtitan/experiments/torchax/distributed.py
         tps = self.ntokens_since_last_log / (
             time_delta * self.parallel_dims.non_data_parallel_size
         )
