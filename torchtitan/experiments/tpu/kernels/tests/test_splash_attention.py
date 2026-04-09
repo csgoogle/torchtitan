@@ -1,5 +1,8 @@
 """Tests for splash attention on TPU."""
 
+import functools
+from typing import Callable
+
 from absl import logging
 from absl.testing import absltest
 import torch
@@ -18,102 +21,92 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
   and Grouped Query Attention (GQA) configurations.
   """
 
-  def test_mha_parity(self):
+  def check_forward_parity(
+      self,
+      splash_fn: Callable[
+          [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
+      ],
+      b: int,
+      n_heads: int,
+      n_kv_heads: int,
+      seq_len: int,
+      head_dim: int,
+  ):
     device = self.accelerator_device
-    b, n_heads, seq_len, head_dim = 2, 8, 128, 64
 
-    # Generate on CPU first
-    q = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
-    k = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
-    v = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
-
-    # Move to TPU
-    q_tpu, k_tpu, v_tpu = q.to(device), k.to(device), v.to(device)
-
-    # Reference Math SDPA on TPU
-    with attention.sdpa_kernel([attention.SDPBackend.MATH]):
-      expected_out = F.scaled_dot_product_attention(
-          q_tpu, k_tpu, v_tpu, is_causal=True
-      )
-
-    # TPU Splash SDPA
-    actual_out = splash_sdpa(
-        q_tpu, k_tpu, v_tpu, is_causal=True, enable_gqa=False
-    )
-
-    torch.testing.assert_close(
-        actual_out.cpu(), expected_out.cpu(), rtol=5e-2, atol=5e-2
-    )
-    logging.info("MHA Parity test passed. Output shape: %s", actual_out.shape)
-
-  def test_mqa_parity(self):
-    device = self.accelerator_device
-    b, n_heads, n_kv_heads, seq_len, head_dim = 2, 8, 2, 128, 64
-
-    # Generate on CPU first
+    # Generates inputs on cpu and moves to tpu.
     q = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
     k = torch.randn(b, n_kv_heads, seq_len, head_dim, dtype=torch.float32)
     v = torch.randn(b, n_kv_heads, seq_len, head_dim, dtype=torch.float32)
-
-    # Move to TPU
     q_tpu, k_tpu, v_tpu = q.to(device), k.to(device), v.to(device)
 
-    # Reference Math SDPA on TPU (manual GQA expansion)
+    # Expands kv_head dim if necessary.
     n_rep = n_heads // n_kv_heads
     k_exp = k_tpu.repeat_interleave(n_rep, dim=1)
     v_exp = v_tpu.repeat_interleave(n_rep, dim=1)
 
+    # Computes expected result using Math SDPA on TPU.
     with attention.sdpa_kernel([attention.SDPBackend.MATH]):
       expected_out = F.scaled_dot_product_attention(
           q_tpu, k_exp, v_exp, is_causal=True
       )
 
-    # TPU Splash SDPA
-    actual_out = splash_sdpa(
-        q_tpu, k_tpu, v_tpu, is_causal=True, enable_gqa=True
-    )
+    actual_out = splash_fn(q_tpu, k_tpu, v_tpu)
 
     torch.testing.assert_close(
         actual_out.cpu(), expected_out.cpu(), rtol=5e-2, atol=5e-2
     )
-    logging.info(
-        "MQA/GQA Parity test passed. Output shape: %s", actual_out.shape
+
+  def test_mha_parity(self):
+    splash_fn = functools.partial(splash_sdpa, is_causal=True, enable_gqa=False)
+    self.check_forward_parity(
+        splash_fn=splash_fn,
+        b=2,
+        n_heads=8,
+        n_kv_heads=8,
+        seq_len=128,
+        head_dim=64,
+    )
+
+  def test_mqa_parity(self):
+    splash_fn = functools.partial(splash_sdpa, is_causal=True, enable_gqa=True)
+    self.check_forward_parity(
+        splash_fn=splash_fn,
+        b=2,
+        n_heads=8,
+        n_kv_heads=2,
+        seq_len=128,
+        head_dim=64,
+    )
+
+  def test_mqa_parity_one_kv_head(self):
+    splash_fn = functools.partial(splash_sdpa, is_causal=True, enable_gqa=True)
+    self.check_forward_parity(
+        splash_fn=splash_fn,
+        b=2,
+        n_heads=8,
+        n_kv_heads=1,
+        seq_len=128,
+        head_dim=64,
     )
 
   def test_block_sizes_parity(self):
-    device = self.accelerator_device
-    b, n_heads, seq_len, head_dim = 2, 8, 256, 64
-
-    # Generate on CPU first
-    q = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
-    k = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
-    v = torch.randn(b, n_heads, seq_len, head_dim, dtype=torch.float32)
-
-    # Move to TPU
-    q_tpu, k_tpu, v_tpu = q.to(device), k.to(device), v.to(device)
-
-    # Reference Math SDPA on TPU
-    with attention.sdpa_kernel([attention.SDPBackend.MATH]):
-      expected_out = F.scaled_dot_product_attention(
-          q_tpu, k_tpu, v_tpu, is_causal=True
-      )
-
-    # TPU Splash SDPA with explicit block sizes
-    actual_out = splash_sdpa(
-        q_tpu,
-        k_tpu,
-        v_tpu,
+    splash_fn = functools.partial(
+        splash_sdpa,
         is_causal=True,
         enable_gqa=False,
         block_q=128,
         block_kv=128,
         block_kv_compute=128,
     )
-
-    torch.testing.assert_close(
-        actual_out.cpu(), expected_out.cpu(), rtol=5e-2, atol=5e-2
+    self.check_forward_parity(
+        splash_fn=splash_fn,
+        b=2,
+        n_heads=8,
+        n_kv_heads=8,
+        seq_len=256,
+        head_dim=64,
     )
-    logging.info("Block sizes parity test passed.")
 
   def test_mha_backward(self):
     """Gradients from splash attention backward match reference SDPA."""

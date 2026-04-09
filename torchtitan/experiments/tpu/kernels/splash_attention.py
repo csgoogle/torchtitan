@@ -50,6 +50,7 @@ def _make_splash_attention_fn(
       grad_out) returning (grad_q, grad_k, grad_v) WITHOUT re-running the
       forward (uses saved residuals to call the backward kernel directly).
   """
+
   def _get_layout(layout_str):
     if layout_str == "HEAD_DIM_MINOR":
       return QKVLayout.HEAD_DIM_MINOR
@@ -359,6 +360,11 @@ def splash_sdpa(
       q = q * scale_ratio  # plain PyTorch op — autograd handles gradient here
 
   input_dtype = q.dtype
+  if n_kv_heads == 1:
+    # For MQA (1 kv head) the splash attentionn kernel expects the kv
+    # head dimension to be squeezed.
+    k = torch.squeeze(k, dim=1)
+    v = torch.squeeze(v, dim=1)
   result = _SplashAttentionFn.apply(q, k, v, torch_fwd_fn, torch_bwd_fn)
   result = typing.cast(torch.Tensor, result)
 
