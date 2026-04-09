@@ -70,7 +70,7 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 
 You can either build TorchTPU from source or install a prebuilt wheel.
 
-Build instructions are available in the [TorchTPU GitHub repository](https://github.com/google-ml-infra/torch_tpu?tab=readme-ov-file#build-from-source) (note that this is a gated repository).
+Build instructions are available in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source) (note that this is a gated repository).
 
 First, create and activate a Python 3.12 virtual environment:
 
@@ -101,7 +101,7 @@ pip install keyrings.google-artifactregistry-auth
 gcloud auth login
 gcloud auth application-default login
 
-pip install --pre --index-url --no-deps "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" --no-deps torch_tpu
+pip install --pre --no-deps --index-url "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch_tpu
 ```
 
 ### Install TorchTitan and its dependencies
@@ -291,7 +291,7 @@ cd torchtitan
 
 Before the public release of TorchTPU, you must either copy a prebuilt wheel file or build one from source.
 
-Build instructions are available in the [TorchTPU GitHub repository](https://github.com/google-ml-infra/torch_tpu?tab=readme-ov-file#build-from-source) (note that this is a gated repository).
+Build instructions are available in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source) (note that this is a gated repository).
 
 To download a prebuilt wheel, run the following:
 
