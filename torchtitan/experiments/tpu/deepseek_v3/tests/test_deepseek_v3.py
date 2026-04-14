@@ -12,6 +12,7 @@ from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.models.deepseek_v3.model import model as deepseek_v3_model
 from torchtitan.models import moe
+from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 
 
 class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
@@ -20,6 +21,11 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
   This class contains tests to ensure parity between CPU and accelerator device
   implementations of various DeepSeekV3 model layers and full model testing.
   """
+
+  def setUp(self):
+    super().setUp()
+    # Enable CPU histc workaround.
+    use_cpu_safe_histc_patch()
 
   def _get_model_args(
       self,

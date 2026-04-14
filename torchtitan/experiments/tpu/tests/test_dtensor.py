@@ -831,6 +831,12 @@ class TrainMLPDTensorTest(
       )
       return
 
+    if acc_type == device_type.AcceleratorDeviceType.TPU:
+      self.skipTest(
+          "Bug with torch.compile on TPU (b/501466433)"
+      )
+      return
+
     distributed.run_distributed(
         self.num_devices,
         acc_type,

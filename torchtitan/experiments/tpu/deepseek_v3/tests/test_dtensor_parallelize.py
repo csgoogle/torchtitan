@@ -14,6 +14,7 @@ from torchtitan.models.deepseek_v3.infra import parallelize as deepseek_v3_dtens
 from torchtitan.models.deepseek_v3.model import model as deepseek_v3_model
 
 
+from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 
 
 # Constants for test parameters
@@ -71,6 +72,8 @@ def _verify_dtensor_deepseek_v3_non_moe_tp_forward_worker(
     device: torch.device, rank: int, world_size: int
 ):
   """Verifies numerical equivalence of forward pass of DeepSeekV3 model with DTensor TP."""
+  # Apply histc CPU workaround in worker process. Doesn't propagate from parent.
+  use_cpu_safe_histc_patch()
 
   def apply_tp_wrapper(model):
     tp_mesh = DeviceMesh(device_type=device.type, mesh=torch.arange(world_size))
@@ -100,6 +103,8 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
     device: torch.device, rank: int, world_size: int
 ):
   """Worker function to run forward andbackward pass on model after apply_tp is called."""
+  # Apply histc CPU workaround in worker process. Doesn't propagate from parent.
+  use_cpu_safe_histc_patch()
 
   def apply_tp_wrapper(model):
     tp_mesh = DeviceMesh(device_type=device.type, mesh=torch.arange(world_size))
@@ -134,6 +139,8 @@ def _verify_dtensor_deepseek_v3_fsdp_training_loop_worker(
     world_size: int,
 ):
   """Worker function to call the FSDP numerical equivalence helper on DeepSeekV3 model."""
+  # Apply histc CPU workaround in worker process. Doesn't propagate from parent.
+  use_cpu_safe_histc_patch()
 
   def apply_fsdp_wrapper(model):
     dp_mesh = DeviceMesh(device_type=device.type, mesh=torch.arange(world_size))

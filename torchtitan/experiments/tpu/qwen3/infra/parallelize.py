@@ -32,6 +32,10 @@ def parallelize_qwen3(
   Returns:
     The parallelized nn.Module.
   """
+
+  # Enable CPU histc workaround.
+  workarounds.use_cpu_safe_histc_patch()
+
   if (
       isinstance(job_config, tpu_job_config.TPUJobConfig)
       and job_config.tpu_config.use_splash_attention_kernel

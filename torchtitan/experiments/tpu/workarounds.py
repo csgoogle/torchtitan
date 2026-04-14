@@ -243,36 +243,14 @@ def use_fill_indices_patch(
   logger.info("Patched MoE kernels to use TPU fill_indices")
 
 
-class CPUSafeHistcMode(TorchDispatchMode):
-  """A global dispatcher that intercepts and casts calls to torch.histc.
+def use_cpu_safe_histc_patch() -> None:
+  """Monkey patches torch.histc to support int dtypes on CPU."""
+  original_histc = torch.histc
 
-  It implements the following workaround, because PyTorch's torch.histc
-  implementation on CPU doesn't support int dtypes.
-  This is in contrast to the GPU and TPU implementations, which support both.
+  def _cpu_safe_histc(input, bins=100, min=0, max=0, *, out=None):
+    if input.device.type == "cpu":
+      return original_histc(input.float(), bins, min, max, out=out).to(input.dtype)
+    return original_histc(input, bins, min, max, out=out)
 
-  Pipeline:
-    original_dtype -> float32 -> torch.histc -> original_dtype
-  """
-
-  def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-    kwargs = kwargs or {}
-
-    if func.overloadpacket == torch.ops.aten.histc:
-      # Unpack arguments.
-      input_tensor, bins, min_val, max_val = args
-
-      if input_tensor.device.type == 'cpu':
-        input_fp32 = input_tensor.to(torch.float32)
-
-        new_args = (input_fp32, bins, min_val, max_val)
-        result = func(*new_args, **kwargs)
-
-        return result.to(input_tensor.dtype)
-
-    return func(*args, **kwargs)
-
-
-_global_histc_mode = CPUSafeHistcMode()
-_global_histc_mode.__enter__()
-
-logging.info('[Workaround] Globally enabled torch.histc workaround for CPU.')
+  torch.histc = _cpu_safe_histc
+  logger.info("Monkey-patched torch.histc to support int dtypes on CPU")

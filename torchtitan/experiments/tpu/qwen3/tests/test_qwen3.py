@@ -20,6 +20,7 @@ from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.models.qwen3.model import model as qwen3_model
 import torchtitan.models.moe
+from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 
 
 # Base arguments for a small Qwen3 test setup.
@@ -84,6 +85,11 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
   This class contains tests to ensure parity between CPU and accelerator device
   implementations of various Qwen3 model layers and full model training.
   """
+
+  def setUp(self):
+    super().setUp()
+    # Enable CPU histc workaround.
+    use_cpu_safe_histc_patch()
 
   def _get_model_args(
       self, test_config: Dict[str, Any]

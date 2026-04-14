@@ -46,6 +46,12 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
+          skip_devices=[
+              # b/501466433 - Bug with torch.compile
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
       ),
       # deepseek_v3
       dict(
@@ -96,6 +102,9 @@ class TrainDistributedTest(
           skip_devices=[
               # b/487028245 - Timing out w/Math Backend
               device_type.AcceleratorDeviceType.TPU,
+              # b/501466433 - Bug with torch.compile
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
       # flux
@@ -107,6 +116,10 @@ class TrainDistributedTest(
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
+          skip_devices=[
+              # b/501467380 - Error during backward pass
+              device_type.AcceleratorDeviceType.TPU,
+          ]
       ),
       dict(
           testcase_name="flux_tp_compile",
@@ -117,6 +130,12 @@ class TrainDistributedTest(
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
+          skip_devices=[
+              # b/501466433 - Bug with torch.compile
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
       ),
       dict(
           testcase_name="flux_fsdp",
@@ -126,6 +145,10 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
+          skip_devices=[
+              # b/501467380 - Error during backward pass
+              device_type.AcceleratorDeviceType.TPU,
+          ],
       ),
       dict(
           testcase_name="flux_fsdp_compile",
@@ -136,6 +159,12 @@ class TrainDistributedTest(
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
+          skip_devices=[
+              # b/501466433 - Bug with torch.compile
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
       ),
       # llama3
       dict(
@@ -152,6 +181,12 @@ class TrainDistributedTest(
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
+          skip_devices=[
+              # b/501466433 - Bug with torch.compile
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
       ),
       dict(
           testcase_name="llama3_fsdp",
@@ -167,6 +202,12 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
+          skip_devices=[
+              # b/501466433 - Bug with torch.compile
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
       ),
       dict(
           testcase_name="llama3_fsdp_checkpoint",
@@ -222,6 +263,12 @@ class TrainDistributedTest(
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
+          skip_devices=[
+              # b/501466433 - Bug with torch.compile
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
       ),
       dict(
           testcase_name="qwen3_fsdp",
@@ -237,6 +284,12 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
+          skip_devices=[
+              # b/501466433 - Bug with torch.compile
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
       ),
       dict(
           testcase_name="qwen3_fsdp_use_loss_kernel",
