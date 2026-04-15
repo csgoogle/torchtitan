@@ -19,6 +19,7 @@ from torchtitan.experiments.tpu import distributed_utils
 from torchtitan.experiments.tpu import numerical_validation
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import train_minimal
+from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools import utils
 
@@ -470,6 +471,88 @@ def config_to_input_distribution(
     return InputDistribution.REPLICATE
 
 
+def _run_cpu_verification(
+    temp_path: str,
+    config_args: list[str],
+    loss_atol: float,
+    loss_rtol: float,
+    grad_atol: float,
+    grad_rtol: float,
+    param_atol: float,
+    param_rtol: float,
+):
+  """Runs the CPU verification in a separate process."""
+  logging.info("[Child Process] Starting CPU Training (Verifying)...")
+
+  # Force device type to CPU in this process
+  tpu_utils.set_device_type("cpu")
+
+  # Load recorded data from the file
+  if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+    raise RuntimeError(f"Recorded history file missing or empty: {temp_path}")
+
+  recorded_history = torch.load(temp_path)
+  logging.info(
+      "Retrieved history for %s steps (including init).",
+      len(recorded_history),
+  )
+
+  # Extract initialization state
+  if "init" not in recorded_history:
+    raise RuntimeError("Recorded history missing 'init' state.")
+  init_state = recorded_history.pop("init")
+
+  # Prepare CPU Configuration
+  config_manager = torchtitan.config.ConfigManager(
+      tpu_job_config_module.TPUJobConfig
+  )
+  cpu_config = config_manager.parse_args(config_args)
+
+  # Force overrides for single-device CPU execution
+  cpu_config.parallelism.tensor_parallel_degree = 1
+  cpu_config.parallelism.data_parallel_shard_degree = 1
+  cpu_config.parallelism.data_parallel_replicate_degree = 1
+  cpu_config.compile.enable = False
+
+  # Setup validator callback
+  validator = numerical_validation.StateValidatorCallback(
+      recorded_history=recorded_history,
+      capture_fn=numerical_validation.capture_local_state,
+      loss_atol=loss_atol,
+      loss_rtol=loss_rtol,
+      grad_atol=grad_atol,
+      grad_rtol=grad_rtol,
+      param_atol=param_atol,
+      param_rtol=param_rtol,
+  )
+
+  with validator:
+    # Initialize CPU Trainer
+    trainer_cpu = train_minimal.TrainerMinimal(
+        device=torch.device("cpu"),
+        rank=0,
+        world_size=1,
+        job_config=cpu_config,
+        step_callback=validator.on_step,
+    )
+
+    # Load the captured distributed weights into the CPU model
+    current_cpu_dict = trainer_cpu.model.state_dict()
+
+    for name, param in init_state["params"].items():
+      if name in current_cpu_dict:
+        with torch.no_grad():
+          current_cpu_dict[name].copy_(param)
+      else:
+        logging.warning(
+            "Param %s from distributed run not found in CPU model.", name
+        )
+
+    logging.info("CPU model initialized with distributed weights.")
+    trainer_cpu.train()
+
+  logging.info("[Child Process] Parity Test Passed Successfully.")
+
 # Chose for wrapper to be class so that output_path can written to/read from
 # outside the function.
 # (alternative is to use functools.partial)
@@ -482,8 +565,6 @@ class DistributedTrainWithRecorder:
     self.__qualname__ = "DistributedTrainWithRecorder"
 
   def __call__(self, config):
-    from torchtitan.experiments.tpu import utils as tpu_utils
-
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     device = tpu_utils.get_device()
@@ -660,84 +741,35 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
           data_parallel_replicate_degree=data_parallel_replicate_degree,
       )
 
-      # Load recorded data from the file (if non-empty; otherwise fail)
-      if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-        recorded_history = torch.load(temp_path)
-        logging.info(
-            "Retrieved history for %s steps (including init).",
-            len(recorded_history),
-        )
-      else:
+      # Verify the distributed run produced data
+      if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
         self.fail(
             "Distributed run finished but returned no data (File"
             " empty/missing)."
         )
 
+      # Setup CPU Verification Run
+      logging.info("[Phase 2] Running CPU Training (Verifying)...")
+
+      try:
+        test_utils.run_in_subprocess(
+            module_name="torchtitan.experiments.tpu.base_distributed_device_test",
+            function_name="_run_cpu_verification",
+            args=[
+                temp_path,
+                config_args,
+                loss_atol,
+                loss_rtol,
+                grad_atol,
+                grad_rtol,
+                param_atol,
+                param_rtol,
+            ],
+        )
+      except Exception as e:
+        self.fail(f"Isolated subprocess failed: {e}")
+
     finally:
       # Cleanup temporary file
       if os.path.exists(temp_path):
         os.remove(temp_path)
-
-    # Setup CPU Verification Run
-    logging.info("[Phase 2] Running CPU Training (Verifying)...")
-
-    # Extract initialization state (must exist)
-    if "init" not in recorded_history:
-      self.fail("Recorded history missing 'init' state. Cannot sync CPU model.")
-    init_state = recorded_history.pop("init")
-
-    # Prepare CPU Configuration
-    # We parse the original args but force parallelism to 1 and device to CPU
-    config_manager = torchtitan.config.ConfigManager(
-        tpu_job_config_module.TPUJobConfig
-    )
-    cpu_config = config_manager.parse_args(config_args)
-
-    # Force overrides for single-device CPU execution
-    cpu_config.parallelism.tensor_parallel_degree = 1
-    cpu_config.parallelism.data_parallel_shard_degree = 1
-    cpu_config.parallelism.data_parallel_replicate_degree = 1
-    cpu_config.compile.enable = False
-
-    # Setup validator callback with the recorded history.
-    validator = numerical_validation.StateValidatorCallback(
-        recorded_history=recorded_history,
-        capture_fn=numerical_validation.capture_local_state,
-        loss_atol=loss_atol,
-        loss_rtol=loss_rtol,
-        grad_atol=grad_atol,
-        grad_rtol=grad_rtol,
-        param_atol=param_atol,
-        param_rtol=param_rtol,
-    )
-
-    with validator:
-      # Initialize CPU Trainer
-      trainer_cpu = train_minimal.TrainerMinimal(
-          device=torch.device("cpu"),
-          rank=0,
-          world_size=1,
-          job_config=cpu_config,
-          step_callback=validator.on_step,
-      )
-
-      # Load the captured distributed weights into the CPU model
-      current_cpu_dict = trainer_cpu.model.state_dict()
-
-      # We only load params that exist in the CPU model
-      # (Distributed run might have extra buffers, but params must match)
-      for name, param in init_state["params"].items():
-        if name in current_cpu_dict:
-          with torch.no_grad():
-            current_cpu_dict[name].copy_(param)
-        else:
-          logging.warning(
-              "Param %s from distributed run not found in CPU model.", name
-          )
-
-      logging.info("CPU model initialized with distributed weights.")
-
-      # Run CPU training with validation callback to compare against reference.
-      trainer_cpu.train()
-
-    logging.info("Parity Test Passed Successfully.")

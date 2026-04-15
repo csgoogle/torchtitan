@@ -1,6 +1,10 @@
 """Shared utilities for accelerator device tests."""
 
 import functools
+import json
+import subprocess
+import sys
+from typing import Any
 from absl import flags
 from absl import logging
 import torch
@@ -166,3 +170,73 @@ def check_equivalence(
         f"\n  Tolerance: {atol} / {rtol}"
     )
     raise AssertionError(error_message)
+
+
+def run_in_subprocess(
+    module_name: str,
+    function_name: str,
+    args: list[Any] | None = None,
+    kwargs: dict[str, Any] | None = None,
+) -> None:
+  """Runs a function in an isolated Python subprocess.
+
+  This is necessary because PyTorch distributed and TPU states (like PjRtClient)
+  are stored globally within the Python process. Re-initializing them for
+  verification steps causes errors.
+
+  Args:
+      module_name: The name of the module containing the function.
+      function_name: The name of the function to run.
+      args: Positional arguments to pass to the function (must be
+        JSON-serializable).
+      kwargs: Keyword arguments to pass to the function (must be
+        JSON-serializable).
+
+  Raises:
+      subprocess.CalledProcessError: If the subprocess fails.
+  """
+  args = args or []
+  kwargs = kwargs or {}
+
+  if sys.executable is None:
+    logging.warning(
+        "sys.executable is None (likely embedded Python). Falling back to"
+        " in-process execution which may leak state."
+    )
+    import importlib
+
+    module = importlib.import_module(module_name)
+    func = getattr(module, function_name)
+    return func(*args, **kwargs)
+
+  logging.info(
+      "Running %s.%s in an isolated subprocess...", module_name, function_name
+  )
+
+  # Build a script that imports the function, decodes arguments, and executes it
+  script = f"""
+import sys
+import json
+import importlib
+
+sys.path = {sys.path}
+
+module_name = {repr(module_name)}
+function_name = {repr(function_name)}
+args = json.loads({repr(json.dumps(args))})
+kwargs = json.loads({repr(json.dumps(kwargs))})
+
+module = importlib.import_module(module_name)
+func = getattr(module, function_name)
+func(*args, **kwargs)
+"""
+
+  result = subprocess.run(
+      [sys.executable, "-c", script],
+      capture_output=True,
+      text=True,
+      check=True,
+  )
+  logging.info("Isolated subprocess output:\n%s", result.stdout)
+  if result.stderr:
+    logging.warning("Isolated subprocess stderr:\n%s", result.stderr)

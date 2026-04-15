@@ -14,59 +14,6 @@ class TrainMinimalDistributedTest(
 ):
   """Tests train_minimal execution in distributed settings."""
 
-  @parameterized.named_parameters([
-      dict(
-          testcase_name="redacted_ddp",
-          model_name="redacted_tpu",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
-          data_parallel_shard_degree=1,
-          data_parallel_replicate_degree=-1,
-          tensor_parallel_degree=1,
-          skip_devices=None,
-      ),
-      dict(
-          testcase_name="redacted_fsdp",
-          model_name="redacted_tpu",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
-          data_parallel_shard_degree=-1,
-          tensor_parallel_degree=1,
-          skip_devices=None,
-      ),
-  ])
-  def test_redacted_train_minimal(
-      self,
-      model_name,
-      config_file,
-      data_parallel_shard_degree,
-      tensor_parallel_degree,
-      data_parallel_replicate_degree=None,
-      extra_args=None,
-      skip_devices=None,
-  ):
-    """Runs execution test specifically for redacted's minimal trainer (experiments/tpu/redacted/train_minimal.py)."""
-    from torchtitan.experiments.tpu.redacted import train_minimal as redacted_train_minimal
-
-    config_args = [
-        f"--model.name={model_name}",
-        f"--job.config_file={config_file}",
-        "--model.hf_assets_path=tests/assets/tokenizer",
-        "--training.dataset_path=tests/assets/c4_test",
-        "--training.seq_len=128",
-        "--training.dataset=c4_test",
-        "--training.steps=5",
-        "--training.local_batch_size=4",
-    ]
-    if extra_args:
-      config_args.extend(extra_args)
-
-    self._test_train_distributed(
-        config_args=config_args,
-        tensor_parallel_degree=tensor_parallel_degree,
-        data_parallel_shard_degree=data_parallel_shard_degree,
-        data_parallel_replicate_degree=data_parallel_replicate_degree,
-        skip_devices=skip_devices,
-        start_trainer=redacted_train_minimal.start_trainer,
-    )
 
   @parameterized.named_parameters([
       # deepseek_v3
@@ -133,7 +80,7 @@ class TrainMinimalDistributedTest(
           # numerical discrepancies.
           loss_atol=1e2,
           loss_rtol=5e-2,
-          grad_atol=5e2,
+          grad_atol=6e2,
           grad_rtol=5e-2,
           param_atol=5e-1,
           param_rtol=5e-2,

@@ -7,11 +7,11 @@ import typing
 import jax
 import optax
 import torch
-import torch_xla2
-from torch_xla2.interop import jax_view
-from torch_xla2.interop import JittableModule
-from torch_xla2.interop import torch_view
-import torch_xla2.train
+import torchax
+from torchax.interop import jax_view
+from torchax.interop import JittableModule
+from torchax.interop import torch_view
+import torchax.train
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.experiments.torchax import redacted as torchax_redacted
 from torchtitan.experiments.torchax import data_utils
@@ -366,7 +366,7 @@ class TorchaxTrainer:
     return jax_optimizer, opt_state
 
   def train(self):
-    xla_env = torch_xla2.default_env()
+    xla_env = torchax.default_env()
     jax.config.update('jax_enable_x64', False)
     xla_env._mesh = self.mesh
     xla_env.use_flash_attention = True
@@ -431,7 +431,7 @@ class TorchaxTrainer:
         # Fallback if get_nparams_and_flops is not implemented (e.g., redacted)
         metrics_processor.num_flops_per_token = 0
 
-    train_step = torch_xla2.train.make_train_step(
+    train_step = torchax.train.make_train_step(
         model_fn,
         loss_fn,
         jax_optimizer,
@@ -512,7 +512,7 @@ class TorchaxTrainer:
       # Only block and log periodically to avoid stalling the TPU hardware pipeline.
       if metrics_processor.should_log(step + 1):
         # wait for iteration to finish to measure time
-        torch_xla2.interop.call_jax(
+        torchax.interop.call_jax(
             jax.block_until_ready, (loss, jittable_mod.params)
         )
 
@@ -529,7 +529,7 @@ class TorchaxTrainer:
 
       if step >= job_config.training.steps - 1:
         # Prevent premature exit before the last step finishes
-        torch_xla2.interop.call_jax(
+        torchax.interop.call_jax(
             jax.block_until_ready, (loss, jittable_mod.params)
         )
         break

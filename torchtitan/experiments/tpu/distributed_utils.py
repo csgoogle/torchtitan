@@ -15,6 +15,14 @@ def maybe_init_distributed(num_devices: int | None = None) -> bool:
   if num_devices <= 1:
     return False
 
+  # Note on differences between cluster and Cloud/GKE initialization:
+  # - Cloud/GKE: Initialization must be called from within each worker process.
+  #   We derive configuration from JAX env vars and initialize `TORCH_TPU_...`
+  #   vars globally since we have a global view and `torchrun` does not
+  #   support per-process env vars.
+  # - cluster: Initialization must be called from the host process before worker
+  #   processes begin. This is because ports need to be fixed beforehand,
+  #   requiring external orchestration (e.g., via launcher) at the host level.
   if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
     return True  # Already initialzed
 

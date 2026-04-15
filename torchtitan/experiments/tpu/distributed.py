@@ -67,8 +67,8 @@ def _run_in_gdist_worker(
   node_rank = int(os.environ["GROUP_RANK"])
 
   global_rank = node_rank * nproc_per_node + local_rank
+  _ensure_device_type_set(accelerator_device_type)
   if accelerator_device_type == device_type.AcceleratorDeviceType.CUDA:
-    _ensure_device_type_set(accelerator_device_type)
     device = torch.device(f"cuda:{local_rank}")
     if not dist.is_initialized() and run_init_process_group:
       dist.init_process_group(
@@ -79,7 +79,6 @@ def _run_in_gdist_worker(
     func(device, global_rank, world_size, *worker_args)
     return
   elif accelerator_device_type == device_type.AcceleratorDeviceType.CPU:
-    _ensure_device_type_set(accelerator_device_type)
     device = torch.device("cpu")
     if not dist.is_initialized() and run_init_process_group:
       dist.init_process_group(
@@ -100,7 +99,6 @@ def _run_in_gdist_worker(
       )
     else:
       device = api.tpu_device()
-    _ensure_device_type_set(accelerator_device_type)
 
     func(device, global_rank, world_size, *worker_args)
   else:

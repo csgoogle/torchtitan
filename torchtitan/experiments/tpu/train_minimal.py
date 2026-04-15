@@ -102,14 +102,22 @@ class TrainerMinimal:
 
       logger.info(f"world_mesh: {self.parallel_dims.world_mesh}")
 
-      # Set random seed, and maybe enable deterministic mode
-      # (mainly for debugging, expect perf loss).
-      dist_utils.set_determinism(
-          self.parallel_dims,
-          self.device,
-          job_config.debug,
-          distinct_seed_mesh_dims=["pp"],
+      seed = job_config.debug.seed or 42
+      torch.manual_seed(seed)
+      logger.info(
+          "Set manual seed to %d on all ranks (workaround for set_determinism"
+          " hang)",
+          seed,
       )
+      # TODO b/498659628: Re-enable set_determinism once the hang is fixed.
+      # # Set random seed, and maybe enable deterministic mode
+      # # (mainly for debugging, expect perf loss).
+      # dist_utils.set_determinism(
+      #     self.parallel_dims,
+      #     self.device,
+      #     job_config.debug,
+      #     distinct_seed_mesh_dims=["pp"],
+      # )
 
     self.train_spec = train_spec_module.get_train_spec(job_config.model.name)
 
