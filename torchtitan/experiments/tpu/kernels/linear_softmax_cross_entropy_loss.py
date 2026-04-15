@@ -110,8 +110,87 @@ def _my_bwd(
   return grad_x, grad_w
 
 
-compiled_fwd = pallas.custom_jax_kernel(_my_fwd, static_argnums=(3, 4, 5, 6, 7))
-compiled_bwd = pallas.custom_jax_kernel(_my_bwd, static_argnums=(5, 6, 7, 8, 9))
+_loss_op_name_cache = {}
+
+
+@torch._dynamo.assume_constant_result
+def _get_loss_op_names(
+    reduction, implementation, b_block_size, h_block_size, v_block_size
+):
+  cache_key = (
+      reduction,
+      implementation,
+      b_block_size,
+      h_block_size,
+      v_block_size,
+  )
+  if cache_key in _loss_op_name_cache:
+    return _loss_op_name_cache[cache_key]
+
+  compiled_fwd = pallas.custom_jax_kernel(_my_fwd, static_argnums=(3, 4, 5, 6, 7))
+  compiled_bwd = pallas.custom_jax_kernel(_my_bwd, static_argnums=(5, 6, 7, 8, 9))
+
+  def fwd_wrapped(x, labels, weights):
+    return compiled_fwd(
+        x,
+        labels,
+        weights,
+        reduction,
+        implementation,
+        b_block_size,
+        h_block_size,
+        v_block_size,
+    )
+
+  def bwd_wrapped(dout, lse, x, labels, weights):
+    return compiled_bwd(
+        dout,
+        lse,
+        x,
+        labels,
+        weights,
+        reduction,
+        implementation,
+        b_block_size,
+        h_block_size,
+        v_block_size,
+    )
+
+  identifier = abs(hash(cache_key))
+  op_fwd_name = f"linear_loss_fwd_{identifier}"
+  op_bwd_name = f"linear_loss_bwd_{identifier}"
+
+  torch_fwd_fn = torch.library.custom_op(
+      f"pallas::{op_fwd_name}",
+      fwd_wrapped,
+      mutates_args=(),
+      schema="(Tensor x, Tensor labels, Tensor weights) -> (Tensor, Tensor)",
+  )
+  torch_fwd_fn.register_fake(
+      lambda x, labels, weights: (
+          torch.empty(1, dtype=torch.float32, device=x.device),
+          torch.empty(x.shape[0], dtype=torch.float32, device=x.device),
+      )
+  )
+
+  torch_bwd_fn = torch.library.custom_op(
+      f"pallas::{op_bwd_name}",
+      bwd_wrapped,
+      mutates_args=(),
+      schema=(
+          "(Tensor dout, Tensor lse, Tensor x, Tensor labels, Tensor weights)"
+          " -> (Tensor, Tensor)"
+      ),
+  )
+  torch_bwd_fn.register_fake(
+      lambda dout, lse, x, labels, weights: (
+          torch.empty_like(x),
+          torch.empty_like(weights),
+      )
+  )
+
+  _loss_op_name_cache[cache_key] = (op_fwd_name, op_bwd_name)
+  return op_fwd_name, op_bwd_name
 
 
 class TorchLinearLoss(torch.autograd.Function):
@@ -131,16 +210,11 @@ class TorchLinearLoss(torch.autograd.Function):
   ):
     labels_int32 = labels.to(torch.int32)
 
-    loss, lse = compiled_fwd(  # type: ignore
-        x,
-        labels_int32,
-        weights,
-        reduction,
-        implementation,
-        b_block_size,
-        h_block_size,
-        v_block_size,
+    fwd_name, _ = _get_loss_op_names(
+        reduction, implementation, b_block_size, h_block_size, v_block_size
     )
+    torch_fwd_fn = getattr(torch.ops.pallas, fwd_name)
+    loss, lse = torch_fwd_fn(x, labels_int32, weights)
     ctx.save_for_backward(x, labels_int32, weights, lse)
     ctx.reduction = reduction
     ctx.implementation = implementation
@@ -159,18 +233,11 @@ class TorchLinearLoss(torch.autograd.Function):
     h_block_size = ctx.h_block_size
     v_block_size = ctx.v_block_size
 
-    grad_x, grad_w = compiled_bwd(  # type: ignore
-        grad_output,
-        lse,
-        x,
-        labels,
-        weights,
-        reduction,
-        implementation,
-        b_block_size,
-        h_block_size,
-        v_block_size,
+    _, bwd_name = _get_loss_op_names(
+        reduction, implementation, b_block_size, h_block_size, v_block_size
     )
+    torch_bwd_fn = getattr(torch.ops.pallas, bwd_name)
+    grad_x, grad_w = torch_bwd_fn(grad_output, lse, x, labels, weights)
 
     return grad_x, None, grad_w, None, None, None, None, None
 

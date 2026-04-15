@@ -56,6 +56,14 @@ def use_splash_attention_patch(
   def _splash_forward(
       self, q, k, v, *, scale=None, enable_gqa=False, is_causal=True):
     """Replace ScaledDotProductAttentionWrapper.forward with splash_sdpa."""
+
+    # Prevent torch.compile failures by ensuring tensors are contiguous for the
+    # custom Pallas kernel, which doesn't handle arbitrary strides. This is a
+    # no-op in eager mode if the tensors are already contiguous.
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+
     kwargs = _get_kwargs(
         block_q=block_q,
         block_kv=block_kv,
@@ -98,6 +106,13 @@ def use_splash_attention_patch(
     key = key.transpose(-3, -2)
     value = value.transpose(-3, -2)
 
+    # Prevent torch.compile failures by ensuring tensors are contiguous for the
+    # custom Pallas kernel, which doesn't handle arbitrary strides. This is a
+    # no-op in eager mode if the tensors are already contiguous.
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+
     call_kwargs = _get_kwargs(
         block_q=block_q,
         block_kv=block_kv,
@@ -124,7 +139,7 @@ def use_splash_attention_patch(
         **call_kwargs,
     )
     # Transpose back to match [redacted]'s expected layout
-    return out.transpose(-3, -2)
+    return out.transpose(-3, -2).contiguous()
 
   # Patch all attention modules in the model
   _patched = 0

@@ -241,6 +241,7 @@ class _SplashAttentionFn(torch.autograd.Function):
     return out
 
   @staticmethod
+  @torch.autograd.function.once_differentiable
   def backward(ctx, grad_output):
     q, k, v, out, logsumexp = ctx.saved_tensors
     # Direct backward — no extra forward inside JAX.
@@ -256,7 +257,67 @@ class _SplashAttentionFn(torch.autograd.Function):
     )  # None for torch_fwd_fn, torch_bwd_fn
 
 
-_splash_cache = {}
+_splash_op_name_cache = {}
+
+
+@torch._dynamo.assume_constant_result
+def _get_splash_op_names(**splash_kwargs):
+  """Create and cache PyTorch forward/backward functions for splash attention."""
+  cache_key = tuple(splash_kwargs.items())
+  if cache_key in _splash_op_name_cache:
+    return _splash_op_name_cache[cache_key]
+
+  splash_fn, splash_bwd_fn = _make_splash_attention_fn(**splash_kwargs)
+  torch_fwd_fn = custom_jax_kernel(splash_fn, name="splash_attention")
+  torch_bwd_fn = custom_jax_kernel(splash_bwd_fn, name="splash_attention_bwd")
+
+  identifier = abs(hash(cache_key))  # TODO: use a better identifier
+  op_fwd_name = f"splash_attn_fwd_{identifier}"
+  op_bwd_name = f"splash_attn_bwd_{identifier}"
+  torch_fwd_fn = torch.library.custom_op(
+      f"pallas::{op_fwd_name}",
+      torch_fwd_fn,
+      mutates_args=(),
+      schema="(Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor)",
+  )
+  torch_fwd_fn.register_fake(
+      # lse: (batch, num_q_heads, q_seq_len, ??)
+      lambda q, k, v: (
+          torch.empty_like(q, dtype=torch.float32),
+          torch.empty(
+              q.shape[0],
+              q.shape[1],
+              q.shape[2],
+              dtype=torch.float32,
+              device=q.device,
+          ),
+      )
+  )
+
+  torch_bwd_fn = torch.library.custom_op(
+      f"pallas::{op_bwd_name}",
+      torch_bwd_fn,
+      mutates_args=(),
+      schema=(
+          "(Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, Tensor"
+          " grad_out) -> (Tensor, Tensor, Tensor)"
+      ),
+  )
+  torch_bwd_fn.register_fake(
+      lambda q, k, v, out, lse, grad_out: (
+          torch.empty_like(q),
+          torch.empty_like(k),
+          torch.empty_like(v),
+      )
+  )
+
+  # Note: We return string names instead of the functions themselves.
+  # Passing callables through activation checkpointing in Dynamo can trigger
+  # safety guards that check for mutation. Since "function guards" are not yet
+  # fully supported in PyTorch, this can cause failures. Using strings avoids
+  # this issue as they are easily guarded by Dynamo.
+  _splash_op_name_cache[cache_key] = (op_fwd_name, op_bwd_name)
+  return op_fwd_name, op_bwd_name
 
 
 def splash_sdpa(
@@ -306,52 +367,27 @@ def splash_sdpa(
         f"n_heads={n_heads}, n_kv_heads={n_kv_heads}"
     )
 
-  cache_key = (
-      batch,
-      n_heads,
-      n_kv_heads,
-      seq_len,
-      head_dim,
-      is_causal,
-      block_q,
-      block_kv,
-      block_dkv,
-      block_kv_compute,
-      block_q_dkv,
-      block_kv_dkv,
-      block_kv_dkv_compute,
-      block_q_dq,
-      block_kv_dq,
-      use_fused_bwd_kernel,
-      q_layout,
-      k_layout,
-      v_layout,
+  splash_args = dict(
+      seq_len=seq_len,
+      n_heads=n_heads,
+      n_kv_heads=n_kv_heads,
+      is_causal=is_causal,
+      block_q=block_q,
+      block_kv=block_kv,
+      block_kv_compute=block_kv_compute,
+      block_q_dkv=block_q_dkv,
+      block_kv_dkv=block_kv_dkv,
+      block_kv_dkv_compute=block_kv_dkv_compute,
+      block_q_dq=block_q_dq,
+      block_kv_dq=block_kv_dq,
+      use_fused_bwd_kernel=use_fused_bwd_kernel,
+      q_layout=q_layout,
+      k_layout=k_layout,
+      v_layout=v_layout,
   )
-
-  if cache_key not in _splash_cache:
-    splash_fn, splash_bwd_fn = _make_splash_attention_fn(
-        seq_len=seq_len,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        is_causal=is_causal,
-        block_q=block_q,
-        block_kv=block_kv,
-        block_kv_compute=block_kv_compute,
-        block_q_dkv=block_q_dkv,
-        block_kv_dkv=block_kv_dkv,
-        block_kv_dkv_compute=block_kv_dkv_compute,
-        block_q_dq=block_q_dq,
-        block_kv_dq=block_kv_dq,
-        use_fused_bwd_kernel=use_fused_bwd_kernel,
-        q_layout=q_layout,
-        k_layout=k_layout,
-        v_layout=v_layout,
-    )
-    torch_fwd_fn = custom_jax_kernel(splash_fn, name="splash_attention")
-    torch_bwd_fn = custom_jax_kernel(splash_bwd_fn, name="splash_attention_bwd")
-    _splash_cache[cache_key] = (torch_fwd_fn, torch_bwd_fn)
-
-  torch_fwd_fn, torch_bwd_fn = _splash_cache[cache_key]
+  torch_fwd_name, torch_bwd_name = _get_splash_op_names(**splash_args)
+  torch_fwd_fn = getattr(torch.ops.pallas, torch_fwd_name)
+  torch_bwd_fn = getattr(torch.ops.pallas, torch_bwd_name)
 
   if scale is not None:
     default_scale = 1.0 / math.sqrt(head_dim)
