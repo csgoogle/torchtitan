@@ -2,10 +2,12 @@
 
 import argparse
 import os
+import typing
 from typing import Callable, List, Sequence, Tuple
 from absl import flags
 from absl.flags import argparse_flags
 import torch.multiprocessing as mp
+from torch_tpu._internal import execution_mode
 
 import torchtitan.config
 from torchtitan.experiments.tpu import distributed_utils as tpu_distributed_utils
@@ -16,6 +18,19 @@ from absl import app
 
 
 global_start_trainer_func = None
+
+
+def _start_trainer(config: tpu_job_config_module.TPUJobConfig):
+  """Starts the trainer with the specified eager mode if enabled."""
+  global global_start_trainer_func  # pylint: disable=global-variable-not-assigned
+  if tpu_utils.get_device_type() == "tpu" and config.tpu_config.eager_mode:
+    eager_mode_enum = getattr(
+        execution_mode.EagerMode,
+        config.tpu_config.eager_mode)
+    with execution_mode.eager_mode(eager_mode_enum):
+      global_start_trainer_func(config)
+  else:
+    global_start_trainer_func(config)
 
 
 def _parse_flags(argv: Sequence[str]) -> Tuple[argparse.Namespace, List[str]]:
@@ -45,9 +60,11 @@ def main(parsed_args: Tuple[argparse.Namespace, List[str]]):
   args, remaining_args = parsed_args
   config_manager = torchtitan.config.ConfigManager(
       tpu_job_config_module.TPUJobConfig)
-  config = config_manager.parse_args(remaining_args)
+  config = typing.cast(
+      tpu_job_config_module.TPUJobConfig,
+      config_manager.parse_args(remaining_args))
 
-  global_start_trainer_func(config)
+  _start_trainer(config)
 
 
 def handle_main(

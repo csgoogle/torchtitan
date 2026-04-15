@@ -1,6 +1,8 @@
 """TPU job config."""
 
 import dataclasses
+from typing import Literal
+
 import torchtitan.config
 
 
@@ -54,6 +56,12 @@ class TPUConfig:
   loss_h_block_size: int = 512
   loss_v_block_size: int = 2048
   enable_pallas_loss_kernel: bool = True
+  eager_mode: Literal[
+      "",
+      "DEFER_AND_FUSE",
+      "INTERNAL_DEFER_ALL",
+      "DEFER_NEVER",
+      "DEFER_NEVER_AND_LAUNCH_BLOCKING"] = ""
 
 
 @dataclasses.dataclass
