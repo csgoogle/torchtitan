@@ -5,6 +5,7 @@ JAX / Flax NNX instead of torchax (the PyTorch-on-JAX wrapper).
 
 Run llama3 8B on v6e-4:
 ```
+LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=131072" \
 python -m torchtitan.experiments.jax.train_minimal \
     --model.name=llama3 \
     --model.flavor=8B \
