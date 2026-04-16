@@ -1,5 +1,9 @@
 """Tests for the minimal distributed training setup for Llama3 models."""
 
+import os
+import shutil
+import tempfile
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
@@ -395,9 +399,12 @@ class TrainDistributedTest(
           "--encoder.clip_encoder=tests/assets/flux_test_encoders/clip-micro",
       ])
     if checkpoint_enabled:
+      test_tmp_dir = tempfile.mkdtemp()
+      self.addCleanup(shutil.rmtree, test_tmp_dir, ignore_errors=True)
       combined_args.extend([
           "--checkpoint.enable",
           "--checkpoint.interval=2",
+          f"--checkpoint.folder={os.path.join(test_tmp_dir, 'checkpoint')}",
       ])
 
     self._test_train_distributed(

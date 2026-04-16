@@ -1,6 +1,7 @@
 """Tests for checkpoint verification in Llama3 models."""
 
 import os
+import shutil
 import tempfile
 
 from absl import logging
@@ -72,6 +73,8 @@ class TrainCheckpointVerificationTest(
       return
 
     test_tmp_dir = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, test_tmp_dir, ignore_errors=True)
+    checkpoint_dir = os.path.join(test_tmp_dir, "test_verification_checkpoint")
     continuous_output = os.path.join(test_tmp_dir, "continuous_losses.pt")
     checkpointed_output = os.path.join(test_tmp_dir, "checkpointed_losses.pt")
 
@@ -104,7 +107,7 @@ class TrainCheckpointVerificationTest(
         "--training.steps=2",
         "--checkpoint.enable",
         "--checkpoint.interval=2",
-        "--checkpoint.folder=test_verification_checkpoint",
+        f"--checkpoint.folder={checkpoint_dir}",
     ]
 
     self._test_train_distributed(
@@ -121,7 +124,7 @@ class TrainCheckpointVerificationTest(
         "--training.steps=5",
         "--checkpoint.enable",
         "--checkpoint.interval=2",
-        "--checkpoint.folder=test_verification_checkpoint",
+        f"--checkpoint.folder={checkpoint_dir}",
     ]
     self._test_train_distributed(
         config_args=load_args,
