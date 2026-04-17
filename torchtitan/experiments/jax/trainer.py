@@ -22,6 +22,7 @@ from flax import nnx
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.experiments.jax import data_utils
 from torchtitan.experiments.jax import distributed
+from torchtitan.experiments.jax import jax_profiling
 from torchtitan.experiments.jax import metrics as jax_metrics
 from torchtitan.experiments.jax import splash_attn
 from torchtitan.experiments.jax import llama3 as jax_llama3
@@ -232,40 +233,44 @@ class JaxTrainer:
 
         logger.info('Starting training loop ...')
 
-        if job_config.profiling.enable_profiling:
-            jax.profiler.start_trace(job_config.profiling.save_traces_folder)
+        with jax_profiling.maybe_enable_profiling(
+            job_config.profiling,
+            global_step=0,
+            base_folder=job_config.job.dump_folder,
+        ) as profiler:
+            step = -1
+            for inputs_np, labels_np in train_loader:
+                step += 1
+                if step >= job_config.training.steps:
+                    break
 
-        step = -1
-        for inputs_np, labels_np in train_loader:
-            step += 1
-            if step >= job_config.training.steps:
-                break
+                data_load_start = time.perf_counter()
+                inputs = jnp.array(inputs_np, dtype=jnp.int32)
+                labels = jnp.array(labels_np, dtype=jnp.int32)
 
-            data_load_start = time.perf_counter()
-            inputs = jnp.array(inputs_np, dtype=jnp.int32)
-            labels = jnp.array(labels_np, dtype=jnp.int32)
+                # Shard batch on FSDP axis.
+                inputs = distributed.shard_input(
+                    inputs, self.mesh, self.num_global_devices, self.num_local_devices
+                )
+                labels = distributed.shard_input(
+                    labels, self.mesh, self.num_global_devices, self.num_local_devices
+                )
 
-            # Shard batch on FSDP axis.
-            inputs = distributed.shard_input(
-                inputs, self.mesh, self.num_global_devices, self.num_local_devices
-            )
-            labels = distributed.shard_input(
-                labels, self.mesh, self.num_global_devices, self.num_local_devices
-            )
+                ntokens = labels.size
+                metrics_processor.ntokens_since_last_log += ntokens
+                metrics_processor.data_loading_times.append(
+                    time.perf_counter() - data_load_start
+                )
 
-            ntokens = labels.size
-            metrics_processor.ntokens_since_last_log += ntokens
-            metrics_processor.data_loading_times.append(
-                time.perf_counter() - data_load_start
-            )
+                with jax.named_scope('train_step'):
+                    loss = train_step(model, optimizer, inputs, labels)
 
-            loss = train_step(model, optimizer, inputs, labels)
+                if profiler is not None:
+                    jax.block_until_ready(loss)
+                    profiler.step()
 
-            if metrics_processor.should_log(step + 1):
-                jax.block_until_ready(loss)
-                metrics_processor.log(step + 1, float(loss) / ntokens)
-
-        if job_config.profiling.enable_profiling:
-            jax.profiler.stop_trace()
+                if metrics_processor.should_log(step + 1):
+                    jax.block_until_ready(loss)
+                    metrics_processor.log(step + 1, float(loss) / ntokens)
 
         return True
