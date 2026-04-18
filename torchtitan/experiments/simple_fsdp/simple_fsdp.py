@@ -153,6 +153,8 @@ def _distribute_dtensor(
     )
 
 
+_patched_classes: dict[type, type] = {}
+
 def _register_parametrization(
     module: nn.Module, param_names: list[str], parametrization: nn.Module
 ) -> None:
@@ -163,18 +165,33 @@ def _register_parametrization(
     TODO: In checkpoint saving/loading, avoid parametrization calls when calling
     get_model_state_dict func in torchtitan's torchtitan/components/checkpoint.py.
     """
-    param_name_to_property = {
-        param_name: property(
-            lambda self, pn=param_name: parametrization(self._parameters[pn])
+    orig_cls = module.__class__
+    # Cache the patched class to avoid creating a new type for every module instance.
+    # This is critical for torch.compile to avoid creating unique types per instance,
+    # which would trigger cache misses and excessive recompilations.
+    if orig_cls not in _patched_classes:
+        # Since the class is shared across instances, we cannot capture `parametrization`
+        # in the lambda closure (which would lock all instances to the first parametrization).
+        # Instead, we store it on the instance and read it via `self`.
+        param_name_to_property = {
+            param_name: property(
+                lambda self, pn=param_name: self._simple_fsdp_parametrization_list[0](
+                    self._parameters[pn]
+                )
+            )
+            for param_name in param_names
+        }
+        module_cls = type(
+            f"SimpleFSDP{orig_cls.__name__}",
+            (orig_cls,),
+            param_name_to_property,
         )
-        for param_name in param_names
-    }
-    module_cls = type(
-        f"SimpleFSDP{module.__class__.__name__}",
-        (module.__class__,),
-        param_name_to_property,
-    )
-    module.__class__ = module_cls
+        _patched_classes[orig_cls] = module_cls
+
+    module.__class__ = _patched_classes[orig_cls]
+    # Wrap in a list to bypass PyTorch's auto-submodule registration, 
+    # and store on instance since the class is shared across instances.
+    module._simple_fsdp_parametrization_list = [parametrization]
 
 
 class ReplicateComputation(torch.nn.Module):
@@ -284,10 +301,12 @@ def data_parallel(
     shard_dim: int = 0,
     reduction_divide_factor: float | None = None,
     full_dtensor: bool = False,
+    ignored_params: set[nn.Parameter] | None = None,
 ) -> nn.Module:
     param_sharding: tuple[Placement, ...]
     if mode == "replicate":
-        param_sharding = (Replicate(),)
+        # Replicate across all dimensions of the device mesh to support multi-dimensional meshes.
+        param_sharding = (Replicate(),) * device_mesh.ndim
     elif mode == "fully_shard":
         param_sharding = (Shard(shard_dim),)
     elif mode == "hybrid_shard":
@@ -308,6 +327,14 @@ def data_parallel(
         if "SimpleFSDP" in mod.__class__.__name__:
             continue
 
+        # Skip parameters that are explicitly ignored (e.g., shared or frozen weights).
+        if ignored_params is not None:
+            params_dict = {
+                p_name: p for p_name, p in params_dict.items() if p not in ignored_params
+            }
+            if not params_dict:
+                continue
+
         for p_name, p in params_dict.items():
             if p is not None and p.numel() > 0:
                 distribute_tensor_func = (
@@ -316,7 +343,9 @@ def data_parallel(
                 mod.register_parameter(
                     p_name,
                     nn.Parameter(
-                        distribute_tensor_func(p, device_mesh, param_sharding)
+                        distribute_tensor_func(p, device_mesh, param_sharding),
+                        # Preserve the requires_grad flag of the original parameter.
+                        requires_grad=p.requires_grad,
                     ),
                 )
 
