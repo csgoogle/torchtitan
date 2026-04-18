@@ -23,6 +23,8 @@ global_start_trainer_func = None
 def _start_trainer(config: tpu_job_config_module.TPUJobConfig):
   """Starts the trainer with the specified eager mode if enabled."""
   global global_start_trainer_func  # pylint: disable=global-variable-not-assigned
+  if os.environ.get("TORCHTITAN_DEVICE_TYPE", ""):
+    tpu_utils.set_device_type(os.environ["TORCHTITAN_DEVICE_TYPE"])
   if tpu_utils.get_device_type() == "tpu" and config.tpu_config.eager_mode:
     eager_mode_enum = getattr(
         execution_mode.EagerMode,
