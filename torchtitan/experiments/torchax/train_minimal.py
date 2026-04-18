@@ -159,7 +159,6 @@ from absl import app
 import jax
 import torchax
 import torchtitan.config
-from torchtitan.experiments.jax.utils import get_accelerator_short_name
 from torchtitan.experiments.torchax import distributed
 from torchtitan.experiments.torchax import gmm
 from torchtitan.experiments.torchax import splash_attn
@@ -171,6 +170,32 @@ import tyro
 
 P = jax.sharding.PartitionSpec
 logger = torchtitan.tools.logging.logger
+
+
+def _get_accelerator_short_name(device_kind: str) -> str:
+  """Parses JAX device kind to get accelerator short name like v5e, h100."""
+  device_lower = device_kind.lower()
+  if 'v4' in device_lower:
+    return 'v4'
+  # v5e is reported as 'TPU v5 lite'
+  if 'v5 lite' in device_lower:
+    return 'v5e'
+  # v5p is reported as 'TPU v5'
+  if device_kind == 'TPU v5':
+    return 'v5p'
+  if 'v6' in device_lower:
+    return 'v6e'
+  if 'tpu7x' in device_lower:
+    return 'v7x'
+  if 'h100' in device_lower:
+    return 'h100'
+  if 'a100' in device_lower:
+    return 'a100'
+  if 'cpu' in device_lower:
+    return 'cpu'
+  raise RuntimeError(
+      f'Could not determine accelerator type from JAX device_kind: {device_kind}'
+  )
 
 
 def main_train_loop(job_config: Any):
@@ -188,7 +213,9 @@ def main_train_loop(job_config: Any):
     raise RuntimeError('No JAX devices found!')
   platform = devices[0].platform
   device_type = devices[0].device_kind
-  accelerator = get_accelerator_short_name(device_type)
+  accelerator = _get_accelerator_short_name(
+      device_type
+  )
   logger.info(
       "Detected JAX device '%s', using accelerator type '%s' for metrics",
       device_type,

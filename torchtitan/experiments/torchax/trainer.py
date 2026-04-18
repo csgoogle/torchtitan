@@ -16,10 +16,10 @@ from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.experiments.torchax import redacted as torchax_redacted
 from torchtitan.experiments.torchax import data_utils
 from torchtitan.experiments.torchax import deepseek_v3 as torchax_dsv3
-from torchtitan.experiments.jax.metrics import JaxMetricsProcessor
 from torchtitan.experiments.torchax import distributed
 from torchtitan.experiments.torchax import jit_utils
 from torchtitan.experiments.torchax import llama3 as torchax_llama3
+from torchtitan.experiments.torchax import metrics
 from torchtitan.experiments.torchax import moe_utils
 from torchtitan.experiments.torchax import qwen3 as torchax_qwen3
 import torchtitan.tools.logging
@@ -390,13 +390,11 @@ class TorchaxTrainer:
 
     _, train_dataloader = self.setup_dataloader(job_config)
 
-    metrics_processor = JaxMetricsProcessor(
+    metrics_processor = metrics.TorchaxMetricsProcessor(
         job_config,
+        self.parallel_dims,
         self.accelerator,
         self.num_global_devices,
-        tpu_megacore=job_config.torchax_config.tpu_megacore,
-        log_freq=job_config.metrics.log_freq,
-        parallel_dims=self.parallel_dims,
     )
 
     if is_moe_model(job_config):

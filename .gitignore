@@ -1,9 +1,0 @@
-__pycache__
-assets
-outputs
-profiles
-traces
-**/.ipynb_checkpoints/
-torchtitan*.ipynb
-**/*.ipynb
-dump_folder

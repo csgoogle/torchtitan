@@ -5,7 +5,6 @@ JAX / Flax NNX instead of torchax (the PyTorch-on-JAX wrapper).
 
 Run llama3 8B on v6e-4:
 ```
-LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=131072" \
 python -m torchtitan.experiments.jax.train_minimal \
     --model.name=llama3 \
     --model.flavor=8B \
@@ -28,7 +27,7 @@ import jax
 import torchtitan.config
 from torchtitan.experiments.jax import jax_job_config
 from torchtitan.experiments.jax import trainer as jax_trainer
-from torchtitan.experiments.jax import utils as jax_utils
+from torchtitan.experiments.torchax import train_minimal as torchax_train_minimal
 import torchtitan.tools.logging
 import tyro
 
@@ -47,7 +46,7 @@ def main_train_loop(job_config: Any):
     raise RuntimeError('No JAX devices found.')
   platform = devices[0].platform
   device_kind = devices[0].device_kind
-  accelerator = jax_utils.get_accelerator_short_name(device_kind)
+  accelerator = torchax_train_minimal._get_accelerator_short_name(device_kind)
   logger.info(
       "Detected JAX device '%s', accelerator type '%s'",
       device_kind,

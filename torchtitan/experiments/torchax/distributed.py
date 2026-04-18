@@ -1,18 +1,65 @@
 import collections
 import functools
+import re
 
 import jax
 import torch
 import torchax
 import torchax.train
 
-from torchtitan.experiments.jax.distributed import _match_path
-from torchtitan.experiments.jax.distributed import sharded_device_put
 import torchtitan.distributed
 import torchtitan.tools.logging
 
 
 logger = torchtitan.tools.logging.logger
+
+
+def sharded_device_put(
+    tensor: jax.Array, sharding, num_global_devices, num_local_devices
+) -> jax.Array:
+  """Places a tensor onto the device with the specified sharding."""
+  if isinstance(tensor, tuple):
+    return tuple(
+        sharded_device_put(t, sharding, num_global_devices, num_local_devices)
+        for t in tensor
+    )
+
+  if num_global_devices == num_local_devices:
+    return jax.device_put(tensor, sharding)
+
+  # Multi-host setup: Each host handles only its accessible devices.
+  shape = tensor.shape
+  x_split = [
+      jax.device_put(tensor[i], device)
+      for device, i in sharding.addressable_devices_indices_map(shape).items()
+  ]
+  return jax.make_array_from_single_device_arrays(shape, sharding, x_split)
+
+
+def _process_sharding_name(name):
+  """Replace integers in param name with *.
+
+  presumably all layers should have the same sharding.
+
+  Args:
+    name: The parameter name string.
+
+  Returns:
+    The processed parameter name string with integers replaced by '*'.
+  """
+
+  def is_integer(t):
+    try:
+      int(t)
+      return True
+    except:
+      return False
+
+  tokens = name.split('.')
+  for i, t in enumerate(tokens):
+    if is_integer(t):
+      tokens[i] = '*'
+  return '.'.join(tokens)
 
 
 def _make_weight_shard(weight_meta, slice_index):
@@ -82,7 +129,18 @@ def create_sharded_weights(model, mesh, sharding_map):
   res = {}
   env = torchax.default_env()
   for name, weight_meta in model.state_dict().items():
-    sharding_spec = _match_path(name, sharding_map)
+    sharding_spec = None
+    processed_name = _process_sharding_name(name)
+    if processed_name in sharding_map:
+      sharding_spec = sharding_map[processed_name]
+    else:
+      for pattern, spec in sharding_map.items():
+        try:
+          if re.match(pattern, name) or re.match(pattern, processed_name):
+            sharding_spec = spec
+            break
+        except re.error:
+          pass
     if sharding_spec is None:
       logger.warning('Skipping weight: %s', name)
       continue

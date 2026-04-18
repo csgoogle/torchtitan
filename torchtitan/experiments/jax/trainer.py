@@ -201,7 +201,6 @@ class JaxTrainer:
             job_config,
             self.accelerator,
             self.num_global_devices,
-            tpu_megacore=job_config.jax_config.tpu_megacore,
             log_freq=job_config.metrics.log_freq,
         )
         # Approximate flops: 6 * n_params * seq_len (dense model estimate).

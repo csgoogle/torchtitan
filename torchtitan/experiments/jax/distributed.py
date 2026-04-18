@@ -1,18 +1,7 @@
-"""JAX distributed utilities: sharding, mesh setup, parameter initialization.
+"""JAX distributed utilities: sharding, mesh setup, parameter initialization."""
 
-This module owns the shared sharding-map matcher used by both the jax/ and
-torchax/ experiments. The matcher supports two path styles:
-
-- Exact paths with integer indices replaced by '*' (e.g.
-  ``layers/*/attention/wq/kernel`` — jax style).
-- Regex patterns (e.g. ``r'.*embedding\\.weight'`` — torchax style).
-
-``_match_path`` tries, in order: exact match, exact match after replacing
-integer path segments with ``*``, then a regex pattern fallback.
-"""
-
+import fnmatch
 import functools
-import re
 
 import jax
 import jax.numpy as jnp
@@ -25,23 +14,12 @@ P = jax.sharding.PartitionSpec
 
 
 def sharded_device_put(
-    array,
+    array: jax.Array,
     sharding,
     num_global_devices: int,
     num_local_devices: int,
-):
-    """Place an array (or tuple of arrays) on devices with the given sharding.
-
-    Handles both single-host (direct ``jax.device_put``) and multi-host
-    (assemble from addressable slices) setups. Accepts tuples so callers in
-    torchax can pass grouped tensors.
-    """
-    if isinstance(array, tuple):
-        return tuple(
-            sharded_device_put(t, sharding, num_global_devices, num_local_devices)
-            for t in array
-        )
-
+) -> jax.Array:
+    """Place an array on devices with the given sharding."""
     if num_global_devices == num_local_devices:
         return jax.device_put(array, sharding)
 
@@ -54,51 +32,15 @@ def sharded_device_put(
     return jax.make_array_from_single_device_arrays(shape, sharding, x_split)
 
 
-def _is_integer(token: str) -> bool:
-    try:
-        int(token)
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
-def _process_sharding_name(name: str) -> str:
-    """Replace integer path segments with '*'.
-
-    Handles the common path separators used across jax/ and torchax/: ``.``,
-    ``/``, and ``___`` (torchax scanned-layer flattened names). Integer
-    segments are replaced so that ``layers/0/attention/wq/kernel`` and
-    ``layers.0.attention.wq`` both map to their ``*``-bearing form.
-    """
-    for sep in ('.', '/', '___'):
-        if sep in name:
-            tokens = name.split(sep)
-            tokens = ['*' if _is_integer(t) else t for t in tokens]
-            name = sep.join(tokens)
-    return name
-
-
 def _match_path(path_str: str, sharding_map: dict) -> tuple | None:
-    """Return the partition spec for ``path_str`` from ``sharding_map``.
-
-    Tries in order:
-      1. Exact match on ``path_str``.
-      2. Exact match after replacing integer segments with ``*``.
-      3. Regex match (``re.match``) of each map key against both forms.
-    """
+    """Return the partition spec tuple for the first matching pattern."""
+    # Exact match first.
     if path_str in sharding_map:
         return sharding_map[path_str]
-
-    processed = _process_sharding_name(path_str)
-    if processed != path_str and processed in sharding_map:
-        return sharding_map[processed]
-
+    # Wildcard / fnmatch patterns.
     for pattern, spec in sharding_map.items():
-        try:
-            if re.match(pattern, path_str) or re.match(pattern, processed):
-                return spec
-        except re.error:
-            pass
+        if fnmatch.fnmatch(path_str, pattern):
+            return spec
     return None
 
 
