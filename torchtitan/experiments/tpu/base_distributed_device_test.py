@@ -618,6 +618,16 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
     self.num_devices = test_utils._NUM_DEVICES.value
     self.accelerator_device_type = test_utils._DEVICE.value
 
+    if not test_utils.flags.FLAGS["num_devices"].present:
+      if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
+        from torch_tpu._internal.utils import hardware  # pylint: disable=g-import-not-at-top
+        logging.info(
+            "--num_devices flag not set, attempting to detect number of TPU"
+            " chips..."
+        )
+        self.num_devices = hardware.get_tpu_device_count()
+        logging.info("Found %d TPU chips.", self.num_devices)
+
     # Ensure Hugging Face datasets use a directory with enough storage
     # (e.g. /tmp). The default cache in `~/.cache` is too small in some
     # environments.

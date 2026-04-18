@@ -220,6 +220,10 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           checkpoint_enabled=True,
+          skip_devices=[
+              # TODO: remove once libtpu version is updated
+              device_type.AcceleratorDeviceType.TPU,
+          ],
       ),
       dict(
           testcase_name="llama3_fsdp_use_loss_kernel",
