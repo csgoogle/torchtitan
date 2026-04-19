@@ -7,7 +7,6 @@ from typing import Callable, List, Sequence, Tuple
 from absl import flags
 from absl.flags import argparse_flags
 import torch.multiprocessing as mp
-from torch_tpu._internal import execution_mode
 
 import torchtitan.config
 from torchtitan.experiments.tpu import distributed_utils as tpu_distributed_utils
@@ -26,6 +25,7 @@ def _start_trainer(config: tpu_job_config_module.TPUJobConfig):
   if os.environ.get("TORCHTITAN_DEVICE_TYPE", ""):
     tpu_utils.set_device_type(os.environ["TORCHTITAN_DEVICE_TYPE"])
   if tpu_utils.get_device_type() == "tpu" and config.tpu_config.eager_mode:
+    from torch_tpu._internal import execution_mode # pylint: disable=g-import-not-at-top
     eager_mode_enum = getattr(
         execution_mode.EagerMode,
         config.tpu_config.eager_mode)
