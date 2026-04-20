@@ -27,7 +27,7 @@ import jax
 import torchtitan.config
 from torchtitan.experiments.jax import jax_job_config
 from torchtitan.experiments.jax import trainer as jax_trainer
-from torchtitan.experiments.torchax import train_minimal as torchax_train_minimal
+from torchtitan.experiments.jax import utils as jax_utils
 import torchtitan.tools.logging
 import tyro
 
@@ -46,7 +46,7 @@ def main_train_loop(job_config: Any):
     raise RuntimeError('No JAX devices found.')
   platform = devices[0].platform
   device_kind = devices[0].device_kind
-  accelerator = torchax_train_minimal._get_accelerator_short_name(device_kind)
+  accelerator = jax_utils.get_accelerator_short_name(device_kind)
   logger.info(
       "Detected JAX device '%s', accelerator type '%s'",
       device_kind,
