@@ -19,6 +19,7 @@ from torchtitan.experiments.tpu import local_tpu_device
 
 device_type = None
 device_module = None
+tpu_device_module = None
 
 
 def get_device_type() -> str:
@@ -131,6 +132,10 @@ def _get_cpu_module() -> torch.device:
 
 def _get_tpu_module() -> torch.device:
   """Returns the torch.tpu module with additional functions."""
+  global tpu_device_module
+  if tpu_device_module is not None:
+    return tpu_device_module
+
   logger.warning("Using TPU device info")
   logger.warning("Patching torch.tpu module to support missing functions")
   _device_module = _get_device_module("tpu")
@@ -184,6 +189,7 @@ def _get_tpu_module() -> torch.device:
     return {}
   setattr(_device_module, "memory_stats", memory_stats)
 
+  tpu_device_module = _device_module
   return _device_module
 
 
