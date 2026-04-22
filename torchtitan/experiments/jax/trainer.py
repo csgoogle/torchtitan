@@ -34,6 +34,60 @@ logger = torchtitan.tools.logging.logger
 P = jax.sharding.PartitionSpec
 
 
+def _scale_by_adam_bf16_state(b1, b2, eps):
+    """Adam with mu and nu stored in bf16; math runs in fp32 per-leaf.
+
+    Stock `optax.scale_by_adam` only exposes `mu_dtype`; nu stays in params'
+    dtype (fp32 here). This helper casts both moments back to bf16 after the
+    update, cutting opt-state footprint in half without changing numerics
+    visibly (the reduction is the same as MaxText's `mu_dtype=bf16` recipe
+    extended to nu).
+    """
+    from optax._src import transform as _optax_transform
+    ScaleByAdamState = _optax_transform.ScaleByAdamState
+
+    def init_fn(params):
+        mu = jax.tree.map(lambda t: jnp.zeros_like(t, dtype=jnp.bfloat16), params)
+        nu = jax.tree.map(lambda t: jnp.zeros_like(t, dtype=jnp.bfloat16), params)
+        return ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=mu, nu=nu)
+
+    def update_fn(updates, state, params=None):
+        del params
+        count_inc = state.count + 1
+        bc1 = 1.0 - b1 ** count_inc.astype(jnp.float32)
+        bc2 = 1.0 - b2 ** count_inc.astype(jnp.float32)
+
+        def _mu(g, m):
+            if g is None:
+                return m
+            return (b1 * m.astype(jnp.float32)
+                    + (1.0 - b1) * g.astype(jnp.float32)).astype(jnp.bfloat16)
+
+        def _nu(g, n):
+            if g is None:
+                return n
+            g32 = g.astype(jnp.float32)
+            return (b2 * n.astype(jnp.float32)
+                    + (1.0 - b2) * (g32 * g32)).astype(jnp.bfloat16)
+
+        def _upd(g, m, n):
+            if g is None:
+                return None
+            mhat = m.astype(jnp.float32) / bc1
+            nhat = n.astype(jnp.float32) / bc2
+            return (mhat / (jnp.sqrt(nhat) + eps)).astype(g.dtype)
+
+        new_mu = jax.tree.map(_mu, updates, state.mu,
+                              is_leaf=lambda x: x is None)
+        new_nu = jax.tree.map(_nu, updates, state.nu,
+                              is_leaf=lambda x: x is None)
+        upds = jax.tree.map(_upd, updates, new_mu, new_nu,
+                            is_leaf=lambda x: x is None)
+        return upds, ScaleByAdamState(count=count_inc, mu=new_mu, nu=new_nu)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 class JaxTrainer:
 
     def __init__(
@@ -125,6 +179,16 @@ class JaxTrainer:
             checkpoint_policy = jax.checkpoint_policies.dots_saveable
         elif ac_mode == 'nothing':
             checkpoint_policy = None
+        elif ac_mode == 'offload_dot':
+            # MaxText-style: offload named tensors (decoder_layer_input) to pinned
+            # host memory during fwd, reload in bwd. Trades PCIe bandwidth for HBM.
+            # Model must wrap the target tensors with jax.ad_checkpoint.checkpoint_name.
+            checkpoint_policy = jax.checkpoint_policies.save_and_offload_only_these_names(
+                names_which_can_be_saved=[],
+                names_which_can_be_offloaded=["decoder_layer_input"],
+                offload_src="device",
+                offload_dst="pinned_host",
+            )
         else:
             checkpoint_policy = jax.checkpoint_policies.nothing_saveable
 
@@ -144,6 +208,15 @@ class JaxTrainer:
 
         logger.info('Building model %s-%s (scan=%s) ...', model_name, model_flavor, use_scan)
 
+        # Map job_config.training.dtype (Literal['bfloat16','float32']) to
+        # the model's master-weight dtype. Compute dtype stays bf16.
+        _param_dtype_map = {'float32': jnp.float32, 'bfloat16': jnp.bfloat16}
+        param_dtype = _param_dtype_map[job_config.training.dtype]
+        logger.info(
+            'Model param_dtype=%s (compute dtype=bfloat16)',
+            jnp.dtype(param_dtype).name,
+        )
+
         # Instantiate on CPU so we don't OOM before sharding.
         with jax.default_device(jax.devices('cpu')[0]):
             model = jax_model_mod.Transformer(
@@ -151,6 +224,7 @@ class JaxTrainer:
                 use_scan=use_scan,
                 attn_fn=attn_fn,
                 checkpoint_policy=checkpoint_policy,
+                param_dtype=param_dtype,
                 rngs=nnx.Rngs(0),
             )
 
@@ -180,7 +254,21 @@ class JaxTrainer:
         elif opt_name == 'adam':
             tx = optax.adam(lr, b1=b1, b2=b2, eps=eps)
         elif opt_name == 'adamw':
-            tx = optax.adamw(lr, b1=b1, b2=b2, eps=eps, weight_decay=wd)
+            if job_config.jax_config.adamw_bf16_state:
+                # Custom Adam with both mu and nu stored in bf16 (upcast to
+                # fp32 per-leaf inside the update math). Stock optax exposes
+                # mu_dtype but not nu_dtype; on fp32 master weights the f32
+                # stacked-MLP nu can be 3.5 GiB/chip and XLA schedules multiple
+                # live copies at optimizer peak. Opt in with
+                # --jax_config.adamw_bf16_state on memory-tight configs.
+                logger.info('adamw: using custom bf16 mu+nu state')
+                tx = optax.chain(
+                    _scale_by_adam_bf16_state(b1=b1, b2=b2, eps=eps),
+                    optax.add_decayed_weights(wd),
+                    optax.scale_by_learning_rate(lr),
+                )
+            else:
+                tx = optax.adamw(lr, b1=b1, b2=b2, eps=eps, weight_decay=wd)
         else:
             raise ValueError(f'Unsupported optimizer: {opt_name}')
 
@@ -212,17 +300,25 @@ class JaxTrainer:
         )
         metrics_processor.num_flops_per_token = 6 * n_params
 
-        @nnx.jit
+        # donate model+optimizer buffers so XLA can alias param-in with
+        # param-out and opt-state-in with opt-state-out, halving peak fp32
+        # copies in the optimizer update section (observed 7+ f32[32,1024,
+        # 28672] live copies in the memory report without donate).
+        @nnx.jit(donate_argnames=("model", "optimizer"))
         def train_step(model, optimizer: nnx.Optimizer, inputs, labels):
             def loss_fn(model):
-                logits = model(inputs)  # [B, S, vocab]
-                # Flatten for cross-entropy.
+                logits = model(inputs)  # [B, S, vocab] — bf16, vocab-sharded
                 B, S, V = logits.shape
                 logits_2d = logits.reshape(B * S, V)
                 labels_1d = labels.reshape(B * S)
-                loss = optax.softmax_cross_entropy_with_integer_labels(
-                    logits_2d, labels_1d
-                ).sum()
+                # Hand-rolled bf16 CE. Stock optax upcasts to fp32, pinning a
+                # f32[B*S, V] live through backward. logsumexp is max-stabilized
+                # so bf16 is adequate.
+                log_z = jax.nn.logsumexp(logits_2d, axis=-1)
+                target = jnp.take_along_axis(
+                    logits_2d, labels_1d[..., None], axis=-1
+                ).squeeze(-1)
+                loss = (log_z - target).astype(jnp.float32).sum()
                 return loss
 
             loss, grads = nnx.value_and_grad(

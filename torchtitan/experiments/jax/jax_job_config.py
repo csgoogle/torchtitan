@@ -26,6 +26,13 @@ class JaxConfig:
     sa_k_layout: str = 'HEAD_DIM_MINOR'
     sa_v_layout: str = 'HEAD_DIM_MINOR'
 
+    # When True, replace optax.adamw with a custom Adam that stores both mu
+    # and nu in bf16 (upcast to fp32 per-leaf inside the update math). Useful
+    # on fp32 master weights + memory-tight configs (e.g. Llama3 8B on v6e-4
+    # where fp32 nu is 3.5 GiB/chip for the stacked MLP kernel alone). Off
+    # by default; stock optax adamw is used when False.
+    adamw_bf16_state: bool = False
+
 
 @dataclasses.dataclass
 class JaxJobConfig(torchtitan.config.JobConfig):

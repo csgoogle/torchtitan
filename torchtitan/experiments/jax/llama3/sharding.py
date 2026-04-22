@@ -35,6 +35,14 @@ sharding_map_original = {
 }
 
 
+# Scan variant below: shard output kernel on VOCAB (dim 1), not hidden.
+# Rationale: softmax_cross_entropy_with_integer_labels internally upcasts logits
+# to fp32, giving f32[B/fsdp, S, V] ≈ 4 GiB/chip at b=16 s=2048 v=128256 — the
+# single biggest fp32 allocation at optimizer peak. Sharding output/kernel on
+# vocab shards the logits [B, S, V/fsdp], cutting this to ~1 GiB/chip. JAX
+# inserts an all-reduce inside log-sum-exp.
+
+
 # ---------------------------------------------------------------------------
 # Scan: ScannedTransformerBlocks stores each stacked parameter as a named
 # nnx.Param attribute derived from the block path (e.g. attention/wq/kernel
@@ -43,8 +51,10 @@ sharding_map_original = {
 # ---------------------------------------------------------------------------
 
 sharding_map_scan = {
-    # Embedding replicated to avoid gather-with-sharded-table issues in JAX.
-    'tok_embeddings/embedding': (),
+    # Embedding sharded on hidden (features) dim. The lookup still works when
+    # tokens are replicated (per-chip holds its D/fsdp slice of each row);
+    # subsequent with_sharding_constraint reshapes to batch-sharded activation.
+    'tok_embeddings/embedding': (None, 'fsdp'),
     # Stacked weights: first axis = layer index (unsharded), rest = weight dims.
     'layers/attention_wq_kernel': (None, 'fsdp', None),
     'layers/attention_wk_kernel': (None, 'fsdp', None),
@@ -56,6 +66,6 @@ sharding_map_scan = {
     'layers/attention_norm_weight': (None, 'fsdp'),
     'layers/ffn_norm_weight': (None, 'fsdp'),
     'norm/weight': ('fsdp',),
-    'output/kernel': ('fsdp', None),
+    'output/kernel': (None, 'fsdp'),  # shard vocab (see comment above)
     'freqs_cis': (),  # RoPE table — replicated on all devices
 }

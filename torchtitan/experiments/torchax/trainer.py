@@ -184,10 +184,19 @@ class TorchaxTrainer:
 
     logger.info('Finial model args: %s', model_args)
 
+    # Map job_config.training.dtype (Literal['bfloat16','float32']) to the
+    # torch master-weight dtype. Default bf16 preserves the prior hardcoded
+    # behavior; setting training.dtype=float32 keeps the torchtitan model
+    # parameters in fp32 (relying on mixed-precision autocast / manual casts
+    # in the forward pass for bf16 matmul compute).
+    _dtype_map = {'bfloat16': torch.bfloat16, 'float32': torch.float32}
+    param_dtype = _dtype_map[job_config.training.dtype]
+    logger.info('torchax model param dtype: %s', param_dtype)
+    torch.set_default_dtype(param_dtype)
+
     # Note: because a single device don't have enough HBM memory
     # nor enough CPU memory to hold the parameters. We instantiate
     # the model on meta then manually initialize then shard each param
-    torch.set_default_dtype(torch.bfloat16)
     with torch.device('meta'):
       model = torchax_model.model(model_args)
 
