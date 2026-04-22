@@ -143,7 +143,7 @@ def _make_splash_attention_fn(
   def splash_fn(q, k, v):
     """Forward: returns (out, logsumexp) for the whole batch."""
     head_dim = q.shape[-1]
-    scale = jnp.float32(1.0 / math.sqrt(head_dim))
+    scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
     q_scaled = q * scale
     out, logsumexp = jax.vmap(_single_fwd_with_lse)(q_scaled, k, v)
     return out, logsumexp
@@ -214,7 +214,7 @@ def _make_splash_attention_fn(
       g: Gradient of the loss with respect to the output (`out`).
     """
     head_dim = q.shape[-1]
-    scale = jnp.float32(1.0 / math.sqrt(head_dim))
+    scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
     q_scaled = q * scale
 
     _, (dq_scaled, dk, dv) = jax.lax.scan(
@@ -283,7 +283,7 @@ def _get_splash_op_names(**splash_kwargs):
   torch_fwd_fn.register_fake(
       # lse: (batch, num_q_heads, q_seq_len, ??)
       lambda q, k, v: (
-          torch.empty_like(q, dtype=torch.float32),
+          torch.empty_like(q),
           torch.empty(
               q.shape[0],
               q.shape[1],
