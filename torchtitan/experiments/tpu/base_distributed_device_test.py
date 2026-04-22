@@ -635,17 +635,6 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
         tempfile.gettempdir(), "huggingface_cache"
     )
 
-    # Set torch and torch.cuda seeds to ensure deterministic behavior.
-    # Note that tests would set it by default to 301, unless overridden:
-    # [internal link]
-    if absltest.FLAGS["test_random_seed"].present:
-      seed = absltest.FLAGS.test_random_seed
-    else:
-      seed = 0
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # safe to call even if not using GPU
-    logging.info("Torch initial seed: %d", torch.initial_seed())
-
   def test_gpu_available(self):
     if self.accelerator_device_type == "cuda":
       if not torch.cuda.is_available():
@@ -663,7 +652,6 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
           ],
           Any,
       ] = None,
-      run_init_process_group: bool = True,
       enable_compile: bool = False,
       data_parallel_replicate_degree: int | None = None,
   ):

@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Literal
 from types import SimpleNamespace
 
 import os
@@ -53,10 +52,9 @@ def get_device_type() -> str:
       # pytype: enable=import-error
     except ImportError:
       logger.warning("libtpu not found.")
-    from torch_tpu import api  # pylint: disable=g-import-not-at-top
     import torchtitan.experiments.tpu.distributed_utils as tpu_dist_utils  # pylint: disable=g-import-not-at-top
     tpu_dist_utils.maybe_init_distributed()
-    _ = api.tpu_device()  # trigger TPU device discovery
+    _ = torch.device("tpu")
     device_type = "tpu"
     return device_type
   except Exception as e:  # pylint: disable=broad-except
@@ -213,10 +211,9 @@ def get_device() -> torch.device:
   if _device_type == "cuda" and torch.cuda.is_available():
     return torch.device(f"{_device_type}:{int(os.getenv('LOCAL_RANK', 0))}")
   elif _device_type == "tpu":
-    from torch_tpu import api  # pylint: disable=g-import-not-at-top
     import torchtitan.experiments.tpu.distributed_utils as tpu_dist_utils  # pylint: disable=g-import-not-at-top
     tpu_dist_utils.maybe_init_distributed()
-    return api.tpu_device()  # Initialize TPU device.
+    return torch.device("tpu")
   else:
     return torch.device(_device_type)
 

@@ -27,9 +27,7 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     torch.compiler.reset()
     self.accelerator_device_type = test_utils._DEVICE.value
     if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
-      from torch_tpu import api  # pylint: disable=g-import-not-at-top
-
-      self.accelerator_device = api.tpu_device()
+      self.accelerator_device = torch.device("tpu")
       logging.info("Using TPU device: %s", self.accelerator_device)
     elif self.accelerator_device_type == device_type.AcceleratorDeviceType.CUDA:
       if not torch.cuda.is_available():

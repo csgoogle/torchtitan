@@ -98,7 +98,6 @@ class TrainCheckpointVerificationTest(
         data_parallel_shard_degree=-1,
         tensor_parallel_degree=1,
         start_trainer=StartTrainerWithLossCapture(continuous_output),
-        run_init_process_group=False,
     )
 
     # Step 2: Checkpointed Run - Save (2 steps)
@@ -115,7 +114,6 @@ class TrainCheckpointVerificationTest(
         data_parallel_shard_degree=-1,
         tensor_parallel_degree=1,
         start_trainer=torchtitan.experiments.tpu.train.start_trainer,
-        run_init_process_group=False,
     )
 
     # Step 3: Checkpointed Run - Load & Resume (steps 3-5)
@@ -131,7 +129,6 @@ class TrainCheckpointVerificationTest(
         data_parallel_shard_degree=-1,
         tensor_parallel_degree=1,
         start_trainer=StartTrainerWithLossCapture(checkpointed_output),
-        run_init_process_group=False,
     )
 
     # Step 4: Compare losses

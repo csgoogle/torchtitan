@@ -418,7 +418,6 @@ class TrainDistributedTest(
         data_parallel_replicate_degree=data_parallel_replicate_degree,
         skip_devices=skip_devices,
         start_trainer=torchtitan.experiments.tpu.train.start_trainer,
-        run_init_process_group=False,
         enable_compile=enable_compile,
     )
 
