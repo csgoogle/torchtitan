@@ -15,13 +15,6 @@ from torchtitan.config import Profiling as ProfilingConfig
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import get_device_type, get_device_module
 
-try:
-    # TODO: b/470479047 - make torch_tpu profiler working on Cloud.
-    from torch_tpu._internal import profiler as tpu_profiler
-    TPU_PROFILING_ENABLED = True
-except ModuleNotFoundError:
-    print("TPU profiling is not supported")
-    TPU_PROFILING_ENABLED = False
 
 # how much memory allocation/free ops to record in memory snapshots
 MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
@@ -80,14 +73,13 @@ def maybe_enable_profiling(
         profiling_context = torch.profiler.profile
         cpu_activity = torch.profiler.ProfilerActivity.CPU
         device_type = get_device_type()
-        if TPU_PROFILING_ENABLED and device_type == "tpu":
-            accelerator_profiled = tpu_profiler.ProfilerActivity.TPU
-            profiling_context = tpu_profiler.profile
-            cpu_activity = tpu_profiler.ProfilerActivity.CPU
+        if device_type == "tpu":
+            accelerator_profiled = torch.profiler.ProfilerActivity.PrivateUse1
             tpu_trace_dir = os.path.join(trace_dir, f"rank_{rank}")
-            trace_handler = tpu_profiler.xprof_trace_handler(
-                dir_name=tpu_trace_dir
-            )
+            trace_handler = torch.profiler.tensorboard_trace_handler(tpu_trace_dir)
+            # TODO: Remove this once trace_dir can be used to save TPU traces
+            os.makedirs(tpu_trace_dir, exist_ok=True)
+            os.environ["TPU_PROFILER_OUTPUT_DIR"] = tpu_trace_dir
 
         with profiling_context(
             # pyrefly: ignore [bad-argument-type]
