@@ -11,7 +11,7 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 import torch.nn.functional as F
-import torchax
+import torch_xla2
 from torchtitan.experiments.torchax import moe_utils
 from torchtitan.models.moe import MoEArgs
 import torchtitan.tools.logging
@@ -444,7 +444,7 @@ class MoE(nn.Module):
     """Attempts to retrieve the global mesh and initialize JAX runners."""
     if self.mesh is None:
       try:
-        env = torchax.default_env()
+        env = torch_xla2.default_env()
         if hasattr(env, "_mesh"):
           self.mesh = env._mesh
           self._jax_count = moe_utils.make_count_runner(
@@ -468,11 +468,11 @@ class MoE(nn.Module):
     If mesh is present, uses JAX local counting to avoid Global Reduce.
     """
     if self.mesh is not None and isinstance(
-        selected_experts, torchax.tensor.Tensor
+        selected_experts, torch_xla2.tensor.Tensor
     ):
-      j_experts = torchax.interop.jax_view(selected_experts)
+      j_experts = torch_xla2.interop.jax_view(selected_experts)
       j_counts = self._jax_count(j_experts)
-      return torchax.interop.torch_view(j_counts)
+      return torch_xla2.interop.torch_view(j_counts)
 
     # Fallback to one-hot implementation
     logger.warning(
@@ -492,8 +492,8 @@ class MoE(nn.Module):
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort input tokens by expert ID."""
 
-    if self.mesh is not None and isinstance(x_flat, torchax.tensor.Tensor):
-      j_x, j_experts, j_scores = torchax.interop.jax_view(
+    if self.mesh is not None and isinstance(x_flat, torch_xla2.tensor.Tensor):
+      j_x, j_experts, j_scores = torch_xla2.interop.jax_view(
           (x_flat, selected_experts, top_scores)
       )
 
@@ -501,7 +501,7 @@ class MoE(nn.Module):
           j_x, j_experts, j_scores
       )
 
-      return torchax.interop.torch_view(
+      return torch_xla2.interop.torch_view(
           (j_routed, j_indices, j_scores_sorted)
       )
 
@@ -532,13 +532,13 @@ class MoE(nn.Module):
     """Scatter outputs back to original token positions."""
 
     if self.mesh is not None and isinstance(
-        routed_output, torchax.tensor.Tensor
+        routed_output, torch_xla2.tensor.Tensor
     ):
-      j_routed, j_indices = torchax.interop.jax_view(
+      j_routed, j_indices = torch_xla2.interop.jax_view(
           (routed_output, sort_indices)
       )
       j_out = self._jax_unpermute(j_routed, j_indices, j_routed)
-      return torchax.interop.torch_view(j_out)
+      return torch_xla2.interop.torch_view(j_out)
 
     # Fallback to PyTorch implementation
     out_flat = torch.zeros(

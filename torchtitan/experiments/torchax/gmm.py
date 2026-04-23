@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 import torchtitan.tools.logging
 import torch
-import torchax
+import torch_xla2
 
 logger = torchtitan.tools.logging.logger
 
@@ -154,7 +154,7 @@ def declare_gmm_kernel(env, mesh):
           offs.dim() == 2
       ), 'JAX GMM kenerl requires 2D offsets [Num_Chips, Experts].'
 
-      j_mat1, j_mat2, j_offs_stacked = torchax.interop.jax_view(
+      j_mat1, j_mat2, j_offs_stacked = torch_xla2.interop.jax_view(
           (mat1, mat2, offs)
       )
 
@@ -171,7 +171,7 @@ def declare_gmm_kernel(env, mesh):
         else:
           res = runner_tp_col(j_mat1, j_mat2, j_offs_stacked)
 
-      return torchax.interop.torch_view(res)
+      return torch_xla2.interop.torch_view(res)
 
     logger.info(
         'Overriding torch._grouped_mm with TPU grouped MM kernel...'

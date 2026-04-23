@@ -2,7 +2,7 @@ import time
 import jax
 from jax.tree_util import tree_map
 from jax.sharding import NamedSharding
-from torchax import interop
+from torch_xla2 import interop
 import torchtitan.tools.logging
 
 P = jax.sharding.PartitionSpec

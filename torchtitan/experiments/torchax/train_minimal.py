@@ -157,7 +157,7 @@ from typing import Any
 
 from absl import app
 import jax
-import torchax
+import torch_xla2
 import torchtitan.config
 from torchtitan.experiments.jax import utils as jax_utils
 from torchtitan.experiments.torchax import distributed
@@ -179,8 +179,8 @@ def main_train_loop(job_config: Any):
   torchtitan.tools.logging.init_logger()
   assert job_config.torchax_config.use_torchax, 'use_torchax must be True'
 
-  torchax.enable_globally()
-  torchax.enable_performance_mode()
+  torch_xla2.enable_globally()
+  torch_xla2.enable_performance_mode()
 
   logger.info('Running with config: %s', job_config)
 
@@ -251,7 +251,7 @@ def main_train_loop(job_config: Any):
         axis_types=(jax.sharding.AxisType.Auto,) * len(('fsdp', 'tp')),
     )
 
-  env = torchax.default_env()
+  env = torch_xla2.default_env()
   env._mesh = mesh  # this is the mesh used by flash attention pallas kernel
 
   if platform == 'tpu':
