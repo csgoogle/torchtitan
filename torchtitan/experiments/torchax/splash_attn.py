@@ -1,7 +1,7 @@
 import jax
 import torch
 import functools
-import torch_xla2
+import torchax
 import torchtitan.tools.logging
 
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
@@ -119,9 +119,9 @@ def declare_splash_attention(env, mesh, torchax_config):
         enable_gqa=False,
     ):
       #  batch, num of head, seq, dim
-      jk, jq, jv = torch_xla2.interop.jax_view((query, key, value))
+      jk, jq, jv = torchax.interop.jax_view((query, key, value))
       res = attention(jk, jq, jv, None)
-      return torch_xla2.interop.torch_view(res)
+      return torchax.interop.torch_view(res)
 
     env.override_op_definition(
         torch.nn.functional.scaled_dot_product_attention, custom_attention

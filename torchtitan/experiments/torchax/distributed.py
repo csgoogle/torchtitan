@@ -3,8 +3,7 @@ import functools
 
 import jax
 import torch
-import torch_xla2
-import torch_xla2.train
+import torchax
 
 from torchtitan.experiments.jax.distributed import _match_path
 from torchtitan.experiments.jax.distributed import sharded_device_put
@@ -80,7 +79,7 @@ def create_sharded_weights(model, mesh, sharding_map):
     (after processing the name) are skipped.
   """
   res = {}
-  env = torch_xla2.default_env()
+  env = torchax.default_env()
   for name, weight_meta in model.state_dict().items():
     sharding_spec = _match_path(name, sharding_map)
     if sharding_spec is None:
@@ -123,7 +122,7 @@ class redactedScannedModule(torch.nn.Module):
   def __init__(self, module_list, checkpoint_policy=None):
     super().__init__()
     assert module_list
-    self.c = torch_xla2.train.Container()
+    self.c = torchax.train.Container()
     self.c.one_mod = module_list[0]
     self.checkpoint_policy = checkpoint_policy
     weights = self._stack_layer_weights(module_list)
@@ -147,7 +146,7 @@ class redactedScannedModule(torch.nn.Module):
     weights = {
         k: self.params[self._param_name_new(k)] for k in self.layer_weights_keys
     }
-    scan = torch_xla2.interop.torch_view(jax.lax.scan)
+    scan = torchax.interop.torch_view(jax.lax.scan)
 
     def eval_one_layer(args, weight):
       (h,) = args
@@ -157,7 +156,7 @@ class redactedScannedModule(torch.nn.Module):
     if self.checkpoint_policy is None:
       _eval_one_layer = eval_one_layer
     else:
-      _eval_one_layer = torch_xla2.interop.gradient_checkpoint(
+      _eval_one_layer = torchax.interop.gradient_checkpoint(
           eval_one_layer,
           kwargs={'policy': self.checkpoint_policy},
       )
@@ -212,7 +211,7 @@ class ModelWithScan(torch.nn.Module):
 
     if n_dense_layers == 0 or n_dense_layers == len(all_layers):
       # keep the original scanned module under "layers" name prefix
-      self.layers = torch_xla2.train.ScannedModule(
+      self.layers = torchax.train.ScannedModule(
           all_layers, checkpoint_policy
       )
     else:
@@ -226,10 +225,10 @@ class ModelWithScan(torch.nn.Module):
           len(moe_layers_list),
       )
 
-      self.layers_dense = torch_xla2.train.ScannedModule(
+      self.layers_dense = torchax.train.ScannedModule(
           dense_layers_list, checkpoint_policy
       )
-      self.layers_moe = torch_xla2.train.ScannedModule(
+      self.layers_moe = torchax.train.ScannedModule(
           moe_layers_list, checkpoint_policy
       )
 
