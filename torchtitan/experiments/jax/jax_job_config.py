@@ -11,6 +11,10 @@ class JaxConfig:
     tpu_num_slices: int = 1
     model_layer_override: int | None = None
 
+    # Splash Attention. Enabled by default on TPU; falls back to standard
+    # scaled-dot-product attention on other platforms or when set to False.
+    use_splash_attention_kernel: bool = True
+
     # Splash Attention block sizes (same defaults as torchax)
     sa_block_q: int = 1024
     sa_block_kv: int = 512
@@ -32,6 +36,14 @@ class JaxConfig:
     # where fp32 nu is 3.5 GiB/chip for the stacked MLP kernel alone). Off
     # by default; stock optax adamw is used when False.
     adamw_bf16_state: bool = False
+
+    # redacted-specific: when True, wrap the compute_loss chunked-CE scan body
+    # in ``jax.checkpoint`` so backward recomputes per-chunk logits instead
+    # of saving ``[n_chunks, chunk_size, V]`` all at once. Required at
+    # larger batch sizes where the materialised logits would OOM
+    # (e.g. B=16 S=8192 V=153600 bf16 ≈ 40 GiB). Off by default; opt in
+    # only when you hit that allocation.
+    redacted_remat_chunks: bool = False
 
 
 @dataclasses.dataclass

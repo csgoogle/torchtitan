@@ -4,6 +4,11 @@ from absl.testing import absltest
 from absl.testing import parameterized
 
 import tyro
+
+from absl import logging
+from flax import nnx
+import jax
+from torchtitan.experiments.jax import redacted
 from torchtitan.experiments.jax import jax_job_config
 from torchtitan.experiments.jax import train_minimal
 
@@ -12,17 +17,31 @@ class TestJaxDistributed(parameterized.TestCase):
 
   @parameterized.named_parameters([
       dict(
-          testcase_name="llama3_8b_scan",
+          testcase_name="llama3_debug_scan",
           model_name="llama3",
+          model_flavor="debug",
           use_scan=True,
       ),
       dict(
-          testcase_name="llama3_8b_no_scan",
+          testcase_name="llama3_debug_no_scan",
           model_name="llama3",
+          model_flavor="debug",
+          use_scan=False,
+      ),
+      dict(
+          testcase_name="redacted_debug_scan",
+          model_name="redacted",
+          model_flavor="debugmodel",
+          use_scan=True,
+      ),
+      dict(
+          testcase_name="redacted_debug_no_scan",
+          model_name="redacted",
+          model_flavor="debugmodel",
           use_scan=False,
       ),
   ])
-  def test_train_jax(self, model_name, use_scan):
+  def test_train_jax(self, model_name, model_flavor, use_scan):
     scan_flag = (
         "--jax_config.use_scan"
         if use_scan
@@ -30,7 +49,7 @@ class TestJaxDistributed(parameterized.TestCase):
     )
     args = [
         f"--model.name={model_name}",
-        "--model.flavor=8B",
+        f"--model.flavor={model_flavor}",
         scan_flag,
         "--jax_config.model_layer_override=1",
         "--training.dataset_path=tests/assets/c4_test",

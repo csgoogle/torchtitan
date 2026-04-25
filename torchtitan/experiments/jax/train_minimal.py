@@ -36,8 +36,44 @@ P = jax.sharding.PartitionSpec
 logger = torchtitan.tools.logging.logger
 
 
+def _maybe_init_jax_distributed():
+  """Initialise JAX's multi-host runtime when running under a multi-host
+  launcher (GKE/XPK, SLURM, etc.). No-op on a single-host VM — libtpu's
+  local discovery already gives us all chips.
+
+  Multi-host is detected via the ``TPU_WORKER_HOSTNAMES`` env var exported
+  by Cloud-TPU-on-GKE; it holds a comma-separated list of worker hostnames
+  (len > 1 ⇒ multi-host). Rank and host count are inferred from
+  ``TPU_WORKER_ID`` / the same hostnames list, which are guaranteed to be
+  set on every TPU GKE pod.
+  """
+  import os
+  hostnames = os.environ.get('TPU_WORKER_HOSTNAMES')
+  if not hostnames:
+    return
+  hosts = hostnames.split(',')
+  if len(hosts) <= 1:
+    return
+  process_id = int(os.environ.get('TPU_WORKER_ID', '0'))
+  coordinator = f"{hosts[0]}:8476"
+  logger.info(
+      'Initialising jax.distributed: num_processes=%d process_id=%d '
+      'coordinator=%s',
+      len(hosts), process_id, coordinator,
+  )
+  jax.distributed.initialize(
+      coordinator_address=coordinator,
+      num_processes=len(hosts),
+      process_id=process_id,
+  )
+
+
 def main_train_loop(job_config: Any):
   torchtitan.tools.logging.init_logger()
+
+  # Must run before any jax.devices() / jit call so the TPU runtime starts
+  # with the full multi-host mesh instead of a single-host slice.
+  _maybe_init_jax_distributed()
 
   logger.info('Running with config: %s', job_config)
 

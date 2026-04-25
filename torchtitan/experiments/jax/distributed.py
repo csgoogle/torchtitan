@@ -11,11 +11,9 @@ torchax/ experiments. The matcher supports two path styles:
 integer path segments with ``*``, then a regex pattern fallback.
 """
 
-import functools
 import re
 
 import jax
-import jax.numpy as jnp
 from flax import nnx
 import torchtitan.tools.logging
 
@@ -142,17 +140,34 @@ def apply_sharding_to_state(
             'Sharding %s  shape=%s  spec=%s',
             path_str, array.shape, spec,
         )
-        return jax.device_put(array, sharding)
+        # Use sharded_device_put so multi-host runs (num_global_devices >
+        # num_local_devices) assemble per-host addressable slices into a
+        # global jax.Array, instead of attempting an unsupported cross-host
+        # device_put. The model is built deterministically on each host's
+        # CPU with the same RNG seed, so every host already holds the full
+        # replicated array and just needs to peel off its local shard.
+        # Materialise as numpy first: slicing a CPU-bound jax.Array and
+        # then device_put-ing the slice triggers "Cannot reshard an input
+        # that is not fully addressable" because each sliced jax.Array is
+        # still single-device-committed. numpy arrays have no sharding so
+        # they assemble cleanly into a multi-host jax.Array.
+        import numpy as _np
+        array_np = _np.asarray(jax.device_get(array))
+        return sharded_device_put(
+            array_np, sharding,
+            num_global_devices=len(jax.devices()),
+            num_local_devices=jax.local_device_count(),
+        )
 
     return jax.tree_util.tree_map_with_path(shard_leaf, state)
 
 
 def shard_input(
-    x: jax.Array,
+    x,
     mesh: jax.sharding.Mesh,
     num_global_devices: int,
     num_local_devices: int,
-) -> jax.Array:
+):
     """Shard a batch input tensor across the FSDP axis (batch dimension)."""
     sharding = jax.sharding.NamedSharding(mesh, P('fsdp'))
     return sharded_device_put(x, sharding, num_global_devices, num_local_devices)

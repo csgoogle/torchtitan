@@ -25,6 +25,7 @@ from torchtitan.experiments.jax import distributed
 from torchtitan.experiments.jax import jax_profiling
 from torchtitan.experiments.jax import metrics as jax_metrics
 from torchtitan.experiments.jax import splash_attn
+from torchtitan.experiments.jax import redacted as jax_redacted
 from torchtitan.experiments.jax import llama3 as jax_llama3
 import torchtitan.tools.logging
 
@@ -127,8 +128,17 @@ class JaxTrainer:
             return train_loader
 
         # Real dataset via torchtitan's data pipeline.
+        # redacted registers its own train spec
+        # (via torchtitan.experiments.tpu.redacted) with the REDACTED tokenizer;
+        # fall back to llama3's spec for other models.
         import torchtitan.protocols.train_spec as ts_mod
-        train_spec = ts_mod.get_train_spec('llama3')
+        model_name = job_config.model.name
+        if model_name == 'redacted':
+            # Import to trigger register_train_spec for redacted_tpu.
+            import torchtitan.experiments.tpu.redacted  # noqa: F401
+            train_spec = ts_mod.get_train_spec('redacted_tpu')
+        else:
+            train_spec = ts_mod.get_train_spec('llama3')
 
         tokenizer = (
             train_spec.build_tokenizer_fn(job_config)
@@ -158,6 +168,10 @@ class JaxTrainer:
 
         if model_name == 'llama3':
             jax_model_mod = jax_llama3
+            layer_attr = 'n_layers'
+        elif model_name == 'redacted':
+            jax_model_mod = jax_redacted
+            layer_attr = 'num_layers'
         else:
             raise ValueError(f'Unsupported model: {model_name}')
 
@@ -165,11 +179,24 @@ class JaxTrainer:
         model_args.max_seq_len = job_config.training.seq_len
 
         if jax_config.model_layer_override is not None:
-            logger.warning(
-                'Overriding n_layers from %d to %d.',
-                model_args.n_layers, jax_config.model_layer_override,
-            )
-            model_args.n_layers = jax_config.model_layer_override
+            old = getattr(model_args, layer_attr)
+            new = jax_config.model_layer_override
+            logger.warning('Overriding %s from %d to %d.', layer_attr, old, new)
+            setattr(model_args, layer_attr, new)
+            # redacted has a second layer-count field (num_kv_reuse_layers) that
+            # must stay ≤ num_layers; scale it proportionally when shrinking.
+            if (model_name == 'redacted' and
+                hasattr(model_args, 'num_kv_reuse_layers') and
+                model_args.num_kv_reuse_layers >= new):
+                scaled = max(0, (model_args.num_kv_reuse_layers * new) // old)
+                # Keep at least one regular layer.
+                scaled = min(scaled, new - 1)
+                logger.warning(
+                    'Overriding num_kv_reuse_layers from %d to %d to fit new '
+                    'num_layers.',
+                    model_args.num_kv_reuse_layers, scaled,
+                )
+                model_args.num_kv_reuse_layers = scaled
 
         # Choose activation checkpoint policy.
         ac_mode = job_config.activation_checkpoint.mode
@@ -192,13 +219,19 @@ class JaxTrainer:
         else:
             checkpoint_policy = jax.checkpoint_policies.nothing_saveable
 
-        # Build splash attention if on TPU.
+        # Build splash attention if on TPU and the flag is enabled.
         devices = jax.devices()
         platform = devices[0].platform if devices else 'cpu'
         attn_fn = None
-        if platform == 'tpu':
+        if platform == 'tpu' and jax_config.use_splash_attention_kernel:
             attn_fn = splash_attn.make_splash_attention_fn(
                 self.mesh, jax_config
+            )
+        elif platform == 'tpu':
+            logger.info(
+                'Splash attention disabled via '
+                '--jax_config.use_splash_attention_kernel=False; '
+                'using fallback scaled-dot-product attention.'
             )
 
         sharding_map = (
@@ -217,8 +250,13 @@ class JaxTrainer:
             jnp.dtype(param_dtype).name,
         )
 
-        # Instantiate on CPU so we don't OOM before sharding.
-        with jax.default_device(jax.devices('cpu')[0]):
+        # Instantiate on the *host-local* CPU so we don't OOM before
+        # sharding. Using `jax.devices('cpu')[0]` on multi-host picks a
+        # CPU device that may not be addressable from every host, which
+        # later breaks `jax.device_get(param)` with "Cannot reshard an
+        # input that is not fully addressable". `local_devices('cpu')[0]`
+        # is always host-local.
+        with jax.default_device(jax.local_devices(backend='cpu')[0]):
             model = jax_model_mod.Transformer(
                 model_args,
                 use_scan=use_scan,
@@ -304,16 +342,25 @@ class JaxTrainer:
         # param-out and opt-state-in with opt-state-out, halving peak fp32
         # copies in the optimizer update section (observed 7+ f32[32,1024,
         # 28672] live copies in the memory report without donate).
+        has_compute_loss = hasattr(model, 'compute_loss')
+        remat_chunks = bool(
+            getattr(job_config.jax_config, 'redacted_remat_chunks', False)
+        )
+
         @nnx.jit(donate_argnames=("model", "optimizer"))
         def train_step(model, optimizer: nnx.Optimizer, inputs, labels):
             def loss_fn(model):
+                if has_compute_loss:
+                    # Model-side chunked CE: logits are materialised in
+                    # [chunk_size, V] tiles rather than [B*S, V] — avoids
+                    # ~80 GiB of bf16 logits at B=8 S=8192 V=153600.
+                    return model.compute_loss(
+                        inputs, labels, remat_chunks=remat_chunks,
+                    )
                 logits = model(inputs)  # [B, S, vocab] — bf16, vocab-sharded
                 B, S, V = logits.shape
                 logits_2d = logits.reshape(B * S, V)
                 labels_1d = labels.reshape(B * S)
-                # Hand-rolled bf16 CE. Stock optax upcasts to fp32, pinning a
-                # f32[B*S, V] live through backward. logsumexp is max-stabilized
-                # so bf16 is adequate.
                 log_z = jax.nn.logsumexp(logits_2d, axis=-1)
                 target = jnp.take_along_axis(
                     logits_2d, labels_1d[..., None], axis=-1
@@ -342,15 +389,20 @@ class JaxTrainer:
                     break
 
                 data_load_start = time.perf_counter()
-                inputs = jnp.array(inputs_np, dtype=jnp.int32)
-                labels = jnp.array(labels_np, dtype=jnp.int32)
+                # Keep the batch as numpy through sharding: jnp.array
+                # commits to host 0's TPU, which would then require an
+                # unsupported cross-host reshard on multi-host runs.
+                # shard_input calls sharded_device_put, which indexes the
+                # numpy array per-addressable-device.
+                inputs_np = np.asarray(inputs_np, dtype=np.int32)
+                labels_np = np.asarray(labels_np, dtype=np.int32)
 
                 # Shard batch on FSDP axis.
                 inputs = distributed.shard_input(
-                    inputs, self.mesh, self.num_global_devices, self.num_local_devices
+                    inputs_np, self.mesh, self.num_global_devices, self.num_local_devices
                 )
                 labels = distributed.shard_input(
-                    labels, self.mesh, self.num_global_devices, self.num_local_devices
+                    labels_np, self.mesh, self.num_global_devices, self.num_local_devices
                 )
 
                 ntokens = labels.size

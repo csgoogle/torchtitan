@@ -51,6 +51,16 @@ class ModelArgs:
 
 
 # Pre-defined configs
+llama3_debug = ModelArgs(
+    dim=64,
+    n_layers=4,
+    n_heads=4,
+    n_kv_heads=2,
+    vocab_size=2048,
+    ffn_dim_multiplier=1.0,
+    multiple_of=16,
+)
+
 llama3_8b = ModelArgs(
     dim=4096,
     n_layers=32,
