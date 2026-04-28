@@ -29,9 +29,6 @@ from torchtitan.experiments.rl.vllm_compat.simple_rl import (
     download_and_convert_model,
     load_gsm8k_dataset,
 )
-vllm_is_batch_invariant = lambda: True
-disable_batch_invariant_mode = lambda: None
-init_batch_invariance = lambda *args, **kwargs: None
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +42,7 @@ async def main():
 
     # Training config
     group_size = 8
-    num_steps = 10
+    num_steps = 3
     learning_rate = 1e-5
     max_new_tokens = 20
 
@@ -99,12 +96,8 @@ async def main():
     device_kwarg = "tpus" if device_type == "tpu" else "gpus"
 
     # Create process meshes
-    if device_type == "tpu":
-        trainer_mesh = this_host().spawn_procs(per_host={"tpus": 2})
-        gen_mesh = this_host().spawn_procs(per_host={"tpus": 1})
-    else:
-        trainer_mesh = this_host().spawn_procs(per_host={"gpus": 2})
-        gen_mesh = this_host().spawn_procs(per_host={"gpus": 1})
+    trainer_mesh = this_host().spawn_procs(per_host={device_kwarg: 2})
+    gen_mesh = this_host().spawn_procs(per_host={device_kwarg: 1})
 
     # Set up distributed env vars so that actors are connected via c10d
     await setup_torch_elastic_env_async(

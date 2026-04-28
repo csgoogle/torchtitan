@@ -41,27 +41,22 @@ class Trainer(Actor):
         titan_checkpoint_path: str,
         model_path: str,
         learning_rate: float = 1e-5,
-        model_mode: str = ModelMode.VLLM_COMPAT,
+        model_mode: str = ModelMode.STANDARD,
         ddp_size: int = 1,
         tp_size: int = 1,
     ):
-        from torchtitan.experiments.tpu.utils import get_device_type
-        device_type = get_device_type()
+        from torchtitan.experiments.tpu.utils import get_device
+        device = get_device()
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-        if device_type == "tpu":
-            from torch_tpu import api
-            device = api.tpu_device()
-        elif device_type == "cuda":
-            device = torch.device(f"cuda:{local_rank}")
-            if torch.cuda.is_available():
-                torch.cuda.set_device(local_rank)
-        else:
-            device = torch.device("cpu")
+        if device.type == "cuda":
+            torch.cuda.set_device(local_rank)
 
         self.model = load_model(
             titan_checkpoint_path, model_path, model_mode=model_mode
         )
+        self.model = self.model.to(device)
+        self.model.train()
         self.ddp_size = ddp_size
         self.tp_size = tp_size
         self.parallel_dims = create_trainer_parallel_dims(self.ddp_size, self.tp_size)
