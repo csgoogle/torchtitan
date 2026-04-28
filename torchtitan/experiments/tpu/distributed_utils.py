@@ -12,9 +12,6 @@ def maybe_init_distributed(num_devices: int | None = None) -> bool:
   if num_devices is None:
     num_devices = int(os.environ.get("WORLD_SIZE", "1"))
 
-  if num_devices <= 1:
-    return False
-
   # Note on differences between cluster and Cloud/GKE initialization:
   # - Cloud/GKE: Initialization must be called from within each worker process.
   #   We derive configuration from JAX env vars and initialize `TORCH_TPU_...`

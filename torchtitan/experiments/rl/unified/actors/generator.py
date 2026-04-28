@@ -27,7 +27,7 @@ from torchtitan.experiments.rl.vllm_compat.simple_rl import (
     trivial_reward_function,
 )
 from torchtitan.experiments.rl.vllm_compat.weights.converter import torchtitan_to_vllm
-from vllm import LLM, SamplingParams
+
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +247,6 @@ class VLLMRolloutEngine:
             temperature=temperature,
             max_tokens=max_new_tokens,
             n=n_samples_per_prompt,
-            seed=42,
             logprobs=1,
             prompt_logprobs=1,  # Also get prompt log probs to access prompt token IDs
         )
@@ -300,7 +299,8 @@ class VLLMRolloutEngine:
         """Cleanup vLLM engine."""
         if hasattr(self, "llm"):
             del self.llm
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 class GeneratorState:
@@ -333,6 +333,7 @@ class Generator(Actor):
 
     def __init__(
         self,
+        titan_checkpoint_path: str,
         model_path: str,
         prompt_texts: List[str],
         expected_answers: List[str],
@@ -344,6 +345,7 @@ class Generator(Actor):
         use_stable_grpo: bool = False,
         tp_size: int = 1,
     ):
+        self.titan_checkpoint_path = titan_checkpoint_path
         self.model_path = model_path
         self.prompt_texts = prompt_texts
         self.expected_answers = expected_answers
@@ -356,11 +358,29 @@ class Generator(Actor):
         self.tp_size = tp_size
 
         # Initialize distributed environment for SPMD generator
+        import torchtitan.experiments.tpu.distributed_utils as tpu_dist_utils
+        tpu_dist_utils.maybe_init_distributed()
+        
+        import os
+        if "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ:
+            os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = "localhost:29502"
+        if "TORCH_TPU_TOPOLOGY" not in os.environ:
+            os.environ["TORCH_TPU_TOPOLOGY"] = "1,1,1"
+            
+        from torch_tpu import api
+        device = api.tpu_device()
+        
         world_size = dist_utils.init_distributed(
             Comm(),
         )
-        # Initialize vLLM engine
-        self.vllm_engine = VLLMRolloutEngine(model_path, tp_size=self.tp_size)
+        
+        from torchtitan.experiments.rl.unified.models.utils import load_model, ModelMode
+        self.model = load_model(titan_checkpoint_path, model_path, model_mode=ModelMode.STANDARD)
+        self.model = self.model.to(device)
+        self.model.eval()
+
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
 
         # State machine
         self.state = GeneratorState.READY_TO_UPDATE
@@ -386,19 +406,73 @@ class Generator(Actor):
                 lambda: self.state == GeneratorState.READY_TO_GENERATE
             )
 
-            # Generate samples using vLLM
-            (
-                completions,
-                vllm_log_probs,
-                vllm_token_ids,
-                vllm_token_log_probs,
-                prompt_token_ids,
-            ) = self.vllm_engine.generate(
-                self.prompt_texts,
-                self.max_new_tokens,
-                self.temperature,
-                n_samples_per_prompt=self.group_size,
-            )
+            import torch
+            import torch.nn.functional as F
+            
+            # Simple autoregressive generation with TorchTitan model
+            self.model.eval()
+            total_samples = len(self.prompt_texts) * self.group_size
+            
+            completions = []
+            vllm_token_ids = []
+            vllm_token_log_probs = []
+            prompt_token_ids = []
+            log_probs_list = []
+            
+            device = next(self.model.parameters()).device
+            
+            with torch.no_grad():
+                for prompt in self.prompt_texts:
+                    # Tokenize
+                    encoded = self.tokenizer(prompt, return_tensors="pt")
+                    input_ids = encoded.input_ids.to(device)
+                    prompt_len = input_ids.shape[1]
+                    
+                    for _ in range(self.group_size):
+                        current_ids = input_ids.clone()
+                        gen_token_ids = []
+                        gen_log_probs = []
+                        
+                        # Generate tokens
+                        for step in range(self.max_new_tokens):
+                            # TorchTitan expects (batch, seq_len)
+                            logits = self.model(current_ids)
+                            
+                            # Get last token logits
+                            next_token_logits = logits[0, -1, :]
+                            
+                            # Apply temperature
+                            if self.temperature > 0:
+                                next_token_logits = next_token_logits / self.temperature
+                                probs = F.softmax(next_token_logits, dim=-1)
+                                next_token = torch.multinomial(probs, num_samples=1).item()
+                            else:
+                                next_token = torch.argmax(next_token_logits).item()
+                                
+                            # Calculate logprob
+                            log_prob = F.log_softmax(next_token_logits, dim=-1)[next_token].item()
+                            
+                            gen_token_ids.append(next_token)
+                            gen_log_probs.append(log_prob)
+                            
+                            # Append to sequence
+                            next_token_tensor = torch.tensor([[next_token]], device=device)
+                            current_ids = torch.cat([current_ids, next_token_tensor], dim=1)
+                            
+                            # Check EOS
+                            if next_token == self.tokenizer.eos_token_id:
+                                break
+                                
+                        # Decode
+                        completion = self.tokenizer.decode(gen_token_ids, skip_special_tokens=True)
+                        
+                        completions.append(completion)
+                        vllm_token_ids.append(gen_token_ids)
+                        vllm_token_log_probs.append(gen_log_probs)
+                        prompt_token_ids.append(input_ids[0].tolist())
+                        log_probs_list.append(sum(gen_log_probs))
+
+            vllm_log_probs = torch.tensor(log_probs_list, dtype=torch.float32)
 
             # Compute rewards
             rewards = self.reward_fn(
@@ -444,16 +518,10 @@ class Generator(Actor):
             return trajectory
 
     @endpoint
-    async def update(self, version: int, vllm_compat_state: dict) -> None:
-        """Update generate weights.
-
-        Args:
-            version: New policy version number
-            vllm_compat_state: vLLM-compatible state dict
-        """
+    async def update(self, version: int, titan_state: dict) -> None:
+        """Update generate weights."""
         async with self.cond:
-            self.vllm_engine.update_weights(vllm_compat_state)
-            # Update version and state
+            self.model.load_state_dict(titan_state, strict=False)
             self.policy_version = version
             self.state = GeneratorState.READY_TO_GENERATE
             self.cond.notify_all()

@@ -11,15 +11,12 @@ from typing import Any, Optional
 import torch
 from monarch.actor import Actor, endpoint
 from torchtitan.experiments.rl.unified.actors.generator import TrajectoryData
-from torchtitan.experiments.rl.unified.models.parallelism_utils import (
+from torchtitan.experiments.rl.unified.infra.parallelism_utils import (
     create_trainer_parallel_dims,
 )
 from torchtitan.experiments.rl.unified.models.utils import load_model, ModelMode
 from torchtitan.experiments.rl.vllm_compat.simple_rl import (
     compute_policy_gradient_loss_vllm,
-)
-from torchtitan.experiments.rl.vllm_compat.weights_vllm_compat import (
-    torchtitan_to_vllm_compat,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,10 +45,19 @@ class Trainer(Actor):
         ddp_size: int = 1,
         tp_size: int = 1,
     ):
-        # Explicitly set cuda device for each trainer, otherwise different processes will use the same CUDA device
-        local_rank = int(os.environ["LOCAL_RANK"])
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(local_rank)
+        from torchtitan.experiments.tpu.utils import get_device_type
+        device_type = get_device_type()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        if device_type == "tpu":
+            from torch_tpu import api
+            device = api.tpu_device()
+        elif device_type == "cuda":
+            device = torch.device(f"cuda:{local_rank}")
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
+        else:
+            device = torch.device("cpu")
 
         self.model = load_model(
             titan_checkpoint_path, model_path, model_mode=model_mode
@@ -82,14 +88,12 @@ class Trainer(Actor):
 
     @endpoint
     async def get_weights(self) -> dict:
-        """Get vLLM-compatible weights for generator.
+        """Get weights for generator.
 
         Returns:
-            vLLM-compatible state dict
+            TorchTitan state dict
         """
-        titan_state = self.model.state_dict()
-        vllm_compat_state = torchtitan_to_vllm_compat(titan_state)
-        return vllm_compat_state
+        return {k: v.cpu() for k, v in self.model.state_dict().items()}
 
     @endpoint
     async def step(self, trajectory: TrajectoryData) -> dict:

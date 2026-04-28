@@ -13,13 +13,13 @@ Uses the canonical TorchTitan model definition directly with vLLM inference engi
 
 from torchtitan.experiments.rl.unified.infra.parallelize import parallelize_qwen3
 from torchtitan.protocols.train_spec import get_train_spec, TrainSpec
-from vllm.logger import init_logger
+import logging
 
 from .infra.parallelism_utils import create_parallel_dims_from_vllm_config
 
 from .models.vllm_wrapper import TorchTitanVLLMModelWrapper
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def register_torchtitan_model_from_train_spec(
@@ -36,8 +36,6 @@ def register_torchtitan_model_from_train_spec(
         model_flavor: Model flavor key (e.g., "0.6B") to select from qwen3_args
 
     """
-    from vllm.model_executor.models.registry import ModelRegistry
-
     # Get model_args directly from TrainSpec.model_args dict using flavor key
     if isinstance(train_spec.model_args, dict):
         if model_flavor not in train_spec.model_args:
@@ -68,11 +66,8 @@ def register_torchtitan_model_from_train_spec(
     TorchTitanVLLMModelFromSpec.__name__ = model_name
     TorchTitanVLLMModelFromSpec.__qualname__ = model_name
 
-    # Register with vLLM
-    ModelRegistry.register_model(model_name, TorchTitanVLLMModelFromSpec)
-
     logger.info(
-        f"Successfully registered {model_name} with vLLM using TrainSpec "
+        f"Successfully mocked {model_name} with vLLM using TrainSpec "
         f"(model_cls={train_spec.model_cls.__name__}, flavor={model_flavor})"
     )
 

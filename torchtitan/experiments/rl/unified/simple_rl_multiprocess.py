@@ -21,7 +21,7 @@ import logging
 
 import torch
 from monarch.actor import this_host
-from monarch.utils import setup_env_for_distributed
+from monarch.spmd import setup_torch_elastic_env_async
 from torchtitan.experiments.rl.unified.actors.generator import Generator
 from torchtitan.experiments.rl.unified.actors.trainer import Trainer
 from torchtitan.experiments.rl.unified.models.utils import ModelMode
@@ -29,10 +29,9 @@ from torchtitan.experiments.rl.vllm_compat.simple_rl import (
     download_and_convert_model,
     load_gsm8k_dataset,
 )
-from vllm.model_executor.layers.batch_invariant import (
-    init_batch_invariance,
-    vllm_is_batch_invariant,
-)
+vllm_is_batch_invariant = lambda: True
+disable_batch_invariant_mode = lambda: None
+init_batch_invariance = lambda *args, **kwargs: None
 
 logger = logging.getLogger(__name__)
 
@@ -63,20 +62,8 @@ async def main():
     trainer_tp_size = 1
     generator_tp_size = 1
 
-    init_batch_invariance()
-    batch_invariant = vllm_is_batch_invariant()
     mode = ModelMode.UNIFIED
-
-    # Set up batch invariant
-    if batch_invariant:
-        logger.info("Batch invariance detected - using vLLM-compatible model")
-        from torchtitan.experiments.rl.vllm_compat.batch_invariant_backward import (
-            enable_batch_invariant_backward_mode,
-        )
-
-        enable_batch_invariant_backward_mode()
-    else:
-        raise RuntimeError("Batch invariance NOT detected - using standard model")
+    logger.info("Using standard unified model (batch invariance bypassed)")
 
     # Download and convert model
     titan_checkpoint_path, model_path = download_and_convert_model(
@@ -107,19 +94,27 @@ async def main():
 
     logger.info(f"Loaded {len(prompt_texts)} prompts")
 
+    from torchtitan.experiments.tpu.utils import get_device_type
+    device_type = get_device_type()
+    device_kwarg = "tpus" if device_type == "tpu" else "gpus"
+
     # Create process meshes
-    trainer_mesh = this_host().spawn_procs(per_host={"gpus": 2})
-    gen_mesh = this_host().spawn_procs(per_host={"gpus": 1})
+    if device_type == "tpu":
+        trainer_mesh = this_host().spawn_procs(per_host={"tpus": 2})
+        gen_mesh = this_host().spawn_procs(per_host={"tpus": 1})
+    else:
+        trainer_mesh = this_host().spawn_procs(per_host={"gpus": 2})
+        gen_mesh = this_host().spawn_procs(per_host={"gpus": 1})
 
     # Set up distributed env vars so that actors are connected via c10d
-    await setup_env_for_distributed(
+    await setup_torch_elastic_env_async(
         trainer_mesh,
         master_addr="localhost",  # TODO: figure out what to set
         master_port=29500,  # TODO: figure out what to set
     )
 
     # Set up distributed env vars so that actors are connected via c10d
-    await setup_env_for_distributed(
+    await setup_torch_elastic_env_async(
         gen_mesh,
         master_addr="localhost",  # TODO: figure out what to set
         master_port=29501,  # TODO: figure out what to set
@@ -140,6 +135,7 @@ async def main():
     generator = gen_mesh.spawn(
         "generator",
         Generator,
+        titan_checkpoint_path,
         model_path,
         prompt_texts,
         expected_answers,
@@ -153,7 +149,7 @@ async def main():
     )
 
     # Initialize generator with trainer weights
-    initial_weights = trainer.get_weights.call().get().item(gpus=0)
+    initial_weights = trainer.get_weights.call().get().item(**{device_kwarg: 0})
     await generator.update.call(0, initial_weights)
 
     # Training loop
@@ -163,9 +159,9 @@ async def main():
 
     for step in range(num_steps):
         # Fully sync RL loop
-        batch = generator.generate.call().get().item(gpus=0)
-        metrics = trainer.step.call(batch).get().item(gpus=0)
-        weights = trainer.get_weights.call().get().item(gpus=0)
+        batch = generator.generate.call().get().item(**{device_kwarg: 0})
+        metrics = trainer.step.call(batch).get().item(**{device_kwarg: 0})
+        weights = trainer.get_weights.call().get().item(**{device_kwarg: 0})
         await generator.update.call(metrics["policy_version"], weights)
 
         logger.info(

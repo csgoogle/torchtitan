@@ -17,14 +17,11 @@ from torchtitan.config.job_config import Comm, JobConfig, Model, Parallelism, Tr
 from torchtitan.distributed import utils as dist_utils
 
 from torchtitan.distributed.parallel_dims import ParallelDims
-from vllm.config import VllmConfig
-from vllm.logger import init_logger
+import logging
+logger = logging.getLogger(__name__)
 
 
-logger = init_logger(__name__)
-
-
-def create_parallel_dims_from_vllm_config(vllm_config: VllmConfig) -> ParallelDims:
+def create_parallel_dims_from_vllm_config(vllm_config) -> ParallelDims:
     """
     Create ParallelDims from vLLM config and maps vLLM parallelism settings to TorchTitan's ParallelDims dataclass.
 
@@ -47,9 +44,9 @@ def create_parallel_dims_from_vllm_config(vllm_config: VllmConfig) -> ParallelDi
 
     # Map vLLM config to TorchTitan ParallelDims
     parallel_dims = ParallelDims(
-        dp_replicate=vllm_config.parallel_config.data_parallel_size,
+        dp_replicate=getattr(vllm_config.parallel_config, "data_parallel_size", 1),
         dp_shard=1,  # vLLM doesn't use FSDP sharding
-        cp=vllm_config.parallel_config.decode_context_parallel_size,
+        cp=getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1),
         tp=vllm_config.parallel_config.tensor_parallel_size,
         pp=vllm_config.parallel_config.pipeline_parallel_size,
         ep=1,  # Expert parallelism not used in vLLM inference yet
@@ -96,7 +93,7 @@ def create_trainer_parallel_dims(ddp_size, tp_size) -> ParallelDims:
 
 
 def create_job_config_from_vllm_config(
-    vllm_config: VllmConfig,
+    vllm_config,
     model_name: str = "qwen3",
     hf_assets_path: str = "/path/to/hf/assets",
 ) -> JobConfig:
@@ -122,9 +119,9 @@ def create_job_config_from_vllm_config(
 
     parallel_config = vllm_config.parallel_config
     job_config.parallelism = Parallelism(
-        data_parallel_replicate_degree=parallel_config.data_parallel_size,
+        data_parallel_replicate_degree=getattr(parallel_config, "data_parallel_size", 1),
         data_parallel_shard_degree=1,  # vLLM doesn't use FSDP sharding in inference
-        context_parallel_degree=parallel_config.decode_context_parallel_size,
+        context_parallel_degree=getattr(parallel_config, "decode_context_parallel_size", 1),
         tensor_parallel_degree=parallel_config.tensor_parallel_size,
         pipeline_parallel_degree=parallel_config.pipeline_parallel_size,
         expert_parallel_degree=1,  # Not used in vLLM inference yet

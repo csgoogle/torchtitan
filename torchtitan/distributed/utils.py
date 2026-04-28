@@ -349,6 +349,14 @@ def init_distributed(
         backend = "nccl"
         if get_device_type() == "tpu":
             backend = "tpu_dist"
+            if not torch.distributed.is_backend_available("tpu_dist"):
+                try:
+                    from torch_tpu._internal.distributed import tpu_distributed
+                    torch.distributed.Backend.register_backend(
+                        "tpu_dist", tpu_distributed.create_process_group, devices="tpu"
+                    )
+                except ImportError:
+                    pass
         if get_device_type() in torch.distributed.Backend.default_device_backend_map:
             backend = torch.distributed.Backend.default_device_backend_map.get(
                 get_device_type()

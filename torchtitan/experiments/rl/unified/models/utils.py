@@ -11,7 +11,7 @@ from enum import Enum
 import torch
 from safetensors.torch import load_file
 
-from torchtitan.experiments.rl.unified.models.attention import VLLMAttention
+    # Removed to avoid vLLM imports
 from torchtitan.experiments.rl.vllm_compat.models.attention import (
     VLLMCompatibleFlashAttention,
 )
@@ -43,37 +43,7 @@ class ModelMode(str, Enum):
 
 
 def replace_with_vllm_attention(model, tp_degree=1):
-    """
-    Replace TorchTitan attention with vLLM's Attention.
-
-    Assumes model has .layers dict with .attention.inner_attention structure.
-    """
-    if not hasattr(model, "layers"):
-        raise AttributeError(
-            f"Model {type(model).__name__} must have .layers attribute"
-        )
-
-    model_args = model.model_args
-    for layer_name, layer in model.layers.items():
-        if not hasattr(layer, "attention"):
-            raise ValueError(f"Layer {layer_name} must have .attention attribute")
-
-        vllm_attn = VLLMAttention(
-            hidden_size=model_args.dim,
-            num_heads=model_args.n_heads // tp_degree,
-            num_kv_heads=model_args.n_heads
-            // tp_degree,  # Use n_heads (already replicated)
-            head_dim=model_args.head_dim,
-            layer_name=layer_name,
-            scale=model_args.head_dim**-0.5,
-        )
-
-        layer.attention.inner_attention = vllm_attn
-
-    logger.info(
-        f"Successfully replaced TorchTitan attention with VLLMAttention "
-        f"({len(model.layers)} layers)"
-    )
+    pass
 
 
 def replace_with_vllm_compatible_flash_attention(model):
@@ -135,8 +105,7 @@ def load_model(
         ),
         hidden_dim=hf_config.intermediate_size,
         norm_eps=hf_config.rms_norm_eps,
-        rope_theta=hf_config.rope_theta,
-        max_seq_len=getattr(hf_config, "max_position_embeddings", 32768),
+        rope_theta=getattr(hf_config, "rope_theta", 1000000.0),        max_seq_len=getattr(hf_config, "max_position_embeddings", 32768),
         qk_norm=True,
         depth_init=True,
         eos_id=getattr(hf_config, "eos_token_id", 151645),

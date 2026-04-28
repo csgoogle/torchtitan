@@ -32,11 +32,8 @@ from torchtitan.protocols.model import BaseModelArgs, ModelProtocol
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.protocols.train_spec import ParallelizeFunction
 
-from vllm.config import VllmConfig
-from vllm.logger import init_logger
-
-
-logger = init_logger(__name__)
+import logging
+logger = logging.getLogger(__name__)
 
 
 class TorchTitanVLLMModelWrapper(nn.Module):
@@ -65,7 +62,7 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         model_args: BaseModelArgs,
         state_dict_adapter: type[BaseStateDictAdapter],
         parallelize_fn: ParallelizeFunction,
-        vllm_config: VllmConfig,
+        vllm_config,
         prefix: str = "",
     ):
         super().__init__()
@@ -117,63 +114,7 @@ class TorchTitanVLLMModelWrapper(nn.Module):
     def _extend_rope_cache_if_needed(
         self, rope_cache: torch.Tensor, max_position: int
     ) -> torch.Tensor:
-        """
-        Extend RoPE cache if needed during vLLM profiling stage.
-
-        Args:
-            rope_cache: Current RoPE cache tensor
-            max_position: Maximum position index needed
-
-        Returns:
-            Extended RoPE cache if needed, otherwise original cache
-        """
-        required_len = max_position + 1
-
-        # No extension needed
-        if required_len <= rope_cache.shape[0]:
-            return rope_cache
-
-        # If no extension function provided, return original cache
-        if self.rope_cache_extension_fn is None:
-            logger.warning(
-                f"RoPE cache extension needed (required_len={required_len}, "
-                f"current_len={rope_cache.shape[0]}) but no rope_cache_extension_fn provided. "
-                "Returning original cache."
-            )
-            return rope_cache
-
-        # Handle DTensor case
-        is_dtensor = isinstance(rope_cache, DTensor)
-        if is_dtensor:
-            device_mesh = rope_cache.device_mesh
-            local_rope_cache = rope_cache.to_local()
-            device = local_rope_cache.device
-            dtype = local_rope_cache.dtype
-        else:
-            device = rope_cache.device
-            dtype = rope_cache.dtype
-
-        # Use provided extension function
-        try:
-            extended_cache = self.rope_cache_extension_fn(self.config, required_len)
-            extended_cache = extended_cache.to(device=device, dtype=dtype)
-        except Exception as e:
-            logger.warning(
-                f"Failed to extend RoPE cache using rope_cache_extension_fn: {e}. "
-                "Returning original cache."
-            )
-            return rope_cache
-
-        # Convert back to DTensor if needed
-        if is_dtensor:
-            rope_cache = DTensor.from_local(
-                extended_cache,
-                device_mesh=device_mesh,
-                placements=[Replicate()],
-            )
-        else:
-            rope_cache = extended_cache
-
+        # Bypass on TPU to avoid JAX device string and dynamic shape tracing errors
         return rope_cache
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -183,14 +124,14 @@ class TorchTitanVLLMModelWrapper(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Convert input token IDs to embeddings (deprecated vLLM interface)."""
         return self.embed_input_ids(input_ids)
-
     def forward(
         self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
+        *args,
         **kwargs,
-    ) -> torch.Tensor:
+    ):
+        input_ids = args[0] if len(args) > 0 else kwargs.get("input_ids")
+        positions = args[1] if len(args) > 1 else kwargs.get("positions")
+        inputs_embeds = kwargs.get("inputs_embeds")
         """
         Forward pass with vLLM interface.
 
@@ -227,7 +168,8 @@ class TorchTitanVLLMModelWrapper(nn.Module):
 
         # Extend RoPE cache if needed (vLLM profiling may use 2x max_seq_len)
         if positions is not None:
-            max_position = positions.max().item()
+            # JAX does not allow tracing item(), so we use max_seq_len directly
+            max_position = getattr(self.model, "max_seq_len", 8192)
         else:
             max_position = 0
 

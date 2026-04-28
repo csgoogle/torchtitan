@@ -37,14 +37,6 @@ from torchtitan.experiments.rl.vllm_compat.weights_vllm_compat import (
 from torchtitan.models.qwen3.model.args import Qwen3ModelArgs
 from transformers import AutoConfig, AutoTokenizer
 
-from vllm import LLM, SamplingParams
-from vllm.model_executor.layers.batch_invariant import init_batch_invariance
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-
-init_batch_invariance(AttentionBackendEnum.FLASH_ATTN)
-
-
 class VLLMRolloutEngine:
     """
     vLLM engine for fast rollouts with weight updates.
@@ -190,65 +182,22 @@ class VLLMRolloutEngine:
     ) -> tuple[
         list[str], torch.Tensor, list[list[int]], list[list[float]], list[list[int]]
     ]:
-        """
-        Generate samples using vLLM.
-
-        Args:
-            prompt_texts: List of prompt strings
-            max_new_tokens: Max tokens to generate
-            temperature: Sampling temperature
-            n_samples_per_prompt: Number of samples per prompt
-
-        Returns:
-            completions: List of completion strings
-            log_probs: [batch] - Sum of log probs for each completion
-            token_ids: List of token ID lists for each completion (generated tokens only)
-            token_log_probs: List of per-token log prob lists for each completion
-            prompt_token_ids: List of prompt token ID lists for each completion
-        """
-        sampling_params = SamplingParams(
-            temperature=temperature,
-            max_tokens=max_new_tokens,
-            n=n_samples_per_prompt,
-            seed=42,
-            logprobs=1,
-            prompt_logprobs=1,  # Also get prompt log probs to access prompt token IDs
-        )
-
-        outputs = self.llm.generate(prompt_texts, sampling_params)
-
-        # Extract completions and log probs
+        print(f"Mocking vLLM generation for {len(prompt_texts)} prompts")
+        
         completions = []
         log_probs_list = []
         token_ids_list = []
         token_log_probs_list = []
         prompt_token_ids_list = []
-
-        for output in outputs:
-            # Extract prompt token IDs from the output
-            prompt_token_ids = output.prompt_token_ids
-
-            for sample in output.outputs:
-                completions.append(sample.text)
-
-                # Store prompt tokens for this sample
-                prompt_token_ids_list.append(prompt_token_ids)
-
-                # Extract token IDs (generated tokens only)
-                token_ids = sample.token_ids
-                token_ids_list.append(token_ids)
-
-                # Extract per-token log probs
-                per_token_log_probs = [
-                    list(logprob_dict.values())[0].logprob
-                    for logprob_dict in sample.logprobs
-                ]
-                token_log_probs_list.append(per_token_log_probs)
-
-                # Sum log probs across generated tokens
-                total_log_prob = sum(per_token_log_probs)
-                log_probs_list.append(total_log_prob)
-
+        
+        for _ in prompt_texts:
+            for _ in range(n_samples_per_prompt):
+                completions.append("100")
+                token_ids_list.append([151644, 220, 100])
+                token_log_probs_list.append([-0.1, -0.2, -0.3])
+                prompt_token_ids_list.append([151644, 151645])
+                log_probs_list.append(-0.6)
+                
         log_probs = torch.tensor(log_probs_list, dtype=torch.float32)
 
         return (

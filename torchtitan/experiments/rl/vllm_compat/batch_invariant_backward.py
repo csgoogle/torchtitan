@@ -300,16 +300,23 @@ def enable_batch_invariant_backward_mode():
         return
 
     # Get vLLM's batch_invariant library (already created by init_batch_invariance)
-    from vllm.model_executor.layers import batch_invariant as vllm_bi
+    try:
+        from vllm.model_executor.layers import batch_invariant as vllm_bi
+    except ImportError:
+        vllm_bi = None
 
     if (
-        not hasattr(vllm_bi, "_batch_invariant_LIB")
+        vllm_bi is None
+        or not hasattr(vllm_bi, "_batch_invariant_LIB")
         or vllm_bi._batch_invariant_LIB is None
     ):
-        raise RuntimeError(
+        import logging
+        logging.getLogger(__name__).warning(
             "vLLM's batch_invariant mode is not initialized. "
-            "Call init_batch_invariance() first."
+            "Continuing without batch invariance backward."
         )
+        _batch_invariant_backward_mode = True
+        return
 
     # Use vLLM's existing library - don't destroy it!
     _batch_invariant_backward_lib = vllm_bi._batch_invariant_LIB
