@@ -142,7 +142,13 @@ class TorchaxTrainer:
       elif 'lora' in job_config.model.flavor and hasattr(
           torchax_model, 'sharding_map_scan_lora'
       ):
-        sharding_map = torchax_model.sharding_map_scan_lora
+        if job_config.torchax_config.use_ddp_sharding and hasattr(
+            torchax_model, 'sharding_map_scan_lora_ddp'
+        ):
+          sharding_map = torchax_model.sharding_map_scan_lora_ddp
+          logger.info('Using DDP-all sharding: base model replicated, no fsdp all-gather')
+        else:
+          sharding_map = torchax_model.sharding_map_scan_lora
       else:
         sharding_map = torchax_model.sharding_map_scan
     else:
@@ -438,12 +444,21 @@ class TorchaxTrainer:
         # Fallback if get_nparams_and_flops is not implemented (e.g., redacted)
         metrics_processor.num_flops_per_token = 0
 
-    train_step = torchax.train.make_train_step(
-        model_fn,
-        loss_fn,
-        jax_optimizer,
-        remat_policy=checkpoint_policy,
-    )
+    if job_config.torchax_config.split_compile:
+      grad_step, opt_step = jit_utils.make_split_train_step(
+          model_fn,
+          loss_fn,
+          jax_optimizer,
+          remat_policy=checkpoint_policy,
+      )
+      train_step = None  # compiled later on first step
+    else:
+      train_step = torchax.train.make_train_step(
+          model_fn,
+          loss_fn,
+          jax_optimizer,
+          remat_policy=checkpoint_policy,
+      )
 
     logger.info(
         'Start training %s - %s %s with %s',
@@ -498,15 +513,27 @@ class TorchaxTrainer:
 
       if step == 0:
         # Compile step specifically for the first iteration
-        train_step = jit_utils.compile_step_func(
-            train_step,
-            jittable_mod.params,
-            jittable_mod.buffers,
-            opt_state,
-            inputs,
-            labels,
-            self.mesh,
-        )
+        if job_config.torchax_config.split_compile:
+          train_step = jit_utils.compile_split_step_func(
+              grad_step,
+              opt_step,
+              jittable_mod.params,
+              jittable_mod.buffers,
+              opt_state,
+              inputs,
+              labels,
+              self.mesh,
+          )
+        else:
+          train_step = jit_utils.compile_step_func(
+              train_step,
+              jittable_mod.params,
+              jittable_mod.buffers,
+              opt_state,
+              inputs,
+              labels,
+              self.mesh,
+          )
 
       # (Removed jax.block_until_ready here to allow async overlap)
 
