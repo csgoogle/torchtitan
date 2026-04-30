@@ -65,6 +65,9 @@ def _maybe_init_distributed_on_gke(
       "TPU_WORKER_HOSTNAMES" not in environ
       or "TPU_CHIPS_PER_HOST_BOUNDS" not in environ
       or "TPU_HOST_BOUNDS" not in environ
+      or "WORLD_SIZE" not in environ
+      or "LOCAL_RANK" not in environ
+      or "RANK" not in environ
   ):
     return False
 

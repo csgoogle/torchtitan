@@ -8,58 +8,75 @@ on:
 
 jobs:
   tpu-tests:
-    runs-on: self-hosted
+    strategy:
+      matrix:
+        job_info: [
+          {
+            runner: "linux-x86-ct6e-180-8tpu",
+            bazel_config: "ci_tpu_on_v6",
+          },
+          {
+            runner: "linux-x86-tpu7x-224-4tpu",
+            bazel_config: "ci_tpu_on_v7",
+          }
+        ]
+    runs-on: ${{ matrix.job_info.runner }}
+
+    # 1. ADD NATIVE CONTAINER DEFINITION HERE WITH AUTHENTICATION
+    container:
+      # TODO b/503780210 - Using manual image until docker autobuild is done.
+      image: us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest
+      credentials:
+        username: _json_key
+        password: ${{ secrets.GAR_JSON_KEY }}
+      # Pass your specific Docker flags here. 
+      # (GitHub Actions automatically handles mounting the workspace, so we removed those flags)
+      options: --privileged --net host -v /dev/shm:/dev/shm
+
+    # 2. SET ENVIRONMENT VARIABLES FOR THE JOB
+    env:
+      PYTHONDONTWRITEBYTECODE: 1
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run torchtitan TPU Unit Tests via Docker
+      # 3. RUN TESTS DIRECTLY (The runner knows it is already inside the container)
+      - name: Run torchtitan TPU Unit Tests
         run: |
-          docker run --rm \
-            --pull always \
-            --privileged \
-            --net host \
-            -v /dev/shm:/dev/shm \
-            -v ${{ github.workspace }}:/workspace \
-            -w /workspace \
-            -e PYTHONDONTWRITEBYTECODE=1 \
-            us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest \
-            /bin/bash -c "
-              set -e
-              ulimit -n 65536
+          set -e
+          ulimit -n 65536
 
-              # --- Core Distributed Tests ---
-              python -m torchtitan.experiments.tpu.tests.test_train_distributed --device=tpu
-              python -m torchtitan.experiments.tpu.tests.test_model_distributed --device=tpu
-              python -m torchtitan.experiments.tpu.tests.test_train_minimal_distributed --device=tpu
-              python -m torchtitan.experiments.tpu.redacted.tests.test_train_minimal_distributed --device=tpu
-              python -m torchtitan.experiments.tpu.tests.test_dtensor --device=tpu
+          # --- Core Distributed Tests ---
+          python -m torchtitan.experiments.tpu.tests.test_train_distributed --device=tpu
+          python -m torchtitan.experiments.tpu.tests.test_model_distributed --device=tpu
+          python -m torchtitan.experiments.tpu.tests.test_train_minimal_distributed --device=tpu
+          python -m torchtitan.experiments.tpu.redacted.tests.test_train_minimal_distributed --device=tpu
+          python -m torchtitan.experiments.tpu.tests.test_dtensor --device=tpu
 
-              # Temporarily disabled: requires newer version of libtpu
-              # python -m torchtitan.experiments.tpu.tests.test_checkpoint_verification --device=tpu
+          # Temporarily disabled: requires newer version of libtpu
+          # python -m torchtitan.experiments.tpu.tests.test_checkpoint_verification --device=tpu
 
-              # --- Kernel Tests ---
-              python -m torchtitan.experiments.tpu.kernels.tests.test_splash_attention --device=tpu
-              python -m torchtitan.experiments.tpu.kernels.tests.test_linear_softmax_cross_entropy_loss --device=tpu
-              python -m torchtitan.experiments.tpu.kernels.tests.test_gmm --device=tpu
-              python -m torchtitan.experiments.tpu.kernels.tests.test_fill_indices --device=tpu
+          # --- Kernel Tests ---
+          python -m torchtitan.experiments.tpu.kernels.tests.test_splash_attention --device=tpu
+          python -m torchtitan.experiments.tpu.kernels.tests.test_linear_softmax_cross_entropy_loss --device=tpu
+          python -m torchtitan.experiments.tpu.kernels.tests.test_gmm --device=tpu
+          python -m torchtitan.experiments.tpu.kernels.tests.test_fill_indices --device=tpu
 
-              # --- Model Specific Tests: Qwen3 ---
-              python -m torchtitan.experiments.tpu.qwen3.tests.test_qwen3 --device=tpu
-              python -m torchtitan.experiments.tpu.qwen3.tests.test_dtensor_parallelize --device=tpu
+          # --- Model Specific Tests: Qwen3 ---
+          python -m torchtitan.experiments.tpu.qwen3.tests.test_qwen3 --device=tpu
+          python -m torchtitan.experiments.tpu.qwen3.tests.test_dtensor_parallelize --device=tpu
 
-              # --- Model Specific Tests: Llama3 ---
-              python -m torchtitan.experiments.tpu.llama3.tests.test_llama3 --device=tpu
-              python -m torchtitan.experiments.tpu.llama3.tests.test_dtensor_parallelize --device=tpu
-              python -m torchtitan.experiments.tpu.llama3.tests.test_llama3_workarounds --device=tpu
+          # --- Model Specific Tests: Llama3 ---
+          python -m torchtitan.experiments.tpu.llama3.tests.test_llama3 --device=tpu
+          python -m torchtitan.experiments.tpu.llama3.tests.test_dtensor_parallelize --device=tpu
+          python -m torchtitan.experiments.tpu.llama3.tests.test_llama3_workarounds --device=tpu
 
-              # --- Model Specific Tests: redacted ---
-              python -m torchtitan.experiments.tpu.redacted.tests.test_simple_fsdp --device=tpu
-              python -m torchtitan.experiments.tpu.redacted.tests.test_dtensor_parallelize --device=tpu
-              python -m torchtitan.experiments.tpu.redacted.tests.test_kernels --device=tpu
+          # --- Model Specific Tests: redacted ---
+          python -m torchtitan.experiments.tpu.redacted.tests.test_simple_fsdp --device=tpu
+          python -m torchtitan.experiments.tpu.redacted.tests.test_dtensor_parallelize --device=tpu
+          python -m torchtitan.experiments.tpu.redacted.tests.test_kernels --device=tpu
 
-              # --- Model Specific Tests: DeepSeek V3 ---
-              python -m torchtitan.experiments.tpu.deepseek_v3.tests.test_deepseek_v3 --device=tpu
-              python -m torchtitan.experiments.tpu.deepseek_v3.tests.test_dtensor_parallelize --device=tpu
-            "
+          # --- Model Specific Tests: DeepSeek V3 ---
+          python -m torchtitan.experiments.tpu.deepseek_v3.tests.test_deepseek_v3 --device=tpu
+          python -m torchtitan.experiments.tpu.deepseek_v3.tests.test_dtensor_parallelize --device=tpu
