@@ -38,24 +38,24 @@ def parallelize_qwen3(
 
   if (
       isinstance(job_config, tpu_job_config.TPUJobConfig)
-      and job_config.tpu_config.use_splash_attention_kernel
+      and job_config.splash_attention_kernel.use_splash_attention_kernel
   ):
     workarounds.use_splash_attention_patch(model)
   if (
       isinstance(job_config, tpu_job_config.TPUJobConfig)
-      and job_config.tpu_config.use_loss_kernel
+      and job_config.loss_kernel.use_loss_kernel
   ):
     workarounds.use_output_projection_patch(model)
 
   if (
       isinstance(job_config, tpu_job_config.TPUJobConfig)
-      and job_config.tpu_config.use_gmm_kernel
+      and job_config.qwen3.use_gmm_kernel
   ):
     workarounds.use_gmm_kernel_patch(model)
 
   if (
       isinstance(job_config, tpu_job_config.TPUJobConfig)
-      and job_config.tpu_config.use_fill_indices_kernel
+      and job_config.qwen3.use_fill_indices_kernel
   ):
     workarounds.use_fill_indices_patch(model)
   dtensor_parallelize.parallelize_qwen3(model, parallel_dims, job_config)

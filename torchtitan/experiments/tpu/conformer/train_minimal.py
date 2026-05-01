@@ -334,6 +334,10 @@ def start_trainer(job_config: JobConfig) -> None:
       targets = batch[1].to(device)
 
       with jax_profiler.TraceAnnotation("train", step_num=step):
+        use_ctc = (
+            isinstance(job_config, TPUJobConfig)
+            and job_config.conformer.use_ctc_loss
+        )
         loss = train_step(
             model,
             inputs,
@@ -341,7 +345,7 @@ def start_trainer(job_config: JobConfig) -> None:
             optimizer,
             loss_fn,
             graph_split=use_graph_split,
-            use_ctc=job_config.tpu_config.use_ctc_loss_for_conformer,
+            use_ctc=use_ctc,
             output_lengths=torch.full(
                 (inputs.size(0),),
                 inputs.size(1),

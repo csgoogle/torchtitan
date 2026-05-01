@@ -70,6 +70,9 @@ freq = 500
 steps = 1200 # Recommend value for c4_validation with world-size=8 and seq_len=8192
 
 [tpu_config]
+eager_mode = "DEFER_AND_FUSE"
+
+[splash_attention_kernel]
 use_splash_attention_kernel = true
 sa_block_q = 2048
 sa_block_kv = 2048

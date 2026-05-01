@@ -28,11 +28,11 @@ def pallas_cross_entropy_loss(
     b_block_size = 1024
     h_block_size = 512
     v_block_size = 2048
-    if job_config and hasattr(job_config, "tpu_config"):
-      b_block_size = job_config.tpu_config.loss_b_block_size
-      h_block_size = job_config.tpu_config.loss_h_block_size
-      v_block_size = job_config.tpu_config.loss_v_block_size
-      if not job_config.tpu_config.enable_pallas_loss_kernel:
+    if job_config and hasattr(job_config, "loss_kernel"):
+      b_block_size = job_config.loss_kernel.loss_b_block_size
+      h_block_size = job_config.loss_kernel.loss_h_block_size
+      v_block_size = job_config.loss_kernel.loss_v_block_size
+      if not job_config.loss_kernel.enable_pallas_loss_kernel:
         implementation = "xla"
 
     if x.shape[0] % 1024 != 0 and implementation == "mosaic_tpu":
@@ -65,8 +65,8 @@ def build_cross_entropy_loss(
     ),
     **kwargs
 ):
-  if hasattr(job_config, "tpu_config") and getattr(
-      job_config.tpu_config, "use_loss_kernel", True
+  if hasattr(job_config, "loss_kernel") and getattr(
+      job_config.loss_kernel, "use_loss_kernel", True
   ):
 
     def loss_fn(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:

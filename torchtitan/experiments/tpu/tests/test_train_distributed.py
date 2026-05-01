@@ -233,11 +233,11 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--training.dtype=bfloat16",
-              "--tpu_config.use_loss_kernel",
+              "--loss_kernel.use_loss_kernel",
               "--training.seq_len=1024",
-              "--tpu_config.loss_b_block_size=128",
-              "--tpu_config.loss_h_block_size=128",
-              "--tpu_config.loss_v_block_size=128",
+              "--loss_kernel.loss_b_block_size=128",
+              "--loss_kernel.loss_h_block_size=128",
+              "--loss_kernel.loss_v_block_size=128",
           ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
@@ -250,7 +250,7 @@ class TrainDistributedTest(
           config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          args=["--tpu_config.use_splash_attention_kernel"],
+          args=["--splash_attention_kernel.use_splash_attention_kernel"],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
@@ -307,11 +307,11 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--training.dtype=bfloat16",
-              "--tpu_config.use_loss_kernel",
+              "--loss_kernel.use_loss_kernel",
               "--training.seq_len=1024",
-              "--tpu_config.loss_b_block_size=128",
-              "--tpu_config.loss_h_block_size=128",
-              "--tpu_config.loss_v_block_size=128",
+              "--loss_kernel.loss_b_block_size=128",
+              "--loss_kernel.loss_h_block_size=128",
+              "--loss_kernel.loss_v_block_size=128",
           ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
@@ -324,7 +324,7 @@ class TrainDistributedTest(
           config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          args=["--tpu_config.use_splash_attention_kernel"],
+          args=["--splash_attention_kernel.use_splash_attention_kernel"],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
@@ -338,7 +338,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--model.flavor=testmodel_moe",  # NOTE: this model has use_grouped_mm=True
-              "--tpu_config.use_gmm_kernel",
+              "--qwen3.use_gmm_kernel",
           ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
@@ -353,8 +353,8 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--model.flavor=testmodel_moe",  # NOTE: this model has use_grouped_mm=True
-              "--tpu_config.use_gmm_kernel",
-              "--tpu_config.use_fill_indices_kernel",
+              "--qwen3.use_gmm_kernel",
+              "--qwen3.use_fill_indices_kernel",
           ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
