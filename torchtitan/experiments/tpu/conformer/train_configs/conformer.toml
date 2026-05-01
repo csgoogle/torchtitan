@@ -1,0 +1,36 @@
+[job]
+dump_folder = "./dump/conformer"
+
+[training]
+dataset = "random"
+steps = 40
+local_batch_size = 32
+seq_len = 512
+dtype = "float32"
+mixed_precision_param = "bfloat16"
+
+[model]
+name = "conformer_tpu"
+flavor = "test"
+hf_assets_path = "tests/assets/tokenizer"
+
+[optimizer]
+lr = 0.0001
+implementation = "foreach"
+
+[lr_scheduler]
+warmup_steps = 5
+
+[metrics]
+log_freq = 5
+
+[parallelism]
+data_parallel_replicate_degree = -1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[tpu_config]
+use_ctc_loss_for_conformer = false
+eager_mode = "DEFER_AND_FUSE"

@@ -24,6 +24,7 @@ class TPUConfig:
   # (B, S, vocab_size) logit tensor. Mutually exclusive with use_loss_kernel.
   # Only implemented for redacted (train_minimal.py).
   use_chunked_loss: bool = False
+  use_ctc_loss_for_conformer: bool = False
   use_splash_attention_kernel: bool = False
   use_gmm_kernel: bool = False
   use_fill_indices_kernel: bool = False
