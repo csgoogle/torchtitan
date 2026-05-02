@@ -1,5 +1,11 @@
+import os
 import sys
 import pytest
+
+# Prevent PyTorch from auto-loading torch_tpu in the main pytest process.
+# This prevents the parent process from acquiring the TPU lock, which causes
+# child processes spawned by torchrun to hang.
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 
 # 1. Duplicate Registration during Collection
 try:
