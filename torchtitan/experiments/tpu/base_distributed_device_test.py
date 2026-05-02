@@ -620,12 +620,16 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
 
     if not test_utils.flags.FLAGS["num_devices"].present:
       if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
-        from torch_tpu._internal.utils import hardware  # pylint: disable=g-import-not-at-top
+        from torchtitan.experiments.tpu import local_tpu_device  # pylint: disable=g-import-not-at-top
         logging.info(
             "--num_devices flag not set, attempting to detect number of TPU"
             " chips..."
         )
-        self.num_devices = hardware.get_tpu_device_count()
+        local_chips = local_tpu_device.get_local_chips()
+        if local_chips is not None and local_chips[1] is not None:
+          self.num_devices = local_chips[1]
+        else:
+          self.num_devices = 1
         logging.info("Found %d TPU chips.", self.num_devices)
 
     # Ensure Hugging Face datasets use a directory with enough storage

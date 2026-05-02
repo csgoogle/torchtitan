@@ -58,7 +58,6 @@ def torchrun(fn, *, nnodes=None, nproc_per_node=None):
         nnodes=nnodes or environment.default_nnodes(),
         nproc_per_node=nproc_per_node or environment.default_nproc_per_node(),
         role=fn.__name__,
-        log_dir=log_dir,
     )
 
     try:

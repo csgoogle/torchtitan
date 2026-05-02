@@ -31,6 +31,11 @@ def get_device_type() -> str:
   Returns:
       The device type as a string ("cuda", "tpu", or "cpu").
   """
+  import traceback
+  with open("/tmp/tpu_init_traceback.txt", "a") as f:
+    traceback.print_stack(file=f)
+    f.write("\n---\n")
+
   global device_type
   if device_type is not None:
     return device_type
