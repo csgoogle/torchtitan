@@ -19,8 +19,6 @@ import os as os
 if "LOCAL_RANK" in os.environ and "WORLD_SIZE" in os.environ:
   os.environ["TPU_VISIBLE_CHIPS"] = os.environ["LOCAL_RANK"]
   os.environ["CLOUD_TPU_TASK_ID"] = os.environ["LOCAL_RANK"]
-  if "TORCH_DEVICE_BACKEND_AUTOLOAD" in os.environ:
-    del os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"]
 
 import torch
 import torch.distributed as dist
