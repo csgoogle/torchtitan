@@ -15,11 +15,6 @@ from typing import List, Optional, Sequence, Tuple
 from absl import flags
 from absl.flags import argparse_flags
 import os as os
-
-if "LOCAL_RANK" in os.environ and "WORLD_SIZE" in os.environ:
-  os.environ["TPU_VISIBLE_CHIPS"] = os.environ["LOCAL_RANK"]
-  os.environ["CLOUD_TPU_TASK_ID"] = os.environ["LOCAL_RANK"]
-
 import torch
 import torch.distributed as dist
 from torchtitan.config import ConfigManager, JobConfig
