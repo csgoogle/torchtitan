@@ -5,7 +5,6 @@ from absl.testing import absltest
 import torch
 import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu.kernels import gmm
 
 
 def manual_gmm_reference(lhs, rhs, group_sizes):
@@ -31,6 +30,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
   """Tests for grouped_matrix_multiply."""
 
   def test_manual_gmm_reference_parity(self):
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Verifies that the TPU kernel output matches manual reference implementation."""
     device = self.accelerator_device
     num_groups = 8
@@ -61,7 +61,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     expected_out = manual_gmm_reference(lhs_tpu, rhs_tpu, group_sizes)
     # Kernel on TPU
     offs_tpu = torch.cumsum(group_sizes, dim=0).to(device=device)
-    actual_out = gmm.grouped_matrix_multiply(lhs_tpu, rhs_tpu, offs_tpu)
+    actual_out = gmm_mod.grouped_matrix_multiply(lhs_tpu, rhs_tpu, offs_tpu)
 
     torch.testing.assert_close(
         actual_out.cpu(), expected_out.cpu(), rtol=1e-5, atol=1e-5
@@ -69,6 +69,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("Parity test passed.")
 
   def test_torch_grouped_mm_parity(self):
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Verifies the custom kernel output against F.grouped_mm."""
 
     device = self.accelerator_device
@@ -83,7 +84,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     rhs_tpu = torch.randn(num_groups, k, n, dtype=torch.float32, device=device)
 
     offs = torch.cumsum(group_sizes, dim=0).to(dtype=torch.int32, device=device)
-    actual_out = gmm.grouped_matrix_multiply(
+    actual_out = gmm_mod.grouped_matrix_multiply(
         lhs_tpu, rhs_tpu, offs
     )
 
@@ -96,6 +97,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("F.grouped_mm parity test passed.")
 
   def test_gradient(self):
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Checks gradients numerically using torch.autograd.gradcheck."""
     device = self.accelerator_device
     # Keep it at the minimum aligned size (128)
@@ -113,7 +115,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     offs_tpu = torch.cumsum(group_sizes, dim=0).to(device)
 
     def func(l, r):
-      return gmm.grouped_matrix_multiply(l, r, offs_tpu)
+      return gmm_mod.grouped_matrix_multiply(l, r, offs_tpu)
 
     # fast_mode=True is critical here; it uses the backward pass to check
     # instead of building the full massive numerical Jacobian matrix.
@@ -123,6 +125,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("Gradient test passed.")
 
   def test_gradient_manual(self):
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Compares analytical gradients to those from manual reference implementation."""
     device = self.accelerator_device
     num_groups = 4
@@ -147,7 +150,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     lhs.grad.zero_()
     rhs.grad.zero_()
     offs_tpu = torch.cumsum(group_sizes, dim=0).to(device)
-    actual_out = gmm.grouped_matrix_multiply(lhs, rhs, offs_tpu)
+    actual_out = gmm_mod.grouped_matrix_multiply(lhs, rhs, offs_tpu)
     loss_actual = actual_out.sum()
     loss_actual.backward()
 
@@ -161,6 +164,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("Manual gradient comparison passed.")
 
   def test_empty_groups(self):
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Ensures the kernel appropriately handles empty expert groups within a batch."""
     device = self.accelerator_device
     # Expert 1 has data, Expert 2 is empty, Expert 3 has data, Expert 4 is empty
@@ -174,12 +178,13 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
 
     expected_out = manual_gmm_reference(lhs, rhs, group_sizes)
     offs_tpu = torch.cumsum(group_sizes, dim=0).to(device)
-    actual_out = gmm.grouped_matrix_multiply(lhs, rhs, offs_tpu)
+    actual_out = gmm_mod.grouped_matrix_multiply(lhs, rhs, offs_tpu)
 
     torch.testing.assert_close(actual_out, expected_out)
     logging.info("Zero-size group test passed.")
 
   def test_jagged_unpadded_offsets(self):
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Verifies that the Pallas kernel securely handles unaligned, jagged offsets natively.
 
     This test proves that the JAX Pallas Megablox engine mathematically bounds
@@ -222,7 +227,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
     # 1. Run custom Pallas TPU GMM kernel
-    gmm_out = gmm.grouped_matrix_multiply(x, w, offs)
+    gmm_out = gmm_mod.grouped_matrix_multiply(x, w, offs)
 
     # 2. Compute the exact theoretical output via PyTorch reference
     group_sizes = num_tokens_per_expert

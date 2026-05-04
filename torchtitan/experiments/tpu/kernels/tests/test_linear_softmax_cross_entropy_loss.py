@@ -21,7 +21,6 @@ from absl.testing import parameterized
 import torch
 from torchtitan.components import loss
 from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss
 
 
 class LinearSoftmaxCrossEntropyLossTest(
@@ -74,6 +73,7 @@ class LinearSoftmaxCrossEntropyLossTest(
     x_flat = x_tpu.view(-1, h)
     labels_flat = labels_tpu.view(-1)
 
+    from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss
     actual_out = (
         linear_softmax_cross_entropy_loss.linear_softmax_cross_entropy_loss(
             x_flat,
@@ -144,6 +144,7 @@ class LinearSoftmaxCrossEntropyLossTest(
 
     # TPU Pallas
     def run_custom(x, l, w):
+      from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss
       return (
           linear_softmax_cross_entropy_loss.linear_softmax_cross_entropy_loss(
               x,

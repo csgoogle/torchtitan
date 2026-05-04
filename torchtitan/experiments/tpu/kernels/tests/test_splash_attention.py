@@ -9,7 +9,6 @@ import torch
 from torch.nn import attention
 import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
 
 
 class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
@@ -22,6 +21,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
   """
 
   def check_forward_parity(
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
       self,
       splash_fn: Callable[
           [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
@@ -58,6 +58,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_mha_parity(self):
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     splash_fn = functools.partial(splash_sdpa, is_causal=True, enable_gqa=False)
     self.check_forward_parity(
         splash_fn=splash_fn,
@@ -69,6 +70,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_mqa_parity(self):
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     splash_fn = functools.partial(splash_sdpa, is_causal=True, enable_gqa=True)
     self.check_forward_parity(
         splash_fn=splash_fn,
@@ -80,6 +82,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_mqa_parity_one_kv_head(self):
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     splash_fn = functools.partial(splash_sdpa, is_causal=True, enable_gqa=True)
     self.check_forward_parity(
         splash_fn=splash_fn,
@@ -91,6 +94,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_block_sizes_parity(self):
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     splash_fn = functools.partial(
         splash_sdpa,
         is_causal=True,
@@ -109,6 +113,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_mha_backward(self):
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     """Gradients from splash attention backward match reference SDPA."""
     device = self.accelerator_device
     b, n_heads, seq_len, head_dim = 2, 8, 128, 64
@@ -169,6 +174,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("MHA backward test passed.")
 
   def test_mqa_backward(self):
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     """Gradients from splash GQA backward match reference SDPA."""
     device = self.accelerator_device
     b, n_heads, n_kv_heads, seq_len, head_dim = 2, 8, 2, 128, 64

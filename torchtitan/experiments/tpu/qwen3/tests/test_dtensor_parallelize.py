@@ -9,10 +9,6 @@ from torchtitan.experiments.tpu.base_distributed_device_test import InputDistrib
 from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu import test_utils
 
-import torchtitan.experiments.tpu.qwen3
-
-from torchtitan.models.qwen3.infra import parallelize as qwen3_dtensor_parallelize
-
 from torchtitan.models.qwen3.model.args import Qwen3ModelArgs
 from torchtitan.models.qwen3.model import model as qwen3_model
 
@@ -62,6 +58,8 @@ def _verify_dtensor_qwen3_non_moe_tp_forward_worker(
     device: torch.device, rank: int, world_size: int
 ):
   """Verifies numerical equivalence of forward pass of Qwen3 model with DTensor TP."""
+  import torchtitan.experiments.tpu.qwen3
+  from torchtitan.models.qwen3.infra import parallelize as qwen3_dtensor_parallelize
 
   def apply_tp_wrapper(model):
     tp_mesh = DeviceMesh(device_type=device.type, mesh=torch.arange(world_size))
@@ -91,6 +89,8 @@ def _verify_dtensor_qwen3_tp_backward_worker(
     device: torch.device, rank: int, world_size: int
 ):
   """Worker function to run forward andbackward pass on model after apply_tp is called."""
+  import torchtitan.experiments.tpu.qwen3
+  from torchtitan.models.qwen3.infra import parallelize as qwen3_dtensor_parallelize
 
   def apply_tp_wrapper(model):
     tp_mesh = DeviceMesh(device_type=device.type, mesh=torch.arange(world_size))
@@ -124,6 +124,8 @@ def _verify_dtensor_qwen3_fsdp_training_loop_worker(
     world_size: int,
 ):
   """Worker function to call the FSDP numerical equivalence helper on Qwen3 model."""
+  import torchtitan.experiments.tpu.qwen3
+  from torchtitan.models.qwen3.infra import parallelize as qwen3_dtensor_parallelize
 
   def apply_fsdp_wrapper(model):
     dp_mesh = DeviceMesh(device_type=device.type, mesh=torch.arange(world_size))

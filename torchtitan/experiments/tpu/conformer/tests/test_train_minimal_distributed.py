@@ -4,7 +4,6 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
 from torchtitan.experiments.tpu import base_distributed_device_test
-from torchtitan.experiments.tpu.conformer import train_minimal as conformer_train_minimal
 
 
 
@@ -57,6 +56,7 @@ class TrainMinimalDistributedTest(
     if extra_args:
       config_args.extend(extra_args)
 
+    import torchtitan.experiments.tpu.conformer.train_minimal as conformer_train_minimal
     self._test_train_distributed(
         config_args=config_args,
         tensor_parallel_degree=tensor_parallel_degree,
