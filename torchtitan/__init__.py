@@ -5,9 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 from importlib.metadata import version
+import os
+if not os.environ.get('PYTEST_CURRENT_TEST'):
+    import torchtitan.components.quantization
 
 # Import to register quantization modules.
-import torchtitan.components.quantization  # noqa: F401
+# import torchtitan.components.quantization  # noqa: F401
 
 try:
     __version__ = version("torchtitan")

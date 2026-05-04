@@ -15,8 +15,6 @@ from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu.base_distributed_device_test import InputDistribution
 from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu import test_utils
-from torchtitan.models.llama3.infra import parallelize as llama3_dtensor_parallelize
-from torchtitan.models.llama3.model import model as llama3_model
 
 
 
@@ -46,8 +44,9 @@ MODEL_N_HEADS = 8
 
 def _get_llama3_model_args(
     vocab_size=128, dim=MODEL_DIM, n_layers=1, n_heads=MODEL_N_HEADS, multiple_of=16,
-) -> llama3_model.TransformerModelArgs:
+):
   """Returns model arguments for Llama3 model for testing."""
+  from torchtitan.models.llama3.model import model as llama3_model
   return llama3_model.TransformerModelArgs(
       dim=dim,
       n_layers=n_layers,
@@ -63,6 +62,8 @@ def _verify_dtensor_llama3_tp_forward_worker(
     device: torch.device, rank: int, world_size: int
 ):
   """Verifies numerical equivalence of forward pass of Llama3 model with DTensor TP."""
+  from torchtitan.models.llama3.infra import parallelize as llama3_dtensor_parallelize
+  from torchtitan.models.llama3.model import model as llama3_model
 
   # Apply TP wrapper
   def apply_tp_wrapper(model):
@@ -94,6 +95,8 @@ def _verify_dtensor_llama3_tp_backward_worker(
     device: torch.device, rank: int, world_size: int
 ):
   """Worker function to run forward and backward pass on model after apply_tp is called."""
+  from torchtitan.models.llama3.infra import parallelize as llama3_dtensor_parallelize
+  from torchtitan.models.llama3.model import model as llama3_model
 
   # Apply TP wrapper
   def apply_tp_wrapper(model):
@@ -129,6 +132,8 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
     device: torch.device, rank: int, world_size: int
 ):
   """Worker function to verify FSDP numerical equivalence on Llama3 model."""
+  from torchtitan.models.llama3.infra import parallelize as llama3_dtensor_parallelize
+  from torchtitan.models.llama3.model import model as llama3_model
 
   # Apply FSDP wrapper
   def apply_fsdp_wrapper(model):

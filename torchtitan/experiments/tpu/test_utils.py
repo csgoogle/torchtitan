@@ -13,10 +13,10 @@ from torchtitan.experiments.tpu import accelerator_device_type as device_type
 
 _DEVICE = flags.DEFINE_enum_class(
     "device",
-    None,  # Default value
+    device_type.AcceleratorDeviceType.TPU,  # Default value
     device_type.AcceleratorDeviceType,
     help="Accelerator to test.",
-    required=True,
+    required=False,
 )
 
 _NUM_DEVICES = flags.DEFINE_integer(

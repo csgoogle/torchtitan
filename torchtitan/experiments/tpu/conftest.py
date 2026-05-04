@@ -12,13 +12,13 @@ def _mock_entry_points(*args, **kwargs):
     if isinstance(eps, dict):
         res = dict(eps)
         if 'torch.backends' in res:
-            res['torch.backends'] = [ep for ep in res['torch.backends'] if getattr(ep, 'name', '') != 'torch_tpu']
+            res['torch.backends'] = [ep for ep in res['torch.backends'] if getattr(ep, 'name', '') not in ('torch_tpu', 'tpu')]
         try:
             return type(eps)(res)
         except Exception:
             return res
-    if isinstance(eps, (list, tuple)):
-        filtered = [ep for ep in eps if not (getattr(ep, 'group', '') == 'torch.backends' and getattr(ep, 'name', '') == 'torch_tpu')]
+    if hasattr(eps, 'select') or isinstance(eps, (list, tuple)):
+        filtered = [ep for ep in eps if not (getattr(ep, 'group', '') == 'torch.backends' and getattr(ep, 'name', '') in ('torch_tpu', 'tpu') )]
         try:
             return type(eps)(filtered)
         except Exception:
@@ -29,7 +29,6 @@ importlib.metadata.entry_points = _mock_entry_points
 
 def pytest_configure(config):
     try:
-        import torchtitan.experiments.tpu.test_utils
         from absl import flags
         # Inject --device=tpu if not present
         if not any(arg.startswith("--device") for arg in sys.argv):
@@ -40,7 +39,11 @@ def pytest_configure(config):
             if arg.startswith("--device") or arg.startswith("--num_devices") or arg.startswith("--test_random_seed"):
                 absl_args.append(arg)
         flags.FLAGS(absl_args, known_only=True)
-    except Exception:
+        import torchtitan.experiments.tpu.test_utils
+        sys.argv = ['pytest'] + sys.argv[1:]
+        flags.FLAGS(sys.argv, known_only=True)
+        flags.FLAGS.mark_as_parsed()
+    except ImportError:
         pass
 
 def pytest_collection_modifyitems(config, items):
