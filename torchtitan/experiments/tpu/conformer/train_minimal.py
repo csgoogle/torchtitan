@@ -1,7 +1,7 @@
 r"""Conformer minimal training script using torchtitan infra.
 
 Example:
-  torchrun --nproc_per_node=1 \
+  torchrun --nproc_per_node=4 \
   -m torchtitan.experiments.tpu.conformer.train_minimal \
   --job.config_file=torchtitan/experiments/tpu/conformer/train_configs/conformer.toml \
   --model.name=conformer_tpu \
@@ -109,6 +109,19 @@ def start_trainer(job_config: JobConfig) -> None:
     job_config.maybe_log()
 
   device = tpu_utils.get_device()
+
+  if world_size == 1 and device.type == "tpu":
+    from torch_tpu._internal.device._device_module import TpuDeviceModule
+
+    if not TpuDeviceModule.is_initialized():
+      logger.info("Initializing PjRt runtime for single chip.")
+      try:
+        TpuDeviceModule._init_runtime_options()
+      except RuntimeError as e:
+        if "PrivateUse1HooksInterface only could be registered once" in str(e):
+          logger.warning("PjRt hooks already registered, ignoring error.")
+        else:
+          raise
 
   if world_size > 1:
     dist_utils.init_distributed(
@@ -227,9 +240,16 @@ def start_trainer(job_config: JobConfig) -> None:
     logger.info("Materializing model on CPU for CPU offloading")
     model = model.to_empty(device="cpu")
 
-  if world_size > 1:
+  model_compile_enabled = (
+      job_config.compile.enable and "model" in job_config.compile.components
+  )
+  if world_size > 1 or model_compile_enabled:
     if train_spec.parallelize_fn is not None:
-      train_spec.parallelize_fn(model, parallel_dims, job_config)
+      compiled_model = train_spec.parallelize_fn(
+          model, parallel_dims, job_config
+      )
+      if compiled_model is not None:
+        model = compiled_model
     else:
       logger.warning("No parallelize_fn provided in TrainSpec.")
 
@@ -338,7 +358,18 @@ def start_trainer(job_config: JobConfig) -> None:
       batch = next(data_iterator)
       metrics_processor.data_loading_times.append(time.perf_counter() - t0)
 
-      inputs = batch[0]["input"].to(device)
+      if parallel_dims.fsdp_enabled or (
+          isinstance(job_config, TPUJobConfig)
+          and job_config.tpu_config.use_simple_fsdp
+      ):
+        compute_dtype = TORCH_DTYPE_MAP[
+            job_config.training.mixed_precision_param
+        ]
+        inputs = batch[0]["input"].to(device, dtype=compute_dtype)
+      else:
+        inputs = batch[0]["input"].to(
+            device, dtype=next(model.parameters()).dtype
+        )
       targets = batch[1].to(device)
 
       with jax_profiler.TraceAnnotation("train", step_num=step):

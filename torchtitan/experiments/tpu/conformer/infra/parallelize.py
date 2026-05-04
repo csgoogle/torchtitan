@@ -1,12 +1,56 @@
 """Parallelization utilities for Conformer on TPU."""
 
-from torch import nn
+import enum
+import torch
 from torch.distributed import fsdp
+from torch.distributed._composable import replicate
+import torch.nn as nn
 import torchtitan.config
 import torchtitan.distributed
+from torchtitan.experiments.simple_fsdp import simple_fsdp
 from torchtitan.experiments.tpu import tpu_job_config
 import torchtitan.experiments.tpu.utils as tpu_utils
-from torchtitan.tools.logging import logger
+from torchtitan.tools import logging
+
+
+class ParallelStrategy(enum.Enum):
+  # FSDP
+  FSDP2 = enum.auto()
+  SIMPLEFSDP = enum.auto()
+  # DDP
+  DDP = enum.auto()
+  DDP_W_FSDP2 = enum.auto()  # FSDP2 with replicate mode
+  DDP_W_SIMPLEFSDP = enum.auto()  # SimpleFSDP with replicate mode
+  # No parallelism
+  NONE = enum.auto()
+
+
+def _determine_parallel_strategy(
+    parallel_dims: torchtitan.distributed.ParallelDims,
+    job_config: torchtitan.config.JobConfig | tpu_job_config.TPUJobConfig,
+) -> ParallelStrategy:
+  """Determine parallel strategy based on config."""
+  fsdp_enabled = parallel_dims.fsdp_enabled
+  ddp_enabled = parallel_dims.dp_replicate_enabled
+
+  use_simple = False
+  amp = True
+
+  if isinstance(job_config, tpu_job_config.TPUJobConfig):
+    use_simple = job_config.tpu_config.use_simple_fsdp
+    amp = job_config.tpu_config.enable_amp
+
+  if fsdp_enabled:
+    return ParallelStrategy.SIMPLEFSDP if use_simple else ParallelStrategy.FSDP2
+
+  if ddp_enabled:
+    if use_simple:
+      return ParallelStrategy.DDP_W_SIMPLEFSDP
+    if amp:
+      return ParallelStrategy.DDP_W_FSDP2
+    return ParallelStrategy.DDP
+
+  return ParallelStrategy.NONE
 
 
 def parallelize_conformer(
@@ -23,8 +67,14 @@ def parallelize_conformer(
   if job_config.activation_checkpoint.mode != "none":
     apply_ac(model)
 
-  # Resolve DeviceMesh and mode based on active dimensions
-  if parallel_dims.fsdp_enabled:
+  strategy = _determine_parallel_strategy(parallel_dims, job_config)
+  logging.logger.info(f"Using parallel strategy: {strategy}")
+
+  if strategy == ParallelStrategy.NONE:
+    return model
+
+  # Resolve DeviceMesh and mode based on strategy
+  if strategy in (ParallelStrategy.FSDP2, ParallelStrategy.SIMPLEFSDP):
     if parallel_dims.dp_replicate_enabled:
       dp_mesh = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
       reshard = not parallel_dims.pp_enabled
@@ -33,7 +83,11 @@ def parallelize_conformer(
       dp_mesh = parallel_dims.get_mesh(["fsdp"])
       reshard = not parallel_dims.pp_enabled
       dp_mode = "fully_shard"
-  elif parallel_dims.dp_replicate_enabled:
+  elif strategy in (
+      ParallelStrategy.DDP,
+      ParallelStrategy.DDP_W_FSDP2,
+      ParallelStrategy.DDP_W_SIMPLEFSDP,
+  ):
     dp_mesh = parallel_dims.get_mesh("dp_replicate")
     reshard = False
     dp_mode = "replicate"
@@ -65,7 +119,86 @@ def parallelize_conformer(
   else:
     encoder = model
 
-  # Shard each individual Conformer layer
+  # Apply compilation if enabled
+  model_compile_enabled = (
+      job_config.compile.enable and "model" in job_config.compile.components
+  )
+  compile_mode = "layer"
+  if isinstance(job_config, tpu_job_config.TPUJobConfig):
+    compile_mode = job_config.tpu_config.compile_mode
+
+  if model_compile_enabled:
+    model = apply_compile(model, job_config)
+
+  if strategy == ParallelStrategy.DDP:
+    logging.logger.info("Applying Native DDP (replicate) to the model")
+    replicate.replicate(model, device_mesh=dp_mesh, bucket_cap_mb=100)
+    return model
+
+  if strategy in (
+      ParallelStrategy.SIMPLEFSDP,
+      ParallelStrategy.DDP_W_SIMPLEFSDP,
+  ):
+    mp_policy = None
+    if enable_amp:
+      mp_policy = simple_fsdp.MixedPrecisionPolicy(
+          param_dtype=torchtitan.config.TORCH_DTYPE_MAP[
+              job_config.training.mixed_precision_param
+          ],
+          reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[
+              job_config.training.mixed_precision_reduce
+          ],
+      )
+    model = simple_fsdp.data_parallel(
+        model,
+        dp_mesh,
+        mode=dp_mode,
+        mp_policy=mp_policy,
+    )
+    logging.logger.info(f"Applied Simple FSDP (dp mode={dp_mode}) to the model")
+    return model
+
+  # Shard each individual Conformer layer (only if not compiling whole model)
+  if not (model_compile_enabled and compile_mode == "whole"):
+    if hasattr(encoder, "layers"):
+      layers = encoder.layers
+    elif hasattr(encoder, "conformer_layers"):
+      layers = encoder.conformer_layers
+    else:
+      layers = None
+
+    if layers is not None:
+      logging.logger.info(f"Sharding Conformer layers (FSDP, mode={dp_mode}).")
+      for layer in layers.children():
+        fsdp.fully_shard(layer, **fsdp_config, reshard_after_forward=reshard)
+    else:
+      logging.logger.warning("No layers found to shard.")
+
+    # Shard the full model (if it's a separate module)
+    if encoder is not model:
+      fsdp.fully_shard(encoder, **fsdp_config, reshard_after_forward=reshard)
+
+  # Shard the outer wrapper (which is the compiled model if whole compiled)
+  fsdp.fully_shard(model, **fsdp_config)
+
+  logging.logger.info("Applied FSDP to the model")
+
+  return model
+
+
+def apply_compile(
+    model: nn.Module, job_config: torchtitan.config.JobConfig
+) -> nn.Module:
+  """Apply torch.compile to layers or whole model."""
+  compile_mode = "layer"
+  if isinstance(job_config, tpu_job_config.TPUJobConfig):
+    compile_mode = job_config.tpu_config.compile_mode
+
+  if hasattr(model, "model"):
+    encoder = model.model
+  else:
+    encoder = model
+
   if hasattr(encoder, "layers"):
     layers = encoder.layers
   elif hasattr(encoder, "conformer_layers"):
@@ -73,28 +206,45 @@ def parallelize_conformer(
   else:
     layers = None
 
-  if layers is not None:
-    logger.info(f"Sharding Conformer layers (FSDP, mode={dp_mode}).")
-    for layer in layers.children():
-      fsdp.fully_shard(layer, **fsdp_config, reshard_after_forward=reshard)
+  if compile_mode == "whole":
+    if hasattr(model, "model"):
+      logging.logger.info("Applying torch.compile to Whole Model (via model.model).")
+      model.model = torch.compile(
+          encoder,
+          backend=job_config.compile.backend,
+          fullgraph=True,
+          dynamic=False,
+      )
+      return model
+    else:
+      logging.logger.info("Applying torch.compile to Whole Model.")
+      return torch.compile(
+          model,
+          backend=job_config.compile.backend,
+          fullgraph=True,
+          dynamic=False,
+      )
+  elif compile_mode == "layer" and layers is not None:
+    logging.logger.info("Applying torch.compile to Conformer layers.")
+    for layer_id, layer in layers.named_children():
+      compiled = torch.compile(
+          layer,
+          backend=job_config.compile.backend,
+          fullgraph=True,
+          dynamic=False,
+      )
+      layers.register_module(layer_id, compiled)
+    return model
   else:
-    logger.warning("No layers found to shard.")
-
-  # Shard the full model (if it's a separate module)
-  if encoder is not model:
-    fsdp.fully_shard(encoder, **fsdp_config, reshard_after_forward=reshard)
-
-  # Shard the outer wrapper
-  fsdp.fully_shard(model, **fsdp_config)
-
-  logger.info("Applied FSDP to the model")
-
-  return model
+    logging.logger.warning(
+        f"Compile mode {compile_mode} not supported or no layers found."
+    )
+    return model
 
 
 def apply_ac(model: nn.Module) -> None:
   """Apply activation checkpointing."""
-  logger.info("Applying activation checkpointing to Conformer layers.")
+  logging.logger.info("Applying activation checkpointing to Conformer layers.")
 
   if hasattr(model, "model"):
     encoder = model.model
@@ -115,4 +265,4 @@ def apply_ac(model: nn.Module) -> None:
       )
       layers.register_module(layer_id, wrapped_layer)
   else:
-    logger.warning("No layers found to apply AC.")
+    logging.logger.warning("No layers found to apply AC.")

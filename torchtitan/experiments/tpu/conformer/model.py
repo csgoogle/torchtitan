@@ -81,18 +81,19 @@ class PatchedMHA(nn.Module):
       average_attn_weights=True,
       is_causal=False,
   ):
-    bsz, tgt_len, embed_dim = query.shape
+    bsz, tgt_len, _ = query.shape
     qkv = self.in_proj(query)
     q, k, v = qkv.chunk(3, dim=-1)
 
-    q = q.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
-    k = k.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
-    v = v.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
-
     if self.use_splash:
-      # splash_sdpa does not take dropout_p!
+      q = q.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+      k = k.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+      v = v.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
       attn_output = splash_sdpa(q, k, v, is_causal=is_causal)
     else:
+      q = q.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
+      k = k.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
+      v = v.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
       attn_output = torch.nn.functional.scaled_dot_product_attention(
           q,
           k,
@@ -102,7 +103,7 @@ class PatchedMHA(nn.Module):
           is_causal=is_causal,
       )
 
-    attn_output = attn_output.transpose(1, 2).reshape(bsz, tgt_len, embed_dim)
+    attn_output = attn_output.transpose(1, 2).contiguous().flatten(start_dim=-2)
     attn_output = self.out_proj(attn_output)
     return attn_output, None
 
@@ -228,7 +229,9 @@ class Conformer(ModelProtocol):
             local_tensor = (
                 param.to_local() if hasattr(param, "to_local") else param
             )
-            local_tensor.uniform_(-bound, bound)
+            cpu_tensor = torch.empty_like(local_tensor, device="cpu")
+            cpu_tensor.uniform_(-bound, bound)
+            local_tensor.copy_(cpu_tensor)
         elif isinstance(module, nn.Conv1d):
           fan_in = module.in_channels * module.kernel_size[0]
           bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
@@ -236,7 +239,9 @@ class Conformer(ModelProtocol):
             local_tensor = (
                 param.to_local() if hasattr(param, "to_local") else param
             )
-            local_tensor.uniform_(-bound, bound)
+            cpu_tensor = torch.empty_like(local_tensor, device="cpu")
+            cpu_tensor.uniform_(-bound, bound)
+            local_tensor.copy_(cpu_tensor)
         elif isinstance(module, (nn.BatchNorm1d, nn.GroupNorm, nn.LayerNorm)):
           if module.weight is not None:
             local_tensor = (

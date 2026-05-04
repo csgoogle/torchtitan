@@ -13,7 +13,7 @@ save_memory_snapshot_folder = "memory_snapshot"
 [training]
 dataset = "random"
 steps = 40
-local_batch_size = 32
+local_batch_size = 512
 seq_len = 512
 dtype = "float32"
 mixed_precision_param = "bfloat16"
@@ -34,8 +34,8 @@ warmup_steps = 5
 log_freq = 5
 
 [parallelism]
-data_parallel_replicate_degree = -1
-data_parallel_shard_degree = 1
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = -1
 tensor_parallel_degree = 1
 pipeline_parallel_degree = 1
 context_parallel_degree = 1
@@ -49,3 +49,10 @@ use_ctc_loss = false
 
 [splash_attention_kernel]
 use_splash_attention_kernel = false
+
+[activation_checkpoint]
+mode = "full"
+
+[compile]
+enable = false
+backend = "tpu"
