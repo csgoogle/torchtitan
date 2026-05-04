@@ -21,7 +21,6 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
   """
 
   def check_forward_parity(
-    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
       self,
       splash_fn: Callable[
           [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
@@ -32,6 +31,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
       seq_len: int,
       head_dim: int,
   ):
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     device = self.accelerator_device
 
     # Generates inputs on cpu and moves to tpu.
@@ -115,6 +115,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
   def test_mha_backward(self):
     from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     """Gradients from splash attention backward match reference SDPA."""
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     device = self.accelerator_device
     b, n_heads, seq_len, head_dim = 2, 8, 128, 64
 
@@ -176,6 +177,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
   def test_mqa_backward(self):
     from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     """Gradients from splash GQA backward match reference SDPA."""
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
     device = self.accelerator_device
     b, n_heads, n_kv_heads, seq_len, head_dim = 2, 8, 2, 128, 64
     n_rep = n_heads // n_kv_heads

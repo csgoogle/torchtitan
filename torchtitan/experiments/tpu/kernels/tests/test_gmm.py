@@ -30,8 +30,8 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
   """Tests for grouped_matrix_multiply."""
 
   def test_manual_gmm_reference_parity(self):
-    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Verifies that the TPU kernel output matches manual reference implementation."""
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     device = self.accelerator_device
     num_groups = 8
     k, n = 128, 128
@@ -69,8 +69,8 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("Parity test passed.")
 
   def test_torch_grouped_mm_parity(self):
-    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Verifies the custom kernel output against F.grouped_mm."""
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
 
     device = self.accelerator_device
     num_groups = 4
@@ -97,8 +97,8 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("F.grouped_mm parity test passed.")
 
   def test_gradient(self):
-    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Checks gradients numerically using torch.autograd.gradcheck."""
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     device = self.accelerator_device
     # Keep it at the minimum aligned size (128)
     num_groups = 1
@@ -125,8 +125,8 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("Gradient test passed.")
 
   def test_gradient_manual(self):
-    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Compares analytical gradients to those from manual reference implementation."""
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     device = self.accelerator_device
     num_groups = 4
     k, n = 128, 128
@@ -164,8 +164,8 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("Manual gradient comparison passed.")
 
   def test_empty_groups(self):
-    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Ensures the kernel appropriately handles empty expert groups within a batch."""
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     device = self.accelerator_device
     # Expert 1 has data, Expert 2 is empty, Expert 3 has data, Expert 4 is empty
     # Total M must still be multiple of 128 (256 here)
@@ -184,7 +184,6 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     logging.info("Zero-size group test passed.")
 
   def test_jagged_unpadded_offsets(self):
-    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     """Verifies that the Pallas kernel securely handles unaligned, jagged offsets natively.
 
     This test proves that the JAX Pallas Megablox engine mathematically bounds
@@ -193,6 +192,7 @@ class GMMTest(base_device_test.BaseAcceleratorDeviceTest):
     may blow up, therefore custom fill_indices kernel should be used in tandem
     with GMM.
     """
+    from torchtitan.experiments.tpu.kernels import gmm as gmm_mod
     device = self.accelerator_device
     logging.info(f"Running on device: {device}")
 

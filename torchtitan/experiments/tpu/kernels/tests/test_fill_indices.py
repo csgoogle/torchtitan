@@ -52,8 +52,8 @@ class TestFillIndices(base_device_test.BaseAcceleratorDeviceTest):
     self.wo = (torch.cumsum(m_sizes, 0) - m_sizes).to(torch.int32)
 
   def test_parity(self):
-    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     """Test functionality matches the CPU reference on default config."""
+    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     device = self.accelerator_device
     tpeg_tpu = self.tpeg.to(device)
     siv_tpu = self.siv.to(device)
@@ -73,8 +73,8 @@ class TestFillIndices(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_truncation(self):
-    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     """Tests functionality when written offsets exceed max sequence length."""
+    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     device = self.accelerator_device
     ml_short = 10
     tpeg_tpu = self.tpeg.to(device)
@@ -96,8 +96,8 @@ class TestFillIndices(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(res_tpu_cpu.size(0), ml_short)
 
   def test_empty(self):
-    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     """Tests functionality with empty uninitialized input arrays."""
+    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     device = self.accelerator_device
     tpeg_empty = torch.zeros_like(self.tpeg)
     siv_empty = torch.zeros_like(self.siv)
@@ -121,8 +121,8 @@ class TestFillIndices(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_random_config(self):
-    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     """Tests functionality on randomly initialized tensor configurations."""
+    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     device = self.accelerator_device
     torch.manual_seed(42)
     epr = 16
@@ -148,8 +148,8 @@ class TestFillIndices(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_real_4_experts_config(self):
-    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     """Tests real configuration logged from Qwen3 with 4 experts."""
+    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     device = self.accelerator_device
     tpeg = torch.tensor([512, 512, 512, 512], dtype=torch.int32)
     siv = torch.tensor([0, 512, 1024, 1536], dtype=torch.int32)
@@ -172,8 +172,8 @@ class TestFillIndices(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_real_16_experts_config(self):
-    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     """Tests real configuration logged from Qwen3 with 16 experts."""
+    from torchtitan.experiments.tpu.kernels.fill_indices import fill_indices
     device = self.accelerator_device
     tpeg = torch.tensor([
         297, 215, 297, 215, 297, 215, 297, 215, 297, 215, 297, 215, 297, 215, 297, 215
