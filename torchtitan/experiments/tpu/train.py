@@ -8,6 +8,7 @@
 
 import argparse
 import contextlib
+import functools
 import json
 import tempfile
 from typing import List, Optional, Sequence, Tuple
@@ -23,6 +24,7 @@ from torchtitan.tools.logging import init_logger, logger
 import torchtitan.train
 
 from torchtitan.experiments.tpu import gmain
+from torchtitan.experiments.tpu import profiler_workaround
 from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.redacted  # trigger model registration
@@ -129,17 +131,9 @@ def start_trainer(config: tpu_job_config_module.TPUJobConfig):
     )
     config.optimizer.implementation = "foreach"
 
-  if hasattr(config, "tpu_config"):
-    if config.tpu_config.use_jax_profiler:
-      from torchtitan.experiments.tpu import jax_profiling
-
-      logger.info(
-          "JAX profiler enabled by config, patching"
-          " torchtitan.train.maybe_enable_profiling..."
-      )
-      torchtitan.train.maybe_enable_profiling = (
-          jax_profiling.maybe_enable_profiling
-      )
+  torchtitan.train.maybe_enable_profiling = functools.partial(
+      profiler_workaround.maybe_enable_profiling, job_config=config
+  )
 
   trainer: Optional[torchtitan.train.Trainer] = None
   if config.model.name == "flux":
