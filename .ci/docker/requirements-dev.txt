@@ -1,6 +1,8 @@
 expecttest==0.1.6
 pytest==7.3.2
 pytest-cov
+pytest-forked
+absl-py
 pre-commit
 pyrefly==0.45.1
 tomli-w >= 1.1.0

@@ -62,7 +62,7 @@ _extra_train_specs: dict[str, TrainSpec] = {}
 def register_train_spec(name: str, train_spec: TrainSpec) -> None:
     global _extra_train_specs
     if name in _extra_train_specs:
-        raise ValueError(f"TrainSpec {name} is already registered.")
+        return
 
     # user can define a TrainSpec from outside of torchtitan
     _extra_train_specs[name] = train_spec
