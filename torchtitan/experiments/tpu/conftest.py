@@ -29,6 +29,7 @@ importlib.metadata.entry_points = _mock_entry_points
 
 def pytest_configure(config):
     try:
+        import torchtitan.experiments.tpu.test_utils
         from absl import flags
         # Inject --device=tpu if not present
         if not any(arg.startswith("--device") for arg in sys.argv):
@@ -39,7 +40,7 @@ def pytest_configure(config):
             if arg.startswith("--device") or arg.startswith("--num_devices") or arg.startswith("--test_random_seed"):
                 absl_args.append(arg)
         flags.FLAGS(absl_args, known_only=True)
-    except ImportError:
+    except Exception:
         pass
 
 def pytest_collection_modifyitems(config, items):
