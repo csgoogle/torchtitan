@@ -9,6 +9,8 @@ from torchtitan.experiments.tpu.base_distributed_device_test import InputDistrib
 from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu import test_utils
 
+import torchtitan.experiments.tpu.qwen3
+
 from torchtitan.models.qwen3.infra import parallelize as qwen3_dtensor_parallelize
 
 from torchtitan.models.qwen3.model.args import Qwen3ModelArgs
