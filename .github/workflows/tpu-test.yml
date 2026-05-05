@@ -47,36 +47,6 @@ jobs:
           set -e
           ulimit -n 65536
 
-          # --- Core Distributed Tests ---
-          python -m torchtitan.experiments.tpu.tests.test_train_distributed --device=tpu
-          python -m torchtitan.experiments.tpu.tests.test_model_distributed --device=tpu
-          python -m torchtitan.experiments.tpu.tests.test_train_minimal_distributed --device=tpu
-          python -m torchtitan.experiments.tpu.redacted.tests.test_train_minimal_distributed --device=tpu
-          python -m torchtitan.experiments.tpu.tests.test_dtensor --device=tpu
-
-          # Temporarily disabled: requires newer version of libtpu
-          # python -m torchtitan.experiments.tpu.tests.test_checkpoint_verification --device=tpu
-
-          # --- Kernel Tests ---
-          python -m torchtitan.experiments.tpu.kernels.tests.test_splash_attention --device=tpu
-          python -m torchtitan.experiments.tpu.kernels.tests.test_linear_softmax_cross_entropy_loss --device=tpu
-          python -m torchtitan.experiments.tpu.kernels.tests.test_gmm --device=tpu
-          python -m torchtitan.experiments.tpu.kernels.tests.test_fill_indices --device=tpu
-
-          # --- Model Specific Tests: Qwen3 ---
-          python -m torchtitan.experiments.tpu.qwen3.tests.test_qwen3 --device=tpu
-          python -m torchtitan.experiments.tpu.qwen3.tests.test_dtensor_parallelize --device=tpu
-
-          # --- Model Specific Tests: Llama3 ---
-          python -m torchtitan.experiments.tpu.llama3.tests.test_llama3 --device=tpu
-          python -m torchtitan.experiments.tpu.llama3.tests.test_dtensor_parallelize --device=tpu
-          python -m torchtitan.experiments.tpu.llama3.tests.test_llama3_workarounds --device=tpu
-
-          # --- Model Specific Tests: redacted ---
-          python -m torchtitan.experiments.tpu.redacted.tests.test_simple_fsdp --device=tpu
-          python -m torchtitan.experiments.tpu.redacted.tests.test_dtensor_parallelize --device=tpu
-          python -m torchtitan.experiments.tpu.redacted.tests.test_kernels --device=tpu
-
-          # --- Model Specific Tests: DeepSeek V3 ---
-          python -m torchtitan.experiments.tpu.deepseek_v3.tests.test_deepseek_v3 --device=tpu
-          python -m torchtitan.experiments.tpu.deepseek_v3.tests.test_dtensor_parallelize --device=tpu
+          # Run all TPU tests using pytest
+          # Temporarily ignoring test_checkpoint_verification.py as it requires a newer version of libtpu
+          pytest torchtitan/experiments/tpu --device=tpu --ignore=torchtitan/experiments/tpu/tests/test_checkpoint_verification.py
