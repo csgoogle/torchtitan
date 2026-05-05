@@ -55,7 +55,12 @@ def use_splash_attention_patch(
 
   def _splash_forward(
       self, q, k, v, *, scale=None, enable_gqa=False, is_causal=True):
-    """Replace ScaledDotProductAttentionWrapper.forward with splash_sdpa."""
+    """Replace ScaledDotProductAttentionWrapper.forward with splash_sdpa.
+
+    Reads ``sliding_window_size`` from the patched module if set; otherwise
+    behaves as before (causal or full mask depending on ``is_causal``). Most
+    torchtitan wrappers don't expose this attribute → defaults to None.
+    """
 
     # Prevent torch.compile failures by ensuring tensors are contiguous for the
     # custom Pallas kernel, which doesn't handle arbitrary strides. This is a
@@ -63,6 +68,8 @@ def use_splash_attention_patch(
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
+
+    local_window_size = getattr(self, "sliding_window_size", None)
 
     kwargs = _get_kwargs(
         block_q=block_q,
@@ -85,6 +92,7 @@ def use_splash_attention_patch(
         v,
         scale=scale,
         is_causal=is_causal,
+        local_window_size=local_window_size,
         enable_gqa=enable_gqa,
         **kwargs,
     )
@@ -99,6 +107,17 @@ def use_splash_attention_patch(
     k/v heads before SDPA. This wrapper mimics [redacted]'s GQA handling,
     transposes inputs to (B, H, S, D) for splash_sdpa, and transposes
     the output back to (B, S, H, D).
+
+    For mixed local/global attention models (e.g. REDACTED PT MoE with
+    ``attention_layer_pattern=[local_rope, local_rope, local_rope, global_nope]``
+    and ``local_attention_window_size=N``), reads
+    ``self.sliding_window_size`` per-layer:
+      * None  → full causal (CausalMask) — same as before, identical to the
+                old redacted path where every layer is global causal.
+      * int N → causal sliding-window (LocalMask with window_size=(N, 0)).
+                The splash kernel's per-window cache means each unique window
+                size compiles its own kernel; mixing windowed and non-windowed
+                layers in one model is supported.
     """
     query, key, value = self._maybe_tile_qkv_for_gqa(query, key, value)
     # Transpose from (B, S, H, D) to (B, H, S, D).
@@ -112,6 +131,12 @@ def use_splash_attention_patch(
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
+
+    # Per-layer mask selection. [redacted]'s ScaledDotProductAttention sets
+    # `sliding_window_size` from the layer config (None for global, int for
+    # local). Models without local layers don't set the attribute at all;
+    # default to None ⇒ same behavior as before this change.
+    local_window_size = getattr(self, "sliding_window_size", None)
 
     call_kwargs = _get_kwargs(
         block_q=block_q,
@@ -135,14 +160,20 @@ def use_splash_attention_patch(
         value,
         scale=scale,
         is_causal=True,
+        local_window_size=local_window_size,
         enable_gqa=False,
         **call_kwargs,
     )
     # Transpose back to match [redacted]'s expected layout
     return out.transpose(-3, -2).contiguous()
 
-  # Patch all attention modules in the model
+  # Patch all attention modules in the model. For [redacted] modules, also note
+  # whether each layer has a local sliding-window — useful for mixed
+  # local/global models (REDACTED PT MoE) so the kernel cache shows the expected
+  # mix of CausalMask and LocalMask compiled ops.
   _patched = 0
+  _windowed = 0
+  _causal = 0
   for _, module in model.named_modules():
     cls_name = type(module).__name__
     if "ScaledDotProductAttentionWrapper" in cls_name:
@@ -151,10 +182,15 @@ def use_splash_attention_patch(
     elif cls_name == "ScaledDotProductAttention":
       module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
       _patched += 1
+      if getattr(module, "sliding_window_size", None) is not None:
+        _windowed += 1
+      else:
+        _causal += 1
 
   logger.info(
-      "Splash attention ENABLED: patched %d attention modules",
-      _patched)
+      "Splash attention ENABLED: patched %d attention modules "
+      "(causal=%d, sliding-window=%d)",
+      _patched, _causal, _windowed)
 
 
 class PallasLossLinear(nn.Module):

@@ -30,6 +30,7 @@ def _make_splash_attention_fn(
     n_heads: int,
     n_kv_heads: int,
     is_causal: bool = True,
+    local_window_size: int | None = None,
     block_q: int = 512,
     block_kv: int = 512,
     block_kv_compute: int = 512,
@@ -81,7 +82,19 @@ def _make_splash_attention_fn(
   )
 
   mask_shape = (seq_len, seq_len)
-  if is_causal:
+  if local_window_size is not None:
+    # Sliding-window causal: each q attends to the previous local_window_size
+    # keys plus itself. window_size=(left, right); right=0 ⇒ no future tokens
+    # (still causal), offset=0 ⇒ q starts at kv start. The LocalMask is more
+    # specific than CausalMask so the splash kernel skips the off-window
+    # blocks entirely. With local_window_size >= seq_len-1, this is
+    # equivalent to a CausalMask (every token attends to every prior token).
+    single_mask = splash_attention_mask.LocalMask(
+        shape=mask_shape,
+        window_size=(local_window_size, 0),
+        offset=0,
+    )
+  elif is_causal:
     single_mask = splash_attention_mask.CausalMask(shape=mask_shape)
   else:
     single_mask = splash_attention_mask.FullMask(mask_shape)
@@ -335,6 +348,7 @@ def splash_sdpa(
     *,
     scale: Optional[float] = None,
     is_causal: bool = True,
+    local_window_size: Optional[int] = None,
     enable_gqa: bool = False,  # Kept for API compatibility
     block_q: int = 512,
     block_kv: int = 512,
@@ -400,6 +414,7 @@ def splash_sdpa(
       n_heads=n_heads,
       n_kv_heads=n_kv_heads,
       is_causal=is_causal,
+      local_window_size=local_window_size,
       block_q=block_q,
       block_kv=block_kv,
       block_kv_compute=block_kv_compute,
