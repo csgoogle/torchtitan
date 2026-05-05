@@ -173,10 +173,32 @@ P = jax.sharding.PartitionSpec
 logger = torchtitan.tools.logging.logger
 
 
+def _maybe_init_jax_distributed():
+  """Initialise JAX's multi-host runtime when running under a multi-host
+  launcher (GKE/XPK, etc.). No-op on single-host."""
+  hostnames = os.environ.get('TPU_WORKER_HOSTNAMES')
+  if not hostnames:
+    return
+  hosts = hostnames.split(',')
+  if len(hosts) <= 1:
+    return
+  process_id = int(os.environ.get('TPU_WORKER_ID', '0'))
+  coordinator = f"{hosts[0]}:8476"
+  logger.info(
+      'Initialising jax.distributed: num_processes=%d process_id=%d coordinator=%s',
+      len(hosts), process_id, coordinator,
+  )
+  jax.distributed.initialize(
+      coordinator_address=coordinator,
+      num_processes=len(hosts),
+      process_id=process_id,
+  )
+
 
 def main_train_loop(job_config: Any):
   """Main training loop for torchax."""
   torchtitan.tools.logging.init_logger()
+  _maybe_init_jax_distributed()  # multi-host JAX init (no-op on single-host)
   assert job_config.torchax_config.use_torchax, 'use_torchax must be True'
 
   torchax.enable_globally()

@@ -8,7 +8,9 @@ import jax
 import optax
 import torch
 import torchax
+import torch_xla2.train
 from torchtitan.components.dataloader import DataloaderExhaustedError
+from torchtitan.experiments.torchax import redacted as torchax_redacted
 from torchtitan.experiments.torchax import redacted as torchax_redacted
 from torchtitan.experiments.torchax import data_utils
 from torchtitan.experiments.torchax import deepseek_v3 as torchax_dsv3
@@ -19,6 +21,64 @@ from torchtitan.experiments.torchax import llama3 as torchax_llama3
 from torchtitan.experiments.torchax import moe_utils
 from torchtitan.experiments.torchax import qwen3 as torchax_qwen3
 import torchtitan.tools.logging
+from [redacted]._ops.segment_matmul import interface as redacted_segment_matmul_interface
+from [redacted].layers import functional as redacted_functional
+
+_original_segment_matmul = redacted_segment_matmul_interface.segment_matmul
+
+
+# Custom JAX-compatible implementation of [redacted]'s segment_matmul to avoid ConcretizationTypeError
+def _custom_segment_matmul_jax(segmented_input, group_sizes, weight):
+  env = torchax.default_env()
+  if (
+      hasattr(segmented_input, "jax")
+      and hasattr(group_sizes, "jax")
+      and hasattr(weight, "jax")
+  ):
+    X = segmented_input.jax()  # [T, B, D_IN]
+    G = group_sizes.jax()  # [T, E]
+    W = weight.jax()  # [T, E, D_IN, D_OUT]
+
+    T = X.shape[0]
+    TotalTokens = X.shape[1]
+    E = G.shape[1]
+
+    borders = jax.numpy.cumsum(G, axis=-1)  # [T, E]
+    token_indices = jax.numpy.arange(TotalTokens)  # [TotalTokens]
+
+    if E > 1:
+      # Broadcasted comparison to find expert_ids per token
+      expert_ids = jax.numpy.sum(
+          token_indices[None, :, None] >= borders[:, None, :-1], axis=-1
+      )  # [T, TotalTokens]
+    else:
+      expert_ids = jax.numpy.zeros((T, TotalTokens), dtype=jax.numpy.int32)
+
+    track_indices = jax.numpy.arange(T)[:, None]  # [T, 1]
+    gathered_weights = W[
+        track_indices, expert_ids, :, :
+    ]  # [T, TotalTokens, D_IN, D_OUT]
+
+    # Batched matmul via einsum
+    res_jax = jax.numpy.einsum("tbi,tbio->tbo", X, gathered_weights)
+
+    return env.j2t_iso(res_jax)
+  else:
+    return _original_segment_matmul(segmented_input, group_sizes, weight)
+
+
+# Custom override for take_along_dim to support int32 indices on TPU
+def _custom_take_along_dim(input_tensor, indices, dim, out=None):
+  env = torchax.default_env()
+  if hasattr(input_tensor, "jax") and hasattr(indices, "jax"):
+    input_jax = input_tensor.jax()
+    indices_jax = indices.jax()
+    res_jax = jax.numpy.take_along_axis(input_jax, indices_jax, axis=dim)
+    return env.j2t_iso(res_jax)
+  else:
+    with torchax.disable_temporarily():
+      return torch.take_along_dim(input_tensor, indices, dim, out=out)
+
 
 
 P = jax.sharding.PartitionSpec
@@ -34,6 +94,11 @@ def is_moe_model(job_config) -> bool:
   if job_config.model.name == 'llama3':
     return False
   elif job_config.model.name == 'redacted':
+    return False
+  elif job_config.model.name == 'redacted':
+    # We use the model's own get_nparams_and_flops via the simple branch;
+    # bypassing the moe_utils path which doesn't know about [redacted]'s MoE
+    # parameter naming convention.
     return False
   elif job_config.model.name == 'qwen3':
     # Naming convention for qwen3 moe model seems to be xB-AyB,
@@ -56,6 +121,11 @@ class TorchaxTrainer:
       num_global_devices: int,
       num_local_devices: int,
   ):
+    torchax.default_env().override_op_definition(
+        torch.take_along_dim, _custom_take_along_dim
+    )
+    redacted_segment_matmul_interface.segment_matmul = _custom_segment_matmul_jax
+    redacted_functional.segment_matmul = _custom_segment_matmul_jax
 
     self.mesh = mesh
     self.parallel_dims = parallel_dims
@@ -130,6 +200,8 @@ class TorchaxTrainer:
       torchax_model = torchax_qwen3
     elif job_config.model.name == 'deepseek_v3':
       torchax_model = torchax_dsv3
+    elif job_config.model.name == 'redacted':
+      torchax_model = torchax_redacted
     elif job_config.model.name == 'redacted':
       torchax_model = torchax_redacted
     else:
@@ -218,6 +290,10 @@ class TorchaxTrainer:
         embedding_constants = precompute_freqs_cis(model_args)
         embedding_constants_key = 'freqs_cis'
       elif job_config.model.name == 'redacted':
+        embedding_constants = None
+        embedding_constants_key = None
+      elif job_config.model.name == 'redacted':
+        # REDACTED PT MoE handles RoPE internally; no precomputed embedding constants needed.
         embedding_constants = None
         embedding_constants_key = None
       else:
