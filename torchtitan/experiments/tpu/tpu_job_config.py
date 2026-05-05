@@ -64,6 +64,7 @@ class LoRAConfig:
 @dataclasses.dataclass
 class SplashAttentionKernelConfig:
   use_splash_attention_kernel: bool = False
+  use_vmap_bwd: bool = False
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512

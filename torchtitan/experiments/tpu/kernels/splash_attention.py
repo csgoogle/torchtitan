@@ -16,6 +16,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ma
 from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_kernel import QKVLayout
 import jax.numpy as jnp
 import torch
+
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
 
@@ -41,6 +42,7 @@ def _make_splash_attention_fn(
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
+    use_vmap_bwd: bool = False,
 ):
   """Create JAX splash attention forward and backward functions.
 
@@ -200,10 +202,11 @@ def _make_splash_attention_fn(
   def splash_bwd_fn(q, k, v, out, logsumexp, g):
     """Backward: uses saved (out, logsumexp) — no extra forward pass.
 
-    Uses jax.lax.scan over the batch dimension so that the XLA backward program
-    is sized for one element at a time (small static buffers).  This avoids the
-    O(batch) growth in XLA program size that jax.vmap produces, allowing
-    larger batch sizes to fit in HBM.
+    Supports both `jax.vmap` and `jax.lax.scan` over the batch dimension.
+    By default, it uses `jax.lax.scan` to be memory safe, sizing the XLA
+    backward program for one element at a time to avoid O(batch) growth in
+    program size. `jax.vmap` can be enabled for better throughput but may
+    hit memory limits for large batches.
 
     Args:
       q: Query tensor.
@@ -217,11 +220,16 @@ def _make_splash_attention_fn(
     scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
     q_scaled = q * scale
 
-    _, (dq_scaled, dk, dv) = jax.lax.scan(
-        _scan_bwd_body,
-        None,
-        (q_scaled, k, v, out, logsumexp, g),
-    )
+    if use_vmap_bwd:
+      dq_scaled, dk, dv = jax.vmap(_single_bwd)(
+          q_scaled, k, v, out, logsumexp, g
+      )
+    else:
+      _, (dq_scaled, dk, dv) = jax.lax.scan(
+          _scan_bwd_body,
+          None,
+          (q_scaled, k, v, out, logsumexp, g),
+      )
     # Chain rule: q_scaled = q * scale  =>  dq = dq_scaled * scale
     dq = dq_scaled * scale
     return dq, dk, dv
@@ -338,6 +346,7 @@ def splash_sdpa(
     block_q_dq: Optional[int] = None,
     block_kv_dq: Optional[int] = None,
     use_fused_bwd_kernel: bool = True,
+    use_vmap_bwd: bool = False,
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
@@ -349,9 +358,28 @@ def splash_sdpa(
   the pallas backward kernel directly — no extra forward pass at backward time.
 
   Args:
+    q: Query tensor.
+    k: Key tensor.
+    v: Value tensor.
+    scale: Scale factor for attention logits.
+    is_causal: Whether to apply causal mask.
+    enable_gqa: Kept for API compatibility.
+    block_q: Block size for Q.
+    block_kv: Block size for KV.
     block_dkv: Block size for the dk/dv backward kernel tiles. Smaller values
       reduce the XLA program size (enabling larger batch sizes) at a small
       efficiency cost. Default 512 matches block_kv; use 256 for large batches.
+    block_kv_compute: Block size for KV compute.
+    block_q_dkv: Block size for Q in DKV.
+    block_kv_dkv: Block size for KV in DKV.
+    block_kv_dkv_compute: Block size for KV compute in DKV.
+    block_q_dq: Block size for Q in DQ.
+    block_kv_dq: Block size for KV in DQ.
+    use_fused_bwd_kernel: Whether to use fused backward kernel.
+    use_vmap_bwd: Whether to use vmap in backward pass. Default False (uses scan for memory safety).
+    q_layout: Layout for Q.
+    k_layout: Layout for K.
+    v_layout: Layout for V.
   """
 
   block_q = int(os.environ.get("SPLASH_BLOCK_Q", block_q))
@@ -381,6 +409,7 @@ def splash_sdpa(
       block_q_dq=block_q_dq,
       block_kv_dq=block_kv_dq,
       use_fused_bwd_kernel=use_fused_bwd_kernel,
+      use_vmap_bwd=use_vmap_bwd,
       q_layout=q_layout,
       k_layout=k_layout,
       v_layout=v_layout,

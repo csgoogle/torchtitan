@@ -21,6 +21,7 @@ class ConformerModelArgs(BaseModelArgs):
   kernel_size: int = 31
   max_seq_len: int = 2048  # Added to match train_minimal expectations
   use_splash: bool = False
+  use_vmap_bwd: bool = False
 
   def update_from_config(self, job_config, **kwargs):
     # Update from job_config if needed
@@ -29,6 +30,9 @@ class ConformerModelArgs(BaseModelArgs):
     if isinstance(job_config, TPUJobConfig):
       self.use_splash = (
           job_config.splash_attention_kernel.use_splash_attention_kernel
+      )
+      self.use_vmap_bwd = (
+          job_config.splash_attention_kernel.use_vmap_bwd
       )
 
   def get_nparams_and_flops(
@@ -60,7 +64,7 @@ class TPUGLU(torch.nn.Module):
 # TPU Patch: PatchedMHA to force Flash Attention
 class PatchedMHA(nn.Module):
 
-  def __init__(self, embed_dim, num_heads, dropout=0.0, use_splash=False):
+  def __init__(self, embed_dim, num_heads, dropout=0.0, use_splash=False, use_vmap_bwd=False):
     super().__init__()
     self.embed_dim = embed_dim
     self.num_heads = num_heads
@@ -69,6 +73,7 @@ class PatchedMHA(nn.Module):
     self.in_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=True)
     self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
     self.use_splash = use_splash
+    self.use_vmap_bwd = use_vmap_bwd
 
   def forward(
       self,
@@ -89,7 +94,7 @@ class PatchedMHA(nn.Module):
       q = q.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
       k = k.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
       v = v.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-      attn_output = splash_sdpa(q, k, v, is_causal=is_causal)
+      attn_output = splash_sdpa(q, k, v, is_causal=is_causal, use_vmap_bwd=self.use_vmap_bwd)
     else:
       q = q.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
       k = k.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -166,13 +171,14 @@ class ConformerLayer(nn.Module):
       kernel_size=31,
       dropout_p=0.0,
       use_splash=False,
+      use_vmap_bwd=False,
   ):
     super().__init__()
     self.ffn1 = _FeedForwardModule(dim, ffn_dim, dropout_p)
     self.self_attn_layer_norm = nn.LayerNorm(dim, eps=1e-05)
     # Use PatchedMHA instead of nn.MultiheadAttention
     self.self_attn = PatchedMHA(
-        dim, num_heads, dropout=dropout_p, use_splash=use_splash
+        dim, num_heads, dropout=dropout_p, use_splash=use_splash, use_vmap_bwd=use_vmap_bwd
     )
     self.self_attn_dropout = nn.Dropout(p=dropout_p)
     self.conv_module = _ConvolutionModule(dim, kernel_size, dropout_p)
@@ -205,6 +211,7 @@ class Conformer(ModelProtocol):
             ffn_dim=4 * model_args.hidden_dim,
             kernel_size=model_args.kernel_size,
             use_splash=model_args.use_splash,
+            use_vmap_bwd=model_args.use_vmap_bwd,
         )
         for _ in range(model_args.num_layers)
     ])
