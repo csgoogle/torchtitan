@@ -27,6 +27,7 @@ class TPUConfig:
       "DEFER_NEVER",
       "DEFER_NEVER_AND_LAUNCH_BLOCKING",
   ] = ""
+  use_internal_xprof: bool = False
 
 
 @dataclasses.dataclass

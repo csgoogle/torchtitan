@@ -15,10 +15,17 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     import os
-    # Add project root to sys.path
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
+    # Add TPU dir and project root to sys.path
+    tpu_dir = os.path.abspath(os.path.dirname(__file__))
+    if tpu_dir not in sys.path:
+        sys.path.insert(0, tpu_dir)
+        
+    root_dir = os.path.abspath(os.path.join(tpu_dir, '../../..'))
     if root_dir not in sys.path:
-        sys.path.insert(0, root_dir)
+        sys.path.insert(1, root_dir)
+        
+    # Update PYTHONPATH so child processes spawned by multiprocessing get the same sys.path order
+    os.environ["PYTHONPATH"] = f"{tpu_dir}:{root_dir}:{os.environ.get('PYTHONPATH', '')}"
     
     # Parse absl flags
     device = config.getoption("--device")
