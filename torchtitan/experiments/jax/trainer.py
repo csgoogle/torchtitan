@@ -26,6 +26,7 @@ from torchtitan.experiments.jax import jax_profiling
 from torchtitan.experiments.jax import metrics as jax_metrics
 from torchtitan.experiments.jax import splash_attn
 from torchtitan.experiments.jax import redacted as jax_redacted
+from torchtitan.experiments.jax import redacted as jax_redacted
 from torchtitan.experiments.jax import llama3 as jax_llama3
 import torchtitan.tools.logging
 
@@ -127,27 +128,34 @@ class JaxTrainer:
             logger.warning('Using fake data loader.')
             return train_loader
 
-        # Real dataset via torchtitan's data pipeline.
-        # redacted registers its own train spec
-        # (via torchtitan.experiments.tpu.redacted) with the REDACTED tokenizer;
-        # fall back to llama3's spec for other models.
-        import torchtitan.protocols.train_spec as ts_mod
+        # Real dataset via torchtitan's data pipeline. We resolve the
+        # tokenizer + dataloader builders directly rather than going through a
+        # PyTorch-side TrainSpec — that import chain
+        # (``torchtitan.experiments.tpu.{redacted, redacted}``) drags in the
+        # torch_tpu / Pallas splash-attention path, which the JAX trainer does
+        # not use (it has its own ``experiments.jax.splash_attn``).
         model_name = job_config.model.name
-        if model_name == 'redacted':
-            # Import to trigger register_train_spec for redacted_tpu.
-            import torchtitan.experiments.tpu.redacted  # noqa: F401
-            train_spec = ts_mod.get_train_spec('redacted_tpu')
+        if model_name in ('redacted', 'redacted'):
+            from torchtitan.experiments.tpu.redacted.tokenizer import (
+                build_redacted as build_tokenizer_fn,
+            )
+            from torchtitan.hf_datasets.text_datasets import (
+                build_text_dataloader as build_dataloader_fn,
+            )
         else:
+            import torchtitan.protocols.train_spec as ts_mod
             train_spec = ts_mod.get_train_spec('llama3')
+            build_tokenizer_fn = train_spec.build_tokenizer_fn
+            build_dataloader_fn = train_spec.build_dataloader_fn
 
         tokenizer = (
-            train_spec.build_tokenizer_fn(job_config)
-            if train_spec.build_tokenizer_fn is not None
+            build_tokenizer_fn(job_config)
+            if build_tokenizer_fn is not None
             else None
         )
         original_local = job_config.training.local_batch_size
         job_config.training.local_batch_size = expected_global_batch_size
-        torch_loader = train_spec.build_dataloader_fn(
+        torch_loader = build_dataloader_fn(
             dp_world_size=1, dp_rank=0,
             tokenizer=tokenizer,
             job_config=job_config,
@@ -172,6 +180,12 @@ class JaxTrainer:
         elif model_name == 'redacted':
             jax_model_mod = jax_redacted
             layer_attr = 'num_layers'
+        elif model_name == 'redacted':
+            jax_model_mod = jax_redacted
+            # REDACTED PT MoE has both num_tracks and num_layers_per_track;
+            # the user-facing "layer count" knob is num_layers_per_track since
+            # num_tracks is normally fixed at 8 for the parallel-track design.
+            layer_attr = 'num_layers_per_track'
         else:
             raise ValueError(f'Unsupported model: {model_name}')
 
@@ -223,10 +237,24 @@ class JaxTrainer:
         devices = jax.devices()
         platform = devices[0].platform if devices else 'cpu'
         attn_fn = None
+        attn_fn_local = None  # only for redacted (mixed local/global mask)
         if platform == 'tpu' and jax_config.use_splash_attention_kernel:
-            attn_fn = splash_attn.make_splash_attention_fn(
-                self.mesh, jax_config
-            )
+            if model_name == 'redacted':
+                # redacted layers cycle ``local_rope`` × N + ``global_nope`` × 1
+                # (see attention_layer_pattern in args.py). Need TWO splash
+                # callables — one with CausalMask (global) and one with
+                # LocalMask (local-windowed-causal).
+                local_window = (
+                    getattr(model_args, 'local_attention_window_size', None) or 512
+                )
+                attn_fn = splash_attn.make_splash_attention_fn(self.mesh, jax_config)
+                attn_fn_local = splash_attn.make_splash_attention_fn(
+                    self.mesh, jax_config, local_window=local_window
+                )
+            else:
+                attn_fn = splash_attn.make_splash_attention_fn(
+                    self.mesh, jax_config
+                )
         elif platform == 'tpu':
             logger.info(
                 'Splash attention disabled via '
@@ -257,14 +285,25 @@ class JaxTrainer:
         # input that is not fully addressable". `local_devices('cpu')[0]`
         # is always host-local.
         with jax.default_device(jax.local_devices(backend='cpu')[0]):
-            model = jax_model_mod.Transformer(
-                model_args,
-                use_scan=use_scan,
-                attn_fn=attn_fn,
-                checkpoint_policy=checkpoint_policy,
-                param_dtype=param_dtype,
-                rngs=nnx.Rngs(0),
-            )
+            if model_name == 'redacted':
+                model = jax_redacted.Transformer(
+                    model_args,
+                    use_scan=use_scan,
+                    attn_fn=attn_fn,
+                    checkpoint_policy=checkpoint_policy,
+                    param_dtype=param_dtype,
+                    rngs=nnx.Rngs(0),
+                    attn_fn_local=attn_fn_local,
+                )
+            else:
+                model = jax_model_mod.Transformer(
+                    model_args,
+                    use_scan=use_scan,
+                    attn_fn=attn_fn,
+                    checkpoint_policy=checkpoint_policy,
+                    param_dtype=param_dtype,
+                    rngs=nnx.Rngs(0),
+                )
 
         # Extract state, apply sharding, merge back.
         graphdef, state = nnx.split(model)
