@@ -11,10 +11,11 @@ jobs:
     strategy:
       matrix:
         job_info: [
-          {
-            runner: "linux-x86-ct6e-180-8tpu",
-            bazel_config: "ci_tpu_on_v6",
-          },
+          # Temporarily disabling v6e tests as it is blocking torch_tpu queue
+          # {
+          #   runner: "linux-x86-ct6e-180-8tpu",
+          #   bazel_config: "ci_tpu_on_v6",
+          # },
           {
             runner: "linux-x86-tpu7x-224-4tpu",
             bazel_config: "ci_tpu_on_v7",
