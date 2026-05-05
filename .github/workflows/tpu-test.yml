@@ -41,6 +41,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install test dependencies
+        run: pip install pytest pytest-forked
+
       # 3. RUN TESTS DIRECTLY (The runner knows it is already inside the container)
       - name: Run torchtitan TPU Unit Tests
         run: |
@@ -49,4 +52,4 @@ jobs:
 
           # Run all TPU tests using pytest
           # Temporarily ignoring test_checkpoint_verification.py as it requires a newer version of libtpu
-          pytest torchtitan/experiments/tpu --device=tpu --ignore=torchtitan/experiments/tpu/tests/test_checkpoint_verification.py
+          python -m pytest torchtitan/experiments/tpu --device=tpu --ignore=torchtitan/experiments/tpu/tests/test_checkpoint_verification.py
