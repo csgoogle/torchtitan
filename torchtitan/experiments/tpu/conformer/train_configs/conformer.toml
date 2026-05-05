@@ -4,8 +4,8 @@ dump_folder = "./dump/conformer"
 [profiling]
 enable_profiling = false
 save_traces_folder = "profile_trace"
-profile_freq = 19
-profiler_active = 3
+profile_freq = 37
+profiler_active = 5
 enable_memory_snapshot = false
 save_memory_snapshot_folder = "memory_snapshot"
 
@@ -28,10 +28,10 @@ lr = 0.0001
 implementation = "foreach"
 
 [lr_scheduler]
-warmup_steps = 5
+warmup_steps = 10
 
 [metrics]
-log_freq = 5
+log_freq = 10
 
 [parallelism]
 data_parallel_replicate_degree = 1
@@ -56,3 +56,4 @@ mode = "full"
 [compile]
 enable = false
 backend = "tpu"
+components = "model"

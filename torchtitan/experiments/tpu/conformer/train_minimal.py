@@ -240,6 +240,27 @@ def start_trainer(job_config: JobConfig) -> None:
     logger.info("Materializing model on CPU for CPU offloading")
     model = model.to_empty(device="cpu")
 
+  use_simple_fsdp = (
+      isinstance(
+          job_config, torchtitan.experiments.tpu.tpu_job_config.TPUJobConfig
+      )
+      and job_config.tpu_config.use_simple_fsdp
+  )
+
+  if use_simple_fsdp:
+    # SimpleFSDP requires weights to be materialized and initialized BEFORE
+    # wrapping/parallelization. This is because SimpleFSDP replaces module
+    # parameters with properties, which breaks in-place initialization (like
+    # model.init_weights()) if called after wrapping.
+    logger.info(
+        "Moving model to device %s before parallelization (SimpleFSDP flow).",
+        device,
+    )
+    if not job_config.training.enable_cpu_offload:
+      model = model.to_empty(device=device)
+    with torch.no_grad():
+      model.init_weights()
+
   model_compile_enabled = (
       job_config.compile.enable and "model" in job_config.compile.components
   )
@@ -253,13 +274,20 @@ def start_trainer(job_config: JobConfig) -> None:
     else:
       logger.warning("No parallelize_fn provided in TrainSpec.")
 
-  loss_fn = None  # Handled in train_step
+  if not use_simple_fsdp:
+    # For FSDP2 and other strategies, we prefer to parallelize (and optionally
+    # compile) FIRST while the model is still on the meta device, and then
+    # materialize and initialize weights on the correct device afterwards.
+    logger.info(
+        "Moving model to device %s after parallelization (Standard flow).",
+        device,
+    )
+    if not job_config.training.enable_cpu_offload:
+      model = model.to_empty(device=device)
+    with torch.no_grad():
+      model.init_weights()
 
-  logger.info("Moving model to device %s", device)
-  if not job_config.training.enable_cpu_offload:
-    model = model.to_empty(device=device)
-  with torch.no_grad():
-    model.init_weights()
+  loss_fn = None  # Handled in train_step
 
   if not job_config.compile.enable and job_config.profiling.enable_profiling:
     model_annotator.wrap_model(model)
@@ -328,6 +356,7 @@ def start_trainer(job_config: JobConfig) -> None:
 
   import functools
   from torchtitan.experiments.tpu import profiler_workaround
+
   maybe_enable_profiling = functools.partial(
       profiler_workaround.maybe_enable_profiling, job_config=job_config
   )
