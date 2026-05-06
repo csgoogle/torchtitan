@@ -151,8 +151,6 @@ def _maybe_init_distributed_on_tpu_vm() -> bool:
   if world_size == 1:
     return False
 
-  if "LOCAL_RANK" not in os.environ:
-    return False
 
   logger.info("Trying to initialize distributed TPU training on TPU VM.")
   local_chips = local_tpu_device.get_local_chips()
