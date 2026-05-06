@@ -27,10 +27,8 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
-              # b/501466433 - Bug with torch.compile
+              # TODO: b/482057603 - Issue with mixing DTensor and Tensor.
               device_type.AcceleratorDeviceType.TPU,
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
       # redacted

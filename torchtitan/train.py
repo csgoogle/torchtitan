@@ -113,20 +113,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             gc_freq=job_config.training.gc_freq, debug=job_config.training.gc_debug
         )
 
-        # Set random seed, and maybe enable deterministic mode
-        # (mainly for debugging, expect perf loss).
-        # TODO: b/498659628 - Re-enable set_determinism on TPU once the hang is fixed.
-        if self.device.type == "tpu":
-            seed = job_config.debug.seed or 42
-            torch.manual_seed(seed)
-            logger.info(f"TPU training using manual seed: {seed}")
-        else:
-            dist_utils.set_determinism(
-                parallel_dims,
-                self.device,
-                job_config.debug,
-                distinct_seed_mesh_dims=["pp"],
-            )
+        dist_utils.set_determinism(
+            parallel_dims,
+            self.device,
+            job_config.debug,
+            distinct_seed_mesh_dims=["pp"],
+        )
         self.train_spec = train_spec_module.get_train_spec(job_config.model.name)
 
         # build tokenizer and dataloader

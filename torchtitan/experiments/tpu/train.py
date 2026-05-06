@@ -151,6 +151,13 @@ def start_trainer(config: tpu_job_config_module.TPUJobConfig):
   # simultaneously before any trainer code runs.
   if dist.is_initialized():
     dist.barrier()
+    
+  if config.debug.seed is None:
+    config.debug.seed = 42
+    logger.info(
+        f"Setting default seed {config.debug.seed} to avoid hang in set_determinism on TPU"
+    )
+
 
   try:
     trainer = trainer_cls(config)
