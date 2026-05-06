@@ -535,17 +535,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             assert len(model_parts) == 1
             with self.train_context():
                 with self.maybe_enable_amp:
-                    pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-                    # Compute loss sum (reduction='sum')
-                    loss_sum = self.loss_fn(pred, labels)
+                    with torch.autograd.profiler.record_function("torchtitan-forward"):
+                        pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+                        # Compute loss sum (reduction='sum')
+                        loss_sum = self.loss_fn(pred, labels)
 
-                    # Scale the loss by the inverse of the total weight denominator before backward
-                    # This ensures gradients are properly normalized across all microbatches
-                    loss = loss_sum / global_valid_tokens
+                        # Scale the loss by the inverse of the total weight denominator before backward
+                        # This ensures gradients are properly normalized across all microbatches
+                        loss = loss_sum / global_valid_tokens
 
                 # need to free pred before bwd to avoid peaking memory
                 del pred
-                loss.backward()
+                with torch.autograd.profiler.record_function("torchtitan-backward"):
+                    loss.backward()
 
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss

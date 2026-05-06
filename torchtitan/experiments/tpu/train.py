@@ -101,9 +101,10 @@ class TPUTrainer(torchtitan.train.Trainer):
 
     with self.train_context():
       with self.maybe_enable_amp:
-        pred = self.model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-        loss_sum = self.loss_fn(pred, labels)
-        loss = loss_sum / global_valid_tokens
+        with torch.autograd.profiler.record_function("tpu-forward"):
+          pred = self.model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+          loss_sum = self.loss_fn(pred, labels)
+          loss = loss_sum / global_valid_tokens
       del pred
 
       # Materialize the forward graph without waiting for execution to
@@ -112,7 +113,8 @@ class TPUTrainer(torchtitan.train.Trainer):
       # unaffected — loss.backward() can still propagate gradients.
       synchronize(loss, wait=False)
 
-      loss.backward()
+      with torch.autograd.profiler.record_function("tpu-backward"):
+        loss.backward()
 
     return loss
 
