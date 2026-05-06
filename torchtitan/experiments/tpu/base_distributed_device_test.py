@@ -697,9 +697,6 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
     config.job.dump_folder = tempfile.gettempdir()
 
     utils.set_device_type(self.accelerator_device_type.value)
-    if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
-      # Construct the environment before spawning workers.
-      distributed_utils.maybe_init_distributed(self.num_devices)
 
     gdist.torchrun(start_trainer, nproc_per_node=self.num_devices)(config)
 

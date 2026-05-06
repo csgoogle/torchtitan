@@ -26,6 +26,12 @@ class TrainDistributedTest(
           config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+          skip_devices=[
+              # b/501466433 - Bug with torch.compile
+              device_type.AcceleratorDeviceType.TPU,
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
       ),
       # redacted
       dict(
