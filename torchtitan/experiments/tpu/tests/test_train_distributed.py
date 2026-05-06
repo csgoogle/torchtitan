@@ -26,6 +26,10 @@ class TrainDistributedTest(
           config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+          skip_devices=[
+              # b/510378879 - Hanging on Cloud VM.
+              device_type.AcceleratorDeviceType.TPU,
+          ],
       ),
       # redacted
       dict(
