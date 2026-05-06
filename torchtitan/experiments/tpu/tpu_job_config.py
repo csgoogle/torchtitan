@@ -39,6 +39,13 @@ class redactedConfig:
 
 
 @dataclasses.dataclass
+class redactedConfig:
+  use_chunked_loss: bool = False
+  enable_manual_ddp: bool = False
+  use_segment_matmul_kernel: bool = False
+
+
+@dataclasses.dataclass
 class ConformerConfig:
   use_ctc_loss: bool = False
 
@@ -95,6 +102,9 @@ class LossKernelConfig:
 class TPUJobConfig(torchtitan.config.JobConfig):
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
   redacted: redactedConfig = dataclasses.field(default_factory=redactedConfig)
+  redacted: redactedConfig = dataclasses.field(
+      default_factory=redactedConfig
+  )
   conformer: ConformerConfig = dataclasses.field(
       default_factory=ConformerConfig
   )
