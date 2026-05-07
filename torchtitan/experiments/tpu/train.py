@@ -152,6 +152,13 @@ def start_trainer(config: tpu_job_config_module.TPUJobConfig):
   if dist.is_initialized():
     dist.barrier()
 
+  # TODO: b/498659628 - Remove once hanging is fixed.
+  if config.debug.seed is None:
+    config.debug.seed = 42
+    logger.info(
+        f"Setting default seed {config.debug.seed} to avoid hang on TPU"
+    )
+
   try:
     trainer = trainer_cls(config)
     config.maybe_log()

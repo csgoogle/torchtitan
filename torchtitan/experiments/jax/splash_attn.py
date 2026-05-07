@@ -46,12 +46,19 @@ def build_splash_attention_callable(
     *,
     apply_shard_map: bool = True,
     attn_logits_soft_cap: float | None = None,
+    local_window: int | None = None,
 ):
     """Return a jitted, sharded splash-attention callable.
 
     Signature of the returned callable:
         attn_fn(query, key, value, segment_ids) -> jax.Array
     where tensors are [batch, n_heads, seq, head_dim].
+
+    When ``local_window`` is None the mask is full causal. When it is an int
+    ``W``, the mask is causal-with-sliding-window: each query at position q can
+    attend to keys at positions [q-W+1, q]. Models like REDACTED PT MoE that mix
+    local + global attention need separate callables (one per mask) by calling
+    ``make_splash_attention_fn`` twice.
     """
 
     def _wrap_flash_attention(query, key, value, segment_ids):
@@ -63,9 +70,21 @@ def build_splash_attention_callable(
                 'Sharding along sequence dimension not allowed in tpu kernel attention'
             )
         block_sizes = _build_block_sizes(config, query.shape, key.shape)
-        mask = splash_attention_mask.CausalMask(
-            shape=(query.shape[2], query.shape[2])
-        )
+        if local_window is not None:
+            # Causal local-window: each q at position p attends to keys in
+            # [p - local_window + 1, p]. Splash's LocalMask uses the
+            # ``window_size = (left, right)`` convention with offset=0:
+            # ``left = local_window - 1`` past tokens included on the left,
+            # ``right = 0`` no future tokens. ``shape = (S, S)``.
+            mask = splash_attention_mask.LocalMask(
+                shape=(query.shape[2], query.shape[2]),
+                window_size=(local_window - 1, 0),
+                offset=0,
+            )
+        else:
+            mask = splash_attention_mask.CausalMask(
+                shape=(query.shape[2], query.shape[2])
+            )
         multi_head_mask = splash_attention_mask.MultiHeadMask(
             masks=(mask,) * query.shape[1]
         )
@@ -90,7 +109,7 @@ def build_splash_attention_callable(
     return jax.jit(fn)
 
 
-def make_splash_attention_fn(mesh, jax_config):
+def make_splash_attention_fn(mesh, jax_config, *, local_window: int | None = None):
     """Build a splash-attention callable for the jax experiment.
 
     Returns ``None`` on failure (caller should fall back to default SDPA).
@@ -98,9 +117,12 @@ def make_splash_attention_fn(mesh, jax_config):
     try:
         q_sharding = P('fsdp', 'tp', None, None)
         attn_fn = build_splash_attention_callable(
-            mesh, q_sharding, jax_config, apply_shard_map=True
+            mesh, q_sharding, jax_config, apply_shard_map=True, local_window=local_window
         )
-        logger.info('Splash attention kernel enabled.')
+        if local_window is not None:
+            logger.info('Splash attention (local window=%d) enabled.', local_window)
+        else:
+            logger.info('Splash attention kernel enabled.')
         return attn_fn
     except Exception as e:
         logger.error(

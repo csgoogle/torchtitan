@@ -27,10 +27,8 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
-              # b/501466433 - Bug with torch.compile
+              # b/510378879 - Hanging on Cloud VM.
               device_type.AcceleratorDeviceType.TPU,
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
       # redacted
