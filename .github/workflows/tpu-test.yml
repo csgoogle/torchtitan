@@ -52,6 +52,9 @@ jobs:
           set -e
           ulimit -n 65536
 
+          # Install pytest in case it's not present in the container
+          python -m pip install pytest
+
           # Run all TPU tests using pytest
           # Temporarily disabled: requires newer version of libtpu
-          pytest torchtitan/experiments/tpu --ignore=torchtitan/experiments/tpu/tests/test_checkpoint_verification.py --device=tpu
+          python -m pytest torchtitan/experiments/tpu --ignore=torchtitan/experiments/tpu/tests/test_checkpoint_verification.py --device=tpu
