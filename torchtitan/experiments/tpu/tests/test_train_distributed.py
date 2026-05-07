@@ -27,7 +27,7 @@ class TrainDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
-              # TODO: b/482057603 - Issue with mixing DTensor and Tensor.
+              # b/510378879 - Hanging on Cloud VM.
               device_type.AcceleratorDeviceType.TPU,
           ],
       ),

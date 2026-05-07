@@ -40,6 +40,12 @@ class TestJaxDistributed(parameterized.TestCase):
           model_flavor="debugmodel",
           use_scan=False,
       ),
+      dict(
+          testcase_name="redacted_debug_no_scan",
+          model_name="redacted",
+          model_flavor="debugmodel",
+          use_scan=False,
+      ),
   ])
   def test_train_jax(self, model_name, model_flavor, use_scan):
     scan_flag = (
@@ -47,11 +53,14 @@ class TestJaxDistributed(parameterized.TestCase):
         if use_scan
         else "--jax_config.no_use_scan"
     )
+    layer_override = 1
+    if model_name == "redacted":
+        layer_override = 2
     args = [
         f"--model.name={model_name}",
         f"--model.flavor={model_flavor}",
         scan_flag,
-        "--jax_config.model_layer_override=1",
+        f"--jax_config.model_layer_override={layer_override}",
         "--training.dataset_path=tests/assets/c4_test",
         "--model.hf_assets_path=tests/assets/tokenizer",
         "--training.seq_len=128",
