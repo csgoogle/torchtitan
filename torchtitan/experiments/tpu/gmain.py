@@ -30,7 +30,7 @@ def _start_trainer(config: tpu_job_config_module.TPUJobConfig):
     eager_mode_enum = getattr(
         execution_mode.EagerMode, config.tpu_config.eager_mode
     )
-    with execution_mode.eager_mode(eager_mode_enum):
+    with execution_mode.set_eager_mode(eager_mode_enum):
       global_start_trainer_func(config)
   else:
     global_start_trainer_func(config)
