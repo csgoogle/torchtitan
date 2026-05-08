@@ -88,9 +88,8 @@ def _run_in_gdist_worker(
       )
     func(device, global_rank, world_size, *worker_args)
   elif accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
-    from torch_tpu import api  # pylint: disable=g-import-not-at-top
     if not dist.is_initialized() and run_init_process_group:
-      device = api.tpu_device()
+      device = torch.device("tpu")
 
       dist.init_process_group(
           backend="tpu_dist",
@@ -98,7 +97,7 @@ def _run_in_gdist_worker(
           world_size=world_size,
       )
     else:
-      device = api.tpu_device()
+      device = torch.device("tpu")
 
     func(device, global_rank, world_size, *worker_args)
   else:
@@ -143,8 +142,7 @@ def run_distributed(
   if num_devices == 1:
     _ensure_device_type_set(accelerator_device_type)
     if accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
-      from torch_tpu import api  # pylint: disable=g-import-not-at-top
-      accelerator_device = api.tpu_device()
+      accelerator_device = torch.device("tpu")
       logging.info("Using TPU device: %s", accelerator_device)
       func(accelerator_device, 0, 1, *worker_args)
     elif accelerator_device_type == device_type.AcceleratorDeviceType.CUDA:
