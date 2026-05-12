@@ -10,7 +10,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import _StridedShard, Replicate, Shard
 
-from torchtitan.protocols.model import BaseModelArgs
+from torchtitan.models.common.decoder import Decoder
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
 from torchtitan.tools.logging import logger
@@ -28,11 +28,11 @@ class MoEStateDictAdapter(StateDictAdapter):
 
     def __init__(
         self,
-        model_args: BaseModelArgs,
+        model_config: Decoder.Config,
         hf_assets_path: str | None,
     ):
-        super().__init__(model_args, hf_assets_path)
-        self.model_args = model_args
+        super().__init__(model_config, hf_assets_path)
+        self.model_config = model_config
         self.hf_assets_path = hf_assets_path
         # Store metadata for GroupedExperts <-> individual experts conversion
         self.grouped_expert_weight_placements = {}  # {titan_abstract_key: placements}
@@ -223,7 +223,7 @@ class MoEStateDictAdapter(StateDictAdapter):
                 # Strided shard on non-expert dim, keep in sub-mesh
                 sub_mesh_names.append(name)
                 sub_placements.append(
-                    # pyrefly: ignore [unexpected-positional-argument]
+                    # pyrefly: ignore [bad-argument-type, unexpected-positional-argument]
                     _StridedShard(placement.dim, placement.split_factor)
                 )
             else:
@@ -386,17 +386,21 @@ class MoEStateDictAdapter(StateDictAdapter):
 
 
 def get_dense_model_nparams_and_flops(
-    model_args: BaseModelArgs,
     model: nn.Module,
+    n_layers: int,
+    n_heads: int,
     head_dims: int,
     seq_len: int,
+    enable_weight_tying: bool = False,
 ) -> tuple[int, int]:
     """
     Args:
-        model_args: BaseModelArgs object containing model configuration parameters.
         model: nn.Module representing the model.
+        n_layers: The number of transformer layers.
+        n_heads: The number of attention heads.
         head_dims: The sum of qk and v head dimensions.
         seq_len: The sequence length in training configs.
+        enable_weight_tying: Whether weight tying is enabled.
 
     Returns:
         Tuple of (nparams, num_flops_per_token):
@@ -419,21 +423,20 @@ def get_dense_model_nparams_and_flops(
     # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
     # 4. we follow the convention and do not account for sparsity in causal attention
     num_flops_per_token = (
-        6 * (nparams - nparams_embedding)
-        # pyrefly: ignore [missing-attribute]
-        + 6 * model_args.n_layers * model_args.n_heads * head_dims * seq_len
+        6 * (nparams - nparams_embedding) + 6 * n_layers * n_heads * head_dims * seq_len
     )
 
     # If weight tying is enabled, subtract embedding parameters from total count
-    if hasattr(model_args, "enable_weight_tying") and model_args.enable_weight_tying:
+    if enable_weight_tying:
         nparams = nparams - nparams_embedding
 
     return nparams, num_flops_per_token
 
 
 def get_moe_model_nparams_and_flops(
-    model_args: BaseModelArgs,
+    model_config: Decoder.Config,
     model: nn.Module,
+    n_heads: int,
     head_dims: int,
     seq_len: int,
 ) -> tuple[int, int]:
@@ -441,8 +444,9 @@ def get_moe_model_nparams_and_flops(
     Calculate nparams and nflops for MoE models.
 
     Args:
-        model_args: BaseModelArgs object containing model configuration parameters including MoE settings.
+        model_config: Decoder.Config object containing model configuration parameters including MoE settings.
         model: nn.Module representing the MoE model.
+        n_heads: The number of attention heads.
         head_dims: The sum of qk and v head dimensions.
         seq_len: The sequence length in training configs.
 
@@ -473,12 +477,16 @@ def get_moe_model_nparams_and_flops(
 
     nparams_sparse = nparams_moe_router + nparams_shared_experts + nparams_experts
     nparams = nparams_dense + nparams_sparse
-    nparams_sparse_active = (
-        nparams_moe_router
-        + nparams_shared_experts
-        # pyrefly: ignore [missing-attribute]
-        + nparams_experts * model_args.moe_args.top_k // model_args.moe_args.num_experts
-    )
+
+    moe_config = next((l.moe for l in model_config.layers if l.moe is not None), None)
+    if moe_config is not None:
+        nparams_sparse_active = (
+            nparams_moe_router
+            + nparams_shared_experts
+            + nparams_experts * moe_config.router.top_k // moe_config.num_experts
+        )
+    else:
+        nparams_sparse_active = 0
 
     logger.info(
         f"Total parameter count: dense {nparams_dense:,}, "
@@ -487,12 +495,14 @@ def get_moe_model_nparams_and_flops(
 
     num_flops_per_token = (
         6 * (nparams_dense - nparams_embedding + nparams_sparse_active)
-        # pyrefly: ignore [missing-attribute]
-        + 6 * model_args.n_layers * model_args.n_heads * head_dims * seq_len
+        + 6 * len(model_config.layers) * n_heads * head_dims * seq_len
     )
 
     # If weight tying is enabled, subtract embedding parameters from total count
-    if hasattr(model_args, "enable_weight_tying") and model_args.enable_weight_tying:
+    if (
+        hasattr(model_config, "enable_weight_tying")
+        and model_config.enable_weight_tying
+    ):
         nparams = nparams - nparams_embedding
 
     return nparams, num_flops_per_token

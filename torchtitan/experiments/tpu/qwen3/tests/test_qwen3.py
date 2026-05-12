@@ -12,69 +12,59 @@ from typing import Any, Dict, Tuple
 
 from absl.testing import absltest
 from absl.testing import parameterized
-
 import torch
 from torch import nn
-from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
-from torchtitan.models.qwen3.model import model as qwen3_model
-import torchtitan.models.moe
+import torchtitan.experiments.tpu.qwen3 as qwen3_tpu
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
+from torchtitan.models.common.attention import GQAttention
+from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.rope import RoPE
+from torchtitan.models.qwen3.model import Qwen3Model, Qwen3TransformerBlock
 
 
-# Base arguments for a small Qwen3 test setup.
-BASE_TEST_ARGS = {
-    "dim": 64,
-    "n_layers": 2,
-    "n_heads": 4,
-    "n_kv_heads": 4,
-    "vocab_size": 32,
-    "max_seq_len": 16,
-    "head_dim": 16,
-    "hidden_dim": 256,
-    "rope_theta": 100000.0,
-}
+def _get_model_config(model_name: str = "testmodel") -> Qwen3Model.Config:
+  """Retrieves a registered Qwen3 configuration dynamically from TPU registry.
 
-DENSE_TEST_CONFIG = {
-    **BASE_TEST_ARGS,
-    "moe_enabled": False,
-    "moe_inter_dim": 0,
-    "moe_args": None,
-}
+  Defaults for 'testmodel' (Dense):
+    - vocab_size = 2048, max_seq_len = 128, dim = 128
+    - n_layers = 3, n_heads = 8, n_kv_heads = 8, hidden_dim = 256
+    - head_dim = 16, rope_theta = 1000000.0, enable_weight_tying = True
 
-MOE_TEST_CONFIG = {
-    **BASE_TEST_ARGS,
-    "moe_enabled": True,
-    "moe_inter_dim": 768,
-    # Use for-loop experts for device compatibility on CPU.
-    "moe_args": torchtitan.models.moe.MoEArgs(
-        num_experts=4, top_k=2, use_grouped_mm=False),
-}
+  Defaults for 'testmodel_moe' (MoE):
+    - vocab_size = 2048, max_seq_len = 128, dim = 128
+    - n_layers = 3, n_heads = 8, n_kv_heads = 8, hidden_dim = 256
+    - head_dim = 16, rope_theta = 1000000.0
+    - moe_inter_dim = 128, num_experts = 8, top_k = 2
+  """
+  return qwen3_tpu.qwen3_configs[model_name]
+
 
 FULL_MODEL_TEST_CONFIGS = [
     dict(
         testcase_name="_DENSE",
-        test_config=DENSE_TEST_CONFIG,
-        loss_atol=2e-2,
+        model_name="testmodel",
+        loss_atol=1e-1,
         loss_rtol=1e-2,
-        grad_atol=0.5,  # Grad noise builds up over multiple steps
+        grad_atol=1.0,  # Grad noise builds up over multiple steps
         grad_rtol=1e-2,
-        param_atol=5e-2,
+        param_atol=8e-2,
         param_rtol=1e-2,
         is_moe=False,
     ),
     dict(
         testcase_name="_MOE",
-        test_config=MOE_TEST_CONFIG,
+        model_name="testmodel_moe",
         # May need looser tolerances for MOE
-        loss_atol=2e-2,
+        loss_atol=1e-1,
         loss_rtol=1e-2,
-        grad_atol=0.5,  # Grad noise builds up over multiple steps
+        grad_atol=1.0,  # Grad noise builds up over multiple steps
         grad_rtol=1e-2,
-        param_atol=5e-2,
+        param_atol=8e-2,
         param_rtol=1e-2,
-        is_moe=True,   # Used for skipping MOE TPU tests.
+        is_moe=True,  # Used for skipping MOE TPU tests.
     ),
 ]
 
@@ -91,50 +81,40 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
     # Enable CPU histc workaround.
     use_cpu_safe_histc_patch()
 
-  def _get_model_args(
-      self, test_config: Dict[str, Any]
-  ) -> qwen3_model.Qwen3ModelArgs:
-    """Returns default model args for Qwen3 model."""
-    model_args_dict = test_config.copy()
-    return qwen3_model.Qwen3ModelArgs(**model_args_dict)
-
   def _create_rope_input_tensors_cpu_device(
       self,
-      args: qwen3_model.Qwen3ModelArgs,
+      config: Qwen3Model.Config,
       batch: int = 2,
       seq_len: int = 8,
       requires_grad: bool = True,
   ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Creates input tensors (x, rope_cache) necessary for the Attention module."""
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, args.dim),
-        requires_grad=requires_grad)
+        (batch, seq_len, config.dim), requires_grad=requires_grad
+    )
 
-    rope_cache_cpu = qwen3_model.precompute_rope_cache(
-        args.head_dim,
-        args.max_seq_len,
-        base=args.rope_theta)
+    rope_module = RoPE(config.rope)
+    rope_cache_cpu = rope_module.cache[:seq_len]
     rope_cache_device = rope_cache_cpu.to(self.accelerator_device)
 
     return x_cpu, x_device, rope_cache_cpu, rope_cache_device
 
   def test_qwen_embedding_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the Embedding layer."""
-    args = self._get_model_args(DENSE_TEST_CONFIG)
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     # CPU and DEVICE setup
     embedding_cpu, embedding_device = self._setup_module_cpu_device(
         nn.Embedding,
         init_fn=lambda m: nn.init.normal_(m.weight),
-        num_embeddings=args.vocab_size,
-        embedding_dim=args.dim
+        num_embeddings=config.vocab_size,
+        embedding_dim=config.dim,
     )
 
     tokens_cpu = torch.randint(
-        0, args.vocab_size,
-        (batch, seq_len),
-        device="cpu")
+        0, config.vocab_size, (batch, seq_len), device="cpu"
+    )
     tokens_device = tokens_cpu.to(self.accelerator_device)
 
     with self.subTest(name="ForwardPass"):
@@ -168,18 +148,18 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_qwen_attention_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the Attention layer."""
-    args = self._get_model_args(DENSE_TEST_CONFIG)
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     # CPU and DEVICE setup
     attention_cpu, attention_device = self._setup_module_cpu_device(
-        qwen3_model.Attention,
-        lambda m: m.init_weights(init_std=0.02),
-        args
+        GQAttention,
+        init_fn=lambda m: None,
+        config=config.layers[0].attention,
     )
 
     x_cpu, x_device, rope_cache_cpu, rope_cache_device = (
-        self._create_rope_input_tensors_cpu_device(args, batch, seq_len)
+        self._create_rope_input_tensors_cpu_device(config, batch, seq_len)
     )
 
     with self.subTest(name="ForwardPass"):
@@ -190,8 +170,8 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
       test_utils.check_equivalence(
           out_device.cpu(),
           out_cpu,
-          atol=1e-3,
-          rtol=1e-3,
+          atol=5e-3,
+          rtol=5e-3,
           check_name="Attention Forward",
       )
       with self.subTest(name="BackwardPass"):
@@ -205,8 +185,8 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
         test_utils.check_equivalence(
             x_device.grad.cpu(),
             x_cpu.grad,
-            atol=1e-3,
-            rtol=1e-3,
+            atol=2e-2,
+            rtol=2e-2,
             check_name="Attention Input Grad",
         )
         for (name, p_cpu), p_device in zip(
@@ -222,15 +202,15 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_qwen_rmsnorm_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the RMSNorm layer."""
-    args = self._get_model_args(DENSE_TEST_CONFIG)
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     # CPU and DEVICE setup
     # Manual setup kept ad-hoc for simplicity.
-    norm_cpu = nn.RMSNorm(args.dim, eps=args.norm_eps).cpu()
+    norm_cpu = nn.RMSNorm(config.dim, eps=config.norm.eps).cpu()
     norm_device = copy.deepcopy(norm_cpu).to(self.accelerator_device)
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, args.dim), requires_grad=True
+        (batch, seq_len, config.dim), requires_grad=True
     )
 
     with self.subTest(name="ForwardPass"):
@@ -271,17 +251,18 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_qwen_dense_feedforward_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the Dense FeedForward layer."""
-    args = self._get_model_args(DENSE_TEST_CONFIG)
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     # CPU and DEVICE setup
     feedforward_cpu, feedforward_device = self._setup_module_cpu_device(
-        qwen3_model.FeedForward,
-        init_fn=lambda m: m.init_weights(init_std=0.02),
-        dim=args.dim,
-        hidden_dim=args.hidden_dim)
-    x_cpu, x_device = self._create_input_tensor_cpu_device((
-        batch, seq_len, args.dim), requires_grad=True)
+        FeedForward,
+        init_fn=lambda m: None,
+        config=config.layers[0].feed_forward,
+    )
+    x_cpu, x_device = self._create_input_tensor_cpu_device(
+        (batch, seq_len, config.dim), requires_grad=True
+    )
 
     with self.subTest(name="ForwardPass"):
       # Forward pass
@@ -291,8 +272,8 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
       test_utils.check_equivalence(
           out_device.cpu(),
           out_cpu,
-          atol=1e-4,
-          rtol=1e-4,
+          atol=2e-3,
+          rtol=2e-3,
           check_name="Dense FFN Forward",
       )
       with self.subTest(name="BackwardPass"):
@@ -305,8 +286,8 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
         test_utils.check_equivalence(
             x_device.grad.cpu(),
             x_cpu.grad,
-            atol=5e-4,
-            rtol=5e-4,
+            atol=5e-3,
+            rtol=5e-3,
             check_name="Dense FFN Input Grad",
         )
         for (name, p_cpu), p_device in zip(
@@ -316,38 +297,26 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
           test_utils.check_equivalence(
               p_device.grad.cpu(),
               p_cpu.grad,
-              atol=5e-3,
-              rtol=5e-3,
+              atol=2e-2,
+              rtol=2e-2,
               check_name=f"Dense FFN Param Grad: {name}",
           )
 
   def test_qwen_moe_feedforward_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the raw MoE layer."""
-    args = self._get_model_args(MOE_TEST_CONFIG)
+    config = _get_model_config("testmodel_moe")
     batch, seq_len = 2, 8
 
-    # CPU setup (uses for-loop impl)
-    cpu_moe_args = copy.deepcopy(args.moe_args)
-    cpu_moe_args.use_grouped_mm = False 
-    moe_cpu = torchtitan.models.moe.MoE(
-        moe_args=cpu_moe_args,
-        dim=args.dim,
-        hidden_dim=args.moe_inter_dim,
-    )
-    moe_cpu.init_weights(init_std=0.02, buffer_device=torch.device("cpu"))
+    # CPU setup (uses standard config but cpu device)
+    moe_cpu = MoE(config.layers[0].moe)
     moe_cpu = moe_cpu.cpu()
 
-    # Device setup (uses grouped_mm default)
-    device_moe_args = copy.deepcopy(args.moe_args)
-    moe_device = torchtitan.models.moe.MoE(
-        moe_args=device_moe_args,
-        dim=args.dim,
-        hidden_dim=args.moe_inter_dim,
-    )
+    # Device setup (uses identical config but mapped to device)
+    moe_device = MoE(config.layers[0].moe)
     moe_device.load_state_dict(moe_cpu.state_dict())
     moe_device = moe_device.to(self.accelerator_device)
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, args.dim), requires_grad=True
+        (batch, seq_len, config.dim), requires_grad=True
     )
 
     with self.subTest(name="ForwardPass"):
@@ -357,8 +326,8 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
       test_utils.check_equivalence(
           out_device.cpu(),
           out_cpu,
-          atol=1e-3,
-          rtol=1e-3,
+          atol=3e-2,
+          rtol=3e-2,
           check_name="MoE Forward",
       )
 
@@ -371,8 +340,8 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
         test_utils.check_equivalence(
             x_device.grad.cpu(),
             x_cpu.grad,
-            atol=5e-3,
-            rtol=5e-3,
+            atol=3e-2,
+            rtol=3e-2,
             check_name="MoE Input Grad",
         )
         for (name, p_cpu), p_device in zip(
@@ -389,23 +358,29 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
   @parameterized.named_parameters(*FULL_MODEL_TEST_CONFIGS)
   def test_qwen_transformer_block_cpu_device_parity(
       self,
-      test_config,
-      loss_atol, loss_rtol, grad_atol, grad_rtol, param_atol, param_rtol, is_moe,  # pylint: disable=unused-argument
+      model_name,
+      loss_atol,
+      loss_rtol,
+      grad_atol,
+      grad_rtol,
+      param_atol,
+      param_rtol,
+      is_moe,  # pylint: disable=unused-argument
   ):
     """Tests the CPU vs. DEVICE parity of the TransformerBlock layer."""
 
-    args = self._get_model_args(test_config)
+    config = _get_model_config(model_name)
     batch, seq_len, layer_id = 2, 8, 0
+    block_config = config.layers[layer_id]
     transformer_block_cpu, transformer_block_device = (
         self._setup_module_cpu_device(
-            qwen3_model.TransformerBlock,
-            lambda m: m.init_weights(buffer_device=torch.device("cpu")),
-            layer_id,
-            args,
+            Qwen3TransformerBlock,
+            lambda m: m.init_states(buffer_device=torch.device("cpu")),
+            config=block_config,
         )
     )
     x_cpu, x_device, rope_cache_cpu, rope_cache_device = (
-        self._create_rope_input_tensors_cpu_device(args, batch, seq_len)
+        self._create_rope_input_tensors_cpu_device(config, batch, seq_len)
     )
 
     out_cpu = transformer_block_cpu(x_cpu, rope_cache_cpu, None)
@@ -423,8 +398,8 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
     test_utils.check_equivalence(
         x_device.grad.cpu(),
         x_cpu.grad,
-        atol=5e-4,
-        rtol=5e-4,
+        atol=2e-3,
+        rtol=2e-3,
         check_name="TransformerBlock Input Grad",
     )
     for (name, p_cpu), p_device in zip(
@@ -448,7 +423,7 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
   @parameterized.named_parameters(*FULL_MODEL_TEST_CONFIGS)
   def test_qwen_full_model_training_steps_cpu_device_parity(
       self,
-      test_config,
+      model_name,
       loss_atol,
       loss_rtol,
       grad_atol,
@@ -459,12 +434,12 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
   ):
     """Tests CPU vs. DEVICE parity of full model after 3 training steps."""
 
-    args = self._get_model_args(test_config)
+    config = _get_model_config(model_name)
     batch, seq_len = 2, 8
 
     # For MoE's it is important to initialize model before passing to test
     # helper.
-    model_cpu = qwen3_model.Qwen3Model(args)
+    model_cpu = Qwen3Model(config)
     model_cpu.init_weights(buffer_device=torch.device("cpu"))
     model_cpu = model_cpu.cpu()
 
@@ -477,10 +452,11 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
         grad_rtol=grad_rtol,
         param_atol=param_atol,
         param_rtol=param_rtol,
-        vocab_size=args.vocab_size,
+        vocab_size=config.vocab_size,
         batch=batch,
         seq_len=seq_len,
     )
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -1,10 +1,13 @@
 import logging
+from typing import Any
 import torch
-import torch.nn.functional as F
+from torch import nn
 from torch.nn.attention import sdpa_kernel
+import torch.nn.functional as F
 from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.tools.logging import logger
-from torch import nn
+
+# TODO(tbajpai): check that patches/workarounds are being properly applied.
 
 def attention_sdpa_forward_dtensor_workaround(sdpa_backends, q, k, v, scale=None, is_causal=True, enable_gqa=False):
     """
@@ -285,13 +288,15 @@ def use_fill_indices_patch(
   This workload-specific monkey patch replaces the default implementations in
   torchtitan.models.moe.kernels with our TPU-specific JAX implementation.
   """
-  from torchtitan.experiments.tpu.kernels import fill_indices as tpu_fill_indices
-  from torchtitan.models.moe import kernels as moe_kernels
+  # from torchtitan.experiments.tpu.kernels import fill_indices as tpu_fill_indices
+  # from torchtitan.models.moe import kernels as moe_kernels
 
-  # Patch both because generate_permute_indices defaults to use_cpu=True
-  moe_kernels.fill_indices_wrapper = tpu_fill_indices.fill_indices
-  moe_kernels.fill_indices_cpu = tpu_fill_indices.fill_indices
-  logger.info("Patched MoE kernels to use TPU fill_indices")
+  # # Patch both because generate_permute_indices defaults to use_cpu=True
+  # moe_kernels.fill_indices_wrapper = tpu_fill_indices.fill_indices
+  # moe_kernels.fill_indices_cpu = tpu_fill_indices.fill_indices
+  # logger.info("Patched MoE kernels to use TPU fill_indices")
+  # TODO update patch code with correct imports etc.
+  pass
 
 
 def use_cpu_safe_histc_patch() -> None:
@@ -305,3 +310,29 @@ def use_cpu_safe_histc_patch() -> None:
 
   torch.histc = _cpu_safe_histc
   logger.info("Monkey-patched torch.histc to support int dtypes on CPU")
+
+
+def apply_patches(model: nn.Module, job_config: Any) -> None:
+  """Applies all TPU-specific patches and workarounds to the model."""
+  # Enable CPU safe histc workaround.
+  use_cpu_safe_histc_patch()
+
+  # Splash Attention Patch
+  if (
+      hasattr(job_config, "splash_attention_kernel")
+      and job_config.splash_attention_kernel.use_splash_attention_kernel
+  ):
+    use_splash_attention_patch(model)
+
+  # Pallas Loss Patch (Output Projection)
+  if (
+      hasattr(job_config, "loss_kernel")
+      and job_config.loss_kernel.use_loss_kernel
+  ):
+    use_output_projection_patch(model)
+
+  # Qwen3 GMM MoE Patches
+  if hasattr(job_config, "qwen3") and job_config.qwen3.use_gmm_kernel:
+    use_gmm_kernel_patch(model)
+  if hasattr(job_config, "qwen3") and job_config.qwen3.use_fill_indices_kernel:
+    use_fill_indices_patch(model)

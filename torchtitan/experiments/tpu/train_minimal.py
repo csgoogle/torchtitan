@@ -7,7 +7,7 @@ import os
 import time
 import traceback
 import typing
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from absl import flags
 from absl.flags import argparse_flags
@@ -24,15 +24,16 @@ import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
-import torchtitan.protocols.train_spec as train_spec_module
+import torchtitan.experiments.tpu.workarounds as workarounds
+import torchtitan.trainer
 from torchtitan.tools import utils
 import torchtitan.tools.logging
-import torchtitan.tools.profiling
+# import torchtitan.tools.profiling  # Deprecated upstream
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
-JobConfig = torchtitan.config.JobConfig
+JobConfig = torchtitan.trainer.Trainer.Config
 ParallelDims = torchtitan.distributed.ParallelDims
-TPUJobConfig = torchtitan.experiments.tpu.tpu_job_config.TPUJobConfig
+TPUJobConfig = torchtitan.experiments.tpu.tpu_job_config.TPUTrainerConfig
 logger = torchtitan.tools.logging.logger
 
 TrainStepCallback = Callable[[int, nn.Module, torch.Tensor], None]
@@ -73,7 +74,7 @@ class TrainerMinimal:
       dist_utils.init_distributed(
           job_config.comm,
           enable_cpu_backend=job_config.training.enable_cpu_offload,
-          base_folder=job_config.job.dump_folder,
+          base_folder=job_config.dump_folder,
       )
 
     parallelism_config = self.job_config.parallelism
@@ -84,7 +85,6 @@ class TrainerMinimal:
         tp=parallelism_config.tensor_parallel_degree,
         pp=parallelism_config.pipeline_parallel_degree,
         ep=parallelism_config.expert_parallel_degree,
-        etp=parallelism_config.expert_tensor_parallel_degree,
         world_size=self.world_size,
     )
 
@@ -119,87 +119,92 @@ class TrainerMinimal:
       #     distinct_seed_mesh_dims=["pp"],
       # )
 
-    self.train_spec = train_spec_module.get_train_spec(job_config.model.name)
+    assert job_config.model_spec is not None
+    self.model_spec = job_config.model_spec
 
     self.tokenizer = typing.cast(
         torchtitan.components.tokenizer.HuggingFaceTokenizer,
-        self.train_spec.build_tokenizer_fn(job_config)
-        if self.train_spec.build_tokenizer_fn is not None
-        else None
+        job_config.tokenizer.build(tokenizer_path=job_config.hf_assets_path)
     )
 
-    self.dataloader = self.train_spec.build_dataloader_fn(
+    self.dataloader = job_config.dataloader.build(
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=self.tokenizer,
-        job_config=job_config,
+        seq_len=job_config.training.seq_len,
+        local_batch_size=job_config.training.local_batch_size,
     )
 
-    model_args = self.train_spec.model_args[job_config.model.flavor]
-    # set the model args from training job configs
-    model_args.update_from_config(job_config)
-    self.model_args: Any = model_args
+    model_config = self.model_spec.model
+    model_config.update_from_config(trainer_config=job_config)
+    self.model_config = model_config
 
     if (
-        self.model_args.vocab_size is not None
-        and self.tokenizer.vocab_size > self.model_args.vocab_size
+        self.model_config.vocab_size is not None
+        and self.tokenizer.vocab_size > self.model_config.vocab_size
     ):
       logger.warning(
-          "Vocab size for tokenizer is %d while model args vocab size is %d."
-          " Expanding model args vocab size to match tokenizer vocab size.",
+          "Vocab size for tokenizer is %d while model config vocab size is %d."
+          " Expanding model config vocab size to match tokenizer vocab size.",
           self.tokenizer.vocab_size,
-          self.model_args.vocab_size,
+          self.model_config.vocab_size,
       )
-      self.model_args.vocab_size = self.tokenizer.vocab_size
+      self.model_config.vocab_size = self.tokenizer.vocab_size
 
     logger.info(
-        f"Building {self.job_config.model.name} {self.job_config.model.flavor}"
-        f"  with {self.model_args}"
+        f"Building {self.model_spec.name} {self.model_spec.flavor}"
+        f" with {self.model_config}"
     )
 
     with (
         torch.device("meta"),
         utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
     ):
-      model: nn.Module = typing.cast(
-          nn.Module, self.train_spec.model_cls(self.model_args)
-      )
+      model = model_config.build()
 
     # calculate model size and flops per token
     (
         model_param_count,
         _,
-    ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
+    ) = model_config.get_nparams_and_flops(model, job_config.training.seq_len)
 
     logger.info(
-        f"Model {job_config.model.name} {job_config.model.flavor} "
+        f"Model {self.model_spec.name} {self.model_spec.flavor} "
         f"size: {model_param_count:,} total parameters"
     )
 
-    self.loss_fn = self.train_spec.build_loss_fn(job_config)
+    self.loss_fn = job_config.loss.build(compile_config=job_config.compile)
+
+    # Apply TPU-specific patches/workarounds
+    workarounds.apply_patches(model, job_config)
 
     if self.world_size > 1:
-      self.train_spec.parallelize_fn(
+      self.model_spec.parallelize_fn(
           model,
           self.parallel_dims,
           job_config)
 
     logger.info(
-        f"Moving model {self.job_config.model.name}"
-        f" {self.job_config.model.flavor} to device {self.device}"
+        f"Moving model {self.model_spec.name}"
+        f" {self.model_spec.flavor} to device {self.device}"
     )
     self.model = model.to_empty(device=self.device)
     with torch.no_grad():
       self.model.init_weights()
+
+    from torchtitan.components.loss import ChunkedCELoss
+    if isinstance(self.loss_fn, ChunkedCELoss):
+      lm_head = self.model.lm_head
+      assert lm_head is not None, "Model must have lm_head for ChunkedCELoss"
+      self.loss_fn.set_lm_head(lm_head)
+      self.model._skip_lm_head = True
 
     assert (
         self.device.type != "tpu" or
         job_config.optimizer.implementation != "fused"
     ), ("TODO b/45811390 - Fused optimizer not supported on TPU."
         "You can disable this by setting --optimizer.implementation=foreach")
-    self.optimizers = self.train_spec.build_optimizers_fn(
-        [self.model], job_config.optimizer, self.parallel_dims, None
-    )
+    self.optimizers = job_config.optimizer.build(model_parts=[self.model])
 
     loss_parallel_enabled = (
         self.parallel_dims.tp_enabled and
@@ -224,19 +229,19 @@ class TrainerMinimal:
       def _get_dummy_batch():
         tokens = torch.randint(
             0,
-            self.model_args.vocab_size,
+            self.model_config.vocab_size,
             (
                 self.job_config.training.local_batch_size,
-                self.model_args.max_seq_len,
+                self.job_config.training.seq_len,
             ),
             device=self.device,
         )
         labels = torch.randint(
             0,
-            self.model_args.vocab_size,
+            self.model_config.vocab_size,
             (
                 self.job_config.training.local_batch_size,
-                self.model_args.max_seq_len,
+                self.job_config.training.seq_len,
             ),
             device=self.device,
         )
@@ -246,11 +251,11 @@ class TrainerMinimal:
       total_time = 0.0
 
       for step in range(self.job_config.training.steps):
-        with torchtitan.tools.profiling.maybe_enable_profiling(
-            self.job_config.profiling,
-            global_step=step,
-            base_folder=self.job_config.job.dump_folder,
-        ) as torch_profiler:
+          with torchtitan.tools.profiling.maybe_enable_profiling(
+              self.job_config.profiling,
+              global_step=step,
+              base_folder=self.job_config.job.dump_folder,
+          ) as torch_profiler:
           step_start_time = time.time()
           self.optimizers.zero_grad()
           tokens, labels = get_batch()
@@ -272,12 +277,12 @@ class TrainerMinimal:
           if step >= self.job_config.lr_scheduler.warmup_steps:
             total_tokens += (
                 self.job_config.training.local_batch_size *
-                self.model_args.max_seq_len)
+                self.job_config.training.seq_len)
             total_time += step_time
 
           tokens_per_sec = (
               self.job_config.training.local_batch_size *
-              self.model_args.max_seq_len) / step_time
+              self.job_config.training.seq_len) / step_time
 
           logger.info(
               "Step %d/%d | Loss: %.4f | Step time: %.2f sec | "

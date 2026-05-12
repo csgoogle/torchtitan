@@ -1,94 +1,83 @@
-from torchtitan.components.lr_scheduler import build_lr_schedulers
-from torchtitan.components.optimizer import build_optimizers
-from torchtitan.components.tokenizer import build_hf_tokenizer
-from torchtitan.components.validate import build_validator
-from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
+from torchtitan.components.loss import ChunkedCELoss
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.components.validate import Validator
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.hf_datasets.text_datasets import build_text_dataloader
 from torchtitan.protocols.train_spec import TrainSpec, register_train_spec
+import torchtitan.models.common as common_models
+import torchtitan.models.llama3 as llama3_models
 
 from .infra.parallelize import parallelize_llama
 from .infra.pipeline import pipeline_llama
 
-from .model.args import TransformerModelArgs
-
-from torchtitan.models.llama3.model.model import Transformer
-from torchtitan.models.llama3.model.state_dict_adapter import Llama3StateDictAdapter
-
 __all__ = [
     "parallelize_llama",
-    "TransformerModelArgs",
-    "Transformer",
-    "llama3_args",
+    "llama3_configs",
 ]
 
 
-llama3_args = {
-    "debugmodel": TransformerModelArgs(
-        dim=256, n_layers=6, n_heads=16, vocab_size=2048, rope_theta=500000
-    ),
-    "debugmodel_flex_attn": TransformerModelArgs(
-        dim=256,
-        n_layers=6,
-        n_heads=16,
-        vocab_size=2048,
-        rope_theta=500000,
-        attn_type="flex",
-        attn_mask_type="block_causal",
-    ),
-    "1B": TransformerModelArgs(
-        dim=2048,
-        n_layers=16,
-        n_heads=32,
-        n_kv_heads=8,
-        ffn_dim_multiplier=1.5,
-        multiple_of=256,
-        rope_theta=500000,
-    ),
-    "8B": TransformerModelArgs(
-        dim=4096,
-        n_layers=32,
-        n_heads=32,
-        n_kv_heads=8,
-        ffn_dim_multiplier=1.3,
-        multiple_of=1024,
-        rope_theta=500000,
-    ),
-    "70B": TransformerModelArgs(
-        dim=8192,
-        n_layers=80,
-        n_heads=64,
-        n_kv_heads=8,
-        ffn_dim_multiplier=1.3,
-        multiple_of=4096,
-        rope_theta=500000,
-    ),
-    "405B": TransformerModelArgs(
-        dim=16384,
-        n_layers=126,
-        n_heads=128,
-        n_kv_heads=8,
-        ffn_dim_multiplier=1.2,
-        multiple_of=4096,
-        rope_theta=500000,
-    ),
+def _testmodel(attn_backend: str = "sdpa") -> llama3_models.Llama3Model.Config:
+  dim = 64
+  n_heads = 8
+  n_layers = 1
+  return llama3_models.Llama3Model.Config(
+      dim=dim,
+      vocab_size=128,
+      tok_embeddings=common_models.Embedding.Config(
+          num_embeddings=128,
+          embedding_dim=dim,
+          param_init=llama3_models._EMBEDDING_INIT,
+      ),
+      norm=common_models.RMSNorm.Config(
+          normalized_shape=dim,
+          param_init=llama3_models._NORM_INIT,
+      ),
+      lm_head=common_models.Linear.Config(
+          in_features=dim,
+          out_features=128,
+          param_init=llama3_models._LINEAR_INIT,
+      ),
+      rope=common_models.RoPE.Config(
+          dim=dim // n_heads,
+          max_seq_len=512,
+          backend="complex",
+      ),
+      layers=llama3_models._build_llama3_layers(
+          n_layers=n_layers,
+          dim=dim,
+          n_heads=n_heads,
+          n_kv_heads=n_heads,
+          hidden_dim=4 * dim,
+          attn_backend=attn_backend,
+      ),
+  )
+
+
+llama3_configs = {
+    "testmodel": _testmodel("sdpa"),
+    "debugmodel": llama3_models.llama3_configs["debugmodel"]("sdpa"),
+    "debugmodel_flex_attn": llama3_models.llama3_configs["debugmodel"]("flex"),
+    "1B": llama3_models.llama3_configs["1B"]("sdpa"),
+    "8B": llama3_models.llama3_configs["8B"]("sdpa"),
+    "70B": llama3_models.llama3_configs["70B"]("sdpa"),
+    "405B": llama3_models.llama3_configs["405B"]("sdpa"),
 }
 
 # pytype: disable=wrong-arg-types
 register_train_spec(
     name="llama3_tpu",
     train_spec=TrainSpec(
-        model_cls=Transformer,
-        model_args=llama3_args,
+        model_cls=llama3_models.Llama3Model,
+        model_args=llama3_configs,
         parallelize_fn=parallelize_llama,
         pipelining_fn=pipeline_llama,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_text_dataloader,
-        build_tokenizer_fn=build_hf_tokenizer,
-        build_loss_fn=build_cross_entropy_loss,
-        build_validator_fn=build_validator,
-        state_dict_adapter=Llama3StateDictAdapter,
+        loss_config=ChunkedCELoss.Config(),
+        optimizer_config=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
+        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        validator_config=Validator.Config(enable=True),
+        state_dict_adapter=llama3_models.Llama3StateDictAdapter,
     )
 )
 # pytype: enable=wrong-arg-types

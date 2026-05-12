@@ -8,13 +8,12 @@ import contextlib
 import gc
 import subprocess
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Generator, Optional
 
 import torch
 from torch._utils import _get_available_device_type, _get_device_module
-
 from torchtitan.tools.logging import logger
 
 
@@ -78,7 +77,8 @@ class GarbageCollection:
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
 
 
-# hardcoded BF16 type peak flops for NVIDIA A100, H100, H200, B200 GPU and AMD MI250, MI300X, MI325X, MI355X and Intel PVC
+# hardcoded BF16 type peak flops for NVIDIA A100, H20, H100, H200, B200 GPU,
+# AMD MI250, MI300X, MI325X, MI355X, Intel PVC, and AWS Trainium/Inferentia
 def get_peak_flops(device_name: str) -> float:
     try:
         # Run the lspci command and capture the output
@@ -96,6 +96,11 @@ def get_peak_flops(device_name: str) -> float:
     if "A100" in device_name:
         # data from https://www.nvidia.com/en-us/data-center/a100/
         return 312e12
+    elif "A6000" in device_name:
+        # data from https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/
+        # quadro-product-literature/proviz-print-nvidia-rtx-a6000-datasheet-us-nvidia-1454980-r9-web%20(1).pdf
+        # NOTE: 309.7 TFLOPS is with sparsity; dense value is half.
+        return 154.85e12
     elif "H100" in device_name:
         # data from https://www.nvidia.com/en-us/data-center/h100/
         # NOTE: Specifications are one-half lower without sparsity.
@@ -108,8 +113,24 @@ def get_peak_flops(device_name: str) -> float:
     elif "H200" in device_name:
         # data from https://www.nvidia.com/en-us/data-center/h200/
         return 989e12
-    elif "B200" in device_name:
+    elif "H20" in device_name:
+        # NVIDIA H20 is a region-specific GPU variant.
+        # Since first-hand specifications do not seem to be readily available on
+        # NVIDIA's official global website, we refer to technical reports from
+        # Tom's Hardware. The peak BF16/FP16 Tensor performance is reported as
+        # 148 TFLOPS.
+        # Ref: https://www.tomshardware.com/news/
+        # nvidias-latest-regulation-compliant-gpu-for-china-has-been-delayed-to-early-next-year
+        return 148e12
+    elif "GB200" in device_name or "GB300" in device_name:
+        # Grace Blackwell Superchips (Grace CPU + Blackwell GPU)
+        # BF16 dense per GPU: 2,500 TFLOPS (half of 5,000 TFLOPS with sparsity)
+        # GB200 data from https://www.nvidia.com/en-us/data-center/dgx-gb200
+        # GB300 data from https://www.nvidia.com/en-us/data-center/dgx-gb300
+        return 2.5e15
+    elif "B300" in device_name or "B200" in device_name:
         # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
+        # Checked after GB300 to avoid false match on "GB300"
         return 2.25e15
     elif "MI355X" in device_name:
         # MI355X data from https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
@@ -153,6 +174,24 @@ def get_peak_flops(device_name: str) -> float:
             # data from https://docs.cloud.google.com/tpu/docs/tpu7x
             # The quoted number is per chip. We halve it for per-core FLOPS.
             return 2307e12 / 2
+    elif "neuron" in device_name:
+        # AWS Trainium/Inferentia: query chip type via torch.neuron
+        # TensorEngine BF16 TFLOPS per NeuronCore × default Logical NeuronCore (LNC) count per device
+        neuron_device_name = device_module.get_device_properties().name
+        if neuron_device_name in ("trn1", "trn1n", "inf2"):
+            # NeuronCore-v2 TensorEngine: 90 BF16 TFLOPS/core, LNC=1
+            # https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v2.html
+            return 90e12 * 1
+        elif neuron_device_name in ("trn2", "trn2n", "trn2u", "trn3", "trn3u"):
+            # NeuronCore-v3/NeuronCore-v4 TensorEngine: 79 BF16 TFLOPS/core, LNC=2
+            # https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v3.html
+            # https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v4.html
+            return 79e12 * 2
+        else:
+            logger.warning(
+                f"Unknown neuron device: {neuron_device_name}, fallback to trn2/trn3"
+            )
+            return 79e12 * 2
 
     else:  # for other GPU types, assume A100
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
@@ -197,7 +236,7 @@ assert set(NoColor.__dataclass_fields__.keys()) == set(
 def check_if_feature_in_pytorch(
     feature_name: str,
     pull_request: str,
-    min_nightly_version: Optional[str] = None,
+    min_nightly_version: str | None = None,
 ) -> None:
     if "git" in torch.__version__:  # pytorch is built from source
         # notify users to check if the pull request is included in their pytorch
@@ -238,9 +277,3 @@ def set_default_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
         yield
     finally:
         torch.set_default_dtype(old_dtype)
-
-
-def _round_up(x: int, y: int) -> int:
-    """Round up x to the nearest multiple of y."""
-    x_ceil_div_y = (x + y - 1) // y
-    return x_ceil_div_y * y

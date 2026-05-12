@@ -4,15 +4,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import unittest
 from unittest.mock import patch
 
+import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
+from torchtitan.config.configs import ParallelismConfig
 from torchtitan.distributed import ParallelDims
+from torchtitan.models.llama3 import model_registry
+from torchtitan.models.llama3.parallelize import apply_fsdp
 
 
 class TestParallelDimsValidation(unittest.TestCase):
@@ -28,7 +34,6 @@ class TestParallelDimsValidation(unittest.TestCase):
             tp=2,
             pp=1,
             ep=1,
-            etp=1,
             world_size=8,
         )
         self.assertEqual(parallel_dims.dp_replicate, 2)
@@ -37,7 +42,26 @@ class TestParallelDimsValidation(unittest.TestCase):
         self.assertEqual(parallel_dims.tp, 2)
         self.assertEqual(parallel_dims.pp, 1)
         self.assertEqual(parallel_dims.ep, 1)
-        self.assertEqual(parallel_dims.etp, 1)
+        self.assertEqual(parallel_dims.world_size, 8)
+
+    @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
+    def test_from_config(self):
+        """Test constructing ParallelDims from a ParallelismConfig."""
+        config = ParallelismConfig(
+            data_parallel_replicate_degree=2,
+            data_parallel_shard_degree=-1,
+            context_parallel_degree=1,
+            tensor_parallel_degree=2,
+            pipeline_parallel_degree=1,
+            expert_parallel_degree=1,
+        )
+        parallel_dims = ParallelDims.from_config(config, world_size=8)
+        self.assertEqual(parallel_dims.dp_replicate, 2)
+        self.assertEqual(parallel_dims.dp_shard, 2)  # auto-calculated: 8 / (2*1*2*1)
+        self.assertEqual(parallel_dims.cp, 1)
+        self.assertEqual(parallel_dims.tp, 2)
+        self.assertEqual(parallel_dims.pp, 1)
+        self.assertEqual(parallel_dims.ep, 1)
         self.assertEqual(parallel_dims.world_size, 8)
 
     @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
@@ -50,7 +74,6 @@ class TestParallelDimsValidation(unittest.TestCase):
             tp=2,
             pp=1,
             ep=1,
-            etp=1,
             world_size=8,
         )
         self.assertEqual(parallel_dims.dp_shard, 2)
@@ -66,23 +89,7 @@ class TestParallelDimsValidation(unittest.TestCase):
                 tp=2,
                 pp=1,
                 ep=1,
-                etp=1,
                 world_size=10,  # Invalid: 2*2*1*2*1 = 8, not 10
-            )
-
-    @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
-    def test_validation_invalid_etp(self):
-        """Test validation fails when etp is not equal to tp or 1."""
-        with self.assertRaises(AssertionError):
-            ParallelDims(
-                dp_replicate=1,
-                dp_shard=1,
-                cp=1,
-                tp=4,
-                pp=1,
-                ep=2,
-                etp=2,  # Invalid: etp must be tp or 1 when ep > 1
-                world_size=8,
             )
 
     @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
@@ -96,7 +103,6 @@ class TestParallelDimsValidation(unittest.TestCase):
                 tp=1,
                 pp=1,
                 ep=1,
-                etp=1,
                 world_size=1,
             )
 
@@ -111,7 +117,6 @@ class TestParallelDimsValidation(unittest.TestCase):
                 tp=1,
                 pp=1,
                 ep=1,
-                etp=1,
                 world_size=1,
             )
 
@@ -126,7 +131,6 @@ class TestParallelDimsValidation(unittest.TestCase):
             tp=2,
             pp=1,
             ep=1,
-            etp=1,
             world_size=8,
         )
         self.assertTrue(parallel_dims.dp_enabled)
@@ -136,7 +140,6 @@ class TestParallelDimsValidation(unittest.TestCase):
         self.assertTrue(parallel_dims.tp_enabled)
         self.assertFalse(parallel_dims.pp_enabled)
         self.assertFalse(parallel_dims.ep_enabled)
-        self.assertFalse(parallel_dims.etp_enabled)
         self.assertTrue(parallel_dims.fsdp_enabled)
 
         # Test with CP enabled
@@ -147,7 +150,6 @@ class TestParallelDimsValidation(unittest.TestCase):
             tp=1,
             pp=1,
             ep=1,
-            etp=1,
             world_size=2,
         )
         self.assertFalse(parallel_dims.dp_enabled)
@@ -163,11 +165,9 @@ class TestParallelDimsValidation(unittest.TestCase):
             tp=1,
             pp=1,
             ep=2,
-            etp=1,
             world_size=2,
         )
         self.assertTrue(parallel_dims.ep_enabled)
-        self.assertFalse(parallel_dims.etp_enabled)
 
         # Test with PP enabled
         parallel_dims = ParallelDims(
@@ -177,26 +177,9 @@ class TestParallelDimsValidation(unittest.TestCase):
             tp=1,
             pp=2,
             ep=1,
-            etp=1,
             world_size=2,
         )
         self.assertTrue(parallel_dims.pp_enabled)
-
-    @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
-    def test_fsdp_gradient_divide_factor(self):
-        """Test fsdp_gradient_divide_factor calculation."""
-        parallel_dims = ParallelDims(
-            dp_replicate=2,
-            dp_shard=3,
-            cp=2,
-            tp=1,
-            pp=1,
-            ep=1,
-            etp=1,
-            world_size=12,
-        )
-        # Should be dp_replicate * dp_shard * cp = 2 * 3 * 2 = 12
-        self.assertEqual(parallel_dims.fsdp_gradient_divide_factor, 12)
 
     @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
     def test_non_data_parallel_size(self):
@@ -208,7 +191,6 @@ class TestParallelDimsValidation(unittest.TestCase):
             tp=3,
             pp=2,
             ep=1,
-            etp=1,
             world_size=48,
         )
         # Should be cp * tp * pp = 2 * 3 * 2 = 12
@@ -224,7 +206,6 @@ class TestParallelDimsValidation(unittest.TestCase):
             tp=4,
             pp=1,
             ep=1,
-            etp=1,
             world_size=16,
         )
         # Should be tp * (cp * 2) = 4 * 4 = 16
@@ -259,7 +240,6 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             tp=1,
             pp=1,
             ep=1,
-            etp=1,
             world_size=1,
         )
         parallel_dims.build_mesh()
@@ -278,7 +258,6 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             tp=1,
             pp=1,
             ep=1,
-            etp=1,
             world_size=1,
         )
         # Don't call build_mesh explicitly
@@ -303,7 +282,6 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             tp=1,
             pp=1,
             ep=1,
-            etp=1,
             world_size=1,
         )
 
@@ -331,7 +309,6 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
         self.assertEqual(parallel_dims._meshes["pp"].size(), 1)
         self.assertEqual(parallel_dims._meshes["cp"].size(), 1)
         self.assertEqual(parallel_dims._meshes["ep"].size(), 1)
-        self.assertEqual(parallel_dims._meshes["etp"].size(), 1)
         self.assertEqual(parallel_dims._meshes["efsdp"].size(), 1)
 
         # Validate 2D mesh shapes
@@ -343,15 +320,12 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             ["dp_replicate", "efsdp"]
         )
         self.assertIsNone(dp_replicate_efsdp_mesh)  # Both dimensions have size 1
-        ep_etp_mesh = parallel_dims.get_optional_mesh(["ep", "etp"])
-        self.assertIsNone(ep_etp_mesh)  # Both dimensions have size 1
 
         # Test get_optional_mesh returns None when all dimensions have size 1
         self.assertIsNone(parallel_dims.get_optional_mesh("tp"))
         self.assertIsNone(parallel_dims.get_optional_mesh("dp_replicate"))
         self.assertIsNone(parallel_dims.get_optional_mesh("pp"))
         self.assertIsNone(parallel_dims.get_optional_mesh("cp"))
-        self.assertIsNone(parallel_dims.get_optional_mesh("fsdp"))
 
         # Test get_optional_mesh with list input
         self.assertIsNone(parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"]))
@@ -375,7 +349,6 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             tp=1,
             pp=1,
             ep=1,
-            etp=1,
             world_size=1,
         )
         parallel_dims.build_mesh()
@@ -396,11 +369,9 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             tp=1,
             pp=1,
             ep=2,
-            etp=1,
             world_size=2,  # 1 * 2 * 1 * 1 * 1 = 2
         )
         self.assertTrue(parallel_dims.ep_enabled)
-        self.assertFalse(parallel_dims.etp_enabled)
 
         # Test with larger configuration
         parallel_dims = ParallelDims(
@@ -410,11 +381,9 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             tp=1,
             pp=1,
             ep=3,
-            etp=1,
             world_size=4,  # 2 * 2 * 1 * 1 * 1 = 4
         )
         self.assertTrue(parallel_dims.ep_enabled)
-        self.assertFalse(parallel_dims.etp_enabled)
         self.assertTrue(parallel_dims.dp_replicate_enabled)
         self.assertTrue(parallel_dims.dp_shard_enabled)
 
@@ -444,7 +413,6 @@ class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
                 tp=2,
                 pp=1,
                 ep=1,
-                etp=1,
                 world_size=8,
             )
 
@@ -463,7 +431,6 @@ class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
             self.assertIn("cp", parallel_dims._meshes)
             self.assertIn("tp", parallel_dims._meshes)
             self.assertIn("ep", parallel_dims._meshes)
-            self.assertIn("etp", parallel_dims._meshes)
             self.assertIn("efsdp", parallel_dims._meshes)
 
             # Validate 1D mesh sizes match parallelism configuration
@@ -481,10 +448,9 @@ class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
             self.assertEqual(parallel_dims._meshes["cp"].size(), 1)
             self.assertEqual(parallel_dims._meshes["tp"].size(), 2)
             self.assertEqual(parallel_dims._meshes["ep"].size(), 1)
-            self.assertEqual(parallel_dims._meshes["etp"].size(), 1)
             self.assertEqual(
                 parallel_dims._meshes["efsdp"].size(), 4
-            )  # fsdp * tp / (etp * ep) = 2 * 2 / (1 * 1) = 4
+            )  # fsdp * tp / ep = 2 * 2 / 1 = 4
 
             # Validate 2D mesh shapes
             dp_replicate_fsdp_mesh = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
@@ -497,9 +463,6 @@ class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
                 ["dp_replicate", "efsdp"]
             )
             self.assertIsNone(dp_replicate_efsdp_mesh)  # efsdp disabled when ep=1
-            ep_etp_mesh = parallel_dims.get_optional_mesh(["ep", "etp"])
-            self.assertIsNone(ep_etp_mesh)  # Both dimensions have size 1
-
             # Test get_mesh returns valid meshes for enabled dimensions (size > 1)
             self.assertIsNotNone(parallel_dims.get_mesh("tp"))
             self.assertIsNotNone(parallel_dims.get_mesh("dp_replicate"))
@@ -527,11 +490,10 @@ class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
             self.assertIn("batch", one_d_meshes)
             self.assertIn("loss", one_d_meshes)
             self.assertIn("efsdp", one_d_meshes)
-            # Should not include: pp, cp, ep, etp (all with size = 1)
+            # Should not include: pp, cp, ep (all with size = 1)
             self.assertNotIn("pp", one_d_meshes)
             self.assertNotIn("cp", one_d_meshes)
             self.assertNotIn("ep", one_d_meshes)
-            self.assertNotIn("etp", one_d_meshes)
 
             # Test that we can get 2D meshes via get_mesh() instead
             dp_replicate_fsdp = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
@@ -555,14 +517,88 @@ class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
 
             # Validate calculated properties
             self.assertEqual(
-                parallel_dims.fsdp_gradient_divide_factor, 4
-            )  # dp_replicate * dp_shard * cp = 2 * 2 * 1
-            self.assertEqual(
                 parallel_dims.non_data_parallel_size, 2
             )  # cp * tp * pp = 1 * 2 * 1
             self.assertEqual(
                 parallel_dims.seq_len_divisor, 4
             )  # tp * (cp * 2) = 2 * (1 * 2) = 2 * 2
+
+
+class TestSingleGPUMixedPrecisionFSDP(DTensorTestBase):
+    """Verify apply_fsdp on Llama3 debugmodel matches single-device reference.
+
+    Tests that torchtitan's apply_fsdp with MixedPrecisionPolicy at degree 1
+    produces numerically identical results to a reference model with manually
+    cast bf16 parameters, following the pattern in
+    pytorch/test/distributed/_composable/fsdp/test_fully_shard_mixed_precision.py.
+
+    See https://github.com/pytorch/torchtitan/issues/2886
+    """
+
+    @property
+    def world_size(self):
+        return 1
+
+    @with_comms
+    def test_apply_fsdp_mixed_precision_single_gpu(self):
+        """apply_fsdp with bf16 on Llama3 debugmodel matches manual bf16 reference on a single GPU."""
+        torch.manual_seed(42)
+
+        model_spec = model_registry("debugmodel")
+        model_config = model_spec.model
+
+        with torch.device("meta"):
+            model = model_config.build()
+        model.to_empty(device=self.device_type)
+        with torch.no_grad():
+            model.init_states(buffer_device=None)
+
+        ref_model = copy.deepcopy(model)
+        ref_optim = torch.optim.Adam(ref_model.parameters(), lr=1e-4)
+
+        dp_mesh = init_device_mesh(self.device_type, (1,))
+        apply_fsdp(
+            model,
+            dp_mesh,
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            pp_enabled=False,
+        )
+        optim = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+        # Cast only parameters to bf16, matching MixedPrecisionPolicy behavior
+        # (buffers like freqs_cis stay fp32)
+        ref_model_bf16 = copy.deepcopy(ref_model)
+        for p in ref_model_bf16.parameters():
+            p.data = p.data.to(torch.bfloat16)
+
+        tokens = torch.randint(
+            0, model_config.vocab_size, (2, 32), device=self.device_type
+        )
+        for iter_idx in range(10):
+            optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
+            loss = model(tokens).sum()
+            loss.backward()
+            optim.step()
+
+            ref_optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
+            ref_loss = ref_model_bf16(tokens).sum()
+            ref_loss.backward()
+            for p_fp32, p_bf16 in zip(
+                ref_model.parameters(), ref_model_bf16.parameters()
+            ):
+                p_fp32.grad = p_bf16.grad.to(p_fp32.dtype)
+                p_bf16.grad = None
+            ref_optim.step()
+            for p_fp32, p_bf16 in zip(
+                ref_model.parameters(), ref_model_bf16.parameters()
+            ):
+                p_bf16.detach().copy_(p_fp32)
+
+            # Validates that apply_fsdp with param_dtype=bf16 matches the manual
+            # bf16 reference. Would fail if mp_policy used param_dtype=fp32 instead,
+            # since the ref model runs forward/backward in bf16.
+            self.assertEqual(loss, ref_loss)
 
 
 if __name__ == "__main__":

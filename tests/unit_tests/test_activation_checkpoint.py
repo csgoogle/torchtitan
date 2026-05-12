@@ -5,51 +5,37 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+from copy import deepcopy
 
 import torch
-import torch.nn as nn
 from torch.utils.flop_counter import FlopCounterMode
-
-from torchtitan.config.job_config import ActivationCheckpoint as ACConfig
+from torchtitan.config import ActivationCheckpointConfig as ACConfig
 from torchtitan.distributed.activation_checkpoint import apply_ac
+from torchtitan.models.common.linear import Linear
+from torchtitan.protocols.module import Module, ModuleDict
 
 
-# for selective op activation checkpointing
-_op_sac_save_list = {
-    torch.ops.aten.mm.default,
-    torch.ops.aten._scaled_dot_product_efficient_attention.default,
-    torch.ops.aten._scaled_dot_product_flash_attention.default,
-    torch.ops.aten._scaled_dot_product_cudnn_attention.default,
-    torch.ops.aten._scaled_dot_product_attention_math.default,
-    torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
-    torch.ops._c10d_functional.reduce_scatter_tensor.default,
-    # for low precision training, it's useful to always save
-    # the result of max, since the absolute maximum is
-    # used to compute the scaling factor for quantization.
-    torch.ops.aten.max.default,
-    torch._higher_order_ops.flex_attention,
-    torch.ops.torch_attn._varlen_attn,
-}
-
-
-class ToyModule(nn.Module):
+class ToyModule(Module):
     def __init__(self):
         super().__init__()
-        self.layers = nn.ModuleDict({"0": TransformerBlock()})
+        self.layers = ModuleDict({"0": TransformerBlock()})
 
     def forward(self, x):
         return self.layers["0"](x)
 
 
-class TransformerBlock(nn.Module):
+class TransformerBlock(Module):
     def __init__(self):
         super().__init__()
-        self.moe = nn.Module()
-        self.moe.router = nn.Module()
-        self.moe.router.gate = nn.Linear(512, 512, bias=False)
-        self.attention = nn.Module()
-        self.attention.wq = nn.Linear(512, 512, bias=False)
-        self.output = nn.Linear(512, 1024, bias=False)
+        linear_config = Linear.Config(in_features=512, out_features=512, bias=False)
+        self.moe = Module()
+        self.moe.router = Module()
+        self.moe.router.gate = linear_config.build()
+        self.attention = Module()
+        self.attention.wq = linear_config.build()
+        output_config = deepcopy(linear_config)
+        output_config.out_features = 1024
+        self.output = output_config.build()
 
     def forward(self, x):
         gate_out = self.moe.router.gate(x)
@@ -66,10 +52,11 @@ class TestApplyAC(unittest.TestCase):
             out.backward()
 
             x = torch.randn(512, 512, requires_grad=True)
-            out = model_fn(x)
-            with FlopCounterMode(display=False) as mode:
+            with FlopCounterMode(display=False) as fwd_mode:
+                out = model_fn(x)
+            with FlopCounterMode(display=False) as bwd_mode:
                 out.backward()
-            return mode.get_total_flops() / (512**3 * 2)
+            return bwd_mode.get_total_flops() / (512**3 * 2)
 
         # 1. No AC
         model_no_ac = ToyModule()
@@ -80,7 +67,6 @@ class TestApplyAC(unittest.TestCase):
         model_selective_ac = ToyModule()
         ac_config_no_force = ACConfig(
             mode="selective",
-            selective_ac_option="op",
             per_op_sac_force_recompute_mm_shapes_by_fqns=[],  # Empty list
             early_stop=False,
         )
@@ -88,7 +74,6 @@ class TestApplyAC(unittest.TestCase):
             model_selective_ac,
             ac_config_no_force,
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
         flops_selective_ac = get_bw_flops(model_selective_ac)
 
@@ -97,7 +82,6 @@ class TestApplyAC(unittest.TestCase):
         model_with_force_first = ToyModule()
         ac_config_with_force_first = ACConfig(
             mode="selective",
-            selective_ac_option="op",
             per_op_sac_force_recompute_mm_shapes_by_fqns=["moe.router.gate"],
             early_stop=False,
         )
@@ -105,7 +89,6 @@ class TestApplyAC(unittest.TestCase):
             model_with_force_first,
             ac_config_with_force_first,
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
         flops_with_force_first = get_bw_flops(model_with_force_first)
 
@@ -113,7 +96,6 @@ class TestApplyAC(unittest.TestCase):
         model_with_force_last = ToyModule()
         ac_config_with_force_last = ACConfig(
             mode="selective",
-            selective_ac_option="op",
             per_op_sac_force_recompute_mm_shapes_by_fqns=["output"],
             early_stop=False,
         )
@@ -121,7 +103,6 @@ class TestApplyAC(unittest.TestCase):
             model_with_force_last,
             ac_config_with_force_last,
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
         flops_with_force_last = get_bw_flops(model_with_force_last)
 
@@ -135,7 +116,6 @@ class TestApplyAC(unittest.TestCase):
             model_with_full_ac,
             ac_config_full_ac,
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
         flops_full_ac = get_bw_flops(model_with_full_ac)
 
@@ -170,14 +150,12 @@ class TestApplyAC(unittest.TestCase):
         model_selective_ac = ToyModule().cuda()
         ac_config_no_force = ACConfig(
             mode="selective",
-            selective_ac_option="op",
             per_op_sac_force_recompute_mm_shapes_by_fqns=[],  # Empty list
         )
         apply_ac(
             model_selective_ac,
             ac_config_no_force,
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
         mem_selective_ac = get_act_mem(model_selective_ac)
 
@@ -186,14 +164,12 @@ class TestApplyAC(unittest.TestCase):
         model_with_force_first = ToyModule().cuda()
         ac_config_with_force_first = ACConfig(
             mode="selective",
-            selective_ac_option="op",
             per_op_sac_force_recompute_mm_shapes_by_fqns=["moe.router.gate"],
         )
         apply_ac(
             model_with_force_first,
             ac_config_with_force_first,
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
         mem_with_force_first = get_act_mem(model_with_force_first)
 
@@ -201,14 +177,12 @@ class TestApplyAC(unittest.TestCase):
         model_with_force_last = ToyModule().cuda()
         ac_config_with_force_last = ACConfig(
             mode="selective",
-            selective_ac_option="op",
             per_op_sac_force_recompute_mm_shapes_by_fqns=["output"],
         )
         apply_ac(
             model_with_force_last,
             ac_config_with_force_last,
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
         mem_with_force_last = get_act_mem(model_with_force_last)
 
@@ -221,7 +195,6 @@ class TestApplyAC(unittest.TestCase):
             model_with_full_ac,
             ac_config_full_ac,
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
         mem_full_ac = get_act_mem(model_with_full_ac)
 
@@ -243,11 +216,9 @@ class TestApplyAC(unittest.TestCase):
             model_selective_ac,
             ACConfig(
                 mode="selective",
-                selective_ac_option="op",
                 per_op_sac_force_recompute_mm_shapes_by_fqns=[],
             ),
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
         model_force_first = ToyModule()
         model_force_first.load_state_dict(model_no_ac.state_dict())
@@ -255,11 +226,9 @@ class TestApplyAC(unittest.TestCase):
             model_force_first,
             ACConfig(
                 mode="selective",
-                selective_ac_option="op",
                 per_op_sac_force_recompute_mm_shapes_by_fqns=["moe.router.gate"],
             ),
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
 
         model_force_last = ToyModule()
@@ -268,11 +237,9 @@ class TestApplyAC(unittest.TestCase):
             model_force_last,
             ACConfig(
                 mode="selective",
-                selective_ac_option="op",
                 per_op_sac_force_recompute_mm_shapes_by_fqns=["output"],
             ),
             model_compile_enabled=False,
-            op_sac_save_list=_op_sac_save_list,
         )
 
         def run_fwd_bwd(model, batch):
@@ -316,6 +283,63 @@ class TestApplyAC(unittest.TestCase):
             torch.testing.assert_close(g_ref, g_sel)
             torch.testing.assert_close(g_ref, g_f1)
             torch.testing.assert_close(g_ref, g_fl)
+
+    def test_force_recompute_mm_fqns(self):
+        """Test that per_op_sac_force_recompute_mm_shapes_by_fqns controls
+        exactly which matmuls are recomputed vs stored during backward.
+
+        Approach: during backward, count aten.mm calls per weight tensor.
+        count=1 means stored (gradient mm only), count=2 means recomputed
+        (gradient mm + recomputed forward mm).
+        """
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        class MmWeightTracker(TorchDispatchMode):
+            def __init__(self, ptrs):
+                super().__init__()
+                self._ptrs = ptrs
+                self.counts = {n: 0 for n in ptrs.values()}
+
+            def __torch_dispatch__(self, func, types, args, kwargs=None):
+                if func == torch.ops.aten.mm.default:
+                    for arg in args:
+                        name = self._ptrs.get(arg.data_ptr())
+                        if name is not None:
+                            self.counts[name] += 1
+                            break
+                return func(*args, **(kwargs or {}))
+
+        def get_recomputed(force_recompute_fqns):
+            m = ToyModule()
+            apply_ac(
+                m,
+                ACConfig(
+                    mode="selective",
+                    per_op_sac_force_recompute_mm_shapes_by_fqns=force_recompute_fqns,
+                    early_stop=False,
+                ),
+                model_compile_enabled=False,
+            )
+            ptr_to_name = {
+                mod.weight.data_ptr(): fqn.rsplit(".", 1)[-1]
+                for fqn, mod in m.named_modules()
+                if isinstance(mod, Linear)
+            }
+            x = torch.randn(64, 512, requires_grad=True)
+            out = m(x)
+            tracker = MmWeightTracker(ptr_to_name)
+            with tracker:
+                out.backward()
+            return {n for n, c in tracker.counts.items() if c == 2}
+
+        # No force recompute: alternating pattern recomputes every 2nd mm
+        self.assertEqual(get_recomputed([]), {"wq"})
+        # force_recompute="moe.router.gate": shape (512,512) also matches wq,
+        # so both are force-recomputed; output is 1st in alternation → saved
+        self.assertEqual(get_recomputed(["moe.router.gate"]), {"gate", "wq"})
+        # force_recompute="output": shape (512,1024) is unique to output,
+        # gate and wq still alternate (gate saved, wq recomputed)
+        self.assertEqual(get_recomputed(["output"]), {"wq", "output"})
 
 
 if __name__ == "__main__":

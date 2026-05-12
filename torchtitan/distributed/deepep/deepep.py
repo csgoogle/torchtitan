@@ -8,21 +8,19 @@
 DeepEP primitives for MoE Expert Parallel.
 
 Provides low-level functions and autograd wrappers for DeepEP communication.
-Used by DeepEPExpertParallel in expert_parallel.py.
+Used by DeepEPTokenDispatcher in token_dispatcher.py.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
+from torch.utils._python_dispatch import _disable_current_modes
 
 try:
-    from deep_ep import Buffer  # pyrefly: ignore[missing-import]
-    from deep_ep.utils import (  # pyrefly: ignore[missing-import]
-        EventHandle,
-        EventOverlap,
-    )
+    from deep_ep import Buffer
+
+    from deep_ep.utils import EventHandle, EventOverlap
 except ImportError as e:
     raise ImportError(
         "DeepEP is required for this module. "
@@ -31,13 +29,19 @@ except ImportError as e:
 
 
 # Global buffer (single buffer per process, recreated if group changes)
-# pyrefly: ignore [bad-assignment]
 _buffer: Buffer = None
 
 # Global cache for dispatch handles, keyed by handle_id
 # SAC saves the handle_id tensor; we use it to retrieve the non-tensor handle
 _handle_cache: dict = {}
 _handle_counter: int = 0
+
+# Pending combine event for deferred synchronization.
+# Stores the EventOverlap from buffer.combine() to allow overlapping
+# shared_experts computation with combine communication.
+# This is process-local state (each GPU process has its own Python interpreter),
+# and execution is single-threaded, so a simple module variable suffices.
+_pending_combine_event: EventOverlap | None = None
 
 
 def _get_next_handle_id() -> torch.Tensor:
@@ -74,7 +78,7 @@ def _dispatch_op_impl(
     num_tokens_per_rdma_rank: torch.Tensor,
     is_token_in_rank: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Execute DeepEP dispatch."""
     global _buffer
 
@@ -111,7 +115,6 @@ def _dispatch_op_impl(
     recv_num_tokens_per_expert = torch.tensor(
         recv_num_tokens_per_expert_list, dtype=torch.int32, device="cpu"
     )
-    # pyrefly: ignore [bad-return]
     return recv_x, recv_indices, recv_scores, recv_num_tokens_per_expert, handle_id
 
 
@@ -164,7 +167,7 @@ def _dispatch_backward(
 @torch.library.impl(_lib, "combine", "CUDA")
 def _combine_op_impl(x: torch.Tensor, handle_id: torch.Tensor) -> torch.Tensor:
     """Execute DeepEP combine."""
-    global _buffer
+    global _buffer, _pending_combine_event
 
     buffer = _buffer
     assert buffer is not None, "Buffer must be initialized before combine"
@@ -187,7 +190,10 @@ def _combine_op_impl(x: torch.Tensor, handle_id: torch.Tensor) -> torch.Tensor:
         allocate_on_comm_stream=True,
     )
 
-    after_event.current_stream_wait()
+    # Store event for deferred sync instead of syncing immediately.
+    # This enables overlapping shared_experts computation with combine communication.
+    # The caller MUST call sync_combine() before using the returned tensor.
+    _pending_combine_event = after_event
 
     return combined
 
@@ -233,6 +239,54 @@ torch.library.register_autograd(
 )
 
 
+def sync_combine() -> None:
+    """Synchronize the current CUDA stream with the pending combine operation.
+
+    This function MUST be called before using the result of combine_tokens()
+    to ensure the async combine has completed. It inserts a wait operation
+    on the current CUDA stream, making subsequent CUDA kernels wait for
+    the combine to finish.
+
+    torch.compile Compatibility:
+        Guarded with is_compiling() to skip in compile mode.
+        This avoids issues with CUDA event operations not being traceable.
+
+    Process Isolation:
+        Each GPU process has its own Python interpreter, so this module-level
+        variable is inherently process-local. No cross-process interference.
+
+    Single-Threaded Execution:
+        PyTorch training is single-threaded per process, so no thread safety
+        concerns. Sequential execution guarantees correct event ordering.
+
+    Activation Checkpointing Compatibility:
+        - During forward: combine stores event, sync_combine() waits on it
+        - During AC recomputation: combine runs again, stores NEW event,
+          sync_combine() waits on the new event
+        - Sequential execution ensures each forward/recompute uses its own event
+
+    Multiple MoE Layers:
+        Each layer's combine overwrites the pending event. Since sync_combine()
+        is called before using each layer's output (and before the next layer's
+        combine), this is safe. The sync clears the event to prevent double-sync.
+
+    Safe to call multiple times - subsequent calls are no-ops if the event
+    was already synced or if no combine operation is pending.
+    """
+    global _pending_combine_event
+    # is_compiling() is True under Dynamo (aot mode) — skip to avoid tracing
+    # through global state Dynamo can't handle. Under make_fx (aot_fx_trace),
+    # is_compiling() is False so this guard doesn't fire, but the function is
+    # still safe: _pending_combine_event is None during tracing (no real
+    # combine ran), so the body below is a no-op.
+    if torch.compiler.is_compiling():
+        return
+
+    if _pending_combine_event is not None:
+        _pending_combine_event.current_stream_wait()
+        _pending_combine_event = None
+
+
 def get_hidden_bytes(x: torch.Tensor) -> int:
     """Calculate the number of hidden bytes for one token."""
     # Use at least 2 bytes (bf16 size) so buffer works for both fp8 and bf16 without reallocation
@@ -269,7 +323,7 @@ def _permute_tokens(
     hidden_states: torch.Tensor,
     dispatched_indices: torch.Tensor,
     dispatched_scores: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert dispatch output to grouped_mm format with permutation and token expansion.
 
     Each token may be routed to multiple experts (top-k), so tokens are expanded and sorted
@@ -335,7 +389,7 @@ class DispatchState:
     handle_id: torch.Tensor  # CPU tensor used to retrieve cached handle
     permuted_indices: torch.Tensor
     num_recv_tokens: int
-    permuted_scores: Optional[torch.Tensor] = None
+    permuted_scores: torch.Tensor | None = None
 
 
 def dispatch_tokens(
@@ -346,7 +400,7 @@ def dispatch_tokens(
     num_experts: int,
     group: ProcessGroup,
     score_before_experts: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, DispatchState]:
+) -> tuple[torch.Tensor, torch.Tensor, DispatchState]:
     """Dispatch tokens to experts via DeepEP.
 
     Args:
@@ -371,18 +425,23 @@ def dispatch_tokens(
     if top_scores.dtype != torch.float32:
         top_scores = top_scores.float()
 
-    buffer = get_buffer(group, get_hidden_bytes(hidden_states))
+    # Hide buffer setup from SAC's __torch_dispatch__ via _disable_current_modes().
+    # Buffer.__init__ calls all_gather_object() which triggers aten._to_copy
+    # (CUDA→CPU), a MUST_SAVE op in our SAC policy. These are infrastructure
+    # ops, not model compute, and must not enter SAC's FIFO cache.
+    with _disable_current_modes():
+        buffer = get_buffer(group, get_hidden_bytes(hidden_states))
 
-    # Calculate dispatch layout before actual dispatch
-    (
-        num_tokens_per_rank,
-        num_tokens_per_rdma_rank,
-        num_tokens_per_expert_dispatch,
-        is_token_in_rank,
-        _,
-    ) = buffer.get_dispatch_layout(
-        topk_idx=selected_experts_indices, num_experts=num_experts
-    )
+        # Calculate dispatch layout before actual dispatch
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert_dispatch,
+            is_token_in_rank,
+            _,
+        ) = buffer.get_dispatch_layout(
+            topk_idx=selected_experts_indices, num_experts=num_experts
+        )
 
     # Dispatch tokens to experts
     (

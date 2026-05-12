@@ -7,23 +7,32 @@
 import time
 
 import torch
-
 from autoparallel.api import AutoParallel
 from autoparallel.auto_bucketing import configure_inductor_for_autobucketing
-
+from autoparallel.compile import autoparallel_backend
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
-
-from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    ParallelismConfig,
+    TORCH_DTYPE_MAP,
+    TrainingConfig,
+)
 from torchtitan.distributed import ParallelDims
-
+from torchtitan.experiments.autoparallel.configs import AutoParallelCompileConfig
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import device_type
 
 
 def parallelize_llama(
     model,
+    *,
     parallel_dims: ParallelDims,
-    job_config: JobConfig,
+    training: TrainingConfig,
+    parallelism: ParallelismConfig,
+    compile_config: AutoParallelCompileConfig,
+    ac_config: ActivationCheckpointConfig,
+    dump_folder: str,
 ):
     """
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
@@ -40,9 +49,7 @@ def parallelize_llama(
     torch._inductor.config.allow_buffer_reuse = False
 
     # allow configuring inductor comms optimizations from torchtitan commandline
-    configure_inductor_for_autobucketing(
-        job_config.experimental.comms_bucket_reorder_strategy
-    )
+    configure_inductor_for_autobucketing(compile_config.comms_bucket_reorder_strategy)
 
     dense_names = ["dp_replicate", "fsdp", "tp"]
     dense_names = [
@@ -53,19 +60,18 @@ def parallelize_llama(
     dense_mesh = parallel_dims.get_mesh(dense_names)
 
     def input_fn():
-        global_batch_size = job_config.training.global_batch_size
+        global_batch_size = training.global_batch_size
         if global_batch_size < 0:
             # This global batch size results in 1 gradient accumulation
             # step.
             dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-            global_batch_size = job_config.training.local_batch_size * dp_degree
+            global_batch_size = training.local_batch_size * dp_degree
         return (
             torch.randint(
                 0,
-                # job_config.training.vocab_size,
-                model.vocab_size,
-                (global_batch_size, job_config.training.seq_len),
-                device=torch.device("cuda"),
+                model.config.vocab_size,
+                (global_batch_size, training.seq_len),
+                device=torch.device(device_type),
             ),
         )
 
@@ -84,19 +90,22 @@ def parallelize_llama(
     # bail out
     # model = model_fn()
     # return model
-    if job_config.experimental.autop_force_bf16:
+    if compile_config.autop_force_bf16:
         logger.info("Forcing bf16 on model")
         model = model.bfloat16()
 
-    param_dtype = TORCH_DTYPE_MAP[job_config.training.mixed_precision_param]
-    reduce_dtype = TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce]
-    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
+    reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        cast_forward_inputs=False,
+    )
     with AutoParallel(
         model,
         input_fn,
         dense_mesh,
         mp_policy=mp_policy,
-        compile=job_config.compile,
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
 
@@ -120,8 +129,7 @@ def parallelize_llama(
         )
         out_sharding = x_sharding
         loss_parallel_enabled = (
-            parallel_dims.tp_enabled
-            and not job_config.parallelism.disable_loss_parallel
+            parallel_dims.tp_enabled and not parallelism.disable_loss_parallel
         )
         if loss_parallel_enabled:
             out_sharding = tuple(
@@ -136,6 +144,9 @@ def parallelize_llama(
         t1 = time.time()
         logger.info(f"AutoParallel took {t1 - t0} seconds")
         parallel_mod = autop.apply_placement(sharding_placement)
+
+    if compile_config.enable:
+        parallel_mod = torch.compile(parallel_mod, backend=autoparallel_backend())
 
     if loss_parallel_enabled:
 

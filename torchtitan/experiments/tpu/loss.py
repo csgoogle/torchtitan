@@ -7,6 +7,7 @@ a Pallas implementation of cross-entropy loss with fallback to XLA.
 import torch
 from torchtitan.components import loss as components_loss
 import torchtitan.config
+import torchtitan.trainer
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 import torchtitan.tools.logging as torchtitan_logging
 
@@ -61,7 +62,7 @@ def pallas_cross_entropy_loss(
 
 def build_cross_entropy_loss(
     job_config: (
-        torchtitan.config.JobConfig | tpu_job_config_module.TPUJobConfig
+        torchtitan.trainer.Trainer.Config | tpu_job_config_module.TPUJobConfig
     ),
     **kwargs
 ):
@@ -73,4 +74,4 @@ def build_cross_entropy_loss(
       return pallas_cross_entropy_loss(pred, labels, job_config)
 
     return loss_fn
-  return components_loss.build_cross_entropy_loss(job_config, **kwargs)
+  return components_loss.CrossEntropyLoss(components_loss.CrossEntropyLoss.Config())

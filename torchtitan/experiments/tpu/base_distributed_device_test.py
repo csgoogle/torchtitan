@@ -14,6 +14,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torchtitan.experiments.tpu import gdist
 import torchtitan.config
+import torchtitan.trainer
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import distributed_utils
 from torchtitan.experiments.tpu import numerical_validation
@@ -453,7 +454,7 @@ def _capture_distributed_state(
 
 
 def config_to_input_distribution(
-    config: torchtitan.config.JobConfig,
+    config: torchtitan.trainer.Trainer.Config,
 ) -> InputDistribution:
   """Determines the input distribution based on the config.
 
@@ -503,9 +504,7 @@ def _run_cpu_verification(
   init_state = recorded_history.pop("init")
 
   # Prepare CPU Configuration
-  config_manager = torchtitan.config.ConfigManager(
-      tpu_job_config_module.TPUJobConfig
-  )
+  config_manager = torchtitan.config.ConfigManager()
   cpu_config = config_manager.parse_args(config_args)
 
   # Force overrides for single-device CPU execution
@@ -648,7 +647,9 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       skip_devices: list[device_type.AcceleratorDeviceType] | None = None,
       start_trainer: Callable[
           [
-              torchtitan.config.JobConfig | tpu_job_config_module.TPUJobConfig,
+              torchtitan.trainer.Trainer.Config
+              | tpu_job_config_module.TPUJobConfig
+              | tpu_job_config_module.TPUTrainerConfig,
           ],
           Any,
       ] = None,
@@ -689,12 +690,10 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
           f"--parallelism.data_parallel_replicate_degree={data_parallel_replicate_degree}"
       )
 
-    config_manager = torchtitan.config.ConfigManager(
-        tpu_job_config_module.TPUJobConfig
-    )
+    config_manager = torchtitan.config.ConfigManager()
 
     config = config_manager.parse_args(config_args)
-    config.job.dump_folder = tempfile.gettempdir()
+    config.dump_folder = tempfile.gettempdir()
 
     utils.set_device_type(self.accelerator_device_type.value)
     if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:

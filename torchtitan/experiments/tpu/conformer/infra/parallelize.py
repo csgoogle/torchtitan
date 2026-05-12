@@ -7,6 +7,7 @@ from torch.distributed._composable import replicate
 import torch.nn as nn
 import torchtitan.config
 import torchtitan.distributed
+import torchtitan.trainer
 from torchtitan.experiments.simple_fsdp import simple_fsdp
 from torchtitan.experiments.tpu import tpu_job_config
 import torchtitan.experiments.tpu.utils as tpu_utils
@@ -27,7 +28,7 @@ class ParallelStrategy(enum.Enum):
 
 def _determine_parallel_strategy(
     parallel_dims: torchtitan.distributed.ParallelDims,
-    job_config: torchtitan.config.JobConfig | tpu_job_config.TPUJobConfig,
+    job_config: torchtitan.trainer.Trainer.Config | tpu_job_config.TPUJobConfig,
 ) -> ParallelStrategy:
   """Determine parallel strategy based on config."""
   fsdp_enabled = parallel_dims.fsdp_enabled
@@ -56,7 +57,7 @@ def _determine_parallel_strategy(
 def parallelize_conformer(
     model: nn.Module,
     parallel_dims: torchtitan.distributed.ParallelDims,
-    job_config: torchtitan.config.JobConfig | tpu_job_config.TPUJobConfig,
+    job_config: torchtitan.trainer.Trainer.Config | tpu_job_config.TPUJobConfig,
 ) -> nn.Module:
   """Apply parallelism and activation checkpointing to Conformer."""
 
@@ -187,7 +188,7 @@ def parallelize_conformer(
 
 
 def apply_compile(
-    model: nn.Module, job_config: torchtitan.config.JobConfig
+    model: nn.Module, job_config: torchtitan.trainer.Trainer.Config
 ) -> nn.Module:
   """Apply torch.compile to layers or whole model."""
   compile_mode = "layer"

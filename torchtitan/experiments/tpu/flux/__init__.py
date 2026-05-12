@@ -4,118 +4,44 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.loss import build_mse_loss
-from torchtitan.components.lr_scheduler import build_lr_schedulers
-from torchtitan.components.optimizer import build_optimizers
+from torchtitan.components.loss import MSELoss
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
-from torchtitan.models.flux.flux_datasets import build_flux_dataloader
-from torchtitan.protocols.train_spec import TrainSpec
-from .infra.parallelize import parallelize_flux
-from .model.args import FluxModelArgs
-from torchtitan.models.flux.model.autoencoder import AutoEncoderParams
+import torchtitan.models.flux as native_flux_models
+from torchtitan.models.flux.flux_datasets import FluxDataLoader
+from torchtitan.models.flux.validate import FluxValidator
+from torchtitan.experiments.tpu.flux.infra.parallelize import parallelize_flux
 from torchtitan.models.flux.model.model import FluxModel
 from torchtitan.models.flux.model.state_dict_adapter import FluxStateDictAdapter
-from torchtitan.models.flux.validate import build_flux_validator
 
 __all__ = [
-    "FluxModelArgs",
-    "FluxModel",
-    # pyrefly: ignore [missing-module-attribute]
     "flux_configs",
     "parallelize_flux",
 ]
 
-
-flux_args = {
-    "flux-dev": FluxModelArgs(
-        in_channels=64,
-        out_channels=64,
-        vec_in_dim=768,
-        context_in_dim=4096,
-        hidden_size=3072,
-        mlp_ratio=4.0,
-        num_heads=24,
-        depth=19,
-        depth_single_blocks=38,
-        axes_dim=(16, 56, 56),
-        theta=10_000,
-        qkv_bias=True,
-        autoencoder_params=AutoEncoderParams(
-            resolution=256,
-            in_channels=3,
-            ch=128,
-            out_ch=3,
-            ch_mult=(1, 2, 4, 4),
-            num_res_blocks=2,
-            z_channels=16,
-            scale_factor=0.3611,
-            shift_factor=0.1159,
-        ),
-    ),
-    "flux-schnell": FluxModelArgs(
-        in_channels=64,
-        out_channels=64,
-        vec_in_dim=768,
-        context_in_dim=4096,
-        hidden_size=3072,
-        mlp_ratio=4.0,
-        num_heads=24,
-        depth=19,
-        depth_single_blocks=38,
-        axes_dim=(16, 56, 56),
-        theta=10_000,
-        qkv_bias=True,
-        autoencoder_params=AutoEncoderParams(
-            resolution=256,
-            in_channels=3,
-            ch=128,
-            out_ch=3,
-            ch_mult=(1, 2, 4, 4),
-            num_res_blocks=2,
-            z_channels=16,
-            scale_factor=0.3611,
-            shift_factor=0.1159,
-        ),
-    ),
-    "flux-debug": FluxModelArgs(
-        in_channels=64,
-        out_channels=64,
-        vec_in_dim=768,
-        context_in_dim=4096,
-        hidden_size=1536,
-        mlp_ratio=4.0,
-        num_heads=12,
-        depth=2,
-        depth_single_blocks=2,
-        axes_dim=(16, 56, 56),
-        theta=10_000,
-        qkv_bias=True,
-        autoencoder_params=AutoEncoderParams(
-            resolution=256,
-            in_channels=3,
-            ch=128,
-            out_ch=3,
-            ch_mult=(1, 2, 4, 4),
-            num_res_blocks=2,
-            z_channels=16,
-            scale_factor=0.3611,
-            shift_factor=0.1159,
-        ),
-    ),
+flux_configs = {
+    "flux-dev": native_flux_models.flux_configs["flux-dev"](),
+    "flux-schnell": native_flux_models.flux_configs["flux-schnell"](),
+    "flux-debug": native_flux_models.flux_configs["flux-debug"](),
 }
 
 
-def get_train_spec() -> TrainSpec:
-    return TrainSpec(
+# pytype: disable=wrong-arg-types
+register_train_spec(
+    name="flux_tpu",
+    train_spec=TrainSpec(
         model_cls=FluxModel,
-        model_args=flux_args,
+        model_args=flux_configs,
         parallelize_fn=parallelize_flux,
         pipelining_fn=None,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_flux_dataloader,
-        build_tokenizer_fn=None,
-        build_loss_fn=build_mse_loss,
-        build_validator_fn=build_flux_validator,
+        loss_config=MSELoss.Config(),
+        optimizer_config=OptimizersContainer.Config(lr=1e-4),
+        lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
+        dataloader_config=FluxDataLoader.Config(),
+        validator_config=FluxValidator.Config(enable=True),
         state_dict_adapter=FluxStateDictAdapter,
     )
+)
+# pytype: enable=wrong-arg-types

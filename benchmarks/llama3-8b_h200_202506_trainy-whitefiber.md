@@ -16,8 +16,7 @@ Each host has
 
 Runs were invoked with the following, where `NUM_NODES` was `4` and `8`.
 
-**Warning**: the command here has been updated to use the latest version of torchtitan, which has had API changes since this benchmark was ran.
-To reproduce the results using the original torchtitan commit, change all instances of `quantize.linear.float8` to `float8` in the command below.
+**Warning**: the command below reflects the original invocation at the time of this benchmark. The torchtitan CLI has since changed to use `--module` and `--config` flags instead of `--job.config-file`. See the current [README](/README.md) for up-to-date usage.
 ```
   torchrun \
     --nnodes $NUM_NODES  \
@@ -34,7 +33,7 @@ To reproduce the results using the original torchtitan commit, change all instan
     --quantize.linear.float8.enable_fsdp_float8_all_gather \
     --quantize.linear.float8.precompute_float8_dynamic_scale_for_fsdp \
     --quantize.linear.float8.force_recompute_fp8_weight_in_bwd \
-    --profiling.profile_freq 1000000
+    --profiler.profile_freq 1000000
     --training.steps 2000
 ```
 

@@ -13,7 +13,7 @@ from torch.distributed.tensor import DTensor
 import torch.nn.functional as F
 import torchax
 from torchtitan.experiments.torchax import moe_utils
-from torchtitan.models.moe import MoEArgs
+from torchtitan.protocols.train_spec import MoEArgs
 import torchtitan.tools.logging
 
 

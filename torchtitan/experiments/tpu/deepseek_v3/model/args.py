@@ -10,8 +10,7 @@
 from dataclasses import dataclass, field
 
 from torch import nn
-
-from torchtitan.config import JobConfig
+from torchtitan.config import Configurable
 from torchtitan.models.moe import MoEArgs
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.model import BaseModelArgs
@@ -22,7 +21,7 @@ from torchtitan.tools.utils import has_cuda_capability
 # Reference: https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 @dataclass
 class DeepSeekV3ModelArgs(BaseModelArgs):
-    """
+  """
     Data class for defining model arguments and hyperparameters.
 
     Attributes:
@@ -51,85 +50,88 @@ class DeepSeekV3ModelArgs(BaseModelArgs):
         beta_slow (int): Slow beta correction factor.
     """
 
-    max_batch_size: int = 8
-    max_seq_len: int = 4096 * 4
-    vocab_size: int = 102400
-    dim: int = 2048
-    inter_dim: int = 10944
-    moe_inter_dim: int = 1408
-    n_layers: int = 27
-    n_dense_layers: int = 1
-    n_heads: int = 16
-    norm_eps: float = 1e-5  # eps used for RMSNorm
+  max_batch_size: int = 8
+  max_seq_len: int = 4096 * 4
+  vocab_size: int = 102400
+  dim: int = 2048
+  inter_dim: int = 10944
+  moe_inter_dim: int = 1408
+  n_layers: int = 27
+  n_dense_layers: int = 1
+  n_heads: int = 16
+  norm_eps: float = 1e-5  # eps used for RMSNorm
 
-    # MoE
-    moe_args: MoEArgs = field(default_factory=MoEArgs)
+  # MoE
+  moe_args: MoEArgs = field(default_factory=MoEArgs)
 
-    # Expert parallel communication backend (set from config)
-    expert_parallel_comm_backend: str = "standard"  # "standard" or "deepep"
+  # Expert parallel communication backend (set from config)
+  expert_parallel_comm_backend: str = "standard"  # "standard" or "deepep"
 
-    # Multi-Head Latent Attention (MLA)
-    q_lora_rank: int = 0
-    kv_lora_rank: int = 512
-    qk_nope_head_dim: int = 128
-    qk_rope_head_dim: int = 64
-    v_head_dim: int = 128
-    attn_type: str = "sdpa"
-    attn_mask_type: str = "causal"
+  # Multi-Head Latent Attention (MLA)
+  q_lora_rank: int = 0
+  kv_lora_rank: int = 512
+  qk_nope_head_dim: int = 128
+  qk_rope_head_dim: int = 64
+  v_head_dim: int = 128
+  attn_type: str = "sdpa"
+  attn_mask_type: str = "causal"
 
-    # yarn
-    original_seq_len: int = 4096
-    rope_theta: float = 10000.0
-    rope_factor: float = 40
-    beta_fast: int = 32
-    beta_slow: int = 1
-    mscale: float = 1.0
+  # yarn
+  original_seq_len: int = 4096
+  rope_theta: float = 10000.0
+  rope_factor: float = 40
+  beta_fast: int = 32
+  beta_slow: int = 1
+  mscale: float = 1.0
 
-    def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
-        seq_len = job_config.training.seq_len
-        if seq_len > self.max_seq_len:
-            logger.warning(
-                f"Sequence length {seq_len} exceeds original maximum {self.max_seq_len}."
-            )
-        self.max_seq_len = seq_len
+  def update_from_config(
+      self, job_config: Configurable.Config, **kwargs
+  ) -> None:
+    seq_len = job_config.training.seq_len
+    if seq_len > self.max_seq_len:
+      logger.warning(
+          f"Sequence length {seq_len} exceeds original maximum"
+          f" {self.max_seq_len}."
+      )
+    self.max_seq_len = seq_len
 
-        if self.moe_args.use_grouped_mm and not has_cuda_capability(9, 0):
-            logger.warning(
+    if self.moe_args.use_grouped_mm and not has_cuda_capability(9, 0):
+      logger.warning(
                 "Failed to use grouped mm, which is only supported on SM90 or later",
             )
-            self.moe_args.use_grouped_mm = False
+      self.moe_args.use_grouped_mm = False
 
-        if (
+    if (
             job_config.parallelism.context_parallel_degree > 1
             and self.attn_type != "sdpa"
         ):
-            raise NotImplementedError("CP support is only supported for SDPA.")
+      raise NotImplementedError("CP support is only supported for SDPA.")
 
-        self.moe_args._debug_force_load_balance = (
+    self.moe_args._debug_force_load_balance = (
             job_config.debug.moe_force_load_balance
         )
 
-        # Configure expert parallel communication backend from config (defaults to "standard")
-        self.moe_impl = job_config.parallelism.expert_parallel_comm_backend
+    # Configure expert parallel communication backend from config (defaults to "standard")
+    self.moe_impl = job_config.parallelism.expert_parallel_comm_backend
 
-        # Lazy import to avoid circular dependencies.
-        from torchtitan.experiments.tpu.tpu_job_config import TPUJobConfig
+    # Lazy import to avoid circular dependencies.
+    from torchtitan.experiments.tpu.tpu_job_config import TPUJobConfig
 
-        # Check if we are running a TPU Job
-        if isinstance(job_config, TPUJobConfig):
-            # RoPE workaround enabled by defaul in __post_init__, revert if disabled in TPUJobConfig
-            if not job_config.tpu_config.apply_rope_complex_workaround:
-                from torchtitan.experiments.tpu.deepseek_v3.model import workarounds
+    # Check if we are running a TPU Job
+    if isinstance(job_config, TPUJobConfig):
+      # RoPE workaround enabled by defaul in __post_init__, revert if disabled in TPUJobConfig
+      if not job_config.tpu_config.apply_rope_complex_workaround:
+        from torchtitan.experiments.tpu.deepseek_v3.model import workarounds
 
-                logger.info(
+        logger.info(
                     "TPUJobConfig requested disabling TPU RoPE workaround. Reverting patch."
                 )
-                workarounds.revert_patch()
+        workarounds.revert_patch()
 
-    def get_nparams_and_flops(
+  def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int
     ) -> tuple[int, float]:
-        return get_moe_model_nparams_and_flops(
+    return get_moe_model_nparams_and_flops(
             self,
             model,
             self.qk_nope_head_dim + self.qk_rope_head_dim + self.v_head_dim,

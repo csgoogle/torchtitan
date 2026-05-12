@@ -79,11 +79,10 @@ class TrainCheckpointVerificationTest(
     checkpointed_output = os.path.join(test_tmp_dir, "checkpointed_losses.pt")
 
     base_args = [
-        "--model.name=llama3_tpu",
-        "--job.config_file=torchtitan/models/llama3/train_configs/debug_model.toml",
-        "--training.dataset_path=tests/assets/c4_test",
-        "--training.dataset=c4_test",
-        "--model.hf_assets_path=tests/assets/tokenizer",
+        "--module", "torchtitan.experiments.tpu.llama3",
+        "--config", "llama3_debugmodel",
+        "--dataloader.dataset_path=tests/assets/c4_test",
+        "--hf_assets_path=tests/assets/tokenizer",
         "--training.seq_len=128",
         "--training.local_batch_size=4",
         "--debug.deterministic",

@@ -1,11 +1,11 @@
 """Registration of Conformer model for TorchTitan."""
 
-from torchtitan.components import lr_scheduler
-from torchtitan.components import optimizer
-from torchtitan.components import tokenizer
-from torchtitan.components import validate
-from torchtitan.experiments.tpu import loss
-from torchtitan.hf_datasets import text_datasets
+from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.validate import Validator
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.protocols import train_spec
 from . import model
 from .infra.parallelize import parallelize_conformer
@@ -27,12 +27,12 @@ train_spec.register_train_spec(
         model_args=conformer_args,
         parallelize_fn=parallelize_conformer,
         pipelining_fn=None,
-        build_optimizers_fn=optimizer.build_optimizers,
-        build_lr_schedulers_fn=lr_scheduler.build_lr_schedulers,
-        build_dataloader_fn=text_datasets.build_text_dataloader,
-        build_tokenizer_fn=tokenizer.build_hf_tokenizer,
-        build_loss_fn=loss.build_cross_entropy_loss,
-        build_validator_fn=validate.build_validator,
+        loss_config=CrossEntropyLoss.Config(),
+        optimizer_config=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
+        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        tokenizer_config=HuggingFaceTokenizer.Config(),
+        validator_config=Validator.Config(enable=True),
         state_dict_adapter=None,
     ),
 )

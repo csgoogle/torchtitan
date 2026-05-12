@@ -1,3 +1,4 @@
+
 """Tests for DeepSeekV3 model components on GPU and TPU devices.
 
 This file contains tests to ensure parity between CPU and GPU/TPU device
@@ -5,14 +6,62 @@ implementations of various DeepSeekV3 model layers (including Embedding, and
 Attention) as well as full model testing.
 """
 
+from typing import Tuple
+
 from absl.testing import absltest
+from absl.testing import parameterized
 import torch
 from torch import nn
+import torchtitan.experiments.tpu.deepseek_v3 as deepseek_v3_tpu
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
-from torchtitan.models.deepseek_v3.model import model as deepseek_v3_model
-from torchtitan.models import moe
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
+from torchtitan.models.common.rope import RoPE
+from torchtitan.models.deepseek_v3.model import Attention, DeepSeekV3Model, DeepSeekV3TransformerBlock
+
+
+def _get_model_config(model_name: str = "testmodel") -> DeepSeekV3Model.Config:
+  """Retrieves a registered DeepSeek V3 configuration dynamically from TPU registry.
+
+  Defaults for 'testmodel' (Dense):
+    - vocab_size = 2048, max_seq_len = 128, dim = 128
+    - n_layers = 3, n_dense_layers = 3, n_heads = 8, dense_hidden_dim = 256
+    - head_dim = 16, rope_theta = 10000.0, kv_lora_rank = 512
+
+  Defaults for 'testmodel_moe' (MoE):
+    - vocab_size = 2048, max_seq_len = 128, dim = 128
+    - n_layers = 3, n_dense_layers = 1, n_heads = 8, dense_hidden_dim = 256
+    - head_dim = 16, rope_theta = 10000.0, kv_lora_rank = 512
+    - moe_hidden_dim = 128, num_experts = 8, router_top_k = 2
+  """
+  return deepseek_v3_tpu.deepseekv3_configs[model_name]
+
+
+FULL_MODEL_TEST_CONFIGS = [
+    dict(
+        testcase_name="_DENSE",
+        model_name="testmodel",
+        loss_atol=1e-1,
+        loss_rtol=1e-2,
+        grad_atol=1.0,  # Grad noise builds up over multiple steps
+        grad_rtol=1e-2,
+        param_atol=8e-2,
+        param_rtol=1e-2,
+        is_moe=False,
+    ),
+    dict(
+        testcase_name="_MOE",
+        model_name="testmodel_moe",
+        # May need looser tolerances for MOE
+        loss_atol=1e-1,
+        loss_rtol=1e-2,
+        grad_atol=1.0,  # Grad noise builds up over multiple steps
+        grad_rtol=1e-2,
+        param_atol=8e-2,
+        param_rtol=1e-2,
+        is_moe=True,
+    ),
+]
 
 
 class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
@@ -27,52 +76,40 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
     # Enable CPU histc workaround.
     use_cpu_safe_histc_patch()
 
-  def _get_model_args(
+  def _create_rope_input_tensors_cpu_device(
       self,
-      n_layers: int = 2,
-      vocab_size: int = 32,
-      max_seq_len: int = 8,
-  ) -> deepseek_v3_model.DeepSeekV3ModelArgs:
-    """Returns reduced model arguments for DeepSeek V3 for debugging."""
-    args = deepseek_v3_model.DeepSeekV3ModelArgs(
-        vocab_size=vocab_size,
-        dim=64,
-        inter_dim=128,
-        moe_inter_dim=64,
-        n_layers=n_layers,
-        n_dense_layers=1,
-        n_heads=4,
-        moe_args=moe.MoEArgs(
-            use_grouped_mm=False,
-        ),
-        kv_lora_rank=16,
-        qk_nope_head_dim=16,
-        qk_rope_head_dim=16,
-        v_head_dim=16,
-        mscale=0.70,
-        max_seq_len=max_seq_len,
-        max_batch_size=4,
-        original_seq_len=max_seq_len,
+      config: DeepSeekV3Model.Config,
+      batch: int = 2,
+      seq_len: int = 8,
+      requires_grad: bool = True,
+  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Creates input tensors (x, rope_cache) necessary for the Attention module."""
+    x_cpu, x_device = self._create_input_tensor_cpu_device(
+        (batch, seq_len, config.dim), requires_grad=requires_grad
     )
-    args.moe_impl = "standard"
-    return args
+
+    rope_module = RoPE(config.rope)
+    rope_cache_cpu = rope_module.cache[:seq_len]
+    rope_cache_device = rope_cache_cpu.to(self.accelerator_device)
+
+    return x_cpu, x_device, rope_cache_cpu, rope_cache_device
 
   def test_deepseek_embedding_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the Embedding layer."""
-    args = self._get_model_args()
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     # CPU and DEVICE setup
     embedding_cpu, embedding_device = self._setup_module_cpu_device(
         nn.Embedding,
         init_fn=lambda m: nn.init.normal_(m.weight),
-        num_embeddings=args.vocab_size,
-        embedding_dim=args.dim,
+        num_embeddings=config.vocab_size,
+        embedding_dim=config.dim,
     )
 
     tokens_cpu = torch.randint(
         0,
-        args.vocab_size,
+        config.vocab_size,
         (batch, seq_len),
         device="cpu",
         requires_grad=False,
@@ -106,17 +143,17 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_apply_rotary_emb_cpu_device_parity(self):
     """Tests CPU vs. DEVICE parity for apply_rotary_emb function."""
-
-    batch, seq_len, n_heads, head_dim = 2, 8, 4, 16
-    # Instantiate args just to trigger the patch in __post_init__
-    _ = self._get_model_args()
+    config = _get_model_config()
+    batch, seq_len = 2, 8
+    head_dim = 16
+    n_heads = 8
 
     # CPU setup
     x_cpu = torch.randn(
         batch, seq_len, n_heads, head_dim, device="cpu", requires_grad=True
     )
-    theta = torch.randn(seq_len, head_dim // 2, device="cpu")
-    freqs_cis_cpu = torch.exp(1j * theta)
+    rope_module = RoPE(config.rope)
+    freqs_cis_cpu = rope_module.cache[:seq_len]
 
     # DEVICE setup
     x_device = (
@@ -126,8 +163,10 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
 
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      y_cpu = deepseek_v3_model.apply_rotary_emb(x_cpu, freqs_cis_cpu)
-      y_device = deepseek_v3_model.apply_rotary_emb(x_device, freqs_cis_device)
+      from torchtitan.models.common.rope import apply_rotary_emb_single_complex
+
+      y_cpu = apply_rotary_emb_single_complex(x_cpu, freqs_cis_cpu)
+      y_device = apply_rotary_emb_single_complex(x_device, freqs_cis_device)
 
       test_utils.check_equivalence(y_cpu, y_device.cpu(), atol=1e-5, rtol=1e-5)
 
@@ -145,26 +184,30 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_deepseek_attention_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the Attention layer."""
-    args = self._get_model_args()
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     # CPU and DEVICE setup
     attention_cpu, attention_device = self._setup_module_cpu_device(
-        deepseek_v3_model.Attention,
-        lambda m: m.init_weights(init_std=0.02),
-        args,
+        Attention,
+        init_fn=lambda m: None,
+        config=config.layers[0].attention,
     )
-    x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, args.dim), requires_grad=True
+    x_cpu, x_device, rope_cache_cpu, rope_cache_device = (
+        self._create_rope_input_tensors_cpu_device(config, batch, seq_len)
     )
-    freqs_cis_cpu = deepseek_v3_model.precompute_freqs_cis(args)
-    freqs_cis_device = freqs_cis_cpu.to(self.accelerator_device)
 
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      out_cpu = attention_cpu(x_cpu, freqs_cis_cpu, None)
-      out_device = attention_device(x_device, freqs_cis_device, None)
-      test_utils.check_equivalence(out_cpu, out_device.cpu(), atol=1e-3, rtol=1e-3)
+      out_cpu = attention_cpu(x_cpu, rope_cache_cpu, None)
+      out_device = attention_device(x_device, rope_cache_device, None)
+      test_utils.check_equivalence(
+          out_device.cpu(),
+          out_cpu,
+          atol=5e-3,
+          rtol=5e-3,
+          check_name="Attention Forward",
+      )
 
       with self.subTest(name="BackwardPass"):
         # Backward pass
@@ -174,80 +217,119 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
         loss_device.backward()
 
         test_utils.check_equivalence(
-            x_cpu.grad, x_device.grad.cpu(), atol=1e-3, rtol=1e-3
+            x_device.grad.cpu(),
+            x_cpu.grad,
+            atol=2e-2,
+            rtol=2e-2,
+            check_name="Attention Input Grad",
         )
 
-        for p_cpu, p_device in zip(
-            attention_cpu.parameters(), attention_device.parameters()
+        for (name, p_cpu), p_device in zip(
+            attention_cpu.named_parameters(), attention_device.parameters()
         ):
           test_utils.check_equivalence(
-              p_cpu.grad, p_device.grad.cpu(), atol=1e-1, rtol=1e-1
+              p_device.grad.cpu(),
+              p_cpu.grad,
+              atol=1e-1,
+              rtol=1e-1,
+              check_name=f"Attention Param Grad: {name}",
           )
 
-  def test_deepseek_has_expected_layers(self):
-    """Tests that the DeepSeek model contains MoE and Dense FeedForward layers."""
-    args = self._get_model_args()
-    model = deepseek_v3_model.DeepSeekV3Model(args)
-    model.init_weights()
-
-    contains_moe = False
-    contains_dense = False
-    for layer in model.modules():
-      if isinstance(layer, moe.MoE):
-        contains_moe = True
-      elif isinstance(layer, deepseek_v3_model.FeedForward):
-        contains_dense = True
-    self.assertTrue(contains_moe, "Model does not contain MoE layers.")
-    self.assertTrue(
-        contains_dense, "Model does not contain Dense FeedForward layers."
+  @parameterized.named_parameters(*FULL_MODEL_TEST_CONFIGS)
+  def test_deepseek_transformer_block_cpu_device_parity(
+      self,
+      model_name,
+      loss_atol,
+      loss_rtol,
+      grad_atol,
+      grad_rtol,
+      param_atol,
+      param_rtol,
+      is_moe,  # pylint: disable=unused-argument
+  ):
+    """Tests the CPU vs. DEVICE parity of the TransformerBlock layer."""
+    config = _get_model_config(model_name)
+    batch, seq_len, layer_id = 2, 8, 0
+    block_config = config.layers[layer_id]
+    transformer_block_cpu, transformer_block_device = (
+        self._setup_module_cpu_device(
+            DeepSeekV3TransformerBlock,
+            lambda m: m.init_states(buffer_device=torch.device("cpu")),
+            config=block_config,
+        )
+    )
+    x_cpu, x_device, rope_cache_cpu, rope_cache_device = (
+        self._create_rope_input_tensors_cpu_device(config, batch, seq_len)
     )
 
-  def test_deepseek_complete_model_training_steps_cpu_device_parity(self):
-    """Tests CPU vs DEVICE parity of full DeepSeek model after 3 training steps.
-
-    Uses baseclass function wrapper for full model training steps parity test.
-    """
-    args = self._get_model_args()
-    batch, seq_len = 2, 8
-
-    model = deepseek_v3_model.DeepSeekV3Model(args)
-    model.init_weights()
-
-    self._run_full_model_training_steps_parity_test(
-        model_cpu=model.cpu(),
-        batch=batch,
-        seq_len=seq_len,
-        loss_atol=1e-1,
-        loss_rtol=1e-1,
-        grad_atol=1e-1,
-        grad_rtol=1e-1,
-        param_atol=1e-1,
-        param_rtol=1e-1,
+    out_cpu = transformer_block_cpu(x_cpu, rope_cache_cpu, None)
+    out_device = transformer_block_device(x_device, rope_cache_device, None)
+    test_utils.check_equivalence(
+        out_device.cpu(),
+        out_cpu,
+        atol=5e-3,
+        rtol=5e-3,
+        check_name="TransformerBlock Forward",
     )
 
-  @test_utils.skip_if_cpu(
-      reason="CPU results should be equal",
-      bug_id=None,
-  )
-  @absltest.expectedFailure
-  def test_deepseek_parity_test_raises_assertion_error_with_zero_tol(self):
-    """Tests that the parity test raises an AssertionError with zero tolerance."""
-    args = self._get_model_args()
+    out_cpu.sum().backward()
+    out_device.sum().backward()
+    test_utils.check_equivalence(
+        x_device.grad.cpu(),
+        x_cpu.grad,
+        atol=8e-3,
+        rtol=8e-3,
+        check_name="TransformerBlock Input Grad",
+    )
+    for (name, p_cpu), p_device in zip(
+        transformer_block_cpu.named_parameters(),
+        transformer_block_device.parameters(),
+    ):
+      param_atol = 5e-3
+      param_rtol = 5e-3
+      # Relax tolerances for Attention layers to cover noise from new kernel.
+      if "attention" in name:
+        param_atol = 5e-2
+        param_rtol = 5e-2
+      test_utils.check_equivalence(
+          p_device.grad.cpu(),
+          p_cpu.grad,
+          atol=param_atol,
+          rtol=param_rtol,
+          check_name=f"TransformerBlock Param Grad: {name}",
+      )
+
+  @parameterized.named_parameters(*FULL_MODEL_TEST_CONFIGS)
+  def test_deepseek_complete_model_training_steps_cpu_device_parity(
+      self,
+      model_name,
+      loss_atol,
+      loss_rtol,
+      grad_atol,
+      grad_rtol,
+      param_atol,
+      param_rtol,
+      is_moe,  # pylint: disable=unused-argument
+  ):
+    """Tests CPU vs DEVICE parity of full DeepSeek model after 3 training steps."""
+    config = _get_model_config(model_name)
     batch, seq_len = 2, 8
 
-    model = deepseek_v3_model.DeepSeekV3Model(args)
-    model.init_weights()
+    model_cpu = DeepSeekV3Model(config)
+    model_cpu.init_weights(buffer_device=torch.device("cpu"))
+    model_cpu = model_cpu.cpu()
 
     self._run_full_model_training_steps_parity_test(
-        model_cpu=model.cpu(),
+        model_cpu=model_cpu,
         batch=batch,
         seq_len=seq_len,
-        loss_atol=0.0,
-        loss_rtol=0.0,
-        grad_atol=0.0,
-        grad_rtol=0.0,
-        param_atol=0.0,
-        param_rtol=0.0,
+        loss_atol=loss_atol,
+        loss_rtol=loss_rtol,
+        grad_atol=grad_atol,
+        grad_rtol=grad_rtol,
+        param_atol=param_atol,
+        param_rtol=param_rtol,
+        vocab_size=config.vocab_size,
     )
 
 

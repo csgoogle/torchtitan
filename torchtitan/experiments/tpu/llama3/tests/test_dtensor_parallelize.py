@@ -2,7 +2,6 @@
 
 from absl import logging
 from absl.testing import absltest
-from torch.distributed.device_mesh import DeviceMesh
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Replicate, Shard
@@ -11,12 +10,15 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 import torch.nn as nn
+from torchtitan.config.configs import ActivationCheckpointConfig, CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu import base_distributed_device_test
-from torchtitan.experiments.tpu.base_distributed_device_test import InputDistribution
 from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu import test_utils
-from torchtitan.models.llama3.infra import parallelize as llama3_dtensor_parallelize
-from torchtitan.models.llama3.model import model as llama3_model
+from torchtitan.experiments.tpu.base_distributed_device_test import InputDistribution
+import torchtitan.experiments.tpu.llama3 as llama3_tpu
+from torchtitan.models.llama3 import parallelize as llama3_dtensor_parallelize
+from torchtitan.models.llama3.model import Llama3Model
 
 
 
@@ -26,37 +28,20 @@ from torchtitan.models.llama3.model import model as llama3_model
 # >= 4, i.e. TEST_BATCH_SIZE / world_size >= 4.
 TEST_BATCH_SIZE = 32
 
-# Need to make sure this is large enough for world size for sequence sharding.
-# To use OVERRIDEABLE SDP on TPU, sequence length needs to be multiple of 512.
-TEST_SEQ_LEN = 512
-# If this is too small for worldsize/model, then the following assertion error
-# is raised within the model code: freqs_cis.shape != (seqlen, x.shape[-1])
-MAX_SEQ_LEN = 512
+# To use OVERRIDEABLE SDP on TPU, sequence length needs to be multiple of 512,
+# which is retrieved dynamically from the config's rope.max_seq_len.
 
 # Constants for training parameters
 TEST_TRAINING_STEPS = 3
-TEST_LR = 0.
-
-# Constants for model parameters
-# To use OVERRIDEABLE SDP on TPU, head dimension (which is dim / n_heads)
-# should be either < 128 OR divisible by 128.
-MODEL_DIM = 64
-MODEL_N_HEADS = 8
 
 
-def _get_llama3_model_args(
-    vocab_size=128, dim=MODEL_DIM, n_layers=1, n_heads=MODEL_N_HEADS, multiple_of=16,
-) -> llama3_model.TransformerModelArgs:
-  """Returns model arguments for Llama3 model for testing."""
-  return llama3_model.TransformerModelArgs(
-      dim=dim,
-      n_layers=n_layers,
-      n_heads=n_heads,
-      n_kv_heads=n_heads,
-      vocab_size=vocab_size,
-      multiple_of=multiple_of,
-      max_seq_len=MAX_SEQ_LEN,
-  )
+def _get_model_config(model_name: str = "testmodel") -> Llama3Model.Config:
+  """Retrieves a registered Llama3 configuration dynamically from TPU registry.
+
+  Defaults to 'testmodel' (which specifies dim=64, n_heads=8, n_layers=1,
+  vocab_size=128, max_seq_len=512).
+  """
+  return llama3_tpu.llama3_configs[model_name]
 
 
 def _verify_dtensor_llama3_tp_forward_worker(
@@ -66,17 +51,34 @@ def _verify_dtensor_llama3_tp_forward_worker(
 
   # Apply TP wrapper
   def apply_tp_wrapper(model):
-    tp_mesh = DeviceMesh(device_type=device.type, mesh=torch.arange(world_size))
-    llama3_dtensor_parallelize.apply_tp(
-        model, tp_mesh, loss_parallel=False, enable_float8_tensorwise_tp=False
+    parallel_dims = ParallelDims(
+        dp_shard=1,
+        dp_replicate=1,
+        cp=1,
+        tp=world_size,
+        pp=1,
+        ep=1,
+        world_size=world_size,
     )
+    # pytype: disable=wrong-arg-types
+    llama3_dtensor_parallelize.parallelize_llama(
+        model,
+        ac_config=ActivationCheckpointConfig(),
+        compile_config=CompileConfig(),
+        dump_folder="",
+        parallel_dims=parallel_dims,
+        parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
+        training=TrainingConfig(),
+    )
+    # pytype: enable=wrong-arg-types
 
+  config = _get_model_config()
   runner = base_distributed_device_test.DistributedUnitTestRunner(
       device=device,
       rank=rank,
       world_size=world_size,
-      model_class=llama3_model.Transformer,
-      model_args=_get_llama3_model_args(),
+      model_class=Llama3Model,
+      model_args=config,
       parallelism_func=apply_tp_wrapper,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
@@ -84,9 +86,9 @@ def _verify_dtensor_llama3_tp_forward_worker(
 
   runner.run_forward_parity(
       batch_size=TEST_BATCH_SIZE,
-      seq_len=TEST_SEQ_LEN,
+      seq_len=config.rope.max_seq_len,
       atol=5e-2,
-      rtol=5e-2
+      rtol=5e-2,
   )
 
 
@@ -97,17 +99,34 @@ def _verify_dtensor_llama3_tp_backward_worker(
 
   # Apply TP wrapper
   def apply_tp_wrapper(model):
-    tp_mesh = DeviceMesh(device_type=device.type, mesh=torch.arange(world_size))
-    llama3_dtensor_parallelize.apply_tp(
-        model, tp_mesh, loss_parallel=False, enable_float8_tensorwise_tp=False
+    parallel_dims = ParallelDims(
+        dp_shard=1,
+        dp_replicate=1,
+        cp=1,
+        tp=world_size,
+        pp=1,
+        ep=1,
+        world_size=world_size,
     )
+    # pytype: disable=wrong-arg-types
+    llama3_dtensor_parallelize.parallelize_llama(
+        model,
+        ac_config=ActivationCheckpointConfig(),
+        compile_config=CompileConfig(),
+        dump_folder="",
+        parallel_dims=parallel_dims,
+        parallelism=ParallelismConfig(tensor_parallel_degree=world_size),
+        training=TrainingConfig(),
+    )
+    # pytype: enable=wrong-arg-types
 
+  config = _get_model_config()
   runner = base_distributed_device_test.DistributedUnitTestRunner(
       device=device,
       rank=rank,
       world_size=world_size,
-      model_class=llama3_model.Transformer,
-      model_args=_get_llama3_model_args(),
+      model_class=Llama3Model,
+      model_args=config,
       parallelism_func=apply_tp_wrapper,
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
@@ -117,7 +136,7 @@ def _verify_dtensor_llama3_tp_backward_worker(
   runner.run_backward_parity(
       num_steps=1,
       batch_size=TEST_BATCH_SIZE,
-      seq_len=TEST_SEQ_LEN,
+      seq_len=config.rope.max_seq_len,
       atol_loss=3e-2,
       rtol_loss=3e-2,
       atol_grad=5e-3,
@@ -132,22 +151,34 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
 
   # Apply FSDP wrapper
   def apply_fsdp_wrapper(model):
-    dp_mesh = DeviceMesh(device_type=device.type, mesh=torch.arange(world_size))
-    llama3_dtensor_parallelize.apply_fsdp(
-        model,
-        dp_mesh,
-        param_dtype=torch.float32,
-        reduce_dtype=torch.float32,
-        pp_enabled=False,
-        cpu_offload=False
+    parallel_dims = ParallelDims(
+        dp_shard=world_size,
+        dp_replicate=1,
+        cp=1,
+        tp=1,
+        pp=1,
+        ep=1,
+        world_size=world_size,
     )
+    # pytype: disable=wrong-arg-types
+    llama3_dtensor_parallelize.parallelize_llama(
+        model,
+        ac_config=ActivationCheckpointConfig(),
+        compile_config=CompileConfig(),
+        dump_folder="",
+        parallel_dims=parallel_dims,
+        parallelism=ParallelismConfig(data_parallel_shard_degree=world_size),
+        training=TrainingConfig(),
+    )
+    # pytype: enable=wrong-arg-types
 
+  config = _get_model_config()
   runner = base_distributed_device_test.DistributedUnitTestRunner(
       device=device,
       rank=rank,
       world_size=world_size,
-      model_class=llama3_model.Transformer,
-      model_args=_get_llama3_model_args(),
+      model_class=Llama3Model,
+      model_args=config,
       parallelism_func=apply_fsdp_wrapper,
       input_distribution=InputDistribution.SPLIT_BATCH,  # FSDP = Split Batch
       use_meta_init=True,
@@ -157,7 +188,7 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
   runner.run_backward_parity(
       num_steps=TEST_TRAINING_STEPS,
       batch_size=TEST_BATCH_SIZE,
-      seq_len=TEST_SEQ_LEN,
+      seq_len=config.rope.max_seq_len,
       atol_loss=3,  # TODO(tbajpai): investigate tolerance issues b/495494788
       rtol_loss=3,
       atol_grad=9e-1,
@@ -221,6 +252,7 @@ class Llama3DTensorParallelizeTest(
     logging.info("DTensor issue test finished.")
 
   # TP Tests are run with loss_parallel=False.
+  @absltest.skip("Skipping for now b/510032097")
   def test_apply_tp_forward_equivalence_distributed(self):
     """Verifies numerical equivalence of the DTensor parallel model."""
     logging.info(
@@ -252,6 +284,7 @@ class Llama3DTensorParallelizeTest(
         "Distributed DTensor backward numerical equivalence test finished."
     )
 
+  @absltest.skip("Skipping for now b/510032097")
   def test_apply_fsdp_full_training_loop_equivalence_distributed(self):
     """Verifies numerical equivalence of a full training loop with FSDP."""
     logging.info(

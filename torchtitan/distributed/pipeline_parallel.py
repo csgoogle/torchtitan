@@ -4,21 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import copy
-
 import math
 import os as os
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
+from torch.distributed._mesh_layout import _MeshLayout
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
-
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
     _PipelineScheduleRuntime,
     get_schedule_class,
-    OVERLAP_F_B,
     PipelineScheduleMulti,
     PipelineScheduleSingle,
     # ScheduleDualPipeV, - not yet available in g3
@@ -26,10 +24,16 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from torchtitan.components.loss import LossFunction
-from torchtitan.config import JobConfig
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    CompileConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.dual_pipe_v import overlap_callback
-from torchtitan.protocols.train_spec import BaseModelArgs, ParallelizeFunction
+from torchtitan.protocols.model import BaseModel
+from torchtitan.protocols.model_spec import ParallelizeFunction
+from torchtitan.protocols.module import ModuleDict, ModuleList
 from torchtitan.tools.logging import logger
 
 __all__ = [
@@ -40,32 +44,59 @@ __all__ = [
 ]
 
 
+def _build_get_mesh_callback(
+    parallel_dims: ParallelDims,
+) -> Callable[[tuple[str, ...], _MeshLayout | None], DeviceMesh | None]:
+    """Build a callback that resolves a DeviceMesh from dimension names.
+
+    Pipeline parallelism requires an SPMD mesh during module split so that
+    at runtime the current PP rank can reconstruct a DTensor after receiving
+    a plain tensor from the previous PP rank. DTensors are not directly
+    serializable across PP stages (because ProcessGroup is not serializable),
+    so each stage uses this callback to obtain its local DeviceMesh and
+    re-wrap incoming tensors as DTensors with the correct placements.
+    """
+
+    def _get_mesh(
+        mesh_dim_names: tuple[str, ...], mesh_layout: _MeshLayout | None
+    ) -> DeviceMesh | None:
+        mesh = parallel_dims.get_mesh(list(mesh_dim_names))
+        if mesh_layout is not None and mesh._layout != mesh_layout:
+            return None
+        return mesh
+
+    return _get_mesh
+
+
 def pipeline_llm(
     model: nn.Module,
+    *,
     parallel_dims: ParallelDims,
-    job_config: JobConfig,
+    training: TrainingConfig,
+    parallelism: ParallelismConfig,
+    compile_config: CompileConfig,
+    ac_config: ActivationCheckpointConfig,
+    dump_folder: str,
     device: torch.device,
-    model_args: BaseModelArgs,
+    model_config: BaseModel.Config,
     parallelize_fn: ParallelizeFunction,
     loss_fn: LossFunction,
 ) -> tuple[_PipelineSchedule, list[nn.Module], bool, bool]:
     pp_mesh = parallel_dims.get_mesh("pp")
 
     # Determine the number of virtual stages based on schedule type
-    schedule_class = get_schedule_class(
-        job_config.parallelism.pipeline_parallel_schedule
-    )
+    schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
     is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
-    layers_per_stage = job_config.parallelism.pipeline_parallel_layers_per_stage
-    if hasattr(model_args, "n_layers"):
-        num_layers = model_args.n_layers
+    layers_per_stage = parallelism.pipeline_parallel_layers_per_stage
+    if hasattr(model_config, "layers"):
+        num_layers = len(model_config.layers)
     else:
         raise ValueError("Model does not have n_layers attribute.")
 
     # You can adjust these weights based on the computational cost of embeddings and output layers
     # Higher weights mean these modules are treated as "heavier" in the distribution
-    input_weight = job_config.parallelism.pipeline_parallel_first_stage_less_layers
-    output_weight = job_config.parallelism.pipeline_parallel_last_stage_less_layers
+    input_weight = parallelism.pipeline_parallel_first_stage_less_layers
+    output_weight = parallelism.pipeline_parallel_last_stage_less_layers
 
     # Calculate number of virtual stages
     if layers_per_stage is not None:
@@ -114,7 +145,7 @@ def pipeline_llm(
         stages_per_rank = 1 if is_single_stage_schedule else 2
         num_virtual_stages = parallel_dims.pp * stages_per_rank
 
-    module_names_per_stage = job_config.parallelism.module_fqns_per_model_part
+    module_names_per_stage = parallelism.module_fqns_per_model_part
     if module_names_per_stage is None:
         module_names_per_stage = generate_llm_fqn_per_model_part(
             num_virtual_stages, num_layers, input_weight, output_weight
@@ -122,12 +153,14 @@ def pipeline_llm(
     for i, stage_ms in enumerate(module_names_per_stage):
         logger.debug(f"Stage {i}: {stage_ms}")
 
+    get_mesh_cb = _build_get_mesh_callback(parallel_dims)
     stages, model_parts = pipeline_module_split(
         model,
         pp_mesh,
-        job_config.parallelism.pipeline_parallel_schedule,
+        parallelism.pipeline_parallel_schedule,
         device,
         module_names_per_stage,
+        get_mesh=get_mesh_cb,
     )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
@@ -135,13 +168,26 @@ def pipeline_llm(
     # optimizer, and checkpointing
     for i, m in enumerate(model_parts):
         # apply SPMD-style PT-D techniques
-        m = parallelize_fn(m, parallel_dims, job_config)
+        m = parallelize_fn(
+            m,
+            parallel_dims=parallel_dims,
+            training=training,
+            parallelism=parallelism,
+            compile_config=compile_config,
+            ac_config=ac_config,
+            dump_folder=dump_folder,
+        )
         model_parts[i] = m
         # NOTE: this is to update the model in the stage
         #       in case the model is modified e.g. by torch.compile
         stages[i].submod = m
 
-    pp_schedule = build_pipeline_schedule(job_config, stages, loss_fn)
+    pp_schedule = build_pipeline_schedule(
+        parallelism=parallelism,
+        local_batch_size=training.local_batch_size,
+        stages=stages,
+        loss_fn=loss_fn,
+    )
 
     # This is used in the train loop to determine whether to pass in the input_ids and labels
     has_first_stage = False
@@ -156,19 +202,24 @@ def pipeline_llm(
 
 
 def build_pipeline_schedule(
-    job_config: JobConfig, stages: list[PipelineStage], loss_fn: Callable
+    *,
+    parallelism: ParallelismConfig,
+    local_batch_size: int,
+    stages: list[PipelineStage],
+    loss_fn: Callable,
 ) -> _PipelineSchedule:
     """Builds a pipeline schedule for the given job configuration and stages.
 
     Args:
-        job_config (JobConfig): The job configuration.
+        parallelism (ParallelismConfig): The parallelism configuration.
+        local_batch_size (int): The local batch size for computing microbatches.
         stages (list[PipelineStage]): The stages to be scheduled.
         loss_fn (Callable): The loss function.
 
     Returns:
         _PipelineSchedule: The pipeline schedule for the given stages.
     """
-    pp_schedule_csv = job_config.parallelism.pipeline_parallel_schedule_csv
+    pp_schedule_csv = parallelism.pipeline_parallel_schedule_csv
 
     # Validate that pp_schedule_csv is a valid path
     if pp_schedule_csv:
@@ -178,22 +229,20 @@ def build_pipeline_schedule(
             )
         schedule_class = _PipelineScheduleRuntime
     else:
-        schedule_class = get_schedule_class(
-            job_config.parallelism.pipeline_parallel_schedule
-        )
+        schedule_class = get_schedule_class(parallelism.pipeline_parallel_schedule)
 
     looped_schedule = issubclass(schedule_class, PipelineScheduleMulti)
-    microbatch_size = job_config.parallelism.pipeline_parallel_microbatch_size
-    batch_size = job_config.training.local_batch_size
+    microbatch_size = parallelism.pipeline_parallel_microbatch_size
+    batch_size = local_batch_size
     # validate that the batch size is divisible by the microbatch_size otherwise we'll hang or error during training
     if batch_size % microbatch_size != 0:
         raise ValueError(
-            f"Batch size {job_config.training.local_batch_size} must be divisible by microbatch_size {microbatch_size}. "
+            f"Batch size {local_batch_size} must be divisible by microbatch_size {microbatch_size}. "
             "Update the config arguments for either batch_size or pipeline_parallel_microbatch_size."
         )
     n_microbatches = batch_size // microbatch_size
     # We expect that the number of local stages (`len(stages)`) is the same across all ranks
-    num_total_stages = job_config.parallelism.pipeline_parallel_degree * len(stages)
+    num_total_stages = parallelism.pipeline_parallel_degree * len(stages)
     if n_microbatches < num_total_stages:
         logger.warning(
             f"Number of microbatches ({n_microbatches}) is less than the total number "
@@ -209,14 +258,9 @@ def build_pipeline_schedule(
         scale_grads=False,
     )
     logger.info(
-        f"Using pipeline schedule {job_config.parallelism.pipeline_parallel_schedule} "
+        f"Using pipeline schedule {parallelism.pipeline_parallel_schedule} "
         f"with {n_microbatches} microbatches and {num_total_stages} stages."
     )
-
-    if job_config.parallelism.pipeline_parallel_expert_parallel_overlap and isinstance(
-        schedule, ScheduleDualPipeV
-    ):
-        schedule.register_custom_function(OVERLAP_F_B, overlap_callback)
 
     if pp_schedule_csv:
         assert schedule_class in [
@@ -261,7 +305,7 @@ def generate_llm_fqn_per_model_part(
     if num_stages == 1:
         # Single stage gets everything
         layer_names = [f"layers.{i}" for i in range(num_layers)]
-        return [["tok_embeddings"] + layer_names + ["norm", "output"]]
+        return [["tok_embeddings"] + layer_names + ["norm", "lm_head"]]
 
     # Calculate effective layers including weights
     num_effective_layers = num_layers + input_weight + output_weight
@@ -330,7 +374,7 @@ def generate_llm_fqn_per_model_part(
                     current_layer += 1
 
             # Add output modules
-            stage_modules.extend(["norm", "output"])
+            stage_modules.extend(["norm", "lm_head"])
 
         # Middle stages: only transformer layers
         else:
@@ -350,6 +394,7 @@ def pipeline_module_split(
     pp_schedule: str,
     device: torch.device,
     module_names_per_stage: list[list[str]],
+    get_mesh: Callable | None = None,
 ) -> tuple[list[PipelineStage], list[nn.Module]]:
     """
     This API creates pipeline stages based on specified module names for each stage.
@@ -370,7 +415,7 @@ def pipeline_module_split(
                                - "tok_embeddings" for token embeddings
                                - "layers.0", "layers.1" for specific transformer layers
                                - "norm" for the final normalization layer
-                               - "output" for the output projection layer
+                               - "lm_head" for the output projection layer
 
     Returns:
         Tuple of (stages, models) where stages are PipelineStage objects and models are the
@@ -380,7 +425,7 @@ def pipeline_module_split(
         module_names_per_stage = [
             ["tok_embeddings", "layers.0"],     # Stage 0: embeddings + first layer
             ["layers.1", "layers.2"],           # Stage 1: middle layers
-            ["norm", "output"]                  # Stage 2: final norm + output
+            ["norm", "lm_head"]                  # Stage 2: final norm + output
         ]
     """
     pp_rank = pp_mesh.get_local_rank()
@@ -411,7 +456,7 @@ def pipeline_module_split(
                         indices_to_keep = {
                             int(idx) for idx in layers_to_keep if idx.isdigit()
                         }
-                        new_layers = nn.ModuleList(
+                        new_layers = ModuleList(
                             [
                                 layer
                                 for i, layer in enumerate(module_value)
@@ -422,9 +467,9 @@ def pipeline_module_split(
                 else:
                     # No layers from this structure needed, set to empty structure
                     if isinstance(module_value, nn.ModuleDict):
-                        setattr(model, module_name, nn.ModuleDict())
+                        setattr(model, module_name, ModuleDict())
                     elif isinstance(module_value, nn.ModuleList):
-                        setattr(model, module_name, nn.ModuleList())
+                        setattr(model, module_name, ModuleList())
             # Handle simple module attributes (e.g., "linear", "norm")
             elif module_name not in modules_to_keep:
                 # Replace with None
@@ -436,6 +481,7 @@ def pipeline_module_split(
             num_stages,
             device,
             group=pp_mesh.get_group("pp"),
+            get_mesh=get_mesh,
         )
         return stage, model
 

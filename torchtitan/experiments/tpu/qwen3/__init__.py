@@ -1,226 +1,113 @@
-from torchtitan.components.lr_scheduler import build_lr_schedulers
-from torchtitan.components.optimizer import build_optimizers
-from torchtitan.components.tokenizer import build_hf_tokenizer
-from torchtitan.components.validate import build_validator
-from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
-from torchtitan.hf_datasets.text_datasets import build_text_dataloader
-from torchtitan.models.moe import MoEArgs
+from torchtitan.components.loss import ChunkedCELoss
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.components.validate import Validator
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
+import torchtitan.models.common as common_models
+import torchtitan.models.qwen3 as qwen3_models
 
 from .infra.parallelize import parallelize_qwen3
-from .model.args import Qwen3ModelArgs
 
-from torchtitan.models.qwen3.model.model import Qwen3Model
-from torchtitan.models.qwen3.model.state_dict_adapter import Qwen3StateDictAdapter
+from torchtitan.models.qwen3.model import Qwen3Model
+from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 
 __all__ = [
     "parallelize_qwen3",
-    "Qwen3ModelArgs",
-    "qwen3_args",
+    "qwen3_configs",
 ]
 
-# Adding different variants of the model
+def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
+    dim = 128
+    head_dim = 16
+    n_layers = 3
+    vocab_size = 2048
+    return qwen3_models.Qwen3Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        norm=qwen3_models._qwen3_norm(dim),
+        enable_weight_tying=True,
+        tok_embeddings=common_models.Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=qwen3_models._EMBEDDING_SKIP_INIT,
+        ),
+        lm_head=common_models.Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=qwen3_models._output_linear_init(dim),
+        ),
+        rope=common_models.RoPE.Config(
+            dim=head_dim,
+            max_seq_len=128,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
+        # pytype: disable=wrong-keyword-args
+        layers=qwen3_models._build_qwen3_layers(
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=8,
+            n_kv_heads=8,
+            head_dim=head_dim,
+            hidden_dim=256,
+            attn_backend=attn_backend,
+        ),
+        # pytype: enable=wrong-keyword-args
+    )
 
-qwen3_args = {
-    "testmodel": Qwen3ModelArgs(
-        vocab_size=2048,
-        max_seq_len=128,
-        head_dim=16,
-        dim=128,
-        n_layers=3,
-        n_heads=8,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=256,
-        rope_theta=1000000,
-        enable_weight_tying=True,
-    ),
-    "debugmodel": Qwen3ModelArgs(
-        vocab_size=2048,
-        max_seq_len=4096,
-        head_dim=128,
-        dim=256,
-        n_layers=8,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=3072,
-        rope_theta=1000000,
-        enable_weight_tying=True,
-    ),
-    "0.6B": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
-        dim=1024,
-        n_layers=28,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=3072,
-        rope_theta=1000000,
-        enable_weight_tying=True,
-    ),
-    "1.7B": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
-        dim=2048,
-        n_layers=28,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=6144,
-        rope_theta=1000000,
-        enable_weight_tying=True,
-    ),
-    "4B": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
-        dim=2560,
-        n_layers=36,
-        n_heads=32,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=9728,
-        rope_theta=1000000,
-        enable_weight_tying=True,
-    ),
-    "8B": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
-        dim=4096,
-        n_layers=36,
-        n_heads=32,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=12288,
-        rope_theta=1000000,
-    ),
-    "14B": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
-        dim=5120,
-        n_layers=40,
-        n_heads=40,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=17408,
-        rope_theta=1000000,
-    ),
-    "32B": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
-        dim=5120,
-        n_layers=64,
-        n_heads=64,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=25600,
-        rope_theta=1000000,
-    ),
-    # Qwen3-MoE models
-    "testmodel_moe": Qwen3ModelArgs(
-        vocab_size=2048,
-        max_seq_len=128,
-        head_dim=16,
-        dim=128,
-        n_layers=3,
-        n_heads=8,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=256,
-        rope_theta=1000000,
-        enable_weight_tying=True,
-        moe_enabled=True,
-        moe_inter_dim=128,
-        moe_args=MoEArgs(
+
+def _testmodel_moe(
+    attn_backend: str = "sdpa",
+    moe_comm_backend: str = "standard",
+) -> qwen3_models.Qwen3Model.Config:
+    dim = 128
+    head_dim = 16
+    n_layers = 3
+    vocab_size = 2048
+    return qwen3_models.Qwen3Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        norm=qwen3_models._qwen3_norm(dim),
+        tok_embeddings=common_models.Embedding.Config(
+            num_embeddings=vocab_size, embedding_dim=dim, param_init=qwen3_models._EMBEDDING_INIT
+        ),
+        lm_head=common_models.Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=qwen3_models._output_linear_init(dim),
+        ),
+        rope=common_models.RoPE.Config(
+            dim=head_dim,
+            max_seq_len=128,
+            theta=1000000.0,
+            backend="cos_sin",
+        ),
+        # pytype: disable=wrong-keyword-args
+        layers=qwen3_models._build_qwen3_moe_layers(
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=8,
+            n_kv_heads=8,
+            head_dim=head_dim,
+            moe_hidden_dim=128,
             num_experts=8,
-            num_shared_experts=0,
             top_k=2,
-            score_func="softmax",
-            route_norm=True,
-            route_scale=1.0,
-            score_before_experts=False,
-            use_grouped_mm=True,  # NOTE: Other MoE configs set this to False
+            attn_backend=attn_backend,
+            moe_comm_backend=moe_comm_backend,
         ),
-    ),
-    "debugmodel_moe": Qwen3ModelArgs(
-        vocab_size=2048,
-        max_seq_len=4096,
-        head_dim=128,
-        dim=256,
-        n_layers=8,
-        n_heads=16,
-        n_kv_heads=8,
-        qk_norm=True,
-        hidden_dim=3072,
-        rope_theta=1000000,
-        moe_enabled=True,
-        moe_inter_dim=768,
-        moe_args=MoEArgs(
-            num_experts=64,
-            num_shared_experts=0,
-            top_k=8,
-            score_func="softmax",
-            route_norm=True,
-            route_scale=1.0,
-            score_before_experts=False,
-            use_grouped_mm=False,  # Disable grouped_mm default for now b/492243699
-        ),
-    ),
-    "30B-A3B": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=262144,
-        head_dim=128,
-        dim=2048,
-        n_layers=48,
-        n_heads=32,
-        n_kv_heads=4,
-        qk_norm=True,
-        hidden_dim=6144,
-        rope_theta=1000000,
-        moe_enabled=True,
-        moe_inter_dim=768,
-        moe_args=MoEArgs(
-            num_experts=128,
-            num_shared_experts=0,
-            top_k=8,
-            score_func="softmax",
-            route_norm=True,
-            route_scale=1.0,
-            score_before_experts=False,
-            use_grouped_mm=False,  # Disable grouped_mm default for now b/492243699
-        ),
-    ),
-    "235B-A22B": Qwen3ModelArgs(
-        vocab_size=151936,
-        max_seq_len=4096,
-        head_dim=128,
-        dim=4096,
-        n_layers=94,
-        n_heads=64,
-        n_kv_heads=4,
-        qk_norm=True,
-        hidden_dim=12288,
-        rope_theta=5000000,
-        moe_enabled=True,
-        moe_inter_dim=1536,
-        moe_args=MoEArgs(
-            num_experts=128,
-            num_shared_experts=0,  # no shared experts, double check
-            top_k=8,  # num_experts_per_tok
-            score_func="softmax",  # need double check
-            route_norm=True,
-            route_scale=1.0,  # not needed, need double check
-            score_before_experts=False,
-            use_grouped_mm=False,  # Disable grouped_mm default for now b/492243699
-        ),
-    ),
+        # pytype: enable=wrong-keyword-args
+    )
+
+
+qwen3_configs = {
+    "testmodel": _testmodel("sdpa"),
+    "testmodel_moe": _testmodel_moe("sdpa"),
+    "debugmodel": qwen3_models.qwen3_configs["debugmodel"]("sdpa"),
+    "debugmodel_moe": qwen3_models.qwen3_configs["debugmodel_moe"]("sdpa"),
+    "0.6B": qwen3_models.qwen3_configs["0.6B"]("sdpa"),
+    "1.7B": qwen3_models.qwen3_configs["1.7B"]("sdpa"),
+    "32B": qwen3_models.qwen3_configs["32B"]("sdpa"),
 }
 
 # pytype: disable=wrong-arg-types
@@ -228,15 +115,14 @@ register_train_spec(
     name="qwen3_tpu",
     train_spec=TrainSpec(
         model_cls=Qwen3Model,
-        model_args=qwen3_args,
+        model_args=qwen3_configs,
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=None,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_text_dataloader,
-        build_tokenizer_fn=build_hf_tokenizer,
-        build_loss_fn=build_cross_entropy_loss,
-        build_validator_fn=build_validator,
+        loss_config=ChunkedCELoss.Config(),
+        optimizer_config=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
+        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        validator_config=Validator.Config(enable=True),
         state_dict_adapter=Qwen3StateDictAdapter,
     )
 )

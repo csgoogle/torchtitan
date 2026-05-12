@@ -16,24 +16,6 @@ from typing import List, Optional, Sequence, Tuple
 from absl import flags
 from absl.flags import argparse_flags
 import os as os
-import torch
-import torch.distributed as dist
-from torchtitan.config import ConfigManager, JobConfig
-from torchtitan.tools import utils
-from torchtitan.tools.logging import init_logger, logger
-import torchtitan.train
-
-from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu import profiler_workaround
-from torchtitan.experiments.tpu import utils as tpu_utils
-import torchtitan.experiments.tpu.redacted  # trigger model registration
-import torchtitan.experiments.tpu.redacted  # trigger model registration
-import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
-import torchtitan.experiments.tpu.flux  # trigger model registration
-import torchtitan.experiments.tpu.llama3  # trigger model registration
-import torchtitan.experiments.tpu.qwen3   # trigger model registration
-import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
-
 from absl import app
 
 
@@ -52,7 +34,7 @@ class TPUTrainer(torchtitan.train.Trainer):
     correctly through the full model.
   """
 
-  def __init__(self, job_config: JobConfig):
+  def __init__(self, job_config: Configurable.Config):
     super().__init__(job_config)
     if isinstance(job_config, tpu_job_config_module.TPUJobConfig):
       tpu_config = job_config.tpu_config

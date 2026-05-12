@@ -8,24 +8,21 @@ import os as os
 
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
-
-from torchtitan.config import ConfigManager, JobConfig
+from torchtitan.config import ConfigManager
 from torchtitan.models.flux.inference.sampling import generate_image, save_image
-from torchtitan.models.flux.tokenizer import build_flux_tokenizer
-from torchtitan.models.flux.train import FluxTrainer
+from torchtitan.models.flux.trainer import FluxTrainer
 from torchtitan.tools.logging import init_logger, logger
 
 
 @torch.no_grad()
 @record
-def inference(config: JobConfig):
+def inference(config: FluxTrainer.Config):
     # Reuse trainer to perform forward passes
     trainer = FluxTrainer(config)
 
     # Distributed processing setup: Each GPU/process handles a subset of prompts
     world_size = int(os.environ["WORLD_SIZE"])
     global_rank = int(os.environ["RANK"])
-    # pyrefly: ignore [missing-attribute]
     original_prompts = open(config.inference.prompts_path).readlines()
     total_prompts = len(original_prompts)
 
@@ -39,19 +36,20 @@ def inference(config: JobConfig):
     prompts = original_prompts[global_rank::world_size]
 
     trainer.checkpointer.load(step=config.checkpoint.load_step)
-    t5_tokenizer, clip_tokenizer = build_flux_tokenizer(config)
+
+    # Build tokenizers from the config
+    tokenizer = config.tokenizer.build()
 
     if global_rank == 0:
         logger.info("Starting inference...")
 
     if prompts:
         # Generate images for this process's assigned prompts
-        # pyrefly: ignore [missing-attribute]
         bs = config.inference.local_batch_size
+        img_size = config.inference.img_size
 
         output_dir = os.path.join(
-            config.job.dump_folder,
-            # pyrefly: ignore [missing-attribute]
+            config.dump_folder,
             config.inference.save_img_folder,
         )
         # Create mapping from local indices to global prompt indices
@@ -61,13 +59,16 @@ def inference(config: JobConfig):
             images = generate_image(
                 device=trainer.device,
                 dtype=trainer._dtype,
-                job_config=trainer.job_config,
+                img_height=16 * (img_size // 16),
+                img_width=16 * (img_size // 16),
+                enable_classifier_free_guidance=config.inference.sampling.enable_classifier_free_guidance,
+                denoising_steps=config.inference.sampling.denoising_steps,
+                classifier_free_guidance_scale=config.inference.sampling.classifier_free_guidance_scale,
                 # pyrefly: ignore [bad-argument-type]
                 model=trainer.model_parts[0],
                 prompt=prompts[i : i + bs],
                 autoencoder=trainer.autoencoder,
-                t5_tokenizer=t5_tokenizer,
-                clip_tokenizer=clip_tokenizer,
+                tokenizer=tokenizer,
                 t5_encoder=trainer.t5_encoder,
                 clip_encoder=trainer.clip_encoder,
             )
@@ -91,4 +92,4 @@ if __name__ == "__main__":
     init_logger()
     config_manager = ConfigManager()
     config = config_manager.parse_args()
-    inference(config)
+    inference(config)  # pyrefly: ignore [bad-argument-type]

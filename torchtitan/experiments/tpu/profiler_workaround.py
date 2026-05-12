@@ -3,9 +3,25 @@ from typing import Any
 import os as os
 import torch
 
-from torchtitan.config.job_config import Profiling as ProfilingConfig
 from torchtitan.tools.logging import logger
-from torchtitan.tools.profiling import maybe_enable_profiling as original_maybe_enable_profiling
+import torchtitan.tools.profiler as profiler_tool
+ProfilingConfig = profiler_tool.Profiler.Config
+
+@contextlib.contextmanager
+def original_maybe_enable_profiling(
+    profiling_config: ProfilingConfig,
+    *,
+    global_step: int = 0,
+    base_folder: str = "",
+    leaf_folder: str = "",
+):
+  with profiler_tool.Profiler(
+      profiling_config,
+      global_step=global_step,
+      base_folder=base_folder,
+      leaf_folder=leaf_folder,
+  ) as prof:
+    yield prof
 
 # For JAX profiler
 try:

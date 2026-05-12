@@ -4,169 +4,182 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.loss import build_cross_entropy_loss
-from torchtitan.components.lr_scheduler import build_lr_schedulers
-from torchtitan.components.optimizer import build_optimizers_with_moe_load_balancing
-from torchtitan.components.tokenizer import build_hf_tokenizer
+from torchtitan.components.loss import ChunkedCELoss
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.validate import Validator
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.hf_datasets.text_datasets import build_text_dataloader
-from torchtitan.models.moe import MoEArgs
-from torchtitan.protocols.train_spec import TrainSpec
-
-from torchtitan.models.deepseek_v3.infra.parallelize import parallelize_deepseekv3
-from .model.args import DeepSeekV3ModelArgs
-from torchtitan.models.deepseek_v3.model.model import DeepSeekV3Model
-from torchtitan.models.deepseek_v3.model.state_dict_adapter import DeepSeekV3StateDictAdapter
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+import torchtitan.models.common as common_models
+import torchtitan.models.deepseek_v3 as deepseek_v3_models
+from torchtitan.models.deepseek_v3.model import DeepSeekV3Model
+from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
+from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
+from torchtitan.protocols.train_spec import TrainSpec, register_train_spec
 
 __all__ = [
     "parallelize_deepseekv3",
-    "DeepSeekV3ModelArgs",
-    "DeepSeekV3Model",
-    "deepseekv3_args",
+    "deepseekv3_configs",
 ]
 
 
-deepseekv3_args = {
-    "debugmodel": DeepSeekV3ModelArgs(
-        vocab_size=2048,
-        dim=256,
-        inter_dim=1024,
-        moe_inter_dim=256,
-        n_layers=6,
-        n_dense_layers=1,
-        n_heads=16,
-        moe_args=MoEArgs(
-            num_experts=8,
-            num_shared_experts=2,
-            top_k=3,
-            score_func="softmax",
-            route_norm=False,
-            score_before_experts=False,
-        ),
-        q_lora_rank=0,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        mscale=0.70,
+def _testmodel(
+    attn_backend: str = "sdpa",
+) -> deepseek_v3_models.DeepSeekV3Model.Config:
+  dim = 128
+  head_dim = 16
+  n_layers = 3
+  vocab_size = 2048
+  # pytype: disable=wrong-keyword-args
+  layers = deepseek_v3_models._build_dsv3_layers(
+      n_layers=n_layers,
+      n_dense_layers=n_layers,
+      dim=dim,
+      n_heads=8,
+      q_lora_rank=0,
+      kv_lora_rank=512,
+      qk_nope_head_dim=128,
+      qk_rope_head_dim=head_dim,
+      v_head_dim=128,
+      mscale=0.70,
+      dense_hidden_dim=256,
+      moe_hidden_dim=128,
+      num_experts=8,
+      num_shared_experts=2,
+      router_top_k=2,
+      router_score_func="softmax",
+      attn_backend=attn_backend,
+      moe_comm_backend="standard",
+      non_blocking_capacity_factor=None,
+  )
+  # pytype: enable=wrong-keyword-args
+  return deepseek_v3_models.DeepSeekV3Model.Config(
+      vocab_size=vocab_size,
+      dim=dim,
+      tok_embeddings=common_models.Embedding.Config(
+          num_embeddings=vocab_size,
+          embedding_dim=dim,
+          param_init=deepseek_v3_models._EMBEDDING_INIT,
+      ),
+      norm=common_models.RMSNorm.Config(
+          normalized_shape=dim, param_init=deepseek_v3_models._NORM_INIT
+      ),
+      lm_head=common_models.Linear.Config(
+          in_features=dim,
+          out_features=vocab_size,
+          param_init=deepseek_v3_models._output_linear_init(dim),
+      ),
+      rope=common_models.RoPE.Config(
+          dim=head_dim,
+          max_seq_len=128,
+          theta=10000.0,
+          backend="complex",
+          scaling="yarn",
+          rope_factor=40.0,
+          beta_fast=32.0,
+          beta_slow=1.0,
+          original_seq_len=128,
+      ),
+      layers=layers,
+  )
+
+
+def _testmodel_moe(
+    attn_backend: str = "sdpa",
+) -> deepseek_v3_models.DeepSeekV3Model.Config:
+  dim = 128
+  head_dim = 16
+  n_layers = 3
+  vocab_size = 2048
+  # pytype: disable=wrong-keyword-args
+  layers = deepseek_v3_models._build_dsv3_layers(
+      n_layers=n_layers,
+      n_dense_layers=1,
+      dim=dim,
+      n_heads=8,
+      q_lora_rank=0,
+      kv_lora_rank=512,
+      qk_nope_head_dim=128,
+      qk_rope_head_dim=head_dim,
+      v_head_dim=128,
+      mscale=0.70,
+      dense_hidden_dim=256,
+      moe_hidden_dim=128,
+      num_experts=8,
+      num_shared_experts=2,
+      router_top_k=2,
+      router_score_func="softmax",
+      attn_backend=attn_backend,
+      moe_comm_backend="standard",
+      non_blocking_capacity_factor=None,
+  )
+  # pytype: enable=wrong-keyword-args
+  return deepseek_v3_models.DeepSeekV3Model.Config(
+      vocab_size=vocab_size,
+      dim=dim,
+      tok_embeddings=common_models.Embedding.Config(
+          num_embeddings=vocab_size,
+          embedding_dim=dim,
+          param_init=deepseek_v3_models._EMBEDDING_INIT,
+      ),
+      norm=common_models.RMSNorm.Config(
+          normalized_shape=dim, param_init=deepseek_v3_models._NORM_INIT
+      ),
+      lm_head=common_models.Linear.Config(
+          in_features=dim,
+          out_features=vocab_size,
+          param_init=deepseek_v3_models._output_linear_init(dim),
+      ),
+      rope=common_models.RoPE.Config(
+          dim=head_dim,
+          max_seq_len=128,
+          theta=10000.0,
+          backend="complex",
+          scaling="yarn",
+          rope_factor=40.0,
+          beta_fast=32.0,
+          beta_slow=1.0,
+          original_seq_len=128,
+      ),
+      layers=layers,
+  )
+
+
+deepseekv3_configs = {
+    "testmodel": _testmodel(),
+    "testmodel_moe": _testmodel_moe(),
+    "debugmodel": deepseek_v3_models.deepseekv3_configs["debugmodel"](
+        attn_backend="sdpa", moe_comm_backend="standard"
     ),
-    "debugmodel_flex_attn": DeepSeekV3ModelArgs(
-        vocab_size=2048,
-        dim=256,
-        inter_dim=1024,
-        moe_inter_dim=256,
-        n_layers=6,
-        n_dense_layers=1,
-        n_heads=16,
-        moe_args=MoEArgs(
-            num_experts=8,
-            num_shared_experts=2,
-            top_k=3,
-            score_func="softmax",
-            route_norm=False,
-            score_before_experts=False,
-        ),
-        q_lora_rank=0,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        mscale=0.70,
-        attn_type="flex",
-        attn_mask_type="block_causal",
+    "debugmodel_flex_attn": deepseek_v3_models.deepseekv3_configs["debugmodel"](
+        attn_backend="flex", moe_comm_backend="standard"
     ),
-    "16B": DeepSeekV3ModelArgs(
-        vocab_size=102400,
-        dim=2048,
-        inter_dim=10944,
-        moe_inter_dim=1408,
-        n_layers=27,
-        n_dense_layers=1,
-        n_heads=16,
-        moe_args=MoEArgs(
-            num_experts=64,
-            num_shared_experts=2,
-            top_k=6,
-            score_func="softmax",
-            route_norm=False,
-            score_before_experts=False,
-        ),
-        q_lora_rank=0,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        mscale=0.70,
-        attn_type="flex",
-        attn_mask_type="block_causal",
+    "16B": deepseek_v3_models.deepseekv3_configs["16B"](
+        attn_backend="flex", moe_comm_backend="standard"
     ),
-    "236B": DeepSeekV3ModelArgs(
-        vocab_size=102400,
-        dim=5120,
-        inter_dim=12288,
-        moe_inter_dim=1536,
-        n_layers=60,
-        n_dense_layers=1,
-        n_heads=128,
-        moe_args=MoEArgs(
-            num_experts=160,
-            num_shared_experts=2,
-            top_k=6,
-            num_expert_groups=8,
-            num_limited_groups=3,
-            score_func="softmax",
-            route_norm=False,
-            route_scale=16.0,
-            score_before_experts=False,
-        ),
-        q_lora_rank=1536,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        attn_type="flex",
-        attn_mask_type="block_causal",
+    "236B": deepseek_v3_models.deepseekv3_configs["236B"](
+        attn_backend="flex", moe_comm_backend="standard"
     ),
-    "671B": DeepSeekV3ModelArgs(
-        vocab_size=129280,
-        dim=7168,
-        inter_dim=18432,
-        moe_inter_dim=2048,
-        n_layers=61,
-        n_dense_layers=3,
-        n_heads=128,
-        moe_args=MoEArgs(
-            num_experts=256,
-            num_shared_experts=1,
-            top_k=8,
-            num_expert_groups=8,
-            num_limited_groups=4,
-            score_func="sigmoid",
-            route_norm=True,
-            route_scale=2.5,
-            score_before_experts=False,
-        ),
-        q_lora_rank=1536,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        attn_type="flex",
-        attn_mask_type="block_causal",
+    "671B": deepseek_v3_models.deepseekv3_configs["671B"](
+        attn_backend="flex", moe_comm_backend="standard"
     ),
 }
 
 
-def get_train_spec() -> TrainSpec:
-    return TrainSpec(
+# pytype: disable=wrong-arg-types
+register_train_spec(
+    name="deepseek_v3",
+    train_spec=TrainSpec(
         model_cls=DeepSeekV3Model,
-        model_args=deepseekv3_args,
+        model_args=deepseekv3_configs,
         parallelize_fn=parallelize_deepseekv3,
         pipelining_fn=pipeline_llm,
-        build_optimizers_fn=build_optimizers_with_moe_load_balancing,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_text_dataloader,
-        build_tokenizer_fn=build_hf_tokenizer,
-        build_loss_fn=build_cross_entropy_loss,
+        loss_config=ChunkedCELoss.Config(),
+        optimizer_config=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
+        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        validator_config=Validator.Config(enable=True),
         state_dict_adapter=DeepSeekV3StateDictAdapter,
-    )
+    ),
+)
+# pytype: enable=wrong-arg-types

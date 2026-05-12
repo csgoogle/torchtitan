@@ -3,13 +3,14 @@
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
-from torchtitan.models.flux.infra.parallelize import parallelize_flux as native_parallelize_flux
+import torchtitan.trainer
+from torchtitan.models.flux.parallelize import parallelize_flux as native_parallelize_flux
 
 
 def parallelize_flux(
     model: nn.Module,
     parallel_dims: torchtitan.distributed.ParallelDims,
-    job_config: torchtitan.config.JobConfig,
+    job_config: torchtitan.trainer.Trainer.Config,
 ) -> nn.Module:
   """Parallelizes the Flux model based on the provided configuration.
 
@@ -23,4 +24,12 @@ def parallelize_flux(
   """
   # For now, we delegate to the native implementation.
   # If TPU-specific optimizations are needed, we can implement them here.
-  return native_parallelize_flux(model, parallel_dims, job_config)
+  return native_parallelize_flux(
+      model,
+      ac_config=job_config.activation_checkpoint,
+      compile_config=job_config.compile,
+      dump_folder="",
+      parallel_dims=parallel_dims,
+      parallelism=job_config.parallelism,
+      training=job_config.training,
+  )

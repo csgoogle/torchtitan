@@ -19,7 +19,7 @@ from absl import app
 global_start_trainer_func = None
 
 
-def _start_trainer(config: tpu_job_config_module.TPUJobConfig):
+def _start_trainer(config: tpu_job_config_module.TPUTrainerConfig):
   """Starts the trainer with the specified eager mode if enabled."""
   global global_start_trainer_func  # pylint: disable=global-variable-not-assigned
   if os.environ.get("TORCHTITAN_DEVICE_TYPE", ""):
@@ -61,11 +61,9 @@ def _parse_flags(argv: Sequence[str]) -> Tuple[argparse.Namespace, List[str]]:
 
 def main(parsed_args: Tuple[argparse.Namespace, List[str]]):
   args, remaining_args = parsed_args
-  config_manager = torchtitan.config.ConfigManager(
-      tpu_job_config_module.TPUJobConfig
-  )
+  config_manager = torchtitan.config.ConfigManager()
   config = typing.cast(
-      tpu_job_config_module.TPUJobConfig,
+      tpu_job_config_module.TPUTrainerConfig,
       config_manager.parse_args(remaining_args),
   )
 
@@ -73,7 +71,7 @@ def main(parsed_args: Tuple[argparse.Namespace, List[str]]):
 
 
 def handle_main(
-    start_trainer_func: Callable[[tpu_job_config_module.TPUJobConfig], None],
+    start_trainer_func: Callable[[tpu_job_config_module.TPUTrainerConfig], None],
 ):
   global global_start_trainer_func
   global_start_trainer_func = start_trainer_func

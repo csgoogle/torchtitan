@@ -9,12 +9,19 @@ import time
 import torch
 from autoparallel.api import AutoParallel
 from autoparallel.auto_bucketing import configure_inductor_for_autobucketing
+from autoparallel.compile import autoparallel_backend
 
 from torch.distributed.tensor.placement_types import Shard
-from torchtitan.config import JobConfig
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.distributed import ParallelDims
+from torchtitan.experiments.autoparallel.configs import AutoParallelCompileConfig
 
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import device_type
 
 
 # TODO: Autoparallel should transparently wrap the original nn.Module
@@ -27,8 +34,13 @@ def set_torchtitan_fields(orig, new):
 
 def parallelize_deepseekv3(
     model,
+    *,
     parallel_dims: ParallelDims,
-    job_config: JobConfig,
+    training: TrainingConfig,
+    parallelism: ParallelismConfig,
+    compile_config: AutoParallelCompileConfig,
+    ac_config: ActivationCheckpointConfig,
+    dump_folder: str,
 ):
     """
     Apply Autoparallel to the model
@@ -44,13 +56,11 @@ def parallelize_deepseekv3(
     torch._inductor.config.allow_buffer_reuse = False
 
     # allow configuring inductor comms optimizations from torchtitan commandline
-    configure_inductor_for_autobucketing(
-        job_config.experimental.comms_bucket_reorder_strategy
-    )
+    configure_inductor_for_autobucketing(compile_config.comms_bucket_reorder_strategy)
 
     # Build the sparse mesh for MoE expert parallelism
     # Filter to only include enabled mesh dimensions
-    sparse_names = ["dp_replicate", "efsdp", "ep", "etp"]
+    sparse_names = ["dp_replicate", "efsdp", "ep"]
     sparse_names = [
         name
         for name in sparse_names
@@ -68,26 +78,26 @@ def parallelize_deepseekv3(
             layer.moe.axis_name = "ep"
 
     def input_fn():
-        global_batch_size = job_config.training.global_batch_size
+        global_batch_size = training.global_batch_size
         if global_batch_size < 0:
             # This global batch size results in 1 gradient accumulation
             # step.
             dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-            global_batch_size = job_config.training.local_batch_size * dp_degree
+            global_batch_size = training.local_batch_size * dp_degree
         return (
             torch.randint(
                 0,
-                model.model_args.vocab_size,
-                (global_batch_size, job_config.training.seq_len),
-                device=torch.device("cuda"),
+                model.config.vocab_size,
+                (global_batch_size, training.seq_len),
+                device=torch.device(device_type),
             ),
         )
 
-    should_compile = job_config.compile.enable
+    should_compile = compile_config.enable
     if should_compile:
         # TODO: support more options in AP API
-        assert job_config.compile.components == ["model"]
-        assert job_config.compile.backend == "inductor"
+        assert compile_config.components == ["model"]
+        assert compile_config.backend == "inductor"
 
     mp_policy = None
     with AutoParallel(
@@ -95,15 +105,13 @@ def parallelize_deepseekv3(
         input_fn,
         sparse_mesh,
         mp_policy=mp_policy,
-        compile=should_compile,
         dynamic=True,
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
 
         x_sharding = (Shard(0), Shard(0))
         loss_parallel_enabled = (
-            parallel_dims.tp_enabled
-            and not job_config.parallelism.disable_loss_parallel
+            parallel_dims.tp_enabled and not parallelism.disable_loss_parallel
         )
         assert not loss_parallel_enabled
         autop.add_input_constraints([x_sharding])
@@ -113,6 +121,9 @@ def parallelize_deepseekv3(
         t1 = time.time()
         logger.info(f"AutoParallel took {t1 - t0} seconds")
         parallel_mod = autop.apply_placement(sharding_placement)
+
+    if should_compile:
+        parallel_mod = torch.compile(parallel_mod, backend=autoparallel_backend())
 
     set_torchtitan_fields(model, parallel_mod)
 
@@ -126,7 +137,7 @@ def parallelize_deepseekv3(
         # it would require putting the loss inside the model as well
         def _return_as_dtensor_for_loss_parallel(module, args, output):
             return torch.distributed.tensor.DTensor.from_local(
-                output, sparse_mesh["etp"], (Shard(2),)
+                output, parallel_dims.get_mesh("tp"), (Shard(2),)
             )
 
         # not keeping a reference to the hook, don't plan on

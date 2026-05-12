@@ -5,7 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
-from typing import Any, Generic, Iterator, TypeVar
+import re
+from collections import defaultdict
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from typing import Any, Generic, Literal, overload, TypeVar
 
 import torch
 import torch.distributed.tensor
@@ -19,26 +23,48 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import Replicate
 from torch.optim import Optimizer
-
-from torchtitan.components.ft import FTManager, has_torchft
-from torchtitan.config import Optimizer as OptimizerConfig
+from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
+from torchtitan.tools.logging import logger
 
 __all__ = [
     "OptimizersContainer",
-    "build_optimizers",
-    "build_optimizers_with_moe_load_balancing",
+    "OptimizersInBackwardContainer",
+    "ParamGroupConfig",
+    "register_moe_load_balancing_hook",
 ]
 
 
-if has_torchft:
-    import torchft as ft
+@dataclass(kw_only=True, slots=True)
+class ParamGroupConfig:
+    """Configuration for a parameter group with custom optimizer settings.
+
+    Parameters matching the regex pattern will use lr and weight_decay values
+    derived by multiplying the global optimizer values with the specified multipliers.
+    """
+
+    pattern: str
+    """Regex pattern matched against parameter fully qualified names (FQNs).
+    E.g. '.*bias$', '.*norm.*', '.*\\.embed_tokens\\..*'"""
+
+    lr_multiplier: float = 1.0
+    """Multiplied with the global optimizer lr to get this group's lr."""
+
+    weight_decay_multiplier: float = 1.0
+    """Multiplied with the global optimizer weight_decay to get this group's weight_decay."""
+
+    beta1: float | None = None
+    beta2: float | None = None
+    """Override betas for this group. None means use the global optimizer betas.
+    Each can be overridden independently."""
 
 
 T = TypeVar("T", bound=Optimizer)
 
 
-class OptimizersContainer(Optimizer, Stateful, Generic[T]):
+# TODO: Right now this class is biased towards AdamW. We should refactor to
+# support mixed optimizers, including Muon.
+class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
     """A container for multiple optimizers.
 
     This class is used to wrap multiple optimizers into a single object that can be
@@ -64,22 +90,158 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         name (str): Name of the optimizers.
     """
 
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        name: str = "AdamW"
+        """Optimizer to use"""
+
+        lr: float = 8e-4
+        """Learning rate to use"""
+
+        beta1: float = 0.9
+        beta2: float = 0.95
+        """Exponential moving average hyperparameters to use"""
+
+        eps: float = 1e-8
+        """Epsilon value to use"""
+
+        weight_decay: float = 0.1
+        """Weight decay to use"""
+
+        implementation: Literal[
+            "for-loop", "foreach", "fused", "fused_opt_states_bf16"
+        ] = "fused"
+        """
+        Specify which optimizer implementation to use:
+        - 'fused': Use fused implementation (CUDA only) for best performance.
+        - 'foreach': Use some horizontal fusion of tensors for better performance.
+        - 'for-loop': Use the default implementation for the optimizer (slowest).
+        - 'fused_opt_states_bf16': Like 'fused', but initialize Adam/AdamW
+          momentum and variance in bfloat16 via a step pre-hook so the fused
+          CUDA kernel uses its mixed-precision path (fp32 params + bf16 states).
+          Only supported for Adam/AdamW with OptimizersContainer (not
+          OptimizersInBackwardContainer). See docs/bf16_optimizer_states.md.
+        - more info: https://pytorch.org/docs/stable/optim.html
+        """
+
+        param_groups: list[ParamGroupConfig] = field(default_factory=list)
+        """Optional per-parameter-group overrides. Each entry specifies a regex
+        pattern matching parameter FQNs and multipliers for lr and weight_decay.
+        Parameters not matching any pattern use the global defaults.
+        Patterns are checked in order; first match wins."""
+
+        def __post_init__(self):
+            if self.implementation == "fused_opt_states_bf16":
+                if self.name not in ("Adam", "AdamW"):
+                    raise ValueError(
+                        "implementation='fused_opt_states_bf16' is only supported "
+                        f"for Adam/AdamW, got optimizer '{self.name}'"
+                    )
+
     optimizers: list[T]
     model_parts: list[nn.Module]
 
-    def __init__(
-        self,
-        model_parts: list[nn.Module],
-        optimizer_cls: type[T],
-        optimizer_kwargs: dict[str, Any],
-    ) -> None:
+    @staticmethod
+    def _resolve_optimizer_cls(name: str) -> type:
+        optimizer_classes = {"Adam": torch.optim.Adam, "AdamW": torch.optim.AdamW}
+        if name not in optimizer_classes:
+            raise NotImplementedError(f"Optimizer {name} not added.")
+        return optimizer_classes[name]
+
+    @staticmethod
+    def _build_optimizer_kwargs(config: Config) -> dict[str, Any]:
+        assert config.implementation in [
+            "fused",
+            "foreach",
+            "for-loop",
+            "fused_opt_states_bf16",
+        ]
+        fused = config.implementation in ("fused", "fused_opt_states_bf16")
+        return {
+            "lr": config.lr,
+            "betas": (config.beta1, config.beta2),
+            "eps": config.eps,
+            "weight_decay": config.weight_decay,
+            "fused": fused,
+            "foreach": config.implementation == "foreach",
+        }
+
+    @staticmethod
+    def _build_param_groups(
+        model: nn.Module,
+        config: Config,
+        default_kwargs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Build PyTorch param groups from model parameters and config.
+
+        Each parameter is assigned to the first matching ParamGroupConfig pattern,
+        or to the default group if no pattern matches. Returns a list of dicts
+        with "params" key and optimizer kwargs, suitable for passing to an optimizer.
+        """
+        if not config.param_groups:
+            params = [p for p in model.parameters() if p.requires_grad]
+            return [{"params": params, **default_kwargs}]
+
+        compiled_patterns = [re.compile(pg.pattern) for pg in config.param_groups]
+
+        # group_index -> list of params; None means default group
+        grouped_params: dict[int | None, list[nn.Parameter]] = defaultdict(list)
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            matched_index = None
+            for i, pat in enumerate(compiled_patterns):
+                if pat.search(name):
+                    matched_index = i
+                    break
+            grouped_params[matched_index].append(param)
+
+        # Warn for patterns that matched nothing
+        for i, pg in enumerate(config.param_groups):
+            if i not in grouped_params:
+                logger.warning(
+                    f"Optimizer param_groups pattern '{pg.pattern}' "
+                    f"matched no parameters"
+                )
+
+        result = []
+        # Default group first (unmatched params)
+        if None in grouped_params:
+            result.append({"params": grouped_params[None], **default_kwargs})
+
+        # Then each matched group in pattern order
+        for i, pg in enumerate(config.param_groups):
+            if i not in grouped_params:
+                continue
+            group_kwargs = {**default_kwargs}
+            group_kwargs["lr"] = default_kwargs["lr"] * pg.lr_multiplier
+            group_kwargs["weight_decay"] = (
+                default_kwargs["weight_decay"] * pg.weight_decay_multiplier
+            )
+            if pg.beta1 is not None or pg.beta2 is not None:
+                default_beta1, default_beta2 = default_kwargs["betas"]
+                group_kwargs["betas"] = (
+                    pg.beta1 if pg.beta1 is not None else default_beta1,
+                    pg.beta2 if pg.beta2 is not None else default_beta2,
+                )
+            result.append({"params": grouped_params[i], **group_kwargs})
+
+        return result
+
+    def __init__(self, config: Config, *, model_parts: list[nn.Module]) -> None:
+        optimizer_cls = self._resolve_optimizer_cls(config.name)
+        optimizer_kwargs = self._build_optimizer_kwargs(config)
         all_params = []
         self.optimizers = []
         self.model_parts = model_parts
         for model in self.model_parts:
-            params = [p for p in model.parameters() if p.requires_grad]
-            self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
-            all_params.extend(params)
+            param_groups = self._build_param_groups(model, config, optimizer_kwargs)
+            self.optimizers.append(optimizer_cls(param_groups))
+            for group in param_groups:
+                all_params.extend(group["params"])
+        if config.implementation == "fused_opt_states_bf16":
+            self._register_bf16_optimizer_state_hook()
         self._validate_length(len(self.model_parts))
         self._post_init(all_params, optimizer_kwargs)
 
@@ -89,14 +251,23 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
     def __len__(self) -> int:
         return len(self.optimizers)
 
-    # pyrefly: ignore [bad-override]
-    def step(self, *args, **kwargs) -> None:
-        for optimizer in self.optimizers:
-            optimizer.step(*args, **kwargs)
+    @overload
+    def step(self, closure: None = None) -> None:
+        ...
 
-    def zero_grad(self, *args, **kwargs) -> None:
+    @overload
+    def step(self, closure: Callable[[], float]) -> float:
+        ...
+
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        assert closure is None, "OptimizersContainer does not support closures"
         for optimizer in self.optimizers:
-            optimizer.zero_grad(*args, **kwargs)
+            optimizer.step()
+        return None
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
 
     def state_dict(self) -> dict[str, Any]:
         func = functools.partial(
@@ -130,6 +301,46 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         # functionality such as hooks.
         Optimizer.__init__(self, all_params, optimizer_kwargs)
 
+    def _register_bf16_optimizer_state_hook(self) -> None:
+        """Register a step pre-hook to create Adam optimizer states in bfloat16.
+
+        The hook pre-populates optimizer state before Adam's lazy initialization
+        runs, so that ``_init_group`` finds non-empty state and skips its own
+        fp32 allocation. The fused CUDA kernel then sees the dtype mismatch
+        between fp32 params and bf16 states, dispatching to the mixed-precision
+        kernel (``FusedAdamMathFunctorMP``).
+        """
+
+        def _bf16_state_init_hook(
+            optimizer: Optimizer, args: tuple, kwargs: dict
+        ) -> None:
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    state = optimizer.state[p]
+                    if len(state) == 0:
+                        state["step"] = (
+                            torch.zeros((), dtype=torch.float32, device=p.device)
+                            if group.get("capturable") or group.get("fused")
+                            else torch.tensor(0.0, dtype=torch.float32)
+                        )
+                        state["exp_avg"] = torch.zeros_like(
+                            p, dtype=torch.bfloat16, memory_format=torch.preserve_format
+                        )
+                        state["exp_avg_sq"] = torch.zeros_like(
+                            p, dtype=torch.bfloat16, memory_format=torch.preserve_format
+                        )
+                        if group.get("amsgrad"):
+                            state["max_exp_avg_sq"] = torch.zeros_like(
+                                p,
+                                dtype=torch.bfloat16,
+                                memory_format=torch.preserve_format,
+                            )
+
+        for optim in self.optimizers:
+            optim.register_step_pre_hook(_bf16_state_init_hook)
+
     def init_cache_state_dict(self) -> None:
         """Initialize cached state dict for TorchFT. No-op for base class."""
         pass
@@ -144,20 +355,36 @@ class OptimizersInBackwardContainer(OptimizersContainer):
     execute these methods when the gradient is accumulated.
     """
 
-    def __init__(
-        self,
-        model_parts: list[nn.Module],
-        optimizer_cls: type[T],
-        optimizer_kwargs: dict[str, Any],
-    ) -> None:
+    @dataclass(kw_only=True, slots=True)
+    class Config(OptimizersContainer.Config):
+        def __post_init__(self) -> None:
+            if self.implementation == "fused_opt_states_bf16":
+                raise ValueError(
+                    "implementation='fused_opt_states_bf16' is not supported with "
+                    "OptimizersInBackwardContainer"
+                )
+            OptimizersContainer.Config.__post_init__(self)
+
+    def __init__(self, config: Config, *, model_parts: list[nn.Module]) -> None:
+        optimizer_cls = self._resolve_optimizer_cls(config.name)
+        optimizer_kwargs = self._build_optimizer_kwargs(config)
         all_params = []
         self.model_parts = model_parts
+
+        # Build a mapping from param -> effective kwargs using param group config
+        param_to_kwargs: dict[nn.Parameter, dict[str, Any]] = {}
+        for model in self.model_parts:
+            param_groups = self._build_param_groups(model, config, optimizer_kwargs)
+            for group in param_groups:
+                group_kwargs = {k: v for k, v in group.items() if k != "params"}
+                for p in group["params"]:
+                    param_to_kwargs[p] = group_kwargs
 
         optim_dict = {}
         for model in self.model_parts:
             for p in model.parameters():
                 if p.requires_grad:
-                    optim_dict[p] = optimizer_cls([p], **optimizer_kwargs)
+                    optim_dict[p] = optimizer_cls([p], **param_to_kwargs[p])
                 all_params.append(p)
 
         def optim_hook(param) -> None:
@@ -176,178 +403,36 @@ class OptimizersInBackwardContainer(OptimizersContainer):
         )
         self._post_init(all_params, optimizer_kwargs)
 
-    # pyrefly: ignore [bad-override]
-    def step(self) -> None:
+    @overload
+    def step(self, closure: None = None) -> None:
+        ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float:
+        ...
+
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        return None
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
         pass
 
-    # pyrefly: ignore [bad-override]
-    def zero_grad(self) -> None:
-        pass
 
-
-class FTOptimizersContainer(OptimizersContainer):
-    def __init__(
-        self,
-        model_parts: list[nn.Module],
-        optimizer_cls: type[T],
-        optimizer_kwargs: dict[str, Any],
-        ft_manager: "ft.Manager",
-        use_ft_optimizer: bool = True,
-    ) -> None:
-        super().__init__(model_parts, optimizer_cls, optimizer_kwargs)
-
-        # Force to initialize the optimizer state so that `optim.step()`
-        # won't be called by state_dict() and load_state_dict().
-        _ = {
-            k: v
-            for sd in map(get_optimizer_state_dict, model_parts, self.optimizers)
-            for k, v in sd.items()
-        }
-        self.cache_state_dict: dict[str, Any] = {}
-        self._ft_optimizer = ft.Optimizer(ft_manager, self)
-        # Whether to determine quorum using FT.optimizer,
-        # in semi-sync training we use the synchronization step to start quorum
-        self._use_ft_optimizer: bool = use_ft_optimizer
-
-    def init_cache_state_dict(self) -> None:
-        self.cache_state_dict = super().state_dict()
-
-    def state_dict(self) -> dict[str, Any]:
-        return self.cache_state_dict
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        # We have to invalidate the `cache_state_dict` because optimizer uses
-        # assign instead of copy when doing `load_state_dict()`. Without
-        # invalidating the `cache_state_dict`, there will be memory leakage.
-        self.cache_state_dict = {}
-        super().load_state_dict(state_dict)
-        self.init_cache_state_dict()
-
-    def step(self, *args, **kwargs) -> None:
-        """Calling the correct step() depending on the caller.
-
-        TorchFT's OptimizerWrapper.step() is designed to be called only once
-        per train step per ft.Manager regardless how many optimizers are used.
-        Hence we will need to appropriately dispatch the call.
-        """
-        if self._use_ft_optimizer:
-            self._use_ft_optimizer = False
-            self._ft_optimizer.step(*args, **kwargs)
-            self._use_ft_optimizer = True
-        else:
-            super().step(*args, **kwargs)
-
-    def zero_grad(self, *args, **kwargs) -> None:
-        """Calling the correct zero_grad() depending on the caller.
-
-        Check the comment in ``step()``.
-        """
-        if self._use_ft_optimizer:
-            self._use_ft_optimizer = False
-            self._ft_optimizer.zero_grad(*args, **kwargs)
-            self._use_ft_optimizer = True
-        else:
-            super().zero_grad(*args, **kwargs)
-
-
-def build_optimizers(
+def register_moe_load_balancing_hook(
+    optimizers: OptimizersContainer,
     model_parts: list[nn.Module],
-    optimizer_config: OptimizerConfig,
     parallel_dims: ParallelDims,
-    ft_manager: FTManager | None = None,
-) -> OptimizersContainer:
-    """Create a OptimizersContainer for the given model parts and job config.
+) -> None:
+    """Register an optimizer step pre-hook for MoE auxiliary-loss-free load balancing.
 
-    This function creates a ``OptimizersContainer`` for the given model parts.
-    ``optimizer_config`` should define the correct optimizer name and parameters.
-    This function currently supports creating ``OptimizersContainer`` and
-    ``OptimizersInBackwardContainer``.
-
-    **Note**
-    Users who want to customize the optimizer behavior can create their own
-    ``OptimizersContainer`` subclass and ``build_optimizers``. Passing the
-    customized ``build_optimizers`` to ``TrainSpec`` will create the customized
-    ``OptimizersContainer``.
+    This function checks if MoE load balancing is enabled and, if so, registers
+    a hook that updates expert biases before each optimizer step.
 
     Args:
-        model_parts (List[nn.Module]): List of model parts to be optimized.
-        optimizer_config (OptimizerConfig): Optimizer config containing the optimizer name and parameters.
-        parallel_dims (ParallelDims): Parallel dimensions for the model.
+        optimizers: The optimizers container to register the hook on.
+        model_parts: List of model parts that may contain MoE layers.
+        parallel_dims: Parallel dimensions for distributed communication.
     """
-    optim_in_bwd = optimizer_config.early_step_in_backward
-    if optim_in_bwd:
-        if parallel_dims.ep_enabled:
-            raise NotImplementedError(
-                "Optimizers in backward is not supported with Expert Parallel."
-            )
-        if parallel_dims.pp_enabled:
-            raise NotImplementedError(
-                "Optimizers in backward is not supported with Pipeline Parallel."
-            )
-        if ft_manager and ft_manager.enabled:
-            raise NotImplementedError(
-                "TorchFT is not supported with optimizers in backward."
-            )
-
-    name = optimizer_config.name
-    lr = optimizer_config.lr
-    beta1 = optimizer_config.beta1
-    beta2 = optimizer_config.beta2
-    eps = optimizer_config.eps
-    weight_decay = optimizer_config.weight_decay
-
-    optim_implementation = optimizer_config.implementation
-    assert optim_implementation in ["fused", "foreach", "for-loop"]
-
-    fused = optim_implementation == "fused"
-    foreach = optim_implementation == "foreach"
-
-    optimizer_kwargs = {
-        "lr": lr,
-        "betas": (beta1, beta2),
-        "eps": eps,
-        "weight_decay": weight_decay,
-        "fused": fused,
-        "foreach": foreach,
-    }
-
-    optimizer_classes = {
-        "Adam": torch.optim.Adam,
-        "AdamW": torch.optim.AdamW,
-    }
-    if name not in optimizer_classes:
-        raise NotImplementedError(f"Optimizer {name} not added.")
-    optimizer_cls = optimizer_classes[name]
-
-    if optim_in_bwd:
-        return OptimizersInBackwardContainer(
-            model_parts, optimizer_cls, optimizer_kwargs
-        )
-
-    if ft_manager and ft_manager.enabled:
-        return FTOptimizersContainer(
-            model_parts,
-            optimizer_cls,
-            optimizer_kwargs,
-            ft_manager.manager,
-            use_ft_optimizer=ft_manager.use_async_quorum,
-        )
-
-    return OptimizersContainer(model_parts, optimizer_cls, optimizer_kwargs)
-
-
-def build_optimizers_with_moe_load_balancing(
-    model_parts: list[nn.Module],
-    optimizer_config: OptimizerConfig,
-    parallel_dims: ParallelDims,
-    ft_manager: FTManager | None = None,
-) -> OptimizersContainer:
-    optimizers = build_optimizers(
-        model_parts=model_parts,
-        optimizer_config=optimizer_config,
-        parallel_dims=parallel_dims,
-        ft_manager=ft_manager,
-    )
 
     def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
         for model_part in model_parts:
@@ -441,5 +526,3 @@ def build_optimizers_with_moe_load_balancing(
                 model_parts, parallel_dims=parallel_dims
             )
         )
-
-    return optimizers

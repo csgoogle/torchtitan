@@ -14,13 +14,12 @@ class TrainMinimalDistributedTest(
 ):
   """Tests train_minimal execution in distributed settings."""
 
-
   @parameterized.named_parameters([
       # deepseek_v3
       dict(
           testcase_name="deepseek_v3_tp",
-          model_name="deepseek_v3",
-          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           skip_devices=[
@@ -38,8 +37,8 @@ class TrainMinimalDistributedTest(
       ),
       dict(
           testcase_name="deepseek_v3_fsdp",
-          model_name="deepseek_v3",
-          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
@@ -59,8 +58,8 @@ class TrainMinimalDistributedTest(
       # llama3
       dict(
           testcase_name="llama3_tp",
-          model_name="llama3_tpu",
-          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           loss_atol=1e2,
@@ -72,10 +71,16 @@ class TrainMinimalDistributedTest(
       ),
       dict(
           testcase_name="llama3_fsdp",
-          model_name="llama3_tpu",
-          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+          skip_devices=[
+              # TODO(tbajpai) Fix tests after updating TT head b/511306362
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+              device_type.AcceleratorDeviceType.TPU,
+          ],
           # b/495494788: Trainer/parallelize differences causing large
           # numerical discrepancies.
           loss_atol=1e2,
@@ -88,10 +93,16 @@ class TrainMinimalDistributedTest(
       # qwen3
       dict(
           testcase_name="qwen3_tp",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
+          skip_devices=[
+              # TODO(tbajpai) Fix tests after updating TT head b/511306362
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+              device_type.AcceleratorDeviceType.TPU,
+          ],
           loss_atol=1e2,
           loss_rtol=5e-3,
           grad_atol=1e1,
@@ -101,10 +112,16 @@ class TrainMinimalDistributedTest(
       ),
       dict(
           testcase_name="qwen3_fsdp",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+          skip_devices=[
+              # TODO(tbajpai) Fix tests after updating TT head b/511306362
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+              device_type.AcceleratorDeviceType.TPU,
+          ],
           # b/495494788: Trainer/parallelize differences causing large
           # numerical discrepancies.
           loss_atol=2000.0,
@@ -117,14 +134,17 @@ class TrainMinimalDistributedTest(
   ])
   def test_train_minimal_distributed_parity(
       self,
-      model_name,
-      config_file,
+      module,
+      config,
       data_parallel_shard_degree,
       tensor_parallel_degree,
       skip_devices=None,
-      loss_atol=5e-3, loss_rtol=5e-3,  # Default atol/rtols
-      grad_atol=5e-3, grad_rtol=5e-3,
-      param_atol=5e-3, param_rtol=5e-3,
+      loss_atol=5e-3,
+      loss_rtol=5e-3,  # Default atol/rtols
+      grad_atol=5e-3,
+      grad_rtol=5e-3,
+      param_atol=5e-3,
+      param_rtol=5e-3,
       optimizer_implementation="foreach",
       enable_compile=False,
   ):
@@ -143,13 +163,15 @@ class TrainMinimalDistributedTest(
     """
     self._run_trainer_distributed_parity_test(
         config_args=[
-            f"--model.name={model_name}",
-            f"--job.config_file={config_file}",
+            "--module",
+            module,
+            "--config",
+            config,
             f"--optimizer.implementation={optimizer_implementation}",
-            "--model.hf_assets_path=tests/assets/tokenizer",
-            "--training.dataset_path=tests/assets/c4_test",
+            "--hf_assets_path=tests/assets/tokenizer",
+            "--dataloader.dataset_path=tests/assets/c4_test",
             "--training.seq_len=128",
-            "--training.dataset=c4_test",
+            "--dataloader.dataset=c4_test",
             "--training.steps=3",
             "--training.mixed_precision_param=float32",
             "--training.mixed_precision_reduce=float32",

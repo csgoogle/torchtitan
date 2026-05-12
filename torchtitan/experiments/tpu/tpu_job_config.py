@@ -4,6 +4,7 @@ import dataclasses
 from typing import Literal
 
 import torchtitan.config
+import torchtitan.trainer
 
 
 @dataclasses.dataclass
@@ -98,8 +99,8 @@ class LossKernelConfig:
   enable_pallas_loss_kernel: bool = True
 
 
-@dataclasses.dataclass
-class TPUJobConfig(torchtitan.config.JobConfig):
+@dataclasses.dataclass(kw_only=True, slots=True)
+class TPUJobConfig(torchtitan.trainer.Trainer.Config):
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
   redacted: redactedConfig = dataclasses.field(default_factory=redactedConfig)
   redacted: redactedConfig = dataclasses.field(
@@ -122,3 +123,23 @@ class TPUJobConfig(torchtitan.config.JobConfig):
     # torchtitan.distributed.utils.init_distributed
     # that is chrashing when running on TAP.
     self.comm.trace_buf_size = 0
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class TPUTrainerConfig(torchtitan.trainer.Trainer.Config):
+  tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
+  redacted: redactedConfig = dataclasses.field(default_factory=redactedConfig)
+  redacted: redactedConfig = dataclasses.field(
+      default_factory=redactedConfig
+  )
+  conformer: ConformerConfig = dataclasses.field(
+      default_factory=ConformerConfig
+  )
+  qwen3: Qwen3Config = dataclasses.field(default_factory=Qwen3Config)
+  lora: LoRAConfig = dataclasses.field(default_factory=LoRAConfig)
+  splash_attention_kernel: SplashAttentionKernelConfig = dataclasses.field(
+      default_factory=SplashAttentionKernelConfig
+  )
+  loss_kernel: LossKernelConfig = dataclasses.field(
+      default_factory=LossKernelConfig
+  )

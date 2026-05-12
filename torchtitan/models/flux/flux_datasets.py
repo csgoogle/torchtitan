@@ -6,33 +6,29 @@
 
 import itertools
 import math
-from dataclasses import asdict
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import PIL.Image
-
 import torch
 from datasets import Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
-
 from torch.distributed.checkpoint.stateful import Stateful
-
 from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
-
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.config import JobConfig
 from torchtitan.hf_datasets import DatasetConfig
-from torchtitan.models.flux.tokenizer import build_flux_tokenizer, FluxTokenizer
+from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
 from torchtitan.tools.logging import logger
 
 
 def _process_cc12m_image(
     img: PIL.Image.Image,
     output_size: int = 256,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Process CC12M image to the desired size."""
 
     width, height = img.size
@@ -44,7 +40,7 @@ def _process_cc12m_image(
         # resize height to be equal to output_size, then crop
         new_width, new_height = math.ceil(output_size / height * width), output_size
         img = img.resize((new_width, new_height))
-        left = torch.randint(0, new_width - output_size + 1, (1,)).item()
+        left = int(torch.randint(0, new_width - output_size + 1, (1,)).item())
         resized_img = img.crop((left, 0, left + output_size, output_size))
     else:
         # resize width to be equal to output_size, the crop
@@ -53,7 +49,7 @@ def _process_cc12m_image(
             math.ceil(output_size / width * height),
         )
         img = img.resize((new_width, new_height))
-        lower = torch.randint(0, new_height - output_size + 1, (1,)).item()
+        lower = int(torch.randint(0, new_height - output_size + 1, (1,)).item())
         resized_img = img.crop((0, lower, output_size, lower + output_size))
 
     assert resized_img.size[0] == resized_img.size[1] == output_size
@@ -81,8 +77,7 @@ def _process_cc12m_image(
 
 def _cc12m_wds_data_processor(
     sample: dict[str, Any],
-    t5_tokenizer: FluxTokenizer,
-    clip_tokenizer: FluxTokenizer,
+    tokenizer: FluxTokenizerContainer,
     output_size: int = 256,
 ) -> dict[str, Any]:
     """
@@ -90,27 +85,23 @@ def _cc12m_wds_data_processor(
 
     Args:
         sample: A sample from dataset
-        t5_encoder: T5 encoder
-        clip_encoder: CLIP encoder
+        tokenizer: FluxTokenizerContainer that encodes text with both T5 and CLIP
         output_size: The output image size
 
     """
     img = _process_cc12m_image(sample["jpg"], output_size=output_size)
-    t5_tokens = t5_tokenizer.encode(sample["txt"])
-    clip_tokens = clip_tokenizer.encode(sample["txt"])
+    tokens = tokenizer.encode(sample["txt"])
 
     return {
         "image": img,
-        "clip_tokens": clip_tokens,  # type: List[int]
-        "t5_tokens": t5_tokens,  # type: List[int]
-        "prompt": sample["txt"],  # type: str
+        **tokens,
+        "prompt": sample["txt"],
     }
 
 
 def _coco_data_processor(
     sample: dict[str, Any],
-    t5_tokenizer: FluxTokenizer,
-    clip_tokenizer: FluxTokenizer,
+    tokenizer: FluxTokenizerContainer,
     output_size: int = 256,
 ) -> dict[str, Any]:
     """
@@ -118,8 +109,7 @@ def _coco_data_processor(
 
     Args:
         sample: A sample from dataset
-        t5_encoder: T5 encoder
-        clip_encoder: CLIP encoder
+        tokenizer: FluxTokenizerContainer that encodes text with both T5 and CLIP
         output_size: The output image size
 
     """
@@ -127,14 +117,12 @@ def _coco_data_processor(
     prompt = sample["caption"]
     if isinstance(prompt, list):
         prompt = prompt[0]
-    t5_tokens = t5_tokenizer.encode(prompt)
-    clip_tokens = clip_tokenizer.encode(prompt)
+    tokens = tokenizer.encode(prompt)
 
     return {
         "image": img,
-        "clip_tokens": clip_tokens,  # type: List[int]
-        "t5_tokens": t5_tokens,  # type: List[int]
-        "prompt": prompt,  # type: str
+        **tokens,
+        "prompt": prompt,
     }
 
 
@@ -160,7 +148,7 @@ DATASETS = {
 
 
 def _validate_dataset(
-    dataset_name: str, dataset_path: Optional[str] = None
+    dataset_name: str, dataset_path: str | None = None
 ) -> tuple[str, Callable, Callable]:
     """Validate dataset name and path."""
     if dataset_name not in DATASETS:
@@ -190,10 +178,10 @@ class FluxDataset(IterableDataset, Stateful):
     def __init__(
         self,
         dataset_name: str,
-        dataset_path: Optional[str],
-        t5_tokenizer: BaseTokenizer,
-        clip_tokenizer: BaseTokenizer,
-        job_config: Optional[JobConfig] = None,
+        dataset_path: str | None,
+        tokenizer: FluxTokenizerContainer,
+        prompt_dropout_prob: float,
+        img_size: int,
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
@@ -210,12 +198,13 @@ class FluxDataset(IterableDataset, Stateful):
         self.dataset_name = dataset_name
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
 
-        self._t5_tokenizer = t5_tokenizer
-        self._t5_empty_token = t5_tokenizer.encode("")
-        self._clip_tokenizer = clip_tokenizer
-        self._clip_empty_token = clip_tokenizer.encode("")
+        self._tokenizer = tokenizer
+        empty_tokens = tokenizer.encode("")
+        self._t5_empty_token = empty_tokens["t5"]
+        self._clip_empty_token = empty_tokens["clip"]
         self._data_processor = data_processor
-        self.job_config = job_config
+        self.prompt_dropout_prob = prompt_dropout_prob
+        self.img_size = img_size
 
         self.infinite = infinite
 
@@ -265,9 +254,8 @@ class FluxDataset(IterableDataset, Stateful):
             # Use the dataset-specific preprocessor
             sample_dict = self._data_processor(
                 sample,
-                self._t5_tokenizer,
-                self._clip_tokenizer,
-                output_size=self.job_config.training.img_size,
+                self._tokenizer,
+                output_size=self.img_size,
             )
 
             # skip low quality image or image with color channel = 1
@@ -281,13 +269,12 @@ class FluxDataset(IterableDataset, Stateful):
 
             # Classifier-free guidance: Replace some of the strings with empty strings.
             # Distinct random seed is initialized at the beginning of training for each FSDP rank.
-            # pyrefly: ignore [missing-attribute]
-            dropout_prob = self.job_config.training.classifier_free_guidance_prob
+            dropout_prob = self.prompt_dropout_prob
             if dropout_prob > 0.0:
                 if torch.rand(1).item() < dropout_prob:
-                    sample_dict["t5_tokens"] = self._t5_empty_token
+                    sample_dict["t5"] = self._t5_empty_token
                 if torch.rand(1).item() < dropout_prob:
-                    sample_dict["clip_tokens"] = self._clip_empty_token
+                    sample_dict["clip"] = self._clip_empty_token
 
             self._sample_idx += 1
 
@@ -309,53 +296,6 @@ class FluxDataset(IterableDataset, Stateful):
             return {"data": self._data.state_dict()}
 
 
-def build_flux_dataloader(
-    dp_world_size: int,
-    dp_rank: int,
-    job_config: JobConfig,
-    # This parameter is not used, keep it for compatibility
-    tokenizer: FluxTokenizer | None,
-    infinite: bool = True,
-) -> ParallelAwareDataloader:
-    """Build a data loader for HuggingFace datasets.
-
-    Args:
-        dp_world_size: Data parallelism world size.
-        dp_rank: Data parallelism rank.
-        job_config: Job configuration containing dataset and DataLoader settings.
-        tokenizer: Tokenizer (kept for compatibility, not used).
-        infinite: Whether to loop the dataset infinitely.
-    """
-    dataset_name = job_config.training.dataset
-    dataset_path = job_config.training.dataset_path
-    batch_size = job_config.training.local_batch_size
-
-    t5_tokenizer, clip_tokenizer = build_flux_tokenizer(job_config)
-
-    ds = FluxDataset(
-        dataset_name=dataset_name,
-        dataset_path=dataset_path,
-        t5_tokenizer=t5_tokenizer,
-        clip_tokenizer=clip_tokenizer,
-        job_config=job_config,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        infinite=infinite,
-    )
-
-    dataloader_kwargs = {
-        **asdict(job_config.training.dataloader),
-        "batch_size": batch_size,
-    }
-
-    return ParallelAwareDataloader(
-        dataset=ds,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        **dataloader_kwargs,
-    )
-
-
 class FluxValidationDataset(FluxDataset):
     """
     Adds logic to generate timesteps for flux validation method described in SD3 paper
@@ -367,10 +307,10 @@ class FluxValidationDataset(FluxDataset):
     def __init__(
         self,
         dataset_name: str,
-        dataset_path: Optional[str],
-        t5_tokenizer: BaseTokenizer,
-        clip_tokenizer: BaseTokenizer,
-        job_config: Optional[JobConfig] = None,
+        dataset_path: str | None,
+        tokenizer: FluxTokenizerContainer,
+        prompt_dropout_prob: float,
+        img_size: int,
         dp_rank: int = 0,
         dp_world_size: int = 1,
         generate_timesteps: bool = True,
@@ -380,9 +320,9 @@ class FluxValidationDataset(FluxDataset):
         super().__init__(
             dataset_name=dataset_name,
             dataset_path=dataset_path,
-            t5_tokenizer=t5_tokenizer,
-            clip_tokenizer=clip_tokenizer,
-            job_config=job_config,
+            tokenizer=tokenizer,
+            prompt_dropout_prob=prompt_dropout_prob,
+            img_size=img_size,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             infinite=infinite,
@@ -407,51 +347,96 @@ class FluxValidationDataset(FluxDataset):
             yield sample_dict, labels
 
 
-def build_flux_validation_dataloader(
-    dp_world_size: int,
-    dp_rank: int,
-    job_config: JobConfig,
-    # This parameter is not used, keep it for compatibility
-    tokenizer: BaseTokenizer | None,
-    generate_timestamps: bool = True,
-    infinite: bool = False,
-) -> ParallelAwareDataloader:
-    """Build a validation data loader for HuggingFace datasets.
+class FluxDataLoader(ParallelAwareDataloader):
+    """Configurable Flux dataloader for both training and validation.
 
-    Args:
-        dp_world_size: Data parallelism world size.
-        dp_rank: Data parallelism rank.
-        job_config: Job configuration containing dataset and DataLoader settings.
-        tokenizer: Tokenizer (kept for compatibility, not used).
-        generate_timestamps: Whether to generate timesteps for validation.
-        infinite: Whether to loop the dataset infinitely.
+    This dataloader wraps FluxDataset (or FluxValidationDataset when
+    ``generate_timesteps`` is enabled) and can be used for both training
+    and validation by configuring the appropriate dataset, batch_size, etc.
     """
-    dataset_name = job_config.validation.dataset
-    dataset_path = job_config.validation.dataset_path
-    batch_size = job_config.validation.local_batch_size
 
-    t5_tokenizer, clip_tokenizer = build_flux_tokenizer(job_config)
+    @dataclass(kw_only=True, slots=True)
+    class Config(ParallelAwareDataloader.Config):
+        dataset: str = "cc12m-test"
+        """Dataset to use"""
 
-    ds = FluxValidationDataset(
-        dataset_name=dataset_name,
-        dataset_path=dataset_path,
-        t5_tokenizer=t5_tokenizer,
-        clip_tokenizer=clip_tokenizer,
-        job_config=job_config,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        generate_timesteps=generate_timestamps,
-        infinite=infinite,
-    )
+        infinite: bool = True
+        """Whether to loop the dataset infinitely"""
 
-    dataloader_kwargs = {
-        **asdict(job_config.validation.dataloader),
-        "batch_size": batch_size,
-    }
+        prompt_dropout_prob: float = 0.0
+        """Probability of dropping out (replacing with empty string) each text encoding
+        independently during training. This enables classifier-free guidance at inference
+        time. If `n` text encoders are used, the unconditional model is trained in
+        `p ^ n` of all steps. For example, if `n = 2` and `p = 0.447`, the unconditional
+        model is trained in 20% of all steps.
 
-    return ParallelAwareDataloader(
-        ds,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        **dataloader_kwargs,
-    )
+        Should be 0.0 for validation (enforced automatically when generate_timesteps=True)."""
+
+        img_size: int = 256
+        """Image width to sample"""
+
+        generate_timesteps: bool = False
+        """Generate stratified timesteps in round-robin style (for validation)"""
+
+        def __post_init__(self):
+            if self.generate_timesteps and self.prompt_dropout_prob != 0.0:
+                raise ValueError(
+                    f"prompt_dropout_prob must be 0.0 when generate_timesteps=True "
+                    f"(for validation), but got {self.prompt_dropout_prob}."
+                )
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        dp_world_size: int,
+        dp_rank: int,
+        local_batch_size: int,
+        tokenizer: BaseTokenizer | None = None,
+        **kwargs,
+    ):
+
+        if not isinstance(tokenizer, FluxTokenizerContainer):
+            raise ValueError(
+                "FluxDataLoader requires a FluxTokenizerContainer as tokenizer. "
+                "Set tokenizer=FluxTokenizerContainer.Config(...) in your trainer config."
+            )
+
+        if config.generate_timesteps:
+            ds = FluxValidationDataset(
+                dataset_name=config.dataset,
+                dataset_path=config.dataset_path,
+                tokenizer=tokenizer,
+                prompt_dropout_prob=config.prompt_dropout_prob,
+                img_size=config.img_size,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
+                generate_timesteps=True,
+                infinite=config.infinite,
+            )
+        else:
+            ds = FluxDataset(
+                dataset_name=config.dataset,
+                dataset_path=config.dataset_path,
+                tokenizer=tokenizer,
+                prompt_dropout_prob=config.prompt_dropout_prob,
+                img_size=config.img_size,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
+                infinite=config.infinite,
+            )
+
+        dataloader_kwargs = {
+            "num_workers": config.num_workers,
+            "persistent_workers": config.persistent_workers,
+            "pin_memory": config.pin_memory,
+            "prefetch_factor": config.prefetch_factor,
+            "batch_size": local_batch_size,
+        }
+
+        super().__init__(
+            ds,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            **dataloader_kwargs,
+        )

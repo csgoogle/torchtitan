@@ -8,9 +8,36 @@ FeedForward, and TransformerBlock) as well as full model testing.
 from absl.testing import absltest
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
-from torchtitan.models.llama3.model import model as llama3_model
+import torchtitan.experiments.tpu.llama3 as llama3_tpu
+from torchtitan.models.common.attention import GQAttention as Attention, QKVLinear, ScaledDotProductAttention
+from torchtitan.models.common.decoder import TransformerBlock
+from torchtitan.models.common.embedding import Embedding
+from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.rmsnorm import RMSNorm
+from torchtitan.models.common.rope import RoPE, apply_rotary_emb_complex as apply_rotary_emb
+from torchtitan.models.llama3.model import Llama3Model, Llama3TransformerBlock
+
+
+def init_linear_weights(m: nn.Module):
+  """Applies deterministic normal initialization to linear weights for testing."""
+  for name, p in m.named_parameters():
+    if "weight" in name:
+      nn.init.normal_(p, std=0.02)
+    elif "bias" in name:
+      nn.init.zeros_(p)
+
+
+def _get_model_config(model_name: str = "testmodel") -> Llama3Model.Config:
+  """Retrieves a registered Llama3 configuration dynamically from TPU registry.
+
+  Defaults to 'testmodel' (which specifies dim=64, n_heads=8, n_layers=1,
+  vocab_size=128, max_seq_len=512).
+  """
+  return llama3_tpu.llama3_configs[model_name]
 
 
 class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
@@ -20,39 +47,25 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
   implementations of various Llama3 model layers and full model testing.
   """
 
-  def _get_model_args(
-      self,
-      n_layers: int = 2,
-      vocab_size: int = 32,
-      max_seq_len: int = 16,
-  ) -> llama3_model.TransformerModelArgs:
-    """Returns model arguments for Llama3 model."""
-    return llama3_model.TransformerModelArgs(
-        dim=64,
-        n_layers=n_layers,
-        n_heads=4,
-        n_kv_heads=4,
-        vocab_size=vocab_size,
-        max_seq_len=max_seq_len,
-        multiple_of=16,
-    )
-
   def test_llama_embedding_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the Embedding layer."""
-    args = self._get_model_args()
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     # CPU and DEVICE setup
     embedding_cpu, embedding_device = self._setup_module_cpu_device(
         nn.Embedding,
         init_fn=lambda m: nn.init.normal_(m.weight),
-        num_embeddings=args.vocab_size,
-        embedding_dim=args.dim
+        num_embeddings=config.vocab_size,
+        embedding_dim=config.dim,
     )
 
     tokens_cpu = torch.randint(
-        0, args.vocab_size, (batch, seq_len), device="cpu",
-        requires_grad=False
+        0,
+        config.vocab_size,
+        (batch, seq_len),
+        device="cpu",
+        requires_grad=False,
     )
     tokens_device = tokens_cpu.to(self.accelerator_device)
 
@@ -90,8 +103,6 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
     """Tests the CPU vs. DEVICE parity of torch.view_as_complex."""
 
     batch, seq_len, dim = 4, 8, 64
-    # Instantiate args just to trigger the patch in __post_init__
-    _ = self._get_model_args()
 
     # CPU setup - last dimension must be 2 for view_as_complex
     x_cpu = torch.randn(
@@ -145,8 +156,6 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
     """Tests CPU vs. DEVICE parity for apply_rotary_emb function."""
 
     batch, seq_len, n_heads, head_dim = 8, 128, 16, 64
-    # Instantiate args just to trigger the patch in __post_init__
-    _ = self._get_model_args()
 
     # CPU setup
     xq_cpu = torch.randn(
@@ -169,10 +178,8 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
 
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      xq_out_cpu, xk_out_cpu = llama3_model.apply_rotary_emb(
-          xq_cpu, xk_cpu, freqs_cis_cpu
-      )
-      xq_out_device, xk_out_device = llama3_model.apply_rotary_emb(
+      xq_out_cpu, xk_out_cpu = apply_rotary_emb(xq_cpu, xk_cpu, freqs_cis_cpu)
+      xq_out_device, xk_out_device = apply_rotary_emb(
           xq_device, xk_device, freqs_cis_device
       )
 
@@ -216,20 +223,23 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_llama_attention_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the Attention layer."""
-    args = self._get_model_args()
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     # CPU and DEVICE setup
+    attention_config = config.layers[0].attention
     attention_cpu, attention_device = self._setup_module_cpu_device(
-        llama3_model.Attention,
-        lambda m: m.init_weights(init_std=0.02),
-        args
+        Attention, init_fn=init_linear_weights, config=attention_config
     )
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, args.dim), requires_grad=True)
-    freqs_cis_cpu = llama3_model.precompute_freqs_cis(
-        args.dim // args.n_heads, seq_len, theta=args.rope_theta
+        (batch, seq_len, config.dim), requires_grad=True
     )
+    rope_config = RoPE.Config(
+        dim=config.dim // config.layers[0].attention.n_heads,
+        max_seq_len=seq_len,
+    )
+    rope = RoPE(rope_config)
+    freqs_cis_cpu = rope.cache
     freqs_cis_device = freqs_cis_cpu.to(self.accelerator_device)
 
     with self.subTest(name="ForwardPass"):
@@ -271,21 +281,19 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
 
   def test_llama_feedforward_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the FeedForward layer."""
-    args = self._get_model_args()
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     # CPU and DEVICE setup
+    ffn_config = config.layers[0].feed_forward
     feedforward_cpu, feedforward_device = self._setup_module_cpu_device(
-        llama3_model.FeedForward,
-        init_fn=lambda m: m.init_weights(init_std=0.02),
-        dim=args.dim,
-        hidden_dim=4 * args.dim,
-        multiple_of=args.multiple_of,
-        ffn_dim_multiplier=args.ffn_dim_multiplier,
+        FeedForward,
+        init_fn=init_linear_weights,
+        config=ffn_config,
     )
 
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, args.dim), requires_grad=True
+        (batch, seq_len, config.dim), requires_grad=True
     )
 
     with self.subTest(name="ForwardPass"):
@@ -328,25 +336,27 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
   def test_llama_transformer_block_cpu_device_parity(self):
     """Tests the CPU vs. DEVICE parity of the TransformerBlock layer."""
 
-    args = self._get_model_args()
+    config = _get_model_config()
     batch, seq_len = 2, 8
-    layer_id = 0
 
     # CPU and DEVICE setup
+    block_config = config.layers[0]
     transformer_block_cpu, transformer_block_device = (
         self._setup_module_cpu_device(
-            llama3_model.TransformerBlock,
-            lambda m: m.init_weights(),
-            layer_id,
-            args
+            Llama3TransformerBlock,
+            init_fn=init_linear_weights,
+            config=block_config,
         )
     )
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, args.dim), requires_grad=True
+        (batch, seq_len, config.dim), requires_grad=True
     )
-    freqs_cis_cpu = llama3_model.precompute_freqs_cis(
-        args.dim // args.n_heads, seq_len, theta=args.rope_theta
+    rope_config = RoPE.Config(
+        dim=config.dim // config.layers[0].attention.n_heads,
+        max_seq_len=seq_len,
     )
+    rope = RoPE(rope_config)
+    freqs_cis_cpu = rope.cache
     freqs_cis_device = freqs_cis_cpu.to(self.accelerator_device)
 
     with self.subTest(name="ForwardPass"):
@@ -403,13 +413,14 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
 
     Uses baseclass function wrapper for full model training steps parity test.
     """
-    args = self._get_model_args()
+    config = _get_model_config()
     batch, seq_len = 2, 8
 
     self._run_full_model_training_steps_parity_test(
-        model_cpu=llama3_model.Transformer(args).cpu(),
+        model_cpu=Llama3Model(config).cpu(),
         batch=batch,
         seq_len=seq_len,
+        vocab_size=config.vocab_size,
         loss_atol=5e-3,
         loss_rtol=1e-2,
         grad_atol=0.1,  # Grad noise builds up over multiple steps

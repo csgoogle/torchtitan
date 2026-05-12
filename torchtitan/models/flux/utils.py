@@ -4,14 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Optional
-
 import torch
 
 from torch import Tensor
 
 from .model.autoencoder import AutoEncoder
 from .model.hf_embedder import FluxEmbedder
+
+PATCH_HEIGHT, PATCH_WIDTH = 2, 2
+LATENT_CHANNELS, IMAGE_LATENT_SIZE_RATIO = 16, 8
 
 
 def preprocess_data(
@@ -20,7 +21,7 @@ def preprocess_data(
     dtype: torch.dtype,
     *,
     # arguments from the config
-    autoencoder: Optional[AutoEncoder],
+    autoencoder: AutoEncoder | None,
     clip_encoder: FluxEmbedder,
     t5_encoder: FluxEmbedder,
     batch: dict[str, Tensor],
@@ -40,8 +41,8 @@ def preprocess_data(
         dict[str, Tensor]: batch of preprocessed data
     """
 
-    clip_tokens = batch["clip_tokens"].squeeze(1).to(device=device, dtype=torch.int)
-    t5_tokens = batch["t5_tokens"].squeeze(1).to(device=device, dtype=torch.int)
+    clip_tokens = batch["clip"].squeeze(1).to(device=device, dtype=torch.int)
+    t5_tokens = batch["t5"].squeeze(1).to(device=device, dtype=torch.int)
 
     clip_text_encodings = clip_encoder(clip_tokens)
     t5_text_encodings = t5_encoder(t5_tokens)
@@ -79,7 +80,6 @@ def generate_noise_latent(
             Shape: [num_samples, LATENT_CHANNELS, height // IMG_LATENT_SIZE_RATIO, width // IMG_LATENT_SIZE_RATIO]
 
     """
-    LATENT_CHANNELS, IMAGE_LATENT_SIZE_RATIO = 16, 8
     return torch.randn(
         bsz,
         LATENT_CHANNELS,
@@ -104,8 +104,6 @@ def create_position_encoding_for_latents(
         Tensor: The position encodings.
             Shape: [bsz, (latent_height // PATCH_HEIGHT) * (latent_width // PATCH_WIDTH), POSITION_DIM)
     """
-    PATCH_HEIGHT, PATCH_WIDTH = 2, 2
-
     height = latent_height // PATCH_HEIGHT
     width = latent_width // PATCH_WIDTH
 
@@ -138,8 +136,6 @@ def pack_latents(x: Tensor) -> Tensor:
         Tensor: The packed latents.
             Shape: (bsz, (latent_height // ph) * (latent_width // pw), ch * ph * pw)
     """
-    PATCH_HEIGHT, PATCH_WIDTH = 2, 2
-
     b, c, latent_height, latent_width = x.shape
     h = latent_height // PATCH_HEIGHT
     w = latent_width // PATCH_WIDTH
@@ -169,8 +165,6 @@ def unpack_latents(x: Tensor, latent_height: int, latent_width: int) -> Tensor:
         Tensor: The unpacked latents.
             Shape: [bsz, ch, latent height, latent width]
     """
-    PATCH_HEIGHT, PATCH_WIDTH = 2, 2
-
     b, _, c_ph_pw = x.shape
     h = latent_height // PATCH_HEIGHT
     w = latent_width // PATCH_WIDTH

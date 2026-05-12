@@ -11,8 +11,6 @@ import sys
 import time
 from pathlib import Path
 
-from typing import Optional
-
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
@@ -25,9 +23,8 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
 )
 from torchtitan.components.metrics import build_device_memory_monitor
-from torchtitan.config import ConfigManager, Debug as DebugConfig
+from torchtitan.config import ConfigManager, DebugConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.protocols.train_spec import get_train_spec
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import get_device_module, get_device_type
@@ -46,16 +43,16 @@ def apply_tp_minus_sp(model: nn.Module, tp_mesh: DeviceMesh):
         tp_mesh,
         {
             "tok_embeddings": RowwiseParallel(input_layouts=Replicate()),
-            "output": ColwiseParallel(output_layouts=Replicate()),
+            "lm_head": ColwiseParallel(output_layouts=Replicate()),
         },
     )
 
     # pyrefly: ignore [missing-attribute]
     for _, transformer_block in model.layers.items():
         layer_plan = {
-            "attention.wq": ColwiseParallel(),
-            "attention.wk": ColwiseParallel(),
-            "attention.wv": ColwiseParallel(),
+            "attention.qkv_linear.wq": ColwiseParallel(),
+            "attention.qkv_linear.wk": ColwiseParallel(),
+            "attention.qkv_linear.wv": ColwiseParallel(),
             "attention.wo": RowwiseParallel(),
             "feed_forward.w1": ColwiseParallel(),
             "feed_forward.w2": RowwiseParallel(),
@@ -72,23 +69,26 @@ def apply_tp_minus_sp(model: nn.Module, tp_mesh: DeviceMesh):
 
 @record
 def test_generate(
-    config_path: str,
+    model_name: str,
+    config_name: str,
     checkpoint_path: str,
     prompt: str,
     *,
     temperature: float = 1.0,
     max_new_tokens: int = 32,
     batch_size: int = 1,
-    top_k: Optional[int] = None,
-    seed: Optional[int] = None,
+    top_k: int | None = None,
+    seed: int | None = None,
     deterministic: bool = False,
 ):
     init_logger()
     color = utils.Color
 
-    # Load configuration from toml file
+    # Load configuration from config_registry
     config_manager = ConfigManager()
-    config = config_manager.parse_args([f"--job.config_file={config_path}"])
+    config = config_manager.parse_args(
+        ["--module", model_name, "--config", config_name]
+    )
 
     if len(args.prompt) == 0:
         logger.warning(
@@ -101,26 +101,27 @@ def test_generate(
     get_device_module().set_device(device)
     device_memory_monitor = build_device_memory_monitor()
 
-    train_spec = get_train_spec(config.model.name)
-
     logger.info(f"World Size: {world_size}, Local Rank: {local_rank} on {device}")
 
     # Tokenizer setup
-    # pyrefly: ignore [not-callable]
-    tokenizer = train_spec.build_tokenizer_fn(config)
+    from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
-    model_args = train_spec.model_args[config.model.flavor]
-    model_args.update_from_config(config)
+    tokenizer = HuggingFaceTokenizer.Config().build(
+        tokenizer_path=config.hf_assets_path  # pyrefly: ignore [missing-attribute]
+    )
+
+    model_config = config.model_spec.model  # pyrefly: ignore [missing-attribute]
+    model_config.update_from_config(trainer_config=config)
 
     init_device = "meta" if world_size > 1 else device
     with torch.device(init_device):
         logger.info(f"Init model on init_device: {init_device}")
-        model = train_spec.model_cls(model_args)
+        model = model_config.build()
 
     parallel_dims = None
     # Init distributed env
     if world_size > 1:
-        dist_utils.init_distributed(config.comm)
+        dist_utils.init_distributed(config.comm)  # pyrefly: ignore [missing-attribute]
         parallel_dims = ParallelDims(
             dp_replicate=1,
             dp_shard=-1,
@@ -128,7 +129,6 @@ def test_generate(
             tp=world_size,
             pp=1,
             ep=1,
-            etp=1,
             world_size=world_size,
         )
 
@@ -143,7 +143,6 @@ def test_generate(
             tp=1,
             pp=1,
             ep=1,
-            etp=1,
             world_size=1,
         )
 
@@ -259,7 +258,13 @@ def test_generate(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test generation")
     parser.add_argument(
-        "--config", type=str, required=True, help="TOML config file path (required)"
+        "--module", type=str, required=True, help="Module name (e.g., llama3)"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Config registry function name (e.g., llama3_debugmodel)",
     )
     parser.add_argument(
         "--checkpoint",
@@ -304,7 +309,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     test_generate(
-        config_path=args.config,
+        model_name=args.module,
+        config_name=args.config,
         checkpoint_path=args.checkpoint,
         prompt=args.prompt,
         temperature=args.temperature,

@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torchtitan.components import loss as torchtitan_loss
 import torchtitan.config
+import torchtitan.trainer
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
@@ -34,7 +35,7 @@ def setup_logger():
     logging.set_verbosity(logging.ERROR)
 
 
-def _run_model_distributed(job_config: torchtitan.config.JobConfig):
+def _run_model_distributed(job_config: torchtitan.trainer.Trainer.Config):
   device = tpu_utils.get_device()
   world_size = int(os.environ.get("WORLD_SIZE", 1))
   if world_size > 1:

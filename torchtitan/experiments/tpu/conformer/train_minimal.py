@@ -20,6 +20,7 @@ from torchtitan.components import metrics
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
+import torchtitan.trainer
 from torchtitan.distributed import utils as dist_utils
 import torchtitan.experiments.tpu.conformer  # trigger conformer_tpu model registration
 import torchtitan.experiments.tpu.gmain as gmain
@@ -31,7 +32,7 @@ from torchtitan.tools import utils
 import torchtitan.tools.logging
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
-JobConfig = torchtitan.config.JobConfig
+JobConfig = torchtitan.trainer.Trainer.Config
 ParallelDims = torchtitan.distributed.ParallelDims
 TPUJobConfig = torchtitan.experiments.tpu.tpu_job_config.TPUJobConfig
 logger = torchtitan.tools.logging.logger
