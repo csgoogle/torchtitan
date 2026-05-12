@@ -8,7 +8,7 @@ import torch.nn as nn
 import torchtitan.config
 import torchtitan.distributed
 import torchtitan.trainer
-from torchtitan.experiments.simple_fsdp import simple_fsdp
+from torchtitan.experiments.graph_trainer import simple_fsdp
 from torchtitan.experiments.tpu import tpu_job_config
 import torchtitan.experiments.tpu.utils as tpu_utils
 from torchtitan.tools import logging

@@ -5,13 +5,14 @@ import math
 import torch
 import torch.nn as nn
 from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
-from torchtitan.experiments.tpu.tpu_job_config import TPUJobConfig
-from torchtitan.protocols.model import BaseModelArgs, ModelProtocol
+from torchtitan.experiments.tpu.tpu_job_config import TPUJobConfig, TPUTrainerConfig
+from torchtitan.protocols.model import BaseModel
+from torchtitan.protocols.train_spec import BaseModelArgs
 from torchtitan.tools.logging import logger
 
 
-@dataclass
-class ConformerModelArgs(BaseModelArgs):
+@dataclass(kw_only=True, slots=True)
+class ConformerModelArgs(BaseModel.Config):
   """Arguments for Conformer model configuration."""
 
   vocab_size: int = 64
@@ -27,7 +28,7 @@ class ConformerModelArgs(BaseModelArgs):
     # Update from job_config if needed
     if hasattr(job_config, "training"):
       self.max_seq_len = job_config.training.seq_len
-    if isinstance(job_config, TPUJobConfig):
+    if isinstance(job_config, (TPUJobConfig, TPUTrainerConfig)):
       self.use_splash = (
           job_config.splash_attention_kernel.use_splash_attention_kernel
       )
@@ -86,19 +87,14 @@ class PatchedMHA(nn.Module):
       average_attn_weights=True,
       is_causal=False,
   ):
-    bsz, tgt_len, _ = query.shape
-    qkv = self.in_proj(query)
-    q, k, v = qkv.chunk(3, dim=-1)
+    bsz, tgt_len, hidden_dim = query.shape
+    w = self.in_proj.weight.view(3, self.num_heads, self.head_dim, hidden_dim)
+    qkv = torch.einsum("btd,nhkd->nbhtk", query, w)
+    q, k, v = qkv[0], qkv[1], qkv[2]
 
     if self.use_splash:
-      q = q.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-      k = k.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-      v = v.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
       attn_output = splash_sdpa(q, k, v, is_causal=is_causal, use_vmap_bwd=self.use_vmap_bwd)
     else:
-      q = q.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
-      k = k.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
-      v = v.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
       attn_output = torch.nn.functional.scaled_dot_product_attention(
           q,
           k,
@@ -108,8 +104,16 @@ class PatchedMHA(nn.Module):
           is_causal=is_causal,
       )
 
-    attn_output = attn_output.transpose(1, 2).contiguous().flatten(start_dim=-2)
-    attn_output = self.out_proj(attn_output)
+    w = self.out_proj.weight.view(self.out_proj.out_features, self.num_heads, self.head_dim)
+    outputs = []
+    for i in range(self.num_heads):
+        x_i = attn_output[:, i, :, :]
+        w_i = w[:, i, :].t().unsqueeze(0).expand(bsz, -1, -1)
+        head_out = torch.bmm(x_i, w_i)
+        outputs.append(head_out)
+    attn_output = sum(outputs)
+    if self.out_proj.bias is not None:
+        attn_output = attn_output + self.out_proj.bias
     return attn_output, None
 
 
@@ -197,29 +201,33 @@ class ConformerLayer(nn.Module):
     return x
 
 
-class Conformer(ModelProtocol):
+class Conformer(BaseModel):
   """Build a conformer model matching torchaudio.models.Conformer architecture."""
 
-  def __init__(self, model_args: ConformerModelArgs) -> None:
-    super().__init__(model_args)
-    self._model_args = model_args
+  Config = ConformerModelArgs
+
+  def __init__(self, config: ConformerModelArgs) -> None:
+    super().__init__()
+    self.config = config
+    self._model_args = config
+    self.embedding = nn.Embedding(config.vocab_size, config.hidden_dim)
 
     self.conformer_layers = nn.ModuleList([
         ConformerLayer(
-            dim=model_args.hidden_dim,
-            num_heads=model_args.num_heads,
-            ffn_dim=4 * model_args.hidden_dim,
-            kernel_size=model_args.kernel_size,
-            use_splash=model_args.use_splash,
-            use_vmap_bwd=model_args.use_vmap_bwd,
+            dim=config.hidden_dim,
+            num_heads=config.num_heads,
+            ffn_dim=4 * config.hidden_dim,
+            kernel_size=config.kernel_size,
+            use_splash=config.use_splash,
+            use_vmap_bwd=config.use_vmap_bwd,
         )
-        for _ in range(model_args.num_layers)
+        for _ in range(config.num_layers)
     ])
-    self.fc = nn.Linear(model_args.hidden_dim, model_args.vocab_size)
+    self.fc = nn.Linear(config.hidden_dim, config.vocab_size)
     logger.info("Conformer model built successfully.")
 
   def forward(self, inputs: torch.Tensor, **kwargs):
-    x = inputs
+    x = self.embedding(inputs)
     for layer in self.conformer_layers:
       x = layer(x)
     logits = self.fc(x)
@@ -249,6 +257,15 @@ class Conformer(ModelProtocol):
             cpu_tensor = torch.empty_like(local_tensor, device="cpu")
             cpu_tensor.uniform_(-bound, bound)
             local_tensor.copy_(cpu_tensor)
+        elif isinstance(module, nn.Embedding):
+          local_tensor = (
+              module.weight.to_local()
+              if hasattr(module.weight, "to_local")
+              else module.weight
+          )
+          cpu_tensor = torch.empty_like(local_tensor, device="cpu")
+          cpu_tensor.normal_(0.0, 1.0)
+          local_tensor.copy_(cpu_tensor)
         elif isinstance(module, (nn.BatchNorm1d, nn.GroupNorm, nn.LayerNorm)):
           if module.weight is not None:
             local_tensor = (

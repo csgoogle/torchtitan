@@ -61,7 +61,7 @@ def train_step(
   if graph_split:
     import torch_tpu._internal.sync  # pylint: disable=g-import-not-at-top
 
-  logits = model(inputs)
+  logits = model(inputs.to(torch.long))
   with jax_profiler.TraceAnnotation("loss"):
     if use_ctc:
       # CTC loss expects (T, N, C)
@@ -69,11 +69,11 @@ def train_step(
           0, 1
       )
       criterion = torch.nn.CTCLoss()
-      loss = criterion(log_probs, targets, output_lengths, target_lengths)
+      loss = criterion(log_probs, targets.to(torch.long), output_lengths, target_lengths)
     else:
       loss = F.cross_entropy(
           logits.reshape(-1, logits.shape[-1]),
-          targets.reshape(-1),
+          targets.to(torch.long).reshape(-1),
           reduction="sum",
       )
 
@@ -128,7 +128,7 @@ def start_trainer(job_config: JobConfig) -> None:
     dist_utils.init_distributed(
         job_config.comm,
         enable_cpu_backend=job_config.training.enable_cpu_offload,
-        base_folder=job_config.job.dump_folder,
+        base_folder=job_config.dump_folder,
     )
     torch.distributed.barrier()
 
@@ -149,7 +149,6 @@ def start_trainer(job_config: JobConfig) -> None:
       tp=job_config.parallelism.tensor_parallel_degree,
       pp=job_config.parallelism.pipeline_parallel_degree,
       ep=job_config.parallelism.expert_parallel_degree,
-      etp=job_config.parallelism.expert_tensor_parallel_degree,
       world_size=world_size,
   )
   logger.info("parallel_dims: %s", parallel_dims)
@@ -185,55 +184,57 @@ def start_trainer(job_config: JobConfig) -> None:
   )
   log_freq = job_config.metrics.log_freq
 
-  train_spec = train_spec_module.get_train_spec(job_config.model.name)
-
-  model_args = train_spec.model_args[job_config.model.flavor]
+  model_spec = job_config.model_spec
+  model_args = model_spec.model
   model_args.update_from_config(job_config)
 
   tokenizer = typing.cast(
       torchtitan.components.tokenizer.HuggingFaceTokenizer,
-      train_spec.build_tokenizer_fn(job_config)
-      if train_spec.build_tokenizer_fn is not None
-      else None,
+      job_config.tokenizer.build(tokenizer_path=job_config.hf_assets_path)
   )
 
-  if job_config.training.dataset == "random":
+  if job_config.dataloader.dataset == "random":
     logger.info("Using random data loader instead of real dataset.")
     dataloader = build_random_dataloader(
         job_config, model_args.hidden_dim, model_args.vocab_size, device
     )
   else:
-    dataloader = train_spec.build_dataloader_fn(
+    dataloader = job_config.dataloader.build(
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=tokenizer,
-        job_config=job_config,
+        seq_len=job_config.training.seq_len,
+        local_batch_size=job_config.training.local_batch_size,
     )
 
   logger.info(
       "Building %s %s with %s",
-      job_config.model.name,
-      job_config.model.flavor,
+      model_spec.name,
+      model_spec.flavor,
       model_args,
   )
 
-  metrics_processor = metrics.build_metrics_processor(
-      job_config, parallel_dims, model_args
+  metrics_processor = job_config.metrics.build(
+      parallel_dims=parallel_dims,
+      dump_folder=job_config.dump_folder,
+      pp_schedule=job_config.parallelism.pipeline_parallel_schedule,
+      config_dict=job_config.to_dict(),
+      has_quantization=False,
   )
 
   with (
       torch.device("meta"),
       utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
   ):
-    model = typing.cast(torch.nn.Module, train_spec.model_cls(model_args))
+    model = model_args.build()
 
   model_param_count, _ = model_args.get_nparams_and_flops(
       model, job_config.training.seq_len
   )
   logger.info(
       "Model %s %s size: %d total parameters",
-      job_config.model.name,
-      job_config.model.flavor,
+      model_spec.name,
+      model_spec.flavor,
       model_param_count,
   )
 
@@ -266,14 +267,14 @@ def start_trainer(job_config: JobConfig) -> None:
       job_config.compile.enable and "model" in job_config.compile.components
   )
   if world_size > 1 or model_compile_enabled:
-    if train_spec.parallelize_fn is not None:
-      compiled_model = train_spec.parallelize_fn(
+    if model_spec.parallelize_fn is not None:
+      compiled_model = model_spec.parallelize_fn(
           model, parallel_dims, job_config
       )
       if compiled_model is not None:
         model = compiled_model
     else:
-      logger.warning("No parallelize_fn provided in TrainSpec.")
+      logger.warning("No parallelize_fn provided in ModelSpec.")
 
   if not use_simple_fsdp:
     # For FSDP2 and other strategies, we prefer to parallelize (and optionally
@@ -290,7 +291,7 @@ def start_trainer(job_config: JobConfig) -> None:
 
   loss_fn = None  # Handled in train_step
 
-  if not job_config.compile.enable and job_config.profiling.enable_profiling:
+  if not job_config.compile.enable and job_config.profiler.enable_profiling:
     model_annotator.wrap_model(model)
 
   trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -364,9 +365,9 @@ def start_trainer(job_config: JobConfig) -> None:
 
   ntokens_seen = 0
   with maybe_enable_profiling(
-      job_config.profiling,
+      job_config.profiler,
       global_step=0,
-      base_folder=job_config.job.dump_folder,
+      base_folder=job_config.dump_folder,
   ) as profiler:
     data_iterator = iter(dataloader)
     for step in range(steps):
