@@ -9,7 +9,7 @@ from torch.distributed._composable.fsdp import FSDPModule
 
 
 def disable_fsdp_gradient_division(model: nn.Module) -> None:
-    """
+  """
     Disable FSDP's automatic gradient division for all FSDP modules.
 
     Set gradient_divide_factor=1.0 to disable FSDP's automatic gradient division.
@@ -20,9 +20,20 @@ def disable_fsdp_gradient_division(model: nn.Module) -> None:
     Args:
         model: The model containing FSDP-wrapped or Replicate-wrapped modules
     """
-    for module in model.modules():
-        if isinstance(module, FSDPModule):
-            module.set_gradient_divide_factor(1.0)
+  # The `premul_sum` reduction type is not supported on non-CUDA devices
+  # (e.g., TPU), but it may be used by FSDP on CUDA devices.
+  # To avoid runtime errors on non-CUDA devices, we explicitly disable
+  # `premul_sum` and force post-multiply mode via
+  # `set_force_sum_reduction_for_comms(True)`.
+  # Since `gradient_divide_factor` is set to 1.0 in the code below,
+  # this results in a numerically equivalent outcome between CUDA and
+  # non-CUDA devices (i.e., A/1+B/1+C/1 == (A+B+C)/1).
+  device = next(model.parameters()).device
+  for module in model.modules():
+    if isinstance(module, FSDPModule):
+      if device.type != "cuda":
+        module.set_force_sum_reduction_for_comms(True)
+      module.set_gradient_divide_factor(1.0)
 
 
 def get_fsdp_reshard_after_forward_policy(
