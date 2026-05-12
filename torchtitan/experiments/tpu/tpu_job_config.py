@@ -99,6 +99,7 @@ class LossKernelConfig:
   enable_pallas_loss_kernel: bool = True
 
 
+# TODO(tbajpai) remove after cleaning up type annotations throughout
 @dataclasses.dataclass(kw_only=True, slots=True)
 class TPUJobConfig(torchtitan.trainer.Trainer.Config):
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
@@ -143,3 +144,9 @@ class TPUTrainerConfig(torchtitan.trainer.Trainer.Config):
   loss_kernel: LossKernelConfig = dataclasses.field(
       default_factory=LossKernelConfig
   )
+
+  def __post_init__(self):
+    # This prevents creating folder in
+    # torchtitan.distributed.utils.init_distributed
+    # that is chrashing when running on TAP.
+    self.comm.trace_buf_size = 0

@@ -41,6 +41,7 @@ def _parse_flags(argv: Sequence[str]) -> Tuple[argparse.Namespace, List[str]]:
   parser = argparse_flags.ArgumentParser(
       description="Minimal trainer for TorchTitan models.",
       inherited_absl_flags=flags.FLAGS,
+      allow_abbrev=False,
   )
   parser.add_argument(
       "--device",
