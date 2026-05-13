@@ -107,6 +107,7 @@ qwen3_configs = {
     "debugmodel_moe": qwen3_models.qwen3_configs["debugmodel_moe"]("sdpa"),
     "0.6B": qwen3_models.qwen3_configs["0.6B"]("sdpa"),
     "1.7B": qwen3_models.qwen3_configs["1.7B"]("sdpa"),
+    "4B": qwen3_models.qwen3_configs["4B"]("sdpa"),
     "32B": qwen3_models.qwen3_configs["32B"]("sdpa"),
 }
 
