@@ -15,12 +15,7 @@ import tyro
 from torchtitan.config import Configurable
 from torchtitan.config.function import Function
 from torchtitan.tools.logging import logger
-try:
-    # TODO: b/470479047 - make torch_tpu profiler working on Cloud.
-    from torch_tpu._internal import profiler as tpu_profiler
-    TPU_PROFILING_ENABLED = True
-except ModuleNotFoundError:
-    TPU_PROFILING_ENABLED = False
+
 from torchtitan.tools.utils import get_device_module, get_device_type
 
 # how much memory allocation/free ops to record in memory snapshots
@@ -329,35 +324,26 @@ class Profiler(Configurable):
             wait >= 0
         ), "profile_freq must be greater than or equal to warmup + active"
         device_type = get_device_type()
-        if TPU_PROFILING_ENABLED and device_type == "tpu":
-            tpu_trace_dir = os.path.join(trace_dir, f"rank_{rank}")
-            tpu_trace_handler = tpu_profiler.xprof_trace_handler(dir_name=tpu_trace_dir)
-            torch_profiler = tpu_profiler.profile(
-                activities=[tpu_profiler.ProfilerActivity.CPU, tpu_profiler.ProfilerActivity.TPU],
-                schedule=tpu_profiler.schedule(
-                    wait=wait, warmup=warmup, active=active, **additional_params
-                ),
-                on_trace_ready=tpu_trace_handler,
-                record_shapes=True,
-            )
-        else:
-            activities = [torch.profiler.ProfilerActivity.CPU]
-            if torch.cuda.is_available():
-                activities.append(torch.profiler.ProfilerActivity.CUDA)
-            elif torch.xpu.is_available():
-                activities.append(torch.profiler.ProfilerActivity.XPU)
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device_type == "tpu":
+            # Use PrivateUse1 for TPU until it is fully upstreamed in PyTorch
+            # TODO: b/470479047 - confirm torch.profiler working for TPU on Cloud.
+            activities.append(torch.profiler.ProfilerActivity.PrivateUse1)
+        elif torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        elif torch.xpu.is_available():
+            activities.append(torch.profiler.ProfilerActivity.XPU)
 
-            torch_profiler = torch.profiler.profile(
-                activities=activities,
-                schedule=torch.profiler.schedule(
-                    wait=wait, warmup=warmup, active=active, **additional_params
-                ),
-                on_trace_ready=trace_handler,
-                record_shapes=True,
-            )
+        torch_profiler = torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(
+                wait=wait, warmup=warmup, active=active, **additional_params
+            ),
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+        )
         torch_profiler.__enter__()
-        if get_device_type() != "tpu":
-            torch_profiler.step_num = global_step
+        torch_profiler.step_num = global_step
         return torch_profiler
 
     def build_memory_profiler(
