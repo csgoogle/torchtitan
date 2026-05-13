@@ -72,7 +72,9 @@ def main(parsed_args: Tuple[argparse.Namespace, List[str]]):
 
 
 def handle_main(
-    start_trainer_func: Callable[[tpu_job_config_module.TPUTrainerConfig], None],
+    start_trainer_func: Callable[
+        [tpu_job_config_module.TPUTrainerConfig], None
+    ],
 ):
   global global_start_trainer_func
   global_start_trainer_func = start_trainer_func

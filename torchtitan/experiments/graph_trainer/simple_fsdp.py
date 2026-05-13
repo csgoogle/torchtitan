@@ -144,7 +144,9 @@ def _register_parametrization(
   """
   param_name_to_property = {
       param_name: property(
-          lambda self, pn=param_name: parametrization(self._parameters[pn])
+          lambda self, pn=param_name: self._simple_fsdp_parametrization_list[0](
+              self._parameters[pn]
+          )
       )
       for param_name in param_names
   }
@@ -164,6 +166,7 @@ def _register_parametrization(
     ] = module_cls
     _wrap_class_cache[cache_key] = module_cls
   module.__class__ = module_cls
+  module._simple_fsdp_parametrization_list = [parametrization]
 
 
 class ReplicateComputation(Module):
@@ -270,6 +273,7 @@ def data_parallel(
     mp_policy: MixedPrecisionPolicy | None = None,
     shard_dim: int = 0,
     full_dtensor: bool = False,
+    ignored_params: set[nn.Parameter] | None = None,
 ) -> nn.Module:
   param_sharding: tuple[Placement, ...]
   if mode == "replicate":
@@ -294,6 +298,16 @@ def data_parallel(
     if "SimpleFSDP" in mod.__class__.__name__:
       continue
 
+    # Skip parameters that are explicitly ignored (e.g., shared or frozen weights).
+    if ignored_params is not None:
+      params_dict = {
+          p_name: p
+          for p_name, p in params_dict.items()
+          if p not in ignored_params
+      }
+      if not params_dict:
+        continue
+
     for p_name, p in params_dict.items():
       if p is not None and p.numel() > 0:
         distribute_tensor_func = (
@@ -302,7 +316,8 @@ def data_parallel(
         mod.register_parameter(
             p_name,
             nn.Parameter(
-                distribute_tensor_func(p, device_mesh, param_sharding)
+                distribute_tensor_func(p, device_mesh, param_sharding),
+                requires_grad=p.requires_grad,
             ),
         )
 

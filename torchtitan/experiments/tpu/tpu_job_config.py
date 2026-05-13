@@ -150,3 +150,4 @@ class TPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # torchtitan.distributed.utils.init_distributed
     # that is chrashing when running on TAP.
     self.comm.trace_buf_size = 0
+    self.dump_folder = "/tmp/outputs"
