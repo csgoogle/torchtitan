@@ -14,9 +14,15 @@ Example runs:
     --test_arg=--config=grpo_qwen3_4b_gf
 
   # Qwen3 0.6B FSDP on GLP ([internal link])
+  # xprof: [internal link]
   rabbit test --norun_validations //torchtitan/experiments/tpu/rl:train_grpo_forge_tpu_tpu_2x4 \
     --test_arg=--module=torchtitan.experiments.tpu.rl \
-    --test_arg=--config=grpo_qwen3_0_6b_glp
+    --test_arg=--config=grpo_qwen3_0_6b_glp \
+    --test_arg=--tpu-config.use-internal-xprof \
+    --test_arg=--profiler.profiler_active=2 \
+    --test_arg=--profiler.profile_freq=5 \
+    --test_arg=--sampler.no-use-fake-sampler \
+    --test_arg=--training.steps=5
 """
 
 # pylint: disable=protected-access
