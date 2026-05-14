@@ -252,7 +252,6 @@ class Llama3DTensorParallelizeTest(
     logging.info("DTensor issue test finished.")
 
   # TP Tests are run with loss_parallel=False.
-  @absltest.skip("Skipping for now b/510032097")
   def test_apply_tp_forward_equivalence_distributed(self):
     """Verifies numerical equivalence of the DTensor parallel model."""
     logging.info(
@@ -284,7 +283,6 @@ class Llama3DTensorParallelizeTest(
         "Distributed DTensor backward numerical equivalence test finished."
     )
 
-  @absltest.skip("Skipping for now b/510032097")
   def test_apply_fsdp_full_training_loop_equivalence_distributed(self):
     """Verifies numerical equivalence of a full training loop with FSDP."""
     logging.info(

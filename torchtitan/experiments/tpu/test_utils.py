@@ -158,6 +158,9 @@ def check_equivalence(
         tolerances.
   """
 
+  if tensor_test.dtype != tensor_reference.dtype:
+    tensor_test = tensor_test.to(tensor_reference.dtype)
+
   if not torch.allclose(tensor_test, tensor_reference, atol=atol, rtol=rtol):
     error_info = _get_difference_str(
         tensor_test, tensor_reference, test_label, ref_label

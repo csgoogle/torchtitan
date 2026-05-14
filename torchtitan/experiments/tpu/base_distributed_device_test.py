@@ -352,6 +352,8 @@ class DistributedUnitTestRunner:
     loss = None
 
     if backward and targets is not None:
+      if targets.dtype != output.dtype:
+        targets = targets.to(output.dtype)
       loss = nn.MSELoss()(output, targets)
       loss.backward()
 

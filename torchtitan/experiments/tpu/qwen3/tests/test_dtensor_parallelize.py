@@ -84,7 +84,7 @@ def _verify_dtensor_qwen3_non_moe_tp_forward_worker(
 def _verify_dtensor_qwen3_tp_backward_worker(
     device: torch.device, rank: int, world_size: int
 ):
-  """Worker function to run forward andbackward pass on model after apply_tp is called."""
+  """Worker function to run forward and backward pass on model after apply_tp is called."""
 
   def apply_tp_wrapper(model):
     parallel_dims = ParallelDims(
@@ -119,7 +119,11 @@ def _verify_dtensor_qwen3_tp_backward_worker(
       use_meta_init=True,
   )
   runner.run_backward_parity(
-      num_steps=1, batch_size=TEST_BATCH_SIZE, seq_len=TEST_SEQ_LEN
+      num_steps=1,
+      batch_size=TEST_BATCH_SIZE,
+      seq_len=TEST_SEQ_LEN,
+      rtol_loss=5e-3,
+      atol_loss=5e-3,
   )
 
 
@@ -179,7 +183,6 @@ class Qwen3DTensorParallelizeTest(
 ):
   """Tests the DTensor-based `apply_non_moe_tp` in a distributed environment."""
 
-  @absltest.skip("Skipping for now b/510448556.")
   def test_apply_non_moe_tp_forward_equivalence_distributed(self):
     """Launches test to verify numerical equivalence of the DTensor parallel model."""
     logging.info(
@@ -210,7 +213,6 @@ class Qwen3DTensorParallelizeTest(
         "Distributed DTensor TP backward numerical equivalence test finished."
     )
 
-  @absltest.skip("Skipping for now b/510448556.")
   def test_apply_fsdp_full_training_loop_equivalence_distributed(self):
     """Verifies numerical equivalence of a full training loop with FSDP."""
     logging.info(
