@@ -15,5 +15,15 @@ RUN pip install -r requirements.txt
 COPY torchtitan/.ci/docker/requirements-flux.txt .
 RUN pip install -r requirements-flux.txt
 
+# Restore typeguard to the version tokamax pins (setup.py says ==2.13.3).
+# requirements.txt's tyro silently upgrades typeguard to 4.x at install time,
+# which breaks tokamax's jaxtyping-based shape annotations at import time.
+# See https://github.com/openxla/tokamax/issues/240
+#
+# The runtime ``typeguard.TypeCheckError = TypeError`` shim that tyro 1.x's
+# import path needs lives in torchtitan/experiments/tpu/__init__.py — applies
+# in any environment (docker, local conda, fresh pip), not just here.
+RUN pip install 'typeguard==2.13.3'
+
 COPY torchtitan ./torchtitan
 WORKDIR ./torchtitan

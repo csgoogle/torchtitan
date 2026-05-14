@@ -3,33 +3,26 @@ r"""Pure JAX training for LLM models on TPU.
 Parallel to torchtitan/experiments/torchax/train_minimal.py but uses pure
 JAX / Flax NNX instead of torchax (the PyTorch-on-JAX wrapper).
 
-Run llama3 8B on v6e-4:
+Run redacted debugmodel on v6e-4:
 ```
 python -m torchtitan.experiments.jax.train_minimal \
-    --model.name=llama3 \
-    --model.flavor=8B \
-    --training.dataset_path=tests/assets/c4_test \
-    --model.hf_assets_path=tests/assets/tokenizer \
-    --training.seq_len=2048 \
-    --training.global_batch_size=4 \
-    --training.steps=10 \
-    --jax_config.use_scan \
-    --activation_checkpoint.mode=full
+    --module=torchtitan.experiments.jax.redacted \
+    --config=redacted_debugmodel
 ```
 """
 
-import dataclasses
 import sys
+import typing
 from typing import Any
 
-from absl import app
+from absl import app, flags
 import jax
 import torchtitan.config
+from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.jax import jax_job_config
 from torchtitan.experiments.jax import trainer as jax_trainer
 from torchtitan.experiments.jax import utils as jax_utils
 import torchtitan.tools.logging
-import tyro
 
 
 P = jax.sharding.PartitionSpec
@@ -129,41 +122,19 @@ def main_train_loop(job_config: Any):
     return t.train()
 
 
-def _parse_flags():
-  tyro_args = []
-  absl_args = [sys.argv[0]]
-
-  config_fields = {
-      f.name for f in dataclasses.fields(jax_job_config.JaxJobConfig)
-  }
-
-  def is_tyro_arg(arg):
-    if not arg.startswith('--'):
-      return False
-    key = arg[2:].split('=')[0]
-    top = key.split('.')[0]
-    return top in config_fields
-
-  for arg in sys.argv[1:]:
-    if is_tyro_arg(arg):
-      tyro_args.append(arg)
-    else:
-      absl_args.append(arg)
-  return tyro_args, absl_args
-
-
 def main(argv):
-  assert main_train_loop(_global_config), 'training failed'
+  del argv
+  config = typing.cast(
+      jax_job_config.JaxJobConfig,
+      ConfigManager().parse_args(sys.argv[1:]),
+  )
+  assert main_train_loop(config), 'training failed'
 
 
 if __name__ == '__main__':
-  tyro_args, absl_args = _parse_flags()
-  try:
-    _global_config = tyro.cli(jax_job_config.JaxJobConfig, args=tyro_args)
-  except SystemExit as e:
-    if e.code != 0:
-      print(f'tyro argument parsing failed: {e.code}')
-    sys.exit(e.code)
-
-  sys.argv = absl_args
-  app.run(main)
+  app.run(
+      main,
+      flags_parser=(
+          lambda args: flags.FLAGS(args, known_only=True)
+      ),
+  )

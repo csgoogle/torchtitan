@@ -1,13 +1,13 @@
-"""Tests for the Torchax distributed training setup."""
+"""Tests for the Torchax distributed training setup.
+"""
 
 import os
 
 from absl.testing import absltest
 from absl.testing import parameterized
-from torchtitan.experiments.torchax import torchax_job_config
-from torchtitan.experiments.torchax import train_minimal
-import tyro
 
+from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.torchax import train_minimal
 
 
 # Set standard dummy environment variables for tests if not provided
@@ -22,49 +22,43 @@ class TrainTorchaxTest(parameterized.TestCase):
 
   @parameterized.named_parameters([
       dict(
-          testcase_name="redacted_tpu_scan",
-          model_name="redacted",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          testcase_name="redacted_scan",
+          module="torchtitan.experiments.torchax.redacted",
+          config="redacted_debugmodel",
           use_scan=True,
       ),
       dict(
-          testcase_name="redacted_tpu_lora_scan",
-          model_name="redacted",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model_lora.toml",
-          use_scan=True,
-      ),
-      dict(
-          testcase_name="redacted_tpu_lora_no_scan",
-          model_name="redacted",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model_lora.toml",
+          testcase_name="redacted_no_scan",
+          module="torchtitan.experiments.torchax.redacted",
+          config="redacted_debugmodel",
           use_scan=False,
       ),
       dict(
-          testcase_name="redacted_tpu",
-          model_name="redacted",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          testcase_name="redacted_no_scan",
+          module="torchtitan.experiments.torchax.redacted",
+          config="redacted_debugmodel",
           use_scan=False,
       ),
   ])
-  def test_train_torchax(self, model_name, config_file, use_scan):
+  def test_train_torchax(self, module, config, use_scan):
     scan_flag = (
         "--torchax_config.use_scan"
         if use_scan
-        else "--torchax_config.no_use_scan"
+        else "--torchax_config.no-use-scan"
     )
     args = [
-        f"--model.name={model_name}",
-        f"--job.config_file={config_file}",
+        "--module", module,
+        "--config", config,
         scan_flag,
-        "--training.dataset_path=tests/assets/c4_test",
-        "--training.dataset=c4_test",
-        "--model.hf_assets_path=tests/assets/tokenizer",
+        "--dataloader.dataset_path=tests/assets/c4_test",
+        "--dataloader.dataset=c4_test",
+        "--hf_assets_path=tests/assets/tokenizer",
         "--training.seq_len=128",
         "--training.steps=3",
         "--training.local_batch_size=8",
     ]
 
-    job_config = tyro.cli(torchax_job_config.TorchaxJobConfig, args=args)
+    job_config = ConfigManager().parse_args(args)
     success = train_minimal.main_train_loop(job_config)
     self.assertTrue(success)
 

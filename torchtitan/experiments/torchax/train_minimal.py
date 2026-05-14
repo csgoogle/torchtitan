@@ -7,158 +7,18 @@ This is a simple example for using torchax to train llama3/qwen3 with:
 - sgd/adam/adamw optimizer
 - distributed with fsdp + tp
 - performance optimization: splash attention kernel, scan layers, offload
-
-Run it with the bazel test hack:
-Llama3 8B training (yield MFU ~48%):
-```
-bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_4x2x1 \
-    --test_arg=-- \
-    --test_arg=--model.name=llama3 \
-    --test_arg=--model.flavor=8B \
-    --test_arg=--training.dataset=c4_test \
-    --test_arg=--training.seq_len=2048 \
-    --test_arg=--training.global_batch_size=8 \
-    --test_arg=--training.steps=8 \
-    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
-    --test_arg=--training.dataset_path="tests/assets/c4_test" \
-    --test_arg=--parallelism.tensor_parallel_degree=1 \
-    --test_arg=--torchax_config.use_torchax \
-    --test_arg=--torchax_config.use_scan \
-    --test_arg=--training.enable_cpu_offload
-```
-Llama3 8B training on 2xH100 GPU (MFU ~26%):
-```
-bazel test //torchtitan/experiments/torchax:torchax_train_test_gpu_h100x2 \
-    --test_arg=-- \
-    --test_arg=--model.name=llama3 \
-    --test_arg=--model.flavor=8B \
-    --test_arg=--training.dataset=c4_test \
-    --test_arg=--training.seq_len=2048 \
-    --test_arg=--training.global_batch_size=2 \
-    --test_arg=--training.steps=8 \
-    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
-    --test_arg=--training.dataset_path="tests/assets/c4_test" \
-    --test_arg=--parallelism.tensor_parallel_degree=1 \
-    --test_arg=--torchax_config.use_torchax \
-    --test_arg=--torchax_config.use_scan \
-    --test_arg=--training.enable_cpu_offload
-```
-Qwen3 30B-A3B (override layer from 48 to 8, so ~5.5B-A1B, MFU ~25%):
-```
-bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_4x2x1 \
-    --test_arg=--alsologtostderr \
-    --test_arg=--xprof_end_2_end_upload \
-    --test_arg=--xprof_host_trace_level=2 \
-    --test_arg=-- \
-    --test_arg=--model.name=qwen3 \
-    --test_arg=--model.flavor=30B-A3B \
-    --test_arg=--training.dataset=c4_test \
-    --test_arg=--training.seq_len=8192 \
-    --test_arg=--training.global_batch_size=8 \
-    --test_arg=--training.steps=8 \
-    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
-    --test_arg=--training.dataset_path="tests/assets/c4_test" \
-    --test_arg=--parallelism.tensor_parallel_degree=1 \
-    --test_arg=--torchax_config.model_layer_override=8 \
-    --test_arg=--torchax_config.use_torchax \
-    --test_arg=--torchax_config.use_scan \
-    --test_arg=--training.enable_cpu_offload
-```
-redacted 3B Full FT on v6e-8 (57k TPS total, MFU ~22%):
-```
-bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_2x4 \
-    --test_arg=-- \
-    --test_arg=--model.name=redacted \
-    --test_arg=--model.flavor=3B \
-    --test_arg=--job.config_file="torchtitan/experiments/tpu/redacted/train_configs/redacted_3b.toml" \
-    --test_arg=--training.dataset_path="tests/assets/c4_test" \
-    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
-    --test_arg=--training.seq_len=8192 \
-    --test_arg=--training.global_batch_size=8 \
-    --test_arg=--training.steps=22 \
-    --test_arg=--torchax_config.use_torchax \
-    --test_arg=--torchax_config.use_scan \
-    --test_arg=--activation_checkpoint.mode=full
-```
-redacted 3B LoRA on v6e-8 (51.5k TPS total, MFU ~20.3%):
-```
-bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_2x4 \
-    --test_arg=-- \
-    --test_arg=--model.name=redacted \
-    --test_arg=--model.flavor=3B-lora \
-    --test_arg=--job.config_file="torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
-    --test_arg=--training.dataset_path="tests/assets/c4_test" \
-    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
-    --test_arg=--training.seq_len=8192 \
-    --test_arg=--training.global_batch_size=8 \
-    --test_arg=--training.steps=22 \
-    --test_arg=--torchax_config.use_torchax \
-    --test_arg=--torchax_config.use_scan \
-    --test_arg=--activation_checkpoint.mode=full
-```
-redacted 3B LoRA on 2xH100 GPU (3.9k TPS total, MFU ~5.8%):
-```
-bazel test //torchtitan/experiments/torchax:torchax_train_test_gpu_h100x2 \
-    --test_arg=-- \
-    --test_arg=--model.name=redacted \
-    --test_arg=--model.flavor=3B-lora \
-    --test_arg=--job.config_file="torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
-    --test_arg=--training.dataset=fake \
-    --test_arg=--training.seq_len=8192 \
-    --test_arg=--training.global_batch_size=2 \
-    --test_arg=--training.steps=12 \
-    --test_arg=--torchax_config.use_torchax \
-    --test_arg=--torchax_config.use_scan \
-    --test_arg=--activation_checkpoint.mode=full
-```
-Deepseek_v3 16B (override layer from 27 to 11, so ~6.3B-A1.3B, MFU ~23%):
-```
-bazel test //torchtitan/experiments/torchax:torchax_train_test_tpu_tpu_4x2x1 \
-    --test_arg=-- \
-    --test_arg=--model.name=deepseek_v3 \
-    --test_arg=--model.flavor=16B \
-    --test_arg=--training.dataset=c4_test \
-    --test_arg=--training.seq_len=8192 \
-    --test_arg=--training.global_batch_size=8 \
-    --test_arg=--training.steps=8 \
-    --test_arg=--model.hf_assets_path="tests/assets/tokenizer" \
-    --test_arg=--training.dataset_path="tests/assets/c4_test" \
-    --test_arg=--parallelism.tensor_parallel_degree=1 \
-    --test_arg=--torchax_config.model_layer_override=5 \
-    --test_arg=--torchax_config.use_torchax \
-    --test_arg=--torchax_config.use_scan \
-    --test_arg=--training.enable_cpu_offload
-```
-Run it with launcher (xm/240480403):
-```bash
-launcher launch torchtitan/launcher/xm_launch.py -- \
-    --xm_resource_alloc=cloud-dynamic/cmcs-xm \
-    --target=//torchtitan/experiments/torchax:train_minimal  \
-    --platform=glp=2x4 \
-    -- \
-    --model.name=redacted \
-    --model.flavor=3B-lora \
-    --job.config_file="torchtitan/experiments/tpu/redacted/train_configs/redacted_3b_lora.toml" \
-    --training.dataset=fake \
-    --model.hf_assets_path="tests/assets/tokenizer" \
-    --training.seq_len=8192 \
-    --training.global_batch_size=8 \
-    --training.steps=22 \
-    --torchax_config.use_torchax \
-    --torchax_config.use_scan \
-    --activation_checkpoint.mode=full
-```
 """
 
-import dataclasses
 import os
 import sys
+import typing
 from typing import Any
 
 from absl import app
 import jax
 import torchax
 import torchtitan.config
+from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.jax import utils as jax_utils
 from torchtitan.experiments.torchax import distributed
 from torchtitan.experiments.torchax import gmm
@@ -166,7 +26,6 @@ from torchtitan.experiments.torchax import splash_attn
 from torchtitan.experiments.torchax import torchax_job_config
 from torchtitan.experiments.torchax import trainer
 import torchtitan.tools.logging
-import tyro
 
 
 P = jax.sharding.PartitionSpec
@@ -232,10 +91,6 @@ def main_train_loop(job_config: Any):
       job_config.torchax_config.tpu_num_slices,
   )
 
-  # investigate libtpu env vars
-  for k, v in os.environ.items():
-    logger.info('libtpu env var: %s=%s', k, v)
-
   # only 2D sharding (fsdp x tp) is supported for now
   fsdp = num_global_devices // job_config.parallelism.tensor_parallel_degree
 
@@ -247,7 +102,6 @@ def main_train_loop(job_config: Any):
       cp=1,  # no context parallel for now
       pp=1,  # no pipeline parallel for now
       ep=1,  # no expert parallel for now
-      etp=1,  # no expert tensor parallel for now
       world_size=num_global_devices,
   )
 
@@ -278,7 +132,9 @@ def main_train_loop(job_config: Any):
 
   if platform == 'tpu':
     logger.info('Setup TPU-specific kernel overrides.')
-    splash_attn.declare_splash_attention(env, mesh, job_config.torchax_config)
+    splash_attn.declare_splash_attention(
+        env, mesh, job_config.splash_attention_kernel
+    )
     gmm.declare_gmm_kernel(env, mesh)
 
   with mesh:
@@ -293,56 +149,28 @@ def main_train_loop(job_config: Any):
     return torchax_trainer.train()
 
 
-def _parse_flags():
-  """Parse flags into tyro args and absl args."""
-  tyro_args = []
-  absl_args = [sys.argv[0]]
-
-  # Get top-level field names from the TorchaxJobConfig dataclass
-  config_fields = {
-      f.name for f in dataclasses.fields(torchax_job_config.TorchaxJobConfig)
-  }
-
-  def is_tyro_arg(arg):
-    if not arg.startswith('--'):
-      return False
-    key = arg[2:].split('=')[0]
-    if '.' in key:
-      top_level = key.split('.')[0]
-      return top_level in config_fields
-    else:
-      return key in config_fields
-
-  # Separate args based on whether they look like tyro args for TorchaxJobConfig
-  for arg in sys.argv[1:]:
-    if is_tyro_arg(arg):
-      tyro_args.append(arg)
-    else:
-      absl_args.append(arg)
-  return tyro_args, absl_args
-
-
 def main(argv):
-  # _global_torchtitan_config is populated before app.run is called
-  assert main_train_loop(
-      _global_torchtitan_config
-  ), 'training is not successful'
+  # Args are passed via ``sys.argv`` (set in __main__ from absl-filtered args).
+  # ConfigManager parses ``--module=...`` + ``--config=...`` to load the base
+  # config from the per-model ``config_registry``, then applies any remaining
+  # CLI overrides via ``tyro.cli`` with ``default=loaded_config``. This is the
+  # same launch surface the torch_tpu lane uses (see ``experiments/tpu/gmain``).
+  del argv
+  config = typing.cast(
+      torchax_job_config.TorchaxJobConfig,
+      ConfigManager().parse_args(sys.argv[1:]),
+  )
+  assert main_train_loop(config), 'training is not successful'
 
 
 if __name__ == '__main__':
-  tyro_args, absl_args = _parse_flags()
-
-  # Parse tyro-specific arguments to torchtitan config
-  try:
-    _global_torchtitan_config = tyro.cli(
-        torchax_job_config.TorchaxJobConfig, args=tyro_args
-    )
-  except SystemExit as e:
-    if e.code != 0:
-      print(f'tyro argument parsing failed. Error code: {e.code}')
-    sys.exit(e.code)
-
-  # Replace sys.argv with only the arguments NOT handled by tyro
-  sys.argv = absl_args
-
-  app.run(main)
+  # absl owns ``sys.argv[0]`` parsing. Forward all flags to ``main`` via
+  # ``ConfigManager`` rather than absl flags. ``flags.FLAGS(args, known_only=True)``
+  # consumes only the absl-registered flags and leaves the rest for us.
+  from absl import flags
+  app.run(
+      main,
+      flags_parser=(
+          lambda args: flags.FLAGS(args, known_only=True)
+      ),
+  )

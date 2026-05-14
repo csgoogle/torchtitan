@@ -4,23 +4,34 @@ import collections
 import time
 import typing
 
+import importlib
+
 import jax
 import optax
 import torch
 import torchax
-import torch_xla2.train
+import torch_xla2.train  # required for ``torchax.train.make_train_step``
 from torchtitan.components.dataloader import DataloaderExhaustedError
-from torchtitan.experiments.torchax import redacted as torchax_redacted
-from torchtitan.experiments.torchax import redacted as torchax_redacted
+import torchtitan.components.tokenizer
 from torchtitan.experiments.torchax import data_utils
-from torchtitan.experiments.torchax import deepseek_v3 as torchax_dsv3
 from torchtitan.experiments.jax.metrics import JaxMetricsProcessor
 from torchtitan.experiments.torchax import distributed
 from torchtitan.experiments.torchax import jit_utils
-from torchtitan.experiments.torchax import llama3 as torchax_llama3
 from torchtitan.experiments.torchax import moe_utils
-from torchtitan.experiments.torchax import qwen3 as torchax_qwen3
 import torchtitan.tools.logging
+
+
+# Per-model wrappers under torchtitan.experiments.torchax.* may depend on
+# upstream model module layouts (e.g. torchtitan.models.<m>.model.args) that
+# drift independently per-lane. Import them on demand inside setup_model so a
+# breakage in one lane doesn't take down the trainer for every other lane.
+_TORCHAX_MODEL_MODULES = {
+    'llama3': 'torchtitan.experiments.torchax.llama3',
+    'qwen3': 'torchtitan.experiments.torchax.qwen3',
+    'deepseek_v3': 'torchtitan.experiments.torchax.deepseek_v3',
+    'redacted': 'torchtitan.experiments.torchax.redacted',
+    'redacted': 'torchtitan.experiments.torchax.redacted',
+}
 from [redacted]._ops.segment_matmul import interface as redacted_segment_matmul_interface
 from [redacted].layers import functional as redacted_functional
 
@@ -91,23 +102,23 @@ def is_moe_model(job_config) -> bool:
   Args:
     job_config: The job configuration object.
   """
-  if job_config.model.name == 'llama3':
+  if job_config.model_spec.name == 'llama3':
     return False
-  elif job_config.model.name == 'redacted':
+  elif job_config.model_spec.name == 'redacted':
     return False
-  elif job_config.model.name == 'redacted':
+  elif job_config.model_spec.name == 'redacted':
     # We use the model's own get_nparams_and_flops via the simple branch;
     # bypassing the moe_utils path which doesn't know about [redacted]'s MoE
     # parameter naming convention.
     return False
-  elif job_config.model.name == 'qwen3':
+  elif job_config.model_spec.name == 'qwen3':
     # Naming convention for qwen3 moe model seems to be xB-AyB,
     # i.e. x Billion total parameters with y Billion Active parameters
-    return 'B-A' in job_config.model.flavor or 'moe' in job_config.model.flavor
-  elif job_config.model.name == 'deepseek_v3':
+    return 'B-A' in job_config.model_spec.flavor or 'moe' in job_config.model_spec.flavor
+  elif job_config.model_spec.name == 'deepseek_v3':
     return True
   else:
-    raise ValueError(f'Unsupported model: {job_config.model.name}')
+    raise ValueError(f'Unsupported model: {job_config.model_spec.name}')
 
 
 class TorchaxTrainer:
@@ -137,10 +148,6 @@ class TorchaxTrainer:
 
     self.job_config = job_config
 
-    self.train_spec = torchtitan.protocols.train_spec.get_train_spec(
-        job_config.model.name
-    )
-
   def setup_dataloader(self, job_config):
     """Sets up the dataloader."""
     # TorchAx uses a single controller for all devices, so the single
@@ -158,10 +165,8 @@ class TorchaxTrainer:
     original_local_batch_size = job_config.training.local_batch_size
     job_config.training.local_batch_size = expected_global_batch_size
 
-    if (
-        job_config.training.dataset is None
-        or job_config.training.dataset.startswith('fake')
-    ):
+    dataset = job_config.dataloader.dataset
+    if not dataset or dataset.startswith('fake'):
       # fake dataloader producing random ints, no tokenizer
       tokenizer = None
       train_loader = data_utils.fake_dataloader(
@@ -173,16 +178,17 @@ class TorchaxTrainer:
     else:
       tokenizer = typing.cast(
           torchtitan.components.tokenizer.HuggingFaceTokenizer,
-          self.train_spec.build_tokenizer_fn(job_config)
-          if self.train_spec.build_tokenizer_fn is not None
-          else None,
+          job_config.tokenizer.build(
+              tokenizer_path=job_config.hf_assets_path,
+          ),
       )
 
-      train_loader = self.train_spec.build_dataloader_fn(
+      train_loader = job_config.dataloader.build(
           dp_world_size=1,
           dp_rank=0,
           tokenizer=tokenizer,
-          job_config=job_config,
+          seq_len=job_config.training.seq_len,
+          local_batch_size=job_config.training.local_batch_size,
       )
 
     job_config.training.local_batch_size = original_local_batch_size
@@ -194,24 +200,17 @@ class TorchaxTrainer:
     # TODO(jialeic): Can we do something like
     # [internal link]
 
-    if job_config.model.name == 'llama3':
-      torchax_model = torchax_llama3
-    elif job_config.model.name == 'qwen3':
-      torchax_model = torchax_qwen3
-    elif job_config.model.name == 'deepseek_v3':
-      torchax_model = torchax_dsv3
-    elif job_config.model.name == 'redacted':
-      torchax_model = torchax_redacted
-    elif job_config.model.name == 'redacted':
-      torchax_model = torchax_redacted
-    else:
-      raise ValueError(f'Unsupported model: {job_config.model.name}')
+    if job_config.model_spec.name not in _TORCHAX_MODEL_MODULES:
+      raise ValueError(f'Unsupported model: {job_config.model_spec.name}')
+    torchax_model = importlib.import_module(
+        _TORCHAX_MODEL_MODULES[job_config.model_spec.name]
+    )
 
     if job_config.torchax_config.use_scan:
       # using scan the individial weights will have shape (num_layers, w, h)
       if is_moe_model(job_config):
         sharding_map = torchax_model.sharding_map_scan_moe
-      elif 'lora' in job_config.model.flavor and hasattr(
+      elif 'lora' in job_config.model_spec.flavor and hasattr(
           torchax_model, 'sharding_map_scan_lora'
       ):
         if job_config.torchax_config.use_ddp_sharding and hasattr(
@@ -228,12 +227,15 @@ class TorchaxTrainer:
 
     self.sharding_map = sharding_map
 
-    model_args = torchax_model.args[job_config.model.flavor]
+    model_args = torchax_model.args[job_config.model_spec.flavor]
     # Note: torchtitan's upstream config did not specify this value
     if model_args.vocab_size is None:
       logger.warning('vocab_size is None, using 128256 for llama3.')
       model_args.vocab_size = 128256
-    model_args.max_seq_len = job_config.training.seq_len
+    if hasattr(model_args, 'max_seq_len'):
+      # Some ModelArgs (llama3/qwen3) hold ``max_seq_len`` to size RoPE/attn
+      # caches; redacted/redacted handle that internally and don't expose it.
+      model_args.max_seq_len = job_config.training.seq_len
     self.model_args = model_args
 
     if job_config.torchax_config.model_layer_override is not None:
@@ -276,28 +278,31 @@ class TorchaxTrainer:
 
     # Sharding for embedding constants
     with torch.device('cpu'):
-      if job_config.model.name == 'llama3':
+      if job_config.model_spec.name == 'llama3':
         embedding_constants = model._precompute_freqs_cis()
         embedding_constants_key = 'freqs_cis'
-      elif job_config.model.name == 'qwen3':
+      elif job_config.model_spec.name == 'qwen3':
         embedding_constants = model._precompute_rope_cache()
         embedding_constants_key = 'rope_cache'
-      elif job_config.model.name == 'deepseek_v3':
-        # HACK: deepseek model does not have a _precompute_freqs_cis wrapping
-        # the global precompute_freqs_cis function as in llama3. Consider
-        # make this change upstream to torchtitan deepseek model definition
-        from torchtitan.models.deepseek_v3.model.model import precompute_freqs_cis
-        embedding_constants = precompute_freqs_cis(model_args)
+      elif job_config.model_spec.name == 'deepseek_v3':
+        # New-style upstream: DeepSeekV3Model uses the shared
+        # torchtitan.models.common.rope.RoPE; the freqs_cis cache lives at
+        # ``model.rope.cache``. Build the RoPE on CPU (model itself is on
+        # meta) and pull its precomputed cache. Replaces an older import of
+        # ``deepseek_v3.model.model.precompute_freqs_cis`` from the
+        # pre-restructure upstream layout.
+        from torchtitan.models.common.rope import RoPE
+        embedding_constants = RoPE(model_args.rope).cache
         embedding_constants_key = 'freqs_cis'
-      elif job_config.model.name == 'redacted':
+      elif job_config.model_spec.name == 'redacted':
         embedding_constants = None
         embedding_constants_key = None
-      elif job_config.model.name == 'redacted':
+      elif job_config.model_spec.name == 'redacted':
         # REDACTED PT MoE handles RoPE internally; no precomputed embedding constants needed.
         embedding_constants = None
         embedding_constants_key = None
       else:
-        raise ValueError(f'No embedding constant for: {job_config.model.name}')
+        raise ValueError(f'No embedding constant for: {job_config.model_spec.name}')
 
     # Remat: default to recompute everything inside transformer block
     if job_config.activation_checkpoint.mode == 'full':
@@ -326,7 +331,7 @@ class TorchaxTrainer:
         )
 
     if job_config.torchax_config.use_scan:
-      if job_config.model.name == 'redacted':
+      if job_config.model_spec.name == 'redacted':
         redacted_model = model.model
         seg0 = redacted_model.layers.segment_0
         seg0_layers = list(seg0.layers)
@@ -367,7 +372,7 @@ class TorchaxTrainer:
           seg1._modules = new_modules_1
           seg1._side_input_keys = new_side_keys_1
           seg1._side_output_keys = new_output_keys_1
-      if job_config.model.name != 'redacted':
+      if job_config.model_spec.name != 'redacted':
         model = distributed.ModelWithScan(
             model, checkpoint_policy, embedding_constants_key
         )
@@ -469,7 +474,7 @@ class TorchaxTrainer:
     def model_fn(weights, buffers, args):
       return jittable_mod.functional_call('forward', weights, buffers, args)
 
-    loss_fn = self.train_spec.build_loss_fn(job_config)
+    loss_fn = job_config.loss.build(compile_config=job_config.compile)
 
     jax_optimizer, opt_state = self.setup_optimizer(
         job_config, jittable_mod
@@ -491,10 +496,10 @@ class TorchaxTrainer:
       # When using the jax scan the model name is changed from `moe.experts` to
       # `moe___experts` so we need to use a different naming convention to
       # extract the nparams
-      if job_config.model.name == 'qwen3':
+      if job_config.model_spec.name == 'qwen3':
         # [internal link]
         head_dims = 2 * self.model_args.head_dim  # pytype: disable=attribute-error
-      elif job_config.model.name == 'deepseek_v3':
+      elif job_config.model_spec.name == 'deepseek_v3':
         # [internal link]
         head_dims = (
             self.model_args.qk_nope_head_dim  # pytype: disable=attribute-error
@@ -502,7 +507,7 @@ class TorchaxTrainer:
             + self.model_args.v_head_dim  # pytype: disable=attribute-error
         )
       else:
-        raise ValueError(f'Unsupported MoE model: {job_config.model.name}')
+        raise ValueError(f'Unsupported MoE model: {job_config.model_spec.name}')
 
       _, metrics_processor.num_flops_per_token = (
           moe_utils.get_moe_model_nparams_and_flops(
@@ -538,8 +543,8 @@ class TorchaxTrainer:
 
     logger.info(
         'Start training %s - %s %s with %s',
-        job_config.model.name,
-        job_config.model.flavor,
+        job_config.model_spec.name,
+        job_config.model_spec.flavor,
         '(override layer to'
           f' {job_config.torchax_config.model_layer_override})'
           if job_config.torchax_config.model_layer_override
@@ -547,8 +552,8 @@ class TorchaxTrainer:
         job_config.optimizer.name,
     )
 
-    if job_config.profiling.enable_profiling:
-      jax.profiler.start_trace(job_config.profiling.save_traces_folder)
+    if job_config.profiler.enable_profiling:
+      jax.profiler.start_trace(job_config.profiler.save_traces_folder)
 
     data_iterator = iter(train_dataloader)
     step = -1
@@ -644,7 +649,7 @@ class TorchaxTrainer:
         )
         break
 
-    if job_config.profiling.enable_profiling:
+    if job_config.profiler.enable_profiling:
       jax.profiler.stop_trace()
 
     return True

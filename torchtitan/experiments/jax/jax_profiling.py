@@ -17,10 +17,10 @@ import os
 
 import jax
 
-import torchtitan.config
 import torchtitan.tools.logging
+import torchtitan.tools.profiler
 
-ProfilingConfig = torchtitan.config.Profiling
+ProfilingConfig = torchtitan.tools.profiler.Profiler.Config
 logger = torchtitan.tools.logging.logger
 
 

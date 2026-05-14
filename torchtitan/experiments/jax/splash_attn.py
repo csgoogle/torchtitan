@@ -1,11 +1,4 @@
-"""Splash Attention kernel setup shared by jax/ and torchax/.
-
-- ``build_splash_attention_callable`` constructs a jitted splash-attention
-  callable with a given mesh / q-sharding / config. torchax/splash_attn.py
-  uses this under the hood when overriding torch's SDPA op.
-- ``make_splash_attention_fn`` is the jax-experiment convenience wrapper
-  (hardcodes ``P('fsdp', 'tp', None, None)`` for q-sharding).
-"""
+"""Splash Attention kernel setup shared by jax/ and torchax/."""
 
 import jax
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
@@ -25,7 +18,8 @@ def _build_block_sizes(config, query_shape, key_shape):
         block_kv_compute=min(config.sa_block_kv_compute, key_shape[2]),
         block_q_dkv=min(config.sa_block_q_dkv, query_shape[2]),
         block_kv_dkv=min(config.sa_block_kv_dkv, key_shape[2]),
-        block_kv_dkv_compute=min(config.sa_block_kv_dkv_compute, query_shape[2]),
+        block_kv_dkv_compute=min(config.sa_block_kv_dkv_compute,
+                                 query_shape[2]),
         block_q_dq=None if config.sa_use_fused_bwd_kernel else min(
             config.sa_block_q_dq, query_shape[2]
         ),
@@ -109,18 +103,19 @@ def build_splash_attention_callable(
     return jax.jit(fn)
 
 
-def make_splash_attention_fn(mesh, jax_config, *, local_window: int | None = None):
+def make_splash_attention_fn(
+        mesh, splash_cfg, *, local_window: int | None = None):
     """Build a splash-attention callable for the jax experiment.
-
-    Returns ``None`` on failure (caller should fall back to default SDPA).
     """
     try:
         q_sharding = P('fsdp', 'tp', None, None)
         attn_fn = build_splash_attention_callable(
-            mesh, q_sharding, jax_config, apply_shard_map=True, local_window=local_window
+            mesh, q_sharding, splash_cfg, apply_shard_map=True,
+            local_window=local_window
         )
         if local_window is not None:
-            logger.info('Splash attention (local window=%d) enabled.', local_window)
+            logger.info(
+                'Splash attention (local window=%d) enabled.', local_window)
         else:
             logger.info('Splash attention kernel enabled.')
         return attn_fn

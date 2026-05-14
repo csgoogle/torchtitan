@@ -1,15 +1,10 @@
-"""Tests for the JAX distributed training setup."""
+"""Tests for the JAX distributed training setup.
+"""
 
 from absl.testing import absltest
 from absl.testing import parameterized
 
-import tyro
-
-from absl import logging
-from flax import nnx
-import jax
-from torchtitan.experiments.jax import redacted
-from torchtitan.experiments.jax import jax_job_config
+from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.jax import train_minimal
 
 
@@ -18,58 +13,58 @@ class TestJaxDistributed(parameterized.TestCase):
   @parameterized.named_parameters([
       dict(
           testcase_name="llama3_debug_scan",
-          model_name="llama3",
-          model_flavor="debug",
+          module="torchtitan.experiments.jax.llama3",
+          config="llama3_debugmodel",
           use_scan=True,
       ),
       dict(
           testcase_name="llama3_debug_no_scan",
-          model_name="llama3",
-          model_flavor="debug",
+          module="torchtitan.experiments.jax.llama3",
+          config="llama3_debugmodel",
           use_scan=False,
       ),
       dict(
           testcase_name="redacted_debug_scan",
-          model_name="redacted",
-          model_flavor="debugmodel",
+          module="torchtitan.experiments.jax.redacted",
+          config="redacted_debugmodel",
           use_scan=True,
       ),
       dict(
           testcase_name="redacted_debug_no_scan",
-          model_name="redacted",
-          model_flavor="debugmodel",
+          module="torchtitan.experiments.jax.redacted",
+          config="redacted_debugmodel",
           use_scan=False,
       ),
       dict(
           testcase_name="redacted_debug_no_scan",
-          model_name="redacted",
-          model_flavor="debugmodel",
+          module="torchtitan.experiments.jax.redacted",
+          config="redacted_debugmodel",
           use_scan=False,
       ),
   ])
-  def test_train_jax(self, model_name, model_flavor, use_scan):
+  def test_train_jax(self, module, config, use_scan):
     scan_flag = (
         "--jax_config.use_scan"
         if use_scan
-        else "--jax_config.no_use_scan"
+        else "--jax_config.no-use-scan"
     )
-    layer_override = 1
-    if model_name == "redacted":
-        layer_override = 2
+    # redacted needs >=2 layers (one local + one global rope cycle); other
+    # models tolerate a single layer.
+    layer_override = 2 if "redacted" in module else 1
     args = [
-        f"--model.name={model_name}",
-        f"--model.flavor={model_flavor}",
+        "--module", module,
+        "--config", config,
         scan_flag,
         f"--jax_config.model_layer_override={layer_override}",
-        "--training.dataset_path=tests/assets/c4_test",
-        "--model.hf_assets_path=tests/assets/tokenizer",
+        "--dataloader.dataset_path=tests/assets/c4_test",
+        "--hf_assets_path=tests/assets/tokenizer",
         "--training.seq_len=128",
         "--training.steps=3",
-        "--training.global_batch_size=8",
+        "--training.local_batch_size=8",
         "--activation_checkpoint.mode=full",
     ]
 
-    job_config = tyro.cli(jax_job_config.JaxJobConfig, args=args)
+    job_config = ConfigManager().parse_args(args)
     success = train_minimal.main_train_loop(job_config)
     self.assertTrue(success)
 

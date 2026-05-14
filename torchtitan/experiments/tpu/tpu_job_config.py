@@ -37,6 +37,13 @@ class redactedConfig:
   # Only implemented for redacted (train_minimal.py).
   use_chunked_loss: bool = False
   enable_manual_ddp: bool = False
+  # When True, wrap the chunked-CE scan body in a remat (jax.checkpoint on the
+  # jax lane, torch.utils.checkpoint elsewhere) so backward recomputes per-chunk
+  # logits instead of saving ``[n_chunks, chunk_size, V]`` all at once. Required
+  # at larger batch sizes where the materialised logits would OOM (e.g. B=16
+  # S=8192 V=153600 bf16 ≈ 40 GiB). Off by default; opt in only when you hit
+  # that allocation.
+  remat_chunks: bool = False
 
 
 @dataclasses.dataclass
@@ -99,55 +106,73 @@ class LossKernelConfig:
   enable_pallas_loss_kernel: bool = True
 
 
+# Shared base for every TPU-targeted lane (torch_tpu, jax, torchax). Holds the
+# lane-agnostic, TPU-flavored config blocks (splash attention, Pallas loss
+# kernel, LoRA, per-model toggles). The truly lane-specific runtime knobs
+# (``tpu_config`` for torch_tpu, ``jax_config`` for jax, ``torchax_config`` for
+# torchax) live on the subclasses below.
+@dataclasses.dataclass(kw_only=True, slots=True)
+class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
+  redacted: redactedConfig = dataclasses.field(default_factory=redactedConfig)
+  redacted: redactedConfig = dataclasses.field(
+      default_factory=redactedConfig
+  )
+  conformer: ConformerConfig = dataclasses.field(
+      default_factory=ConformerConfig
+  )
+  qwen3: Qwen3Config = dataclasses.field(default_factory=Qwen3Config)
+  lora: LoRAConfig = dataclasses.field(default_factory=LoRAConfig)
+  splash_attention_kernel: SplashAttentionKernelConfig = dataclasses.field(
+      default_factory=SplashAttentionKernelConfig
+  )
+  loss_kernel: LossKernelConfig = dataclasses.field(
+      default_factory=LossKernelConfig
+  )
+
+  def __post_init__(self):
+    # NOTE: explicit ``super(...)`` (rather than zero-arg ``super()``) is
+    # required because ``@dataclass(slots=True)`` replaces the class object
+    # after decoration, leaving the ``__class__`` cell that zero-arg
+    # ``super()`` relies on pointing at a stale class. See bpo-46404.
+    super(BaseTPUTrainerConfig, self).__post_init__()
+    # This prevents creating folder in
+    # torchtitan.distributed.utils.init_distributed
+    # that is crashing when running on TAP.
+    self.comm.trace_buf_size = 0
+
+  @classmethod
+  def derive_from(cls, src, **overrides):
+    """Copy-construct a ``cls`` instance from a sibling ``BaseTPUTrainerConfig``
+    subclass, then apply ``overrides``.
+
+    Used by the jax / torchax config registries to delegate to the tpu lane:
+    call the tpu function, then ``derive_from`` the resulting
+    ``TPUTrainerConfig`` onto ``JaxJobConfig`` / ``TorchaxJobConfig``. Fields
+    that exist only on the source (e.g. ``tpu_config``) are silently dropped;
+    fields that exist only on the destination (``jax_config`` etc.) get their
+    default unless supplied via ``overrides``. The model_spec.flavor and most
+    other state flow through unchanged — call sites typically only need to
+    mutate the lane-specific bits after construction.
+    """
+    dst_names = {f.name for f in dataclasses.fields(cls)}
+    src_names = {f.name for f in dataclasses.fields(src)}
+    shared = (dst_names & src_names) - set(overrides)
+    return cls(
+        **{name: getattr(src, name) for name in shared},
+        **overrides,
+    )
+
+
 # TODO(tbajpai) remove after cleaning up type annotations throughout
 @dataclasses.dataclass(kw_only=True, slots=True)
-class TPUJobConfig(torchtitan.trainer.Trainer.Config):
+class TPUJobConfig(BaseTPUTrainerConfig):
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
-  redacted: redactedConfig = dataclasses.field(default_factory=redactedConfig)
-  redacted: redactedConfig = dataclasses.field(
-      default_factory=redactedConfig
-  )
-  conformer: ConformerConfig = dataclasses.field(
-      default_factory=ConformerConfig
-  )
-  qwen3: Qwen3Config = dataclasses.field(default_factory=Qwen3Config)
-  lora: LoRAConfig = dataclasses.field(default_factory=LoRAConfig)
-  splash_attention_kernel: SplashAttentionKernelConfig = dataclasses.field(
-      default_factory=SplashAttentionKernelConfig
-  )
-  loss_kernel: LossKernelConfig = dataclasses.field(
-      default_factory=LossKernelConfig
-  )
-
-  def __post_init__(self):
-    # This prevents creating folder in
-    # torchtitan.distributed.utils.init_distributed
-    # that is chrashing when running on TAP.
-    self.comm.trace_buf_size = 0
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
-class TPUTrainerConfig(torchtitan.trainer.Trainer.Config):
+class TPUTrainerConfig(BaseTPUTrainerConfig):
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
-  redacted: redactedConfig = dataclasses.field(default_factory=redactedConfig)
-  redacted: redactedConfig = dataclasses.field(
-      default_factory=redactedConfig
-  )
-  conformer: ConformerConfig = dataclasses.field(
-      default_factory=ConformerConfig
-  )
-  qwen3: Qwen3Config = dataclasses.field(default_factory=Qwen3Config)
-  lora: LoRAConfig = dataclasses.field(default_factory=LoRAConfig)
-  splash_attention_kernel: SplashAttentionKernelConfig = dataclasses.field(
-      default_factory=SplashAttentionKernelConfig
-  )
-  loss_kernel: LossKernelConfig = dataclasses.field(
-      default_factory=LossKernelConfig
-  )
 
   def __post_init__(self):
-    # This prevents creating folder in
-    # torchtitan.distributed.utils.init_distributed
-    # that is chrashing when running on TAP.
-    self.comm.trace_buf_size = 0
+    super(TPUTrainerConfig, self).__post_init__()
     self.dump_folder = "/tmp/outputs"

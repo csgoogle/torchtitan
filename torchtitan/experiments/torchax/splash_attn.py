@@ -16,7 +16,7 @@ def tpu_splash_attention(
     mesh,
     q_sharding,
     apply_shard_map,
-    torchax_config,
+    splash_cfg,
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
@@ -34,20 +34,21 @@ def tpu_splash_attention(
           query.shape[2] == decoder_segment_ids.q.shape[1]
       ), "Sharding along sequence dimension not allowed in tpu kernel attention"
     block_sizes = splash_attention_kernel.BlockSizes(
-        block_q=min(torchax_config.sa_block_q, query.shape[2]),
-        block_kv=min(torchax_config.sa_block_kv, key.shape[2]),
-        block_kv_compute=min(torchax_config.sa_block_kv_compute, key.shape[2]),
-        block_q_dkv=min(torchax_config.sa_block_q_dkv, query.shape[2]),
-        block_kv_dkv=min(torchax_config.sa_block_kv_dkv, key.shape[2]),
-        block_kv_dkv_compute=min(torchax_config.sa_block_kv_dkv_compute, query.shape[2]),
-        block_q_dq=None if torchax_config.sa_use_fused_bwd_kernel else min(
-            torchax_config.sa_block_q_dq, query.shape[2]),
-        block_kv_dq=None if torchax_config.sa_use_fused_bwd_kernel else min(
-            torchax_config.sa_block_kv_dq, query.shape[2]),
-        use_fused_bwd_kernel=torchax_config.sa_use_fused_bwd_kernel,
-        q_layout=splash_attention_kernel.QKVLayout[torchax_config.sa_q_layout],
-        k_layout=splash_attention_kernel.QKVLayout[torchax_config.sa_k_layout],
-        v_layout=splash_attention_kernel.QKVLayout[torchax_config.sa_v_layout],
+        block_q=min(splash_cfg.sa_block_q, query.shape[2]),
+        block_kv=min(splash_cfg.sa_block_kv, key.shape[2]),
+        block_kv_compute=min(splash_cfg.sa_block_kv_compute, key.shape[2]),
+        block_q_dkv=min(splash_cfg.sa_block_q_dkv, query.shape[2]),
+        block_kv_dkv=min(splash_cfg.sa_block_kv_dkv, key.shape[2]),
+        block_kv_dkv_compute=min(splash_cfg.sa_block_kv_dkv_compute,
+                                 query.shape[2]),
+        block_q_dq=None if splash_cfg.sa_use_fused_bwd_kernel else min(
+            splash_cfg.sa_block_q_dq, query.shape[2]),
+        block_kv_dq=None if splash_cfg.sa_use_fused_bwd_kernel else min(
+            splash_cfg.sa_block_kv_dq, query.shape[2]),
+        use_fused_bwd_kernel=splash_cfg.sa_use_fused_bwd_kernel,
+        q_layout=splash_attention_kernel.QKVLayout[splash_cfg.sa_q_layout],
+        k_layout=splash_attention_kernel.QKVLayout[splash_cfg.sa_k_layout],
+        v_layout=splash_attention_kernel.QKVLayout[splash_cfg.sa_v_layout],
     )
 
     mask = splash_attention_mask.CausalMask(
@@ -85,7 +86,7 @@ def tpu_splash_attention(
   return x
 
 
-def declare_splash_attention(env, mesh, torchax_config):
+def declare_splash_attention(env, mesh, splash_cfg):
   """Overrides torch's scaled_dot_product_attention with a TPU Splash Attention.
 
   This function attempts to replace the default
@@ -95,7 +96,8 @@ def declare_splash_attention(env, mesh, torchax_config):
   Args:
     env: The environment object used to override op definitions.
     mesh: The JAX device mesh for sharding.
-    torchax_config: The TorchaxConfig object with block sizes.
+    splash_cfg: ``SplashAttentionKernelConfig`` with block sizes
+      (from the shared ``BaseTPUTrainerConfig`` block).
 
   Returns:
     True if the override was successful, False otherwise.
@@ -104,7 +106,7 @@ def declare_splash_attention(env, mesh, torchax_config):
   try:
     partition = P('fsdp', 'tp', None, None)
     attention = functools.partial(
-        tpu_splash_attention, mesh, partition, True, torchax_config
+        tpu_splash_attention, mesh, partition, True, splash_cfg
     )
     attention = jax.jit(attention)
 

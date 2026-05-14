@@ -2,14 +2,13 @@
 
 import dataclasses
 
-import torchtitan.config
 from torchtitan.experiments.jax.jax_job_config import JaxConfig
+from torchtitan.experiments.tpu.tpu_job_config import BaseTPUTrainerConfig
 
 
 @dataclasses.dataclass
 class TorchaxConfig(JaxConfig):
-  """Torchax-specific config. Inherits all JAX/splash-attention fields
-  from ``JaxConfig`` and adds torchax-only settings."""
+  """Torchax-specific runtime config."""
 
   use_torchax: bool = True
   # separate keys by `|` if there are multiple keys to offload
@@ -27,13 +26,10 @@ class TorchaxConfig(JaxConfig):
   # just the model graph and the optimizer runs outside compile. Useful for
   # inspection / comparing HLO module sizes between frameworks.
   split_compile: bool = False
-  loss_b_block_size: int = 1024
-  loss_h_block_size: int = 512
-  loss_v_block_size: int = 2048
 
 
-@dataclasses.dataclass
-class TorchaxJobConfig(torchtitan.config.JobConfig):
+@dataclasses.dataclass(kw_only=True, slots=True)
+class TorchaxJobConfig(BaseTPUTrainerConfig):
   torchax_config: TorchaxConfig = dataclasses.field(
       default_factory=TorchaxConfig
   )

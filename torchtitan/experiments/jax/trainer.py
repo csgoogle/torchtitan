@@ -116,10 +116,8 @@ class JaxTrainer:
         if expected_global_batch_size <= 0:
             expected_global_batch_size = job_config.training.local_batch_size
 
-        if (
-            job_config.training.dataset is None
-            or job_config.training.dataset.startswith('fake')
-        ):
+        dataset = job_config.dataloader.dataset
+        if not dataset or dataset.startswith('fake'):
             train_loader = data_utils.fake_dataloader(
                 job_config.training.steps,
                 job_config.training.seq_len,
@@ -128,39 +126,22 @@ class JaxTrainer:
             logger.warning('Using fake data loader.')
             return train_loader
 
-        # Real dataset via torchtitan's data pipeline. We resolve the
-        # tokenizer + dataloader builders directly rather than going through a
-        # PyTorch-side TrainSpec — that import chain
-        # (``torchtitan.experiments.tpu.{redacted, redacted}``) drags in the
-        # torch_tpu / Pallas splash-attention path, which the JAX trainer does
-        # not use (it has its own ``experiments.jax.splash_attn``).
-        model_name = job_config.model.name
-        if model_name in ('redacted', 'redacted'):
-            from torchtitan.experiments.tpu.redacted.tokenizer import (
-                build_redacted as build_tokenizer_fn,
-            )
-            from torchtitan.hf_datasets.text_datasets import (
-                build_text_dataloader as build_dataloader_fn,
-            )
-        else:
-            import torchtitan.protocols.train_spec as ts_mod
-            train_spec = ts_mod.get_train_spec('llama3')
-            build_tokenizer_fn = train_spec.build_tokenizer_fn
-            build_dataloader_fn = train_spec.build_dataloader_fn
-
-        tokenizer = (
-            build_tokenizer_fn(job_config)
-            if build_tokenizer_fn is not None
-            else None
+        # Real dataset via the new config-driven builders (the per-train-spec
+        # ``build_tokenizer_fn`` / ``build_dataloader_fn`` callables were
+        # removed in the 2026-05-04 OSS sync; ``config_registry`` factories
+        # now pin the concrete tokenizer / dataloader configs on the job
+        # config). ``HuggingFaceTextDataLoader`` takes ``local_batch_size`` as
+        # a build kwarg so we don't need to mutate ``job_config.training``.
+        tokenizer = job_config.tokenizer.build(
+            tokenizer_path=job_config.hf_assets_path,
         )
-        original_local = job_config.training.local_batch_size
-        job_config.training.local_batch_size = expected_global_batch_size
-        torch_loader = build_dataloader_fn(
-            dp_world_size=1, dp_rank=0,
+        torch_loader = job_config.dataloader.build(
+            dp_world_size=1,
+            dp_rank=0,
             tokenizer=tokenizer,
-            job_config=job_config,
+            seq_len=job_config.training.seq_len,
+            local_batch_size=expected_global_batch_size,
         )
-        job_config.training.local_batch_size = original_local
         return data_utils.torch_loader_to_jax(torch_loader)
 
     # ------------------------------------------------------------------
@@ -169,8 +150,8 @@ class JaxTrainer:
 
     def setup_model(self, job_config):
         """Instantiate and shard the Flax NNX model."""
-        model_name = job_config.model.name   # e.g. 'llama3'
-        model_flavor = job_config.model.flavor  # e.g. '8B'
+        model_name = job_config.model_spec.name   # e.g. 'llama3'
+        model_flavor = job_config.model_spec.flavor  # e.g. '8B'
         jax_config = job_config.jax_config
         use_scan = jax_config.use_scan
 
@@ -234,11 +215,12 @@ class JaxTrainer:
             checkpoint_policy = jax.checkpoint_policies.nothing_saveable
 
         # Build splash attention if on TPU and the flag is enabled.
+        splash_cfg = job_config.splash_attention_kernel
         devices = jax.devices()
         platform = devices[0].platform if devices else 'cpu'
         attn_fn = None
         attn_fn_local = None  # only for redacted (mixed local/global mask)
-        if platform == 'tpu' and jax_config.use_splash_attention_kernel:
+        if platform == 'tpu' and splash_cfg.use_splash_attention_kernel:
             if model_name == 'redacted':
                 # redacted layers cycle ``local_rope`` × N + ``global_nope`` × 1
                 # (see attention_layer_pattern in args.py). Need TWO splash
@@ -247,18 +229,18 @@ class JaxTrainer:
                 local_window = (
                     getattr(model_args, 'local_attention_window_size', None) or 512
                 )
-                attn_fn = splash_attn.make_splash_attention_fn(self.mesh, jax_config)
+                attn_fn = splash_attn.make_splash_attention_fn(self.mesh, splash_cfg)
                 attn_fn_local = splash_attn.make_splash_attention_fn(
-                    self.mesh, jax_config, local_window=local_window
+                    self.mesh, splash_cfg, local_window=local_window
                 )
             else:
                 attn_fn = splash_attn.make_splash_attention_fn(
-                    self.mesh, jax_config
+                    self.mesh, splash_cfg
                 )
         elif platform == 'tpu':
             logger.info(
                 'Splash attention disabled via '
-                '--jax_config.use_splash_attention_kernel=False; '
+                '--splash_attention_kernel.use_splash_attention_kernel=False; '
                 'using fallback scaled-dot-product attention.'
             )
 
@@ -382,9 +364,7 @@ class JaxTrainer:
         # copies in the optimizer update section (observed 7+ f32[32,1024,
         # 28672] live copies in the memory report without donate).
         has_compute_loss = hasattr(model, 'compute_loss')
-        remat_chunks = bool(
-            getattr(job_config.jax_config, 'redacted_remat_chunks', False)
-        )
+        remat_chunks = bool(job_config.redacted.remat_chunks)
 
         @nnx.jit(donate_argnames=("model", "optimizer"))
         def train_step(model, optimizer: nnx.Optimizer, inputs, labels):
@@ -417,9 +397,9 @@ class JaxTrainer:
         logger.info('Starting training loop ...')
 
         with jax_profiling.maybe_enable_profiling(
-            job_config.profiling,
+            job_config.profiler,
             global_step=0,
-            base_folder=job_config.job.dump_folder,
+            base_folder=job_config.dump_folder,
         ) as profiler:
             step = -1
             for inputs_np, labels_np in train_loader:
