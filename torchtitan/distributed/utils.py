@@ -483,7 +483,7 @@ def set_pg_timeouts(
     # otherwise, some ranks may issue collectives with the new/shorter timeout and
     # those may time out, before other ranks have finished with initialization done
     # under the old/slow timeout.
-    if get_device_type() == 'cpu':
+    if get_device_type() == 'cpu' or get_device_type() == 'tpu':
         torch.distributed.barrier()
     else:
         torch.distributed.barrier(device_ids=[get_device_module().current_device()])
