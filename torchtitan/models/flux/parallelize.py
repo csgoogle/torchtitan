@@ -31,6 +31,8 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
 )
+from torchtitan.experiments.tpu import tpu_job_config
+from torchtitan.experiments.tpu import workarounds
 from torchtitan.tools.logging import logger
 
 
@@ -44,6 +46,12 @@ def parallelize_flux(
     ac_config: ActivationCheckpointConfig,
     dump_folder: str,
 ):
+    if (
+        isinstance(training, tpu_job_config.TPUTrainerConfig)
+        and training.splash_attention_kernel.use_splash_attention_kernel
+    ):
+      workarounds.use_splash_attention_patch(model)
+
     if ac_config.mode != "none":
         apply_ac(model, ac_config)
 
