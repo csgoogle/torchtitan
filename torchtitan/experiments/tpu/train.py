@@ -53,7 +53,8 @@ class TPUTrainer(torchtitan.train.Trainer):
 
   def __init__(self, job_config: Configurable.Config):
     super().__init__(job_config)
-    if isinstance(job_config, tpu_job_config_module.TPUJobConfig):
+
+    if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
       tpu_config = job_config.tpu_config
       if not tpu_config.enable_amp:
         logger.info("AMP is disabled, using uniform precision training.")
@@ -63,8 +64,9 @@ class TPUTrainer(torchtitan.train.Trainer):
         # DDP-replicate on TPU uses fully_shard instead of autocast.
         logger.info(
             "Mixed precision training is handled by fully_shard (TPU replicate,"
-            f"param={self.job_config.training.mixed_precision_param}, "
-            f"reduce={self.job_config.training.mixed_precision_reduce})")
+            f"param={self.config.training.mixed_precision_param}, "
+            f"reduce={self.config.training.mixed_precision_reduce})"
+        )
         self.maybe_enable_amp = contextlib.nullcontext()
 
   def forward_backward_step(
@@ -74,9 +76,9 @@ class TPUTrainer(torchtitan.train.Trainer):
       labels: torch.Tensor,
       global_valid_tokens: torch.Tensor,
   ) -> torch.Tensor:
-    config = self.job_config
+    config = self.config
     use_graph_split = (
-        isinstance(config, tpu_job_config_module.TPUJobConfig)
+        isinstance(config, tpu_job_config_module.TPUTrainerConfig)
         and config.tpu_config.use_graph_split
         and not self.parallel_dims.pp_enabled
     )
@@ -116,26 +118,31 @@ class TPUTrainer(torchtitan.train.Trainer):
     return loss
 
 
-def start_trainer(config: tpu_job_config_module.TPUJobConfig):
+def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   """Starts the training process."""
   rank = int(os.getenv("RANK", "0"))
   if rank == 0:
     init_logger()
 
-  if (tpu_utils.get_device_type() == "tpu" and
-      config.optimizer.implementation == "fused"):
+  if (
+      tpu_utils.get_device_type() == "tpu"
+      and train_config.optimizer.implementation == "fused"
+  ):
     # TODO: b/45811390 - Remove this once fused optimizer is supported on TPU.
     logger.warning(
         "Fused optimizer is not supported on TPU, changing to foreach."
     )
-    config.optimizer.implementation = "foreach"
+    train_config.optimizer.implementation = "foreach"
 
   torchtitan.train.maybe_enable_profiling = functools.partial(
-      profiler_workaround.maybe_enable_profiling, job_config=config
+      profiler_workaround.maybe_enable_profiling, job_config=train_config
   )
 
   trainer: Optional[torchtitan.trainer.Trainer] = None
-  if config.model_spec.name == "flux":
+  model_spec = train_config.model_spec
+  assert model_spec is not None
+  model_name = model_spec.name
+  if model_name == "flux":
     from torchtitan.models.flux.trainer import FluxTrainer
     trainer_cls = FluxTrainer
   else:
@@ -152,23 +159,23 @@ def start_trainer(config: tpu_job_config_module.TPUJobConfig):
     dist.barrier()
 
   # TODO: b/498659628 - Remove once hanging is fixed.
-  if config.debug.seed is None:
-    config.debug.seed = 42
+  if train_config.debug.seed is None:
+    train_config.debug.seed = 42
     logger.info(
-        f"Setting default seed {config.debug.seed} to avoid hang on TPU"
+        f"Setting default seed {train_config.debug.seed} to avoid hang on TPU"
     )
 
   try:
-    trainer = trainer_cls(config)
-    config.maybe_log()
+    trainer = trainer_cls(train_config)
+    train_config.maybe_log()
 
-    if config.checkpoint.create_seed_checkpoint:
+    if train_config.checkpoint.create_seed_checkpoint:
       assert int(os.environ["WORLD_SIZE"]) == 1, (
           "Must create seed checkpoint using a single device, to disable"
           " sharding."
       )
       assert (
-          config.checkpoint.enable
+          train_config.checkpoint.enable
       ), "Must enable checkpointing when creating a seed checkpoint."
       trainer.checkpointer.save(curr_step=0, last_step=True)
       logger.info("Created seed checkpoint")
@@ -176,7 +183,7 @@ def start_trainer(config: tpu_job_config_module.TPUJobConfig):
       if rank == 0:
         logger.info(
             "Training with config: %s",
-            json.dumps(config.to_dict(), indent=2, sort_keys=True)
+            json.dumps(train_config.to_dict(), indent=2, sort_keys=True),
         )
       trainer.train()
   except Exception:
