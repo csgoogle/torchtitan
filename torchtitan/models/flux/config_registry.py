@@ -21,6 +21,7 @@ from torchtitan.models.flux.flux_datasets import FluxDataLoader
 from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
 from torchtitan.models.flux.trainer import FluxTrainer
 from torchtitan.models.flux.validate import FluxValidator
+from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 
 from . import model_registry
 
@@ -40,6 +41,7 @@ def flux_debugmodel() -> FluxTrainer.Config:
             clip_encoder="openai/clip-vit-large-patch14",
             autoencoder_path="assets/hf/FLUX.1-dev/ae.safetensors",
         ),
+        tpu_config=TPUConfig(eager_mode="DEFER_AND_FUSE"),
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry("flux-debug"),
         optimizer=OptimizersContainer.Config(lr=8e-4),
@@ -101,6 +103,7 @@ def flux_dev() -> FluxTrainer.Config:
             clip_encoder="openai/clip-vit-large-patch14",
             autoencoder_path="assets/hf/FLUX.1-dev/ae.safetensors",
         ),
+        tpu_config=TPUConfig(eager_mode="DEFER_AND_FUSE"),
         metrics=MetricsProcessor.Config(log_freq=100),
         model_spec=model_registry("flux-dev"),
         optimizer=OptimizersContainer.Config(lr=1e-4),
@@ -153,6 +156,7 @@ def flux_schnell() -> FluxTrainer.Config:
             clip_encoder="openai/clip-vit-large-patch14",
             autoencoder_path="assets/hf/FLUX.1-dev/ae.safetensors",
         ),
+        tpu_config=TPUConfig(eager_mode="DEFER_AND_FUSE"),
         metrics=MetricsProcessor.Config(log_freq=100),
         model_spec=model_registry("flux-schnell"),
         optimizer=OptimizersContainer.Config(lr=1e-4),

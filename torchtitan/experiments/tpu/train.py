@@ -16,6 +16,23 @@ from typing import List, Optional, Sequence, Tuple
 from absl import flags
 from absl.flags import argparse_flags
 import os as os
+import torch
+import torch.distributed as dist
+from torchtitan.config import ConfigManager, Configurable
+from torchtitan.experiments.tpu import gmain
+from torchtitan.experiments.tpu import profiler_workaround
+from torchtitan.experiments.tpu import utils as tpu_utils
+import torchtitan.experiments.tpu.redacted  # trigger model registration
+import torchtitan.experiments.tpu.redacted  # trigger model registration
+import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
+import torchtitan.experiments.tpu.flux  # trigger model registration
+import torchtitan.experiments.tpu.llama3  # trigger model registration
+import torchtitan.experiments.tpu.qwen3   # trigger model registration
+import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
+from torchtitan.tools import utils
+from torchtitan.tools.logging import init_logger, logger
+import torchtitan.train
+
 from absl import app
 
 
@@ -117,9 +134,9 @@ def start_trainer(config: tpu_job_config_module.TPUJobConfig):
       profiler_workaround.maybe_enable_profiling, job_config=config
   )
 
-  trainer: Optional[torchtitan.train.Trainer] = None
-  if config.model.name == "flux":
-    from torchtitan.models.flux.train import FluxTrainer
+  trainer: Optional[torchtitan.trainer.Trainer] = None
+  if config.model_spec.name == "flux":
+    from torchtitan.models.flux.trainer import FluxTrainer
     trainer_cls = FluxTrainer
   else:
     trainer_cls = TPUTrainer

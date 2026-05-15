@@ -81,6 +81,9 @@ class TrainingConfig:
 
 @dataclass(kw_only=True, slots=True)
 class ParallelismConfig:
+    use_simple_fsdp: bool = False
+    """Whether to use SimpleFSDP for data parallelism."""
+
     data_parallel_replicate_degree: int = 1
     """
     The `data_parallel_replicate_degree` argument specifies the degree of

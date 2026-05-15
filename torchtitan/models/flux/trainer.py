@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from torchtitan.models.flux.configs import FluxEncoderConfig, Inference
 from torchtitan.models.flux.model.autoencoder import load_ae
 from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
 from torchtitan.models.flux.parallelize import parallelize_encoders
+from torchtitan.models.flux.precomputed_loader import PrecomputedDataloader
 from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
 from torchtitan.models.flux.utils import (
     create_position_encoding_for_latents,
@@ -26,12 +28,14 @@ from torchtitan.models.flux.utils import (
     PATCH_WIDTH,
     preprocess_data,
 )
+from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
+from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
 
 class FluxTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
-    class Config(Trainer.Config):
+    class Config(TPUTrainerConfig):
         # Overwrite parent class tokenizer
         tokenizer: FluxTokenizerContainer.Config = (  # pyrefly: ignore [bad-override]
             field(default_factory=FluxTokenizerContainer.Config)
@@ -79,32 +83,49 @@ class FluxTrainer(Trainer):
         assert config.model_spec is not None
         model_args = config.model_spec.model
 
-        self.autoencoder = load_ae(
-            config.encoder.autoencoder_path,
-            # pyrefly: ignore [missing-attribute]
-            model_args.autoencoder_params,
-            device=self.device,
-            dtype=self._dtype,
-            random_init=config.encoder.random_init,
-        )
+        # If precomputed_dataset_path is provided in experiment configs,
+        # we load precomputed embeddings directly from disk and skip
+        # computing them as part of the training loop (i.e., skip running the
+        # autoencoder and text encoders (T5, CLIP).
+        precompute_path = config.flux.precomputed_dataset_path
 
-        self.clip_encoder = FluxEmbedder(
-            version=config.encoder.clip_encoder,
-            random_init=config.encoder.random_init,
-        ).to(device=self.device, dtype=self._dtype)
-        self.t5_encoder = FluxEmbedder(
-            version=config.encoder.t5_encoder,
-            random_init=config.encoder.random_init,
-        ).to(device=self.device, dtype=self._dtype)
+        if precompute_path is not None:
+            logger.info(f"Loading precomputed embeddings from {precompute_path}")
+            self.autoencoder = None
+            self.clip_encoder = None
+            self.t5_encoder = None
+
+            rank = int(os.environ.get("RANK", 0))
+            self.dataloader = PrecomputedDataloader(precompute_path, config.training.steps, rank=rank)
+        else:
+            self.autoencoder = load_ae(
+                config.encoder.autoencoder_path,
+                # pyrefly: ignore [missing-attribute]
+                model_args.autoencoder_params,
+                device=self.device,
+                dtype=self._dtype,
+                random_init=config.encoder.random_init,
+            )
+
+            self.clip_encoder = FluxEmbedder(
+                version=config.encoder.clip_encoder,
+                random_init=config.encoder.random_init,
+            ).to(device=self.device, dtype=self._dtype)
+            self.t5_encoder = FluxEmbedder(
+                version=config.encoder.t5_encoder,
+                random_init=config.encoder.random_init,
+            ).to(device=self.device, dtype=self._dtype)
 
         # Apply FSDP to the T5 model / CLIP model
-        # pyrefly: ignore [bad-assignment]
-        self.t5_encoder, self.clip_encoder = parallelize_encoders(
-            t5_model=self.t5_encoder,
-            clip_model=self.clip_encoder,
-            parallel_dims=self.parallel_dims,
-            training=config.training,
-        )
+        if self.t5_encoder is not None or self.clip_encoder is not None:
+            # pyrefly: ignore [bad-assignment]
+            self.t5_encoder, self.clip_encoder = parallelize_encoders(
+                t5_model=self.t5_encoder,
+                clip_model=self.clip_encoder,
+                parallel_dims=self.parallel_dims,
+                training=config.training,
+                parallelism=config.parallelism,
+            )
 
         if config.validator.enable:
             # pyrefly: ignore [missing-attribute]
@@ -164,16 +185,21 @@ class FluxTrainer(Trainer):
         ), "FLUX model don't need to rescale loss by number of global valid tokens"
 
         # generate t5 and clip embeddings
-        input_dict["image"] = labels
-        input_dict = preprocess_data(
-            device=self.device,
-            dtype=self._dtype,
-            autoencoder=self.autoencoder,
-            clip_encoder=self.clip_encoder,
-            t5_encoder=self.t5_encoder,
-            batch=input_dict,
-        )
-        labels = input_dict["img_encodings"]
+        if self.autoencoder is not None:
+            input_dict["image"] = labels
+            input_dict = preprocess_data(
+                device=self.device,
+                dtype=self._dtype,
+                autoencoder=self.autoencoder,
+                clip_encoder=self.clip_encoder,
+                t5_encoder=self.t5_encoder,
+                batch=input_dict,
+            )
+            labels = input_dict["img_encodings"]
+        else:
+            labels = input_dict["img_encodings"].to(device=self.device, dtype=self._dtype)
+            input_dict["clip_encodings"] = input_dict["clip_encodings"].to(device=self.device, dtype=self._dtype)
+            input_dict["t5_encodings"] = input_dict["t5_encodings"].to(device=self.device, dtype=self._dtype)
 
         # rewrite the global_valid_tokens because the `labels` are reset after image encoder.
         local_valid_tokens = torch.tensor(
@@ -200,7 +226,7 @@ class FluxTrainer(Trainer):
 
         with torch.no_grad(), torch.device(self.device):
             noise = torch.randn_like(labels)
-            timesteps = torch.rand((bsz,))
+            timesteps = torch.rand((bsz,), dtype=self._dtype, device=self.device)
             sigmas = timesteps.view(-1, 1, 1, 1)
             latents = (1 - sigmas) * labels + sigmas * noise
 
@@ -211,8 +237,8 @@ class FluxTrainer(Trainer):
             # Create positional encodings
             latent_pos_enc = create_position_encoding_for_latents(
                 bsz, latent_height, latent_width, POSITION_DIM
-            )
-            text_pos_enc = torch.zeros(bsz, t5_encodings.shape[1], POSITION_DIM)
+            ).to(self._dtype)
+            text_pos_enc = torch.zeros(bsz, t5_encodings.shape[1], POSITION_DIM, dtype=self._dtype, device=self.device)
 
             # Patchify: Convert latent into a sequence of patches
             latents = pack_latents(latents)
@@ -294,33 +320,35 @@ class FluxTrainer(Trainer):
         if not self.metrics_processor.should_log(self.step):
             return
 
-        if parallel_dims.dp_cp_enabled:
-            loss = loss.detach()
-            loss_mesh = parallel_dims.get_optional_mesh("loss")
+        # TODO(abrauckmann): Re-enable. This is causing OOM errors currently.
+        # if parallel_dims.dp_cp_enabled:
+        #     loss = loss.detach()
+        #     loss_mesh = parallel_dims.get_optional_mesh("loss")
 
-            # NOTE: the loss returned by train
-            global_avg_loss, global_max_loss, global_ntokens_seen = (
-                dist_utils.dist_sum(loss, loss_mesh),
-                dist_utils.dist_max(loss, loss_mesh),
-                dist_utils.dist_sum(
-                    torch.tensor(
-                        self.ntokens_seen, dtype=torch.int64, device=self.device
-                    ),
-                    loss_mesh,
-                ),
-            )
-        else:
-            global_avg_loss = global_max_loss = float(loss.detach().item())
-            global_ntokens_seen = self.ntokens_seen
+        #     # NOTE: the loss returned by train
+        #     global_avg_loss, global_max_loss, global_ntokens_seen = (
+        #         dist_utils.dist_sum(loss, loss_mesh),
+        #         dist_utils.dist_max(loss, loss_mesh),
+        #         dist_utils.dist_sum(
+        #             torch.tensor(
+        #                 self.ntokens_seen, dtype=torch.int64, device=self.device
+        #             ),
+        #             loss_mesh,
+        #         ),
+        #     )
+        # else:
+        #     global_avg_loss = global_max_loss = float(loss.detach().item())
+        #     global_ntokens_seen = self.ntokens_seen
 
+        # TODO(abrauckmann): Re-enable metrics. This is causing OOM errors currently.
         extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
+            "n_tokens_seen": 0, #global_ntokens_seen,
             "lr": lr,
         }
         self.metrics_processor.log(
             self.step,
-            global_avg_loss,
-            global_max_loss,
-            float(grad_norm.item()),
+            0, #global_avg_loss,
+            0, #global_max_loss,
+            0, #float(grad_norm.item()),
             extra_metrics=extra_metrics,
         )

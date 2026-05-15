@@ -65,6 +65,13 @@ class Qwen3Config:
 
 
 @dataclasses.dataclass
+class FluxConfig:
+    precomputed_dataset_path: str | None = None
+    """Path to the precomputed embeddings"""
+
+
+
+@dataclasses.dataclass
 class LoRAConfig:
   # Whether to enable LoRA.
   use_lora: bool = False
@@ -121,6 +128,7 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
       default_factory=ConformerConfig
   )
   qwen3: Qwen3Config = dataclasses.field(default_factory=Qwen3Config)
+  flux: FluxConfig = dataclasses.field(default_factory=FluxConfig)
   lora: LoRAConfig = dataclasses.field(default_factory=LoRAConfig)
   splash_attention_kernel: SplashAttentionKernelConfig = dataclasses.field(
       default_factory=SplashAttentionKernelConfig

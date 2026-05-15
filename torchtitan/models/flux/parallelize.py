@@ -25,6 +25,12 @@ from torchtitan.config import (
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.context_parallel import apply_cp_to_forward
 from torchtitan.distributed.fsdp import disable_fsdp_gradient_division
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    data_parallel as simple_fsdp_data_parallel,
+)
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
+)
 from torchtitan.tools.logging import logger
 
 
@@ -47,17 +53,44 @@ def parallelize_flux(
     if compile_config.enable and "model" in compile_config.components:
         apply_compile(model, compile_config)
 
-    names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-    dp_mesh = parallel_dims.get_mesh(names)
-    apply_fsdp(
-        model,
-        dp_mesh,
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        cpu_offload=training.enable_cpu_offload,
-    )
+    if parallel_dims.fsdp_enabled:
+        use_simple_fsdp = parallelism.use_simple_fsdp
+        names = (
+            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
+        )
+        dp_mesh = parallel_dims.get_mesh(names)
 
-    logger.info("Applied fully_shard to the model")
+        if use_simple_fsdp:
+            dp_mode = (
+                "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
+            )
+            mp_policy = SimpleFSDPMixedPrecisionPolicy(
+                param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+                reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            )
+            model = simple_fsdp_data_parallel(
+                model,
+                dp_mesh,
+                mode=dp_mode,
+                mp_policy=mp_policy,
+            )
+            logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
+        else:
+            apply_fsdp(
+                model,
+                dp_mesh,
+                param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+                reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+                cpu_offload=training.enable_cpu_offload,
+            )
+
+            if parallel_dims.dp_replicate_enabled:
+                logger.info("Applied HSDP to the model")
+            else:
+                logger.info("Applied FSDP to the model")
+    else:
+        # If FSDP is not enabled (e.g. world_size=1), just return the model
+        logger.info("FSDP not enabled, skipping parallelization")
 
     return model
 
@@ -201,33 +234,57 @@ def parallelize_encoders(
     parallel_dims: ParallelDims,
     *,
     training: TrainingConfig,
+    parallelism: ParallelismConfig,
 ):
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-    )
+    if parallel_dims.dp_shard_enabled:  # apply FSDP or HSDP
+        use_simple_fsdp = parallelism.use_simple_fsdp
+        names = (
+            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
+        )
+        dp_mesh = parallel_dims.get_mesh(names)
 
-    names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-    dp_mesh = parallel_dims.get_mesh(names)
-    fsdp_config: dict[str, Any] = {
-        "mesh": dp_mesh,
-        "mp_policy": mp_policy,
-    }
-    if training.enable_cpu_offload:
-        fsdp_config["offload_policy"] = CPUOffloadPolicy()
+        if use_simple_fsdp:
+            dp_mode = (
+                "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
+            )
+            mp_policy = SimpleFSDPMixedPrecisionPolicy(
+                param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+                reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            )
+            t5_model = simple_fsdp_data_parallel(
+                t5_model,
+                dp_mesh,
+                mode=dp_mode,
+                mp_policy=mp_policy,
+            )
+            logger.info(f"Applied SimpleFSDP ({dp_mode}) to the T5 encoder model")
+        else:
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+                reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            )
+            fsdp_config: dict[str, Any] = {
+                "mesh": dp_mesh,
+                "mp_policy": mp_policy,
+            }
+            if training.enable_cpu_offload:
+                fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    # NOTE: only apply FSDP to the T5 encoder, not the CLIP text encoder.
-    # CLIP Text encoder has low computation / communication ratio, so it's not necessary to apply FSDP to it.
-    # pyrefly: ignore [missing-attribute]
-    for block in t5_model.hf_module.encoder.block:
-        fully_shard(block, **fsdp_config)
-    # pyrefly: ignore [no-matching-overload]
-    fully_shard(t5_model.hf_module, **fsdp_config)
+            # NOTE: only apply FSDP to the T5 encoder, not the CLIP text encoder.
+            # CLIP Text encoder has low computation / communication ratio, so it's not necessary to apply FSDP to it.
+            # pyrefly: ignore [missing-attribute]
+            for block in t5_model.hf_module.encoder.block:
+                fully_shard(block, **fsdp_config)
+            # pyrefly: ignore [no-matching-overload]
+            fully_shard(t5_model.hf_module, **fsdp_config)
 
-    # Disable FSDP's automatic gradient division for all FSDP modules
-    # pyrefly: ignore [bad-argument-type]
-    disable_fsdp_gradient_division(t5_model.hf_module)
+            # Disable FSDP's automatic gradient division for all FSDP modules
+            # pyrefly: ignore [bad-argument-type]
+            disable_fsdp_gradient_division(t5_model.hf_module)
 
-    logger.info("Applied fully_shard to the T5 encoder model")
+            if parallel_dims.dp_replicate_enabled:
+                logger.info("Applied HSDP to the T5 encoder model")
+            else:
+                logger.info("Applied FSDP to the T5 encoder model")
 
     return t5_model, clip_model
