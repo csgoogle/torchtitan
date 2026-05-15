@@ -189,7 +189,6 @@ class DeepSeekV3DTensorParallelizeTest(
   """Tests the DTensor-based `apply_non_moe_tp` in a distributed environment."""
 
   # TP Tests are run with loss_parallel=False.
-  @absltest.skip("Skipping for now b/510453747.")
   def test_apply_non_moe_tp_forward_equivalence_distributed(self):
     """Launches test to verify numerical equivalence of the DTensor parallel model."""
     logging.info(
@@ -220,7 +219,6 @@ class DeepSeekV3DTensorParallelizeTest(
         "Distributed DTensor TP backward numerical equivalence test finished."
     )
 
-  @absltest.skip("Skipping for now b/510453747.")
   def test_apply_fsdp_full_training_loop_equivalence_distributed(self):
     """Verifies numerical equivalence of a full training loop with FSDP."""
     logging.info(
