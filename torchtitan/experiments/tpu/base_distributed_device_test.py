@@ -720,6 +720,12 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       data_parallel_replicate_degree: int | None = None,
   ):
     """Orchestrates a distributed parity test: Record Distributed -> Verify on CPU."""
+    if skip_devices and self.accelerator_device_type in skip_devices:
+      self.skipTest(
+          f"Skipping test for device type: {self.accelerator_device_type}"
+      )
+      return
+
     # Setup temporary file for data transfer.
     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
       temp_path = tmp_file.name

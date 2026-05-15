@@ -18,7 +18,7 @@ class TrainMinimalDistributedTest(
       # deepseek_v3
       dict(
           testcase_name="deepseek_v3_tp",
-          module="torchtitan.experiments.tpu.deepseek_v3",
+          module="deepseek_v3",
           config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
@@ -37,7 +37,7 @@ class TrainMinimalDistributedTest(
       ),
       dict(
           testcase_name="deepseek_v3_fsdp",
-          module="torchtitan.experiments.tpu.deepseek_v3",
+          module="deepseek_v3",
           config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
@@ -58,7 +58,7 @@ class TrainMinimalDistributedTest(
       # llama3
       dict(
           testcase_name="llama3_tp",
-          module="torchtitan.experiments.tpu.llama3",
+          module="llama3",
           config="llama3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
@@ -71,16 +71,10 @@ class TrainMinimalDistributedTest(
       ),
       dict(
           testcase_name="llama3_fsdp",
-          module="torchtitan.experiments.tpu.llama3",
+          module="llama3",
           config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          skip_devices=[
-              # TODO(tbajpai) Fix tests after updating TT head b/511306362
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-              device_type.AcceleratorDeviceType.TPU,
-          ],
           # b/495494788: Trainer/parallelize differences causing large
           # numerical discrepancies.
           loss_atol=1e2,
@@ -93,12 +87,12 @@ class TrainMinimalDistributedTest(
       # qwen3
       dict(
           testcase_name="qwen3_tp",
-          module="torchtitan.experiments.tpu.qwen3",
+          module="qwen3",
           config="qwen3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           skip_devices=[
-              # TODO(tbajpai) Fix tests after updating TT head b/511306362
+              # TODO(tbajpai): Re-examine cause of b/513645397
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
               device_type.AcceleratorDeviceType.TPU,
@@ -112,12 +106,12 @@ class TrainMinimalDistributedTest(
       ),
       dict(
           testcase_name="qwen3_fsdp",
-          module="torchtitan.experiments.tpu.qwen3",
+          module="qwen3",
           config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
-              # TODO(tbajpai) Fix tests after updating TT head b/511306362
+              # TODO(tbajpai): Re-examine cause of b/513645397
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
               device_type.AcceleratorDeviceType.TPU,
@@ -163,10 +157,8 @@ class TrainMinimalDistributedTest(
     """
     self._run_trainer_distributed_parity_test(
         config_args=[
-            "--module",
-            module,
-            "--config",
-            config,
+            f"--module=torchtitan.experiments.tpu.{module}",
+            f"--config={config}",
             f"--optimizer.implementation={optimizer_implementation}",
             "--hf_assets_path=tests/assets/tokenizer",
             "--dataloader.dataset_path=tests/assets/c4_test",

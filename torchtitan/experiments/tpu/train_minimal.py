@@ -140,7 +140,8 @@ class TrainerMinimal:
     self.model_config = model_config
 
     if (
-        self.model_config.vocab_size is not None
+        hasattr(self.model_config, "vocab_size")
+        and self.model_config.vocab_size is not None
         and self.tokenizer.vocab_size > self.model_config.vocab_size
     ):
       logger.warning(
@@ -181,8 +182,13 @@ class TrainerMinimal:
     if self.world_size > 1:
       self.model_spec.parallelize_fn(
           model,
-          self.parallel_dims,
-          job_config)
+          parallel_dims=self.parallel_dims,
+          training=job_config.training,
+          parallelism=job_config.parallelism,
+          compile_config=job_config.compile,
+          ac_config=job_config.activation_checkpoint,
+          dump_folder=job_config.dump_folder,
+      )
 
     logger.info(
         f"Moving model {self.model_spec.name}"
@@ -227,9 +233,10 @@ class TrainerMinimal:
         return tokens, labels
 
       def _get_dummy_batch():
+        vocab_size = getattr(self.model_config, "vocab_size", 32000)
         tokens = torch.randint(
             0,
-            self.model_config.vocab_size,
+            vocab_size,
             (
                 self.job_config.training.local_batch_size,
                 self.job_config.training.seq_len,
@@ -238,7 +245,7 @@ class TrainerMinimal:
         )
         labels = torch.randint(
             0,
-            self.model_config.vocab_size,
+            vocab_size,
             (
                 self.job_config.training.local_batch_size,
                 self.job_config.training.seq_len,
