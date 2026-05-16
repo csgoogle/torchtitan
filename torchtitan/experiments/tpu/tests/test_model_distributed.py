@@ -151,14 +151,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
   @parameterized.named_parameters([
       dict(
           testcase_name="llama3_tp_dtensor",
-          module="llama3",
+          module="torchtitan.experiments.tpu.llama3",
           config="llama3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
       dict(
           testcase_name="llama3_tp_dtensor_compile",
-          module="llama3",
+          module="torchtitan.experiments.tpu.llama3",
           config="llama3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
@@ -172,14 +172,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       ),
       dict(
           testcase_name="qwen3_tp_dtensor",
-          module="qwen3",
+          module="torchtitan.experiments.tpu.qwen3",
           config="qwen3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
       dict(
           testcase_name="qwen3_tp_dtensor_compile",
-          module="qwen3",
+          module="torchtitan.experiments.tpu.qwen3",
           config="qwen3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
@@ -193,14 +193,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       ),
       dict(
           testcase_name="deepseek_v3_tp_dtensor",
-          module="deepseek_v3",
+          module="torchtitan.experiments.tpu.deepseek_v3",
           config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
       dict(
           testcase_name="deepseek_v3_tp_dtensor_compile",
-          module="deepseek_v3",
+          module="torchtitan.experiments.tpu.deepseek_v3",
           config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
@@ -254,7 +254,7 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       dataset="c4_test",
   ):
     args = [
-        f"--module=torchtitan.experiments.tpu.{module}",
+        f"--module={module}",
         f"--config={config}",
         "--optimizer.implementation=foreach",
         "--hf_assets_path=tests/assets/tokenizer",

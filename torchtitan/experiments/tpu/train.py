@@ -165,6 +165,28 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
         f"Setting default seed {train_config.debug.seed} to avoid hang on TPU"
     )
 
+  # Apply TPU-specific workarounds before model parallelization
+  # Moved from deprecated args.py files
+  orig_parallelize = model_spec.parallelize_fn
+
+  def patched_parallelize(model, *args, **kwargs):
+    from torchtitan.experiments.tpu import workarounds
+
+    workarounds.apply_patches(model, train_config)
+    if model_spec.name in (
+        "redacted",
+        "redacted_tpu",
+        "redacted",
+        "redacted_tpu",
+        "flux",
+        "flux_tpu",
+    ):
+      parallel_dims = kwargs.get("parallel_dims")
+      return orig_parallelize(model, parallel_dims, train_config)
+    return orig_parallelize(model, *args, **kwargs)
+
+  model_spec.parallelize_fn = patched_parallelize
+
   try:
     trainer = trainer_cls(train_config)
     train_config.maybe_log()

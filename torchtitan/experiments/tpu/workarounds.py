@@ -295,7 +295,7 @@ def use_fill_indices_patch(
   # moe_kernels.fill_indices_wrapper = tpu_fill_indices.fill_indices
   # moe_kernels.fill_indices_cpu = tpu_fill_indices.fill_indices
   # logger.info("Patched MoE kernels to use TPU fill_indices")
-  # TODO update patch code with correct imports etc.
+  # TODO Evaluate if we can remove this since fill_indices no longer exists.
   pass
 
 

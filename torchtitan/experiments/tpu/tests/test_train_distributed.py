@@ -22,8 +22,8 @@ class TrainDistributedTest(
       # redacted_tpu
       dict(
           testcase_name="redacted_fsdp",
-          model_name="redacted_tpu",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.redacted",
+          config="redacted_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
@@ -34,23 +34,23 @@ class TrainDistributedTest(
       # redacted
       dict(
           testcase_name="redacted_ddp",
-          model_name="redacted_tpu",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.redacted",
+          config="redacted_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=1,
           data_parallel_replicate_degree=-1,
       ),
       dict(
           testcase_name="redacted_fsdp",
-          model_name="redacted_tpu",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.redacted",
+          config="redacted_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
       ),
       dict(
           testcase_name="redacted_fsdp_compile",
-          model_name="redacted_tpu",
-          config_file="torchtitan/experiments/tpu/redacted/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.redacted",
+          config="redacted_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
@@ -64,8 +64,8 @@ class TrainDistributedTest(
       # deepseek_v3
       dict(
           testcase_name="deepseek_v3_tp",
-          model_name="deepseek_v3",
-          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           skip_devices=[
@@ -77,8 +77,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="deepseek_v3_tp_compile",
-          model_name="deepseek_v3",
-          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
@@ -91,8 +91,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="deepseek_v3_fsdp",
-          model_name="deepseek_v3",
-          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
@@ -102,8 +102,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="deepseek_v3_fsdp_compile",
-          model_name="deepseek_v3",
-          config_file="torchtitan/experiments/tpu/deepseek_v3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.deepseek_v3",
+          config="deepseek_v3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
@@ -118,8 +118,8 @@ class TrainDistributedTest(
       # flux
       dict(
           testcase_name="flux_tp",
-          model_name="flux",
-          config_file="torchtitan/experiments/tpu/flux/train_configs/debug_model.toml",
+          module="flux",
+          config="flux_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
@@ -127,12 +127,12 @@ class TrainDistributedTest(
           skip_devices=[
               # b/501467380 - Error during backward pass
               device_type.AcceleratorDeviceType.TPU,
-          ]
+          ],
       ),
       dict(
           testcase_name="flux_tp_compile",
-          model_name="flux",
-          config_file="torchtitan/experiments/tpu/flux/train_configs/debug_model.toml",
+          module="flux",
+          config="flux_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
@@ -147,8 +147,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="flux_fsdp",
-          model_name="flux",
-          config_file="torchtitan/experiments/tpu/flux/train_configs/debug_model.toml",
+          module="flux",
+          config="flux_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           dataset_path="tests/assets/cc12m_test",
@@ -160,8 +160,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="flux_fsdp_compile",
-          model_name="flux",
-          config_file="torchtitan/experiments/tpu/flux/train_configs/debug_model.toml",
+          module="flux",
+          config="flux_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           dataset_path="tests/assets/cc12m_test",
@@ -177,15 +177,15 @@ class TrainDistributedTest(
       # llama3
       dict(
           testcase_name="llama3_tp",
-          model_name="llama3_tpu",
-          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
       dict(
           testcase_name="llama3_tp_compile",
-          model_name="llama3_tpu",
-          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
@@ -198,15 +198,15 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="llama3_fsdp",
-          model_name="llama3_tpu",
-          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
       ),
       dict(
           testcase_name="llama3_fsdp_compile",
-          model_name="llama3_tpu",
-          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
@@ -219,8 +219,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="llama3_fsdp_checkpoint",
-          model_name="llama3_tpu",
-          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           checkpoint_enabled=True,
@@ -231,8 +231,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="llama3_fsdp_use_loss_kernel",
-          model_name="llama3_tpu",
-          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
@@ -250,8 +250,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="llama3_fsdp_use_splash_attention_kernel",
-          model_name="llama3_tpu",
-          config_file="torchtitan/models/llama3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=["--splash_attention_kernel.use_splash_attention_kernel"],
@@ -263,15 +263,15 @@ class TrainDistributedTest(
       # qwen3
       dict(
           testcase_name="qwen3_tp",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
       dict(
           testcase_name="qwen3_tp_compile",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
@@ -284,15 +284,15 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="qwen3_fsdp",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
       ),
       dict(
           testcase_name="qwen3_fsdp_compile",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=True,
@@ -305,8 +305,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="qwen3_fsdp_use_loss_kernel",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
@@ -324,8 +324,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="qwen3_fsdp_use_splash_attention_kernel",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=["--splash_attention_kernel.use_splash_attention_kernel"],
@@ -336,8 +336,8 @@ class TrainDistributedTest(
       ),
       dict(
           testcase_name="qwen3_fsdp_moe_use_gmm_kernel",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
@@ -349,27 +349,28 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
-      dict(
-          testcase_name="qwen3_fsdp_moe_use_gmm_and_fill_indices_kernels",
-          model_name="qwen3_tpu",
-          config_file="torchtitan/experiments/tpu/qwen3/train_configs/debug_model.toml",
-          data_parallel_shard_degree=-1,
-          tensor_parallel_degree=1,
-          args=[
-              "--model.flavor=testmodel_moe",  # NOTE: this model has use_grouped_mm=True
-              "--qwen3.use_gmm_kernel",
-              "--qwen3.use_fill_indices_kernel",
-          ],
-          skip_devices=[
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-          ],
-      ),
+      # TODO(abrauckmann): fill_indices is not in OSS code, update this test once we decide to add it back or remove it.
+      #   dict(
+      #       testcase_name="qwen3_fsdp_moe_use_gmm_and_fill_indices_kernels",
+      #       module="torchtitan.experiments.tpu.qwen3",
+      #       config="qwen3_debugmodel",
+      #       data_parallel_shard_degree=-1,
+      #       tensor_parallel_degree=1,
+      #       args=[
+      #           "--model.flavor=testmodel_moe",  # NOTE: this model has use_grouped_mm=True
+      #           "--qwen3.use_gmm_kernel",
+      #           "--qwen3.use_fill_indices_kernel",
+      #       ],
+      #       skip_devices=[
+      #           device_type.AcceleratorDeviceType.CPU,
+      #           device_type.AcceleratorDeviceType.CUDA,
+      #       ],
+      #   ),
   ])
   def test_train_distributed(
       self,
-      model_name,
-      config_file,
+      module,
+      config,
       data_parallel_shard_degree,
       tensor_parallel_degree,
       data_parallel_replicate_degree=None,
@@ -382,17 +383,17 @@ class TrainDistributedTest(
       args: list[str] | None = None,
   ):
     default_args = [
-        f"--model.name={model_name}",
-        f"--job.config_file={config_file}",
+        f"--module={module}",
+        f"--config={config}",
         f"--optimizer.implementation={optimizer_implementation}",
-        f"--training.dataset_path={dataset_path}",
-        f"--training.dataset={dataset}",
-        "--model.hf_assets_path=tests/assets/tokenizer",
+        f"--dataloader.dataset_path={dataset_path}",
+        f"--dataloader.dataset={dataset}",
+        "--hf_assets_path=tests/assets/tokenizer",
         "--training.seq_len=128",
         "--training.steps=3",
         "--training.mixed_precision_param=float32",
         "--training.mixed_precision_reduce=float32",
-        f"--training.local_batch_size={1 if model_name == 'flux' else 4}",
+        f"--training.local_batch_size={1 if module == 'flux' else 4}",
     ]
     if not args:
       args = []
@@ -401,7 +402,7 @@ class TrainDistributedTest(
     # This allows test cases to override default arguments.
     combined_args = default_args + args
 
-    if model_name == "flux":
+    if module == "flux":
       combined_args.extend([
           "--encoder.t5_encoder=tests/assets/flux_test_encoders/t5-micro",
           "--encoder.clip_encoder=tests/assets/flux_test_encoders/clip-micro",
