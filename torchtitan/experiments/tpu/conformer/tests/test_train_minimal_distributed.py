@@ -17,8 +17,6 @@ class TrainMinimalDistributedTest(
   @parameterized.named_parameters([
       dict(
           testcase_name="conformer_ddp",
-          model_name="conformer_tpu",
-          config_file="torchtitan/experiments/tpu/conformer/train_configs/conformer.toml",
           data_parallel_shard_degree=1,
           data_parallel_replicate_degree=-1,
           tensor_parallel_degree=1,
@@ -26,8 +24,6 @@ class TrainMinimalDistributedTest(
       ),
       dict(
           testcase_name="conformer_fsdp",
-          model_name="conformer_tpu",
-          config_file="torchtitan/experiments/tpu/conformer/train_configs/conformer.toml",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=None,
@@ -35,8 +31,6 @@ class TrainMinimalDistributedTest(
   ])
   def test_conformer_train_minimal(
       self,
-      model_name,
-      config_file,
       data_parallel_shard_degree,
       tensor_parallel_degree,
       data_parallel_replicate_degree=None,
@@ -46,11 +40,10 @@ class TrainMinimalDistributedTest(
     """Runs execution test specifically for Conformer's minimal trainer."""
 
     config_args = [
-        f"--model.name={model_name}",
-        f"--job.config_file={config_file}",
-        "--model.flavor=test",
+        "--module=torchtitan.experiments.tpu.conformer",
+        "--config=conformer_test",
         "--training.seq_len=128",  # Override to smaller length for test speed
-        "--training.dataset=random",
+        "--dataloader.dataset=random",
         "--training.steps=5",
         "--training.local_batch_size=4",
     ]

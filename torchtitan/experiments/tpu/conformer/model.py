@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
-from torchtitan.experiments.tpu.tpu_job_config import TPUJobConfig, TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.train_spec import BaseModelArgs
 from torchtitan.tools.logging import logger
@@ -24,16 +24,16 @@ class ConformerModelArgs(BaseModel.Config):
   use_splash: bool = False
   use_vmap_bwd: bool = False
 
-  def update_from_config(self, job_config, **kwargs):
-    # Update from job_config if needed
-    if hasattr(job_config, "training"):
-      self.max_seq_len = job_config.training.seq_len
-    if isinstance(job_config, (TPUJobConfig, TPUTrainerConfig)):
+  def update_from_config(self, train_config, **kwargs):
+    # Update from train_config if needed
+    if hasattr(train_config, "training"):
+      self.max_seq_len = train_config.training.seq_len
+    if isinstance(train_config, TPUTrainerConfig):
       self.use_splash = (
-          job_config.splash_attention_kernel.use_splash_attention_kernel
+          train_config.splash_attention_kernel.use_splash_attention_kernel
       )
       self.use_vmap_bwd = (
-          job_config.splash_attention_kernel.use_vmap_bwd
+          train_config.splash_attention_kernel.use_vmap_bwd
       )
 
   def get_nparams_and_flops(

@@ -18,7 +18,7 @@ class ConformerModelTest(absltest.TestCase):
 
     batch_size = 2
     seq_len = 16
-    inputs = torch.rand(batch_size, seq_len, args.hidden_dim)
+    inputs = torch.randint(0, args.vocab_size, (batch_size, seq_len), dtype=torch.long)
 
     logits = conformer_model(inputs)
 

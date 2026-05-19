@@ -28,7 +28,7 @@ class ParallelStrategy(enum.Enum):
 
 def _determine_parallel_strategy(
     parallel_dims: torchtitan.distributed.ParallelDims,
-    job_config: torchtitan.trainer.Trainer.Config | tpu_job_config.TPUJobConfig,
+    train_config: torchtitan.trainer.Trainer.Config | tpu_job_config.TPUTrainerConfig,
 ) -> ParallelStrategy:
   """Determine parallel strategy based on config."""
   fsdp_enabled = parallel_dims.fsdp_enabled
@@ -37,9 +37,9 @@ def _determine_parallel_strategy(
   use_simple = False
   amp = True
 
-  if isinstance(job_config, tpu_job_config.TPUJobConfig):
-    use_simple = job_config.tpu_config.use_simple_fsdp
-    amp = job_config.tpu_config.enable_amp
+  if isinstance(train_config, tpu_job_config.TPUTrainerConfig):
+    use_simple = train_config.tpu_config.use_simple_fsdp
+    amp = train_config.tpu_config.enable_amp
 
   if fsdp_enabled:
     return ParallelStrategy.SIMPLEFSDP if use_simple else ParallelStrategy.FSDP2
@@ -57,7 +57,7 @@ def _determine_parallel_strategy(
 def parallelize_conformer(
     model: nn.Module,
     parallel_dims: torchtitan.distributed.ParallelDims,
-    job_config: torchtitan.trainer.Trainer.Config | tpu_job_config.TPUJobConfig,
+    train_config: torchtitan.trainer.Trainer.Config | tpu_job_config.TPUTrainerConfig,
 ) -> nn.Module:
   """Apply parallelism and activation checkpointing to Conformer."""
 
@@ -65,10 +65,10 @@ def parallelize_conformer(
     raise RuntimeError("Tensor Parallelism is not supported for Conformer yet")
 
   # Apply activation checkpointing if enabled
-  if job_config.activation_checkpoint.mode != "none":
+  if train_config.activation_checkpoint.mode != "none":
     apply_ac(model)
 
-  strategy = _determine_parallel_strategy(parallel_dims, job_config)
+  strategy = _determine_parallel_strategy(parallel_dims, train_config)
   logging.logger.info(f"Using parallel strategy: {strategy}")
 
   if strategy == ParallelStrategy.NONE:
@@ -102,16 +102,16 @@ def parallelize_conformer(
     fsdp_config["mesh"] = dp_mesh
 
   enable_amp = True
-  if isinstance(job_config, tpu_job_config.TPUJobConfig):
-    enable_amp = job_config.tpu_config.enable_amp
+  if isinstance(train_config, tpu_job_config.TPUTrainerConfig):
+    enable_amp = train_config.tpu_config.enable_amp
 
   if enable_amp:
     fsdp_config["mp_policy"] = fsdp.MixedPrecisionPolicy(
         param_dtype=torchtitan.config.TORCH_DTYPE_MAP[
-            job_config.training.mixed_precision_param
+            train_config.training.mixed_precision_param
         ],
         reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[
-            job_config.training.mixed_precision_reduce
+            train_config.training.mixed_precision_reduce
         ],
     )
 
@@ -122,14 +122,14 @@ def parallelize_conformer(
 
   # Apply compilation if enabled
   model_compile_enabled = (
-      job_config.compile.enable and "model" in job_config.compile.components
+      train_config.compile.enable and "model" in train_config.compile.components
   )
   compile_mode = "layer"
-  if isinstance(job_config, tpu_job_config.TPUJobConfig):
-    compile_mode = job_config.tpu_config.compile_mode
+  if isinstance(train_config, tpu_job_config.TPUTrainerConfig):
+    compile_mode = train_config.tpu_config.compile_mode
 
   if model_compile_enabled:
-    model = apply_compile(model, job_config)
+    model = apply_compile(model, train_config)
 
   if strategy == ParallelStrategy.DDP:
     logging.logger.info("Applying Native DDP (replicate) to the model")
@@ -144,10 +144,10 @@ def parallelize_conformer(
     if enable_amp:
       mp_policy = simple_fsdp.MixedPrecisionPolicy(
           param_dtype=torchtitan.config.TORCH_DTYPE_MAP[
-              job_config.training.mixed_precision_param
+              train_config.training.mixed_precision_param
           ],
           reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[
-              job_config.training.mixed_precision_reduce
+              train_config.training.mixed_precision_reduce
           ],
       )
     model = simple_fsdp.data_parallel(
@@ -188,12 +188,12 @@ def parallelize_conformer(
 
 
 def apply_compile(
-    model: nn.Module, job_config: torchtitan.trainer.Trainer.Config
+    model: nn.Module, train_config: torchtitan.trainer.Trainer.Config
 ) -> nn.Module:
   """Apply torch.compile to layers or whole model."""
   compile_mode = "layer"
-  if isinstance(job_config, tpu_job_config.TPUJobConfig):
-    compile_mode = job_config.tpu_config.compile_mode
+  if isinstance(train_config, tpu_job_config.TPUTrainerConfig):
+    compile_mode = train_config.tpu_config.compile_mode
 
   if hasattr(model, "model"):
     encoder = model.model
@@ -212,7 +212,7 @@ def apply_compile(
       logging.logger.info("Applying torch.compile to Whole Model (via model.model).")
       model.model = torch.compile(
           encoder,
-          backend=job_config.compile.backend,
+          backend=train_config.compile.backend,
           fullgraph=True,
           dynamic=False,
       )
@@ -221,7 +221,7 @@ def apply_compile(
       logging.logger.info("Applying torch.compile to Whole Model.")
       return torch.compile(
           model,
-          backend=job_config.compile.backend,
+          backend=train_config.compile.backend,
           fullgraph=True,
           dynamic=False,
       )
@@ -230,7 +230,7 @@ def apply_compile(
     for layer_id, layer in layers.named_children():
       compiled = torch.compile(
           layer,
-          backend=job_config.compile.backend,
+          backend=train_config.compile.backend,
           fullgraph=True,
           dynamic=False,
       )

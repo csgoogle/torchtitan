@@ -3,9 +3,8 @@ r"""Conformer minimal training script using torchtitan infra.
 Example:
 torchrun --nproc_per_node=4 \
   -m torchtitan.experiments.tpu.conformer.train_minimal \
-  --job.config_file=torchtitan/experiments/tpu/conformer/train_configs/conformer.toml \
-  --model.name=conformer_tpu \
-  --model.flavor=test \
+  --module=torchtitan.experiments.tpu.conformer \
+  --config=conformer_test \
   --tpu_config.use_simple_fsdp \
   --tpu_config.compile_mode=layer \
   --metrics.log_freq=1 \
@@ -24,21 +23,18 @@ from torchtitan.components import metrics
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
-import torchtitan.trainer
 from torchtitan.distributed import utils as dist_utils
 import torchtitan.experiments.tpu.conformer  # trigger conformer_tpu model registration
 import torchtitan.experiments.tpu.gmain as gmain
 import torchtitan.experiments.tpu.model_annotator as model_annotator
-import torchtitan.experiments.tpu.tpu_job_config
+from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 import torchtitan.experiments.tpu.utils as tpu_utils
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.tools import utils
 import torchtitan.tools.logging
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
-JobConfig = torchtitan.trainer.Trainer.Config
 ParallelDims = torchtitan.distributed.ParallelDims
-TPUJobConfig = torchtitan.experiments.tpu.tpu_job_config.TPUJobConfig
 logger = torchtitan.tools.logging.logger
 
 
@@ -99,19 +95,19 @@ def train_step(
   return loss
 
 
-def build_random_dataloader(job_config, vocab_size, device):
-  local_batch_size = job_config.training.local_batch_size
-  seq_len = job_config.training.seq_len
+def build_random_dataloader(train_config, vocab_size, device):
+  local_batch_size = train_config.training.local_batch_size
+  seq_len = train_config.training.seq_len
   # Inputs should be token IDs for the embedding layer
   x = torch.randint(0, vocab_size, (local_batch_size, seq_len), device=device)
 
   use_ctc = (
-      hasattr(job_config, "conformer") and job_config.conformer.use_ctc_loss
+      hasattr(train_config, "conformer") and train_config.conformer.use_ctc_loss
   )
 
   if use_ctc:
     # Make targets shorter for CTC loss (input length must be >= target length)
-    target_len = getattr(job_config.conformer, "ctc_loss_target_len", 30)
+    target_len = getattr(train_config.conformer, "ctc_loss_target_len", 30)
     targets = torch.randint(
         1, vocab_size, (local_batch_size, target_len), device=device
     )
@@ -124,13 +120,13 @@ def build_random_dataloader(job_config, vocab_size, device):
     yield {"input": x}, targets
 
 
-def start_trainer(job_config: JobConfig) -> None:
+def start_trainer(train_config: TPUTrainerConfig) -> None:
   rank = int(os.environ.get("RANK", 0))
   world_size = int(os.environ.get("WORLD_SIZE", 1))
 
   if rank == 0:
     torchtitan.tools.logging.init_logger()
-    job_config.maybe_log()
+    train_config.maybe_log()
 
   device = tpu_utils.get_device()
 
@@ -149,33 +145,33 @@ def start_trainer(job_config: JobConfig) -> None:
 
   if world_size > 1:
     dist_utils.init_distributed(
-        job_config.comm,
-        enable_cpu_backend=job_config.training.enable_cpu_offload,
-        base_folder=job_config.dump_folder,
+        train_config.comm,
+        enable_cpu_backend=train_config.training.enable_cpu_offload,
+        base_folder=train_config.dump_folder,
     )
     torch.distributed.barrier()
 
-  dp_replicate = job_config.parallelism.data_parallel_replicate_degree
-  dp_shard = job_config.parallelism.data_parallel_shard_degree
+  dp_replicate = train_config.parallelism.data_parallel_replicate_degree
+  dp_shard = train_config.parallelism.data_parallel_shard_degree
 
   if dp_replicate == -1:
     dp_shard = 1
-    cp = job_config.parallelism.context_parallel_degree
-    tp = job_config.parallelism.tensor_parallel_degree
-    pp = job_config.parallelism.pipeline_parallel_degree
+    cp = train_config.parallelism.context_parallel_degree
+    tp = train_config.parallelism.tensor_parallel_degree
+    pp = train_config.parallelism.pipeline_parallel_degree
     dp_replicate = world_size // (dp_shard * cp * tp * pp)
 
   parallel_dims = ParallelDims(
       dp_shard=dp_shard,
       dp_replicate=dp_replicate,
-      cp=job_config.parallelism.context_parallel_degree,
-      tp=job_config.parallelism.tensor_parallel_degree,
-      pp=job_config.parallelism.pipeline_parallel_degree,
-      ep=job_config.parallelism.expert_parallel_degree,
+      cp=train_config.parallelism.context_parallel_degree,
+      tp=train_config.parallelism.tensor_parallel_degree,
+      pp=train_config.parallelism.pipeline_parallel_degree,
+      ep=train_config.parallelism.expert_parallel_degree,
       world_size=world_size,
   )
   logger.info("parallel_dims: %s", parallel_dims)
-  job_config.maybe_log()
+  train_config.maybe_log()
 
   batch_degree, batch_rank = 1, 0
   if world_size > 1:
@@ -188,7 +184,7 @@ def start_trainer(job_config: JobConfig) -> None:
     else:
       batch_degree, batch_rank = 1, 0
 
-  seed = job_config.debug.seed or 42
+  seed = train_config.debug.seed or 42
   if utils.get_device_type() == "tpu":
     torch.manual_seed(seed)
     logger.info("Set manual seed to %d", seed)
@@ -197,37 +193,38 @@ def start_trainer(job_config: JobConfig) -> None:
       dist_utils.set_determinism(
           parallel_dims,
           device,
-          job_config.debug,
+          train_config.debug,
           distinct_seed_mesh_dims=["pp"],
       )
 
   use_graph_split = (
-      isinstance(job_config, TPUJobConfig)
-      and job_config.tpu_config.use_graph_split
+      isinstance(train_config, TPUTrainerConfig)
+      and train_config.tpu_config.use_graph_split
   )
-  log_freq = job_config.metrics.log_freq
+  log_freq = train_config.metrics.log_freq
 
-  model_spec = job_config.model_spec
+  assert train_config.model_spec is not None
+  model_spec = train_config.model_spec
   model_args = model_spec.model
-  model_args.update_from_config(job_config)
+  model_args.update_from_config(train_config=train_config)
 
   tokenizer = typing.cast(
       torchtitan.components.tokenizer.HuggingFaceTokenizer,
-      job_config.tokenizer.build(tokenizer_path=job_config.hf_assets_path)
+      train_config.tokenizer.build(tokenizer_path=train_config.hf_assets_path)
   )
 
-  if job_config.dataloader.dataset == "random":
+  if train_config.dataloader.dataset == "random":
     logger.info("Using random data loader instead of real dataset.")
     dataloader = build_random_dataloader(
-        job_config, model_args.vocab_size, device
+        train_config, model_args.vocab_size, device  # pytype: disable=attribute-error
     )
   else:
-    dataloader = job_config.dataloader.build(
+    dataloader = train_config.dataloader.build(
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=tokenizer,
-        seq_len=job_config.training.seq_len,
-        local_batch_size=job_config.training.local_batch_size,
+        seq_len=train_config.training.seq_len,
+        local_batch_size=train_config.training.local_batch_size,
     )
 
   logger.info(
@@ -237,22 +234,22 @@ def start_trainer(job_config: JobConfig) -> None:
       model_args,
   )
 
-  metrics_processor = job_config.metrics.build(
+  metrics_processor = train_config.metrics.build(
       parallel_dims=parallel_dims,
-      dump_folder=job_config.dump_folder,
-      pp_schedule=job_config.parallelism.pipeline_parallel_schedule,
-      config_dict=job_config.to_dict(),
+      dump_folder=train_config.dump_folder,
+      pp_schedule=train_config.parallelism.pipeline_parallel_schedule,
+      config_dict=train_config.to_dict(),
       has_quantization=False,
   )
 
   with (
       torch.device("meta"),
-      utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
+      utils.set_default_dtype(TORCH_DTYPE_MAP[train_config.training.dtype]),
   ):
     model = model_args.build()
 
   model_param_count, _ = model_args.get_nparams_and_flops(
-      model, job_config.training.seq_len
+      model, train_config.training.seq_len
   )
   logger.info(
       "Model %s %s size: %d total parameters",
@@ -261,15 +258,13 @@ def start_trainer(job_config: JobConfig) -> None:
       model_param_count,
   )
 
-  if job_config.training.enable_cpu_offload:
+  if train_config.training.enable_cpu_offload:
     logger.info("Materializing model on CPU for CPU offloading")
     model = model.to_empty(device="cpu")
 
   use_simple_fsdp = (
-      isinstance(
-          job_config, torchtitan.experiments.tpu.tpu_job_config.TPUJobConfig
-      )
-      and job_config.tpu_config.use_simple_fsdp
+      isinstance(train_config, TPUTrainerConfig)
+      and train_config.tpu_config.use_simple_fsdp
   )
 
   if use_simple_fsdp:
@@ -281,18 +276,18 @@ def start_trainer(job_config: JobConfig) -> None:
         "Moving model to device %s before parallelization (SimpleFSDP flow).",
         device,
     )
-    if not job_config.training.enable_cpu_offload:
+    if not train_config.training.enable_cpu_offload:
       model = model.to_empty(device=device)
     with torch.no_grad():
       model.init_weights()
 
   model_compile_enabled = (
-      job_config.compile.enable and "model" in job_config.compile.components
+      train_config.compile.enable and "model" in train_config.compile.components
   )
   if world_size > 1 or model_compile_enabled:
     if model_spec.parallelize_fn is not None:
       compiled_model = model_spec.parallelize_fn(
-          model, parallel_dims, job_config
+          model, parallel_dims, train_config
       )
       if compiled_model is not None:
         model = compiled_model
@@ -307,14 +302,14 @@ def start_trainer(job_config: JobConfig) -> None:
         "Moving model to device %s after parallelization (Standard flow).",
         device,
     )
-    if not job_config.training.enable_cpu_offload:
+    if not train_config.training.enable_cpu_offload:
       model = model.to_empty(device=device)
     with torch.no_grad():
       model.init_weights()
 
   loss_fn = None  # Handled in train_step
 
-  if not job_config.compile.enable and job_config.profiler.enable_profiling:
+  if not train_config.compile.enable and train_config.profiler.enable_profiling:
     model_annotator.wrap_model(model)
 
   trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -324,28 +319,28 @@ def start_trainer(job_config: JobConfig) -> None:
       model_param_count,
   )
 
-  if job_config.optimizer.implementation == "fused":
+  if train_config.optimizer.implementation == "fused":
     logger.warning(
         "Fused optimizer is not supported on TPU, changing to foreach."
     )
-    job_config.optimizer.implementation = "foreach"
+    train_config.optimizer.implementation = "foreach"
 
-  foreach = job_config.optimizer.implementation == "foreach"
-  fused = job_config.optimizer.implementation == "fused"
+  foreach = train_config.optimizer.implementation == "foreach"
+  fused = train_config.optimizer.implementation == "fused"
 
   optimizer = torch.optim.AdamW(
       trainable_params,
-      lr=job_config.optimizer.lr,
-      eps=job_config.optimizer.eps,
+      lr=train_config.optimizer.lr,
+      eps=train_config.optimizer.eps,
       foreach=foreach,
       fused=fused,
   )
 
-  if job_config.compile.enable and "optimizer" in job_config.compile.components:
+  if train_config.compile.enable and "optimizer" in train_config.compile.components:
     logger.info("Applying torch.compile to optimizer.step")
     optimizer.step = torch.compile(
         optimizer.step,
-        backend=job_config.compile.backend,
+        backend=train_config.compile.backend,
         fullgraph=True,
         dynamic=False,
     )
@@ -353,14 +348,14 @@ def start_trainer(job_config: JobConfig) -> None:
   if torch.distributed.is_initialized():
     torch.distributed.barrier()
 
-  steps = job_config.training.steps
-  local_batch_size = job_config.training.local_batch_size
-  seq_len = job_config.training.seq_len
+  steps = train_config.training.steps
+  local_batch_size = train_config.training.local_batch_size
+  seq_len = train_config.training.seq_len
 
   (
       model_param_count,
       num_flops_per_token,
-  ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
+  ) = model_args.get_nparams_and_flops(model, train_config.training.seq_len)
   metrics_processor.num_flops_per_token = num_flops_per_token
 
   device_name = tpu_utils.get_device_module().get_device_name()
@@ -377,20 +372,20 @@ def start_trainer(job_config: JobConfig) -> None:
   accumulated_time = 0.0
   accumulated_steps = 0
 
-  warmup_steps = job_config.lr_scheduler.warmup_steps
+  warmup_steps = train_config.lr_scheduler.warmup_steps
 
   import functools
   from torchtitan.experiments.tpu import profiler_workaround
 
   maybe_enable_profiling = functools.partial(
-      profiler_workaround.maybe_enable_profiling, job_config=job_config
+      profiler_workaround.maybe_enable_profiling, job_config=train_config
   )
 
   ntokens_seen = 0
   with maybe_enable_profiling(
-      job_config.profiler,
+      train_config.profiler,
       global_step=0,
-      base_folder=job_config.dump_folder,
+      base_folder=train_config.dump_folder,
   ) as profiler:
     data_iterator = iter(dataloader)
     for step in range(steps):
@@ -404,11 +399,11 @@ def start_trainer(job_config: JobConfig) -> None:
       metrics_processor.data_loading_times.append(time.perf_counter() - t0)
 
       if parallel_dims.fsdp_enabled or (
-          isinstance(job_config, TPUJobConfig)
-          and job_config.tpu_config.use_simple_fsdp
+          isinstance(train_config, TPUTrainerConfig)
+          and train_config.tpu_config.use_simple_fsdp
       ):
         compute_dtype = TORCH_DTYPE_MAP[
-            job_config.training.mixed_precision_param
+            train_config.training.mixed_precision_param
         ]
         inputs = batch[0]["input"].to(device, dtype=compute_dtype)
       else:
@@ -419,8 +414,8 @@ def start_trainer(job_config: JobConfig) -> None:
 
       with jax_profiler.TraceAnnotation("train", step_num=step):
         use_ctc = (
-            hasattr(job_config, "conformer")
-            and job_config.conformer.use_ctc_loss
+            hasattr(train_config, "conformer")
+            and train_config.conformer.use_ctc_loss
         )
         loss = train_step(
             model,
