@@ -56,6 +56,9 @@ class redactedConfig:
 @dataclasses.dataclass
 class ConformerConfig:
   use_ctc_loss: bool = False
+  # Target sequence length for synthetic data generation when CTC loss is enabled.
+  # Input sequence length must be >= target sequence length.
+  ctc_loss_target_len: int = 30
 
 
 @dataclasses.dataclass
@@ -68,7 +71,6 @@ class Qwen3Config:
 class FluxConfig:
     precomputed_dataset_path: str | None = None
     """Path to the precomputed embeddings"""
-
 
 
 @dataclasses.dataclass

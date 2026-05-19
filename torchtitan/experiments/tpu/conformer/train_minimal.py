@@ -1,11 +1,15 @@
 r"""Conformer minimal training script using torchtitan infra.
 
 Example:
-  torchrun --nproc_per_node=4 \
+torchrun --nproc_per_node=4 \
   -m torchtitan.experiments.tpu.conformer.train_minimal \
   --job.config_file=torchtitan/experiments/tpu/conformer/train_configs/conformer.toml \
   --model.name=conformer_tpu \
-  --model.flavor=test
+  --model.flavor=test \
+  --tpu_config.use_simple_fsdp \
+  --tpu_config.compile_mode=layer \
+  --metrics.log_freq=1 \
+  --compile.enable
 """
 
 import os
@@ -68,8 +72,16 @@ def train_step(
       log_probs = torch.nn.functional.log_softmax(logits, dim=-1).transpose(
           0, 1
       )
-      criterion = torch.nn.CTCLoss()
-      loss = criterion(log_probs, targets.to(torch.long), output_lengths, target_lengths)
+      # TODO: b/513607161 - change to torch.nn.CTCLoss when ready.
+      loss, _ = torch.ops.aten._ctc_loss.Tensor(
+          log_probs,
+          targets.to(torch.long),
+          output_lengths,
+          target_lengths,
+          blank=0,
+          zero_infinity=False,
+      )
+      loss = loss.sum()
     else:
       loss = F.cross_entropy(
           logits.reshape(-1, logits.shape[-1]),
@@ -87,16 +99,27 @@ def train_step(
   return loss
 
 
-def build_random_dataloader(job_config, hidden_dim, vocab_size, device):
+def build_random_dataloader(job_config, vocab_size, device):
   local_batch_size = job_config.training.local_batch_size
   seq_len = job_config.training.seq_len
-  dtype = TORCH_DTYPE_MAP[job_config.training.dtype]
-  x = torch.rand(
-      local_batch_size, seq_len, hidden_dim, device=device, dtype=dtype
+  # Inputs should be token IDs for the embedding layer
+  x = torch.randint(0, vocab_size, (local_batch_size, seq_len), device=device)
+
+  use_ctc = (
+      hasattr(job_config, "conformer") and job_config.conformer.use_ctc_loss
   )
-  targets = torch.randint(
-      0, vocab_size, (local_batch_size, seq_len), device=device
-  )
+
+  if use_ctc:
+    # Make targets shorter for CTC loss (input length must be >= target length)
+    target_len = getattr(job_config.conformer, "ctc_loss_target_len", 30)
+    targets = torch.randint(
+        1, vocab_size, (local_batch_size, target_len), device=device
+    )
+  else:
+    targets = torch.randint(
+        0, vocab_size, (local_batch_size, seq_len), device=device
+    )
+
   while True:
     yield {"input": x}, targets
 
@@ -196,7 +219,7 @@ def start_trainer(job_config: JobConfig) -> None:
   if job_config.dataloader.dataset == "random":
     logger.info("Using random data loader instead of real dataset.")
     dataloader = build_random_dataloader(
-        job_config, model_args.hidden_dim, model_args.vocab_size, device
+        job_config, model_args.vocab_size, device
     )
   else:
     dataloader = job_config.dataloader.build(
@@ -396,7 +419,7 @@ def start_trainer(job_config: JobConfig) -> None:
 
       with jax_profiler.TraceAnnotation("train", step_num=step):
         use_ctc = (
-            isinstance(job_config, TPUJobConfig)
+            hasattr(job_config, "conformer")
             and job_config.conformer.use_ctc_loss
         )
         loss = train_step(

@@ -20,6 +20,7 @@ conformer_args = {
     )
 }
 
+
 def _conformer_model_spec(flavor: str) -> ModelSpec:
   model_config = conformer_args[flavor]
   return ModelSpec(
@@ -31,6 +32,7 @@ def _conformer_model_spec(flavor: str) -> ModelSpec:
       post_optimizer_build_fn=None,
       state_dict_adapter=None,
   )
+
 
 def conformer_test() -> TPUTrainerConfig:
   """Conformer test model configuration for TPU."""
@@ -54,14 +56,14 @@ def conformer_test() -> TPUTrainerConfig:
           dtype="bfloat16",
       ),
       parallelism=TPUTrainerConfig().parallelism.__class__(
-          data_parallel_shard_degree=8,
+          data_parallel_shard_degree=-1,
           data_parallel_replicate_degree=1,
       ),
       activation_checkpoint=TPUTrainerConfig().activation_checkpoint.__class__(
           mode="full",
       ),
       compile=TPUTrainerConfig().compile.__class__(
-          enable=True,
+          enable=False,
           backend="tpu",
           components=["model"],
       ),
@@ -71,5 +73,8 @@ def conformer_test() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=TPUTrainerConfig().splash_attention_kernel.__class__(
           use_splash_attention_kernel=True,
+      ),
+      conformer=TPUTrainerConfig().conformer.__class__(
+          use_ctc_loss=True,
       ),
   )
