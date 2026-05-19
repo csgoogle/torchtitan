@@ -257,12 +257,17 @@ class TrainerMinimal:
       total_tokens = 0
       total_time = 0.0
 
+      import functools
+      from torchtitan.experiments.tpu import profiler_workaround
+      maybe_enable_profiling = functools.partial(
+          profiler_workaround.maybe_enable_profiling, job_config=self.job_config
+      )
       for step in range(self.job_config.training.steps):
-          with torchtitan.tools.profiling.maybe_enable_profiling(
-              self.job_config.profiling,
-              global_step=step,
-              base_folder=self.job_config.job.dump_folder,
-          ) as torch_profiler:
+        with maybe_enable_profiling(
+            self.job_config.profiler,
+            global_step=step,
+            base_folder=self.job_config.dump_folder,
+        ) as torch_profiler:
           step_start_time = time.time()
           self.optimizers.zero_grad()
           tokens, labels = get_batch()
