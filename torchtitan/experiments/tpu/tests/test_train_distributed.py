@@ -347,6 +347,7 @@ class TrainDistributedTest(
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
+              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
       # TODO(abrauckmann): fill_indices is not in OSS code, update this test once we decide to add it back or remove it.

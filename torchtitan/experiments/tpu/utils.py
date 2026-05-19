@@ -159,14 +159,6 @@ def _get_tpu_module() -> torch.device:
     pass
   setattr(_device_module, "set_device", set_device)
 
-  def current_device():
-    # https://docs.pytorch.org/docs/2.8/generated/torch.cuda.current_device.html
-    # https://docs.pytorch.org/docs/stable/generated/torch.cpu.current_device.html
-    # Need to return index
-    if dist.is_initialized():
-      return dist.get_rank()
-    return 0
-  setattr(_device_module, "current_device", current_device)
 
   def get_device_properties(device=None):
     # properties = torch.cuda._CudaDeviceProperties()
