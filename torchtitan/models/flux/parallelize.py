@@ -187,13 +187,15 @@ def apply_ac(model: nn.Module, ac_config):
 
     # pyrefly: ignore [missing-attribute]
     for layer_id, block in model.double_blocks.named_children():
-        block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
+        # TODO(b/514461185): Set preserve_rng_state=True once bug is fixed.
+        block = ptd_checkpoint_wrapper(block, preserve_rng_state=ac_config.preserve_rng_state)
         # pyrefly: ignore [missing-attribute]
         model.double_blocks.register_module(layer_id, block)
 
     # pyrefly: ignore [missing-attribute]
     for layer_id, block in model.single_blocks.named_children():
-        block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
+        # TODO(b/514461185): Set preserve_rng_state=True once bug is fixed.
+        block = ptd_checkpoint_wrapper(block, preserve_rng_state=ac_config.preserve_rng_state)
         # pyrefly: ignore [missing-attribute]
         model.single_blocks.register_module(layer_id, block)
 
