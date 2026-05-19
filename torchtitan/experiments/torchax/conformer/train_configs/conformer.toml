@@ -1,0 +1,74 @@
+[job]
+dump_folder = "./dump/conformer"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 19
+profiler_active = 3
+enable_memory_snapshot = false
+save_memory_snapshot_folder = "memory_snapshot"
+
+
+[training]
+dataset = "random"
+steps = 100
+local_batch_size = 16
+seq_len = 512
+dtype = "bfloat16"
+mixed_precision_param = "bfloat16"
+
+[model]
+name = "conformer"
+flavor = "test"
+hf_assets_path = "tests/assets/tokenizer"
+
+[optimizer]
+lr = 0.0001
+implementation = "foreach"
+
+[lr_scheduler]
+warmup_steps = 5
+
+[metrics]
+log_freq = 5
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[tpu_config]
+eager_mode = "DEFER_AND_FUSE"
+use_simple_fsdp = false
+use_internal_xprof = false
+
+[conformer]
+use_ctc_loss = true
+
+[activation_checkpoint]
+mode = "full"
+
+[compile]
+enable = false
+backend = "tpu"
+components = "model"
+
+[splash_attention_kernel]
+use_splash_attention_kernel = true
+use_vmap_bwd = true
+sa_block_q = 1024
+sa_block_kv = 1024
+sa_block_dkv = 1024
+sa_block_kv_compute = 1024
+sa_block_q_dkv = 1024
+sa_block_kv_dkv = 1024
+sa_block_kv_dkv_compute = 1024
+sa_block_q_dq = 1024
+sa_block_kv_dq = 1024
+
+[torchax_config]
+use_torchax = true
+use_scan = false
