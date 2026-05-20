@@ -178,8 +178,6 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
         "redacted_tpu",
         "redacted",
         "redacted_tpu",
-        "flux",
-        "flux_tpu",
     ):
       parallel_dims = kwargs.get("parallel_dims")
       return orig_parallelize(model, parallel_dims, train_config)
