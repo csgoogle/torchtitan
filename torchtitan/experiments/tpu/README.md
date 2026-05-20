@@ -133,21 +133,13 @@ Only small models can run on a single host. The following example demonstrates L
 
 ```bash
 torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train  \
-    --job.config_file=./torchtitan/experiments/tpu/llama3/train_configs/llama3.2_1b.toml \
-    --model.name=llama3_tpu \
-    --model.hf_assets_path=assets/hf/Llama-3.2-1B/ \
-    --training.seq_len=128 \
-    --training.steps=10 \
-    --training.dtype=bfloat16 \
-    --training.mixed_precision_param=bfloat16
-
+    --module=torchtitan.experiments.tpu.llama3 \
+    --config=llama3_1b  \
+    --splash_attention_kernel.use_splash_attention_kernel \
+    --training.local_batch_size=4 \
+    --training.seq_len=2048 \
+    --training.steps=10 
 ```
-
-**Notes:**
-
-* Currently, only the `llama3_tpu` configuration is supported.
-* You must limit `seq_len` to 128 at this time; support for the full context length is coming soon.
-* Memory and Model Flops Utilization (MFU) metrics might be inaccurate in the current version.
 
 ---
 
