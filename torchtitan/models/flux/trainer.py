@@ -320,35 +320,33 @@ class FluxTrainer(Trainer):
         if not self.metrics_processor.should_log(self.step):
             return
 
-        # TODO(abrauckmann): Re-enable. This is causing OOM errors currently.
-        # if parallel_dims.dp_cp_enabled:
-        #     loss = loss.detach()
-        #     loss_mesh = parallel_dims.get_optional_mesh("loss")
+        if parallel_dims.dp_cp_enabled:
+            loss = loss.detach()
+            loss_mesh = parallel_dims.get_optional_mesh("loss")
 
-        #     # NOTE: the loss returned by train
-        #     global_avg_loss, global_max_loss, global_ntokens_seen = (
-        #         dist_utils.dist_sum(loss, loss_mesh),
-        #         dist_utils.dist_max(loss, loss_mesh),
-        #         dist_utils.dist_sum(
-        #             torch.tensor(
-        #                 self.ntokens_seen, dtype=torch.int64, device=self.device
-        #             ),
-        #             loss_mesh,
-        #         ),
-        #     )
-        # else:
-        #     global_avg_loss = global_max_loss = float(loss.detach().item())
-        #     global_ntokens_seen = self.ntokens_seen
+            # NOTE: the loss returned by train
+            global_avg_loss, global_max_loss, global_ntokens_seen = (
+                dist_utils.dist_sum(loss, loss_mesh),
+                dist_utils.dist_max(loss, loss_mesh),
+                dist_utils.dist_sum(
+                    torch.tensor(
+                        self.ntokens_seen, dtype=torch.int64, device=self.device
+                    ),
+                    loss_mesh,
+                ),
+            )
+        else:
+            global_avg_loss = global_max_loss = float(loss.detach().item())
+            global_ntokens_seen = self.ntokens_seen
 
-        # TODO(abrauckmann): Re-enable metrics. This is causing OOM errors currently.
         extra_metrics = {
-            "n_tokens_seen": 0, #global_ntokens_seen,
+            "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
         self.metrics_processor.log(
             self.step,
-            0, #global_avg_loss,
-            0, #global_max_loss,
-            0, #float(grad_norm.item()),
+            global_avg_loss,
+            global_max_loss,
+            float(grad_norm.item()),
             extra_metrics=extra_metrics,
         )
