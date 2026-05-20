@@ -7,30 +7,6 @@ import torch.nn.functional as F
 from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.tools.logging import logger
 
-# TODO(tbajpai): check that patches/workarounds are being properly applied.
-
-def attention_sdpa_forward_dtensor_workaround(sdpa_backends, q, k, v, scale=None, is_causal=True, enable_gqa=False):
-    """
-    Unwraps DTensor to prevent SDPA sharding propogation errors (b/482035664)
-    Used in torchtitan.models.attention.ScaledDotProductAttentionWrapper
-    """
-    # get device metadata
-    mesh = q.device_mesh
-    placements = q.placements
-
-    # only unwrap if not already local from previous ops
-    q_in = q.to_local()
-    k_in = k.to_local() if isinstance(k, torch.distributed.tensor.DTensor) else k
-    v_in = v.to_local() if isinstance(v, torch.distributed.tensor.DTensor) else v
-
-    with sdpa_kernel(sdpa_backends, set_priority=True):
-        output_local = F.scaled_dot_product_attention(
-            q_in, k_in, v_in, scale=scale, is_causal=is_causal, enable_gqa=enable_gqa
-        )
-
-    # rewrap to original sharding
-    return torch.distributed.tensor.DTensor.from_local(output_local, mesh, placements)
-
 
 def use_splash_attention_patch(
     model: nn.Module,
@@ -58,19 +34,21 @@ def use_splash_attention_patch(
 
   def _splash_forward(
       self, q, k, v, *, scale=None, enable_gqa=False, is_causal=True):
-    """Replace ScaledDotProductAttentionWrapper.forward with splash_sdpa.
+    """Replace ScaledDotProductAttention.forward with splash_sdpa.
 
     Reads ``sliding_window_size`` from the patched module if set; otherwise
     behaves as before (causal or full mask depending on ``is_causal``). Most
     torchtitan wrappers don't expose this attribute → defaults to None.
     """
 
-    # Prevent torch.compile failures by ensuring tensors are contiguous for the
+    # TorchTitan passes tensors as (B, S, H, D). However, the splash_sdpa Pallas kernel
+    # expects (B, H, S, D). We transpose them here to match the kernel's expected layout.
+    # We also prevent torch.compile failures by ensuring tensors are contiguous for the
     # custom Pallas kernel, which doesn't handle arbitrary strides. This is a
     # no-op in eager mode if the tensors are already contiguous.
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
 
     local_window_size = getattr(self, "sliding_window_size", None)
 
@@ -89,7 +67,7 @@ def use_splash_attention_patch(
         k_layout=k_layout,
         v_layout=v_layout,
     )
-    return splash_sdpa(
+    out = splash_sdpa(
         q,
         k,
         v,
@@ -99,17 +77,19 @@ def use_splash_attention_patch(
         enable_gqa=enable_gqa,
         **kwargs,
     )
+    # Transpose back to (B, S, H, D) so the rest of the TorchTitan model receives its expected format
+    return out.transpose(1, 2)
 
   def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
     """Replaces [redacted]'s native SDPA with splash_sdpa.
 
     This function replaces ScaledDotProductAttention._sdpa_native_torch with
-    `splash_sdpa`. [redacted]'s attention layer requires special handling because
-    unlike torchtitan's wrapper which works with shape (B, H, S, D),
-    it expects inputs of shape (B, S, H, D) and handles GQA by tiling
-    k/v heads before SDPA. This wrapper mimics [redacted]'s GQA handling,
-    transposes inputs to (B, H, S, D) for splash_sdpa, and transposes
-    the output back to (B, S, H, D).
+    `splash_sdpa`. Like TorchTitan's wrapper, [redacted] operates on inputs of shape
+    (B, S, H, D) and requires transposing to (B, H, S, D) for splash_sdpa.
+    However, [redacted] requires special handling because it handles GQA by tiling
+    k/v heads before invoking SDPA. This wrapper aligns with [redacted]'s GQA
+    mechanics, transposes inputs for splash_sdpa, and transposes the output
+    back to (B, S, H, D).
 
     For mixed local/global attention models (e.g. REDACTED PT MoE with
     ``attention_layer_pattern=[local_rope, local_rope, local_rope, global_nope]``
@@ -179,21 +159,28 @@ def use_splash_attention_patch(
   _causal = 0
   for _, module in model.named_modules():
     cls_name = type(module).__name__
-    if "ScaledDotProductAttentionWrapper" in cls_name:
-      module.forward = types.MethodType(_splash_forward, module)
-      _patched += 1
-    elif cls_name == "ScaledDotProductAttention":
-      module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
+    if cls_name == "ScaledDotProductAttention":
+      if "[redacted]" in type(module).__module__:
+        module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
+      else:
+        module.forward = types.MethodType(_splash_forward, module)
       _patched += 1
       if getattr(module, "sliding_window_size", None) is not None:
         _windowed += 1
       else:
         _causal += 1
 
-  logger.info(
-      "Splash attention ENABLED: patched %d attention modules "
-      "(causal=%d, sliding-window=%d)",
-      _patched, _causal, _windowed)
+  if _patched == 0:
+    raise ValueError(
+        "Splash attention patch was requested but NO matching attention "
+        "modules (ScaledDotProductAttention) were found in the model."
+    )
+  else:
+    logger.info(
+        "Splash attention ENABLED: patched %d attention modules "
+        "(causal=%d, sliding-window=%d)",
+        _patched, _causal, _windowed,
+    )
 
 
 class PallasLossLinear(nn.Module):
