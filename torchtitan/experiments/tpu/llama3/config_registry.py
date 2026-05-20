@@ -132,7 +132,7 @@ def llama3_8b() -> TPUTrainerConfig:
           dataset="c4_test",
       ),
       metrics=MetricsProcessor.Config(log_freq=5),
-      parallelism=ParallelismConfig(),
+      parallelism=ParallelismConfig(use_simple_fsdp=True),
       checkpoint=CheckpointManager.Config(
           enable=False,
           interval=500,
