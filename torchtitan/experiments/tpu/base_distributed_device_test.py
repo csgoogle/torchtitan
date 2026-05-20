@@ -650,7 +650,6 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       start_trainer: Callable[
           [
               torchtitan.trainer.Trainer.Config
-              | tpu_job_config_module.TPUJobConfig
               | tpu_job_config_module.TPUTrainerConfig,
           ],
           Any,

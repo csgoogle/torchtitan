@@ -115,16 +115,16 @@ class DeepSeekV3ModelArgs(BaseModelArgs):
     self.moe_impl = job_config.parallelism.expert_parallel_comm_backend
 
     # Lazy import to avoid circular dependencies.
-    from torchtitan.experiments.tpu.tpu_job_config import TPUJobConfig
+    from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
     # Check if we are running a TPU Job
-    if isinstance(job_config, TPUJobConfig):
-      # RoPE workaround enabled by defaul in __post_init__, revert if disabled in TPUJobConfig
+    if isinstance(job_config, TPUTrainerConfig):
+      # RoPE workaround enabled by default in __post_init__, revert if disabled in TPUTrainerConfig
       if not job_config.tpu_config.apply_rope_complex_workaround:
         from torchtitan.experiments.tpu.deepseek_v3.model import workarounds
 
         logger.info(
-                    "TPUJobConfig requested disabling TPU RoPE workaround. Reverting patch."
+                    "TPUTrainerConfig requested disabling TPU RoPE workaround. Reverting patch."
                 )
         workarounds.revert_patch()
 

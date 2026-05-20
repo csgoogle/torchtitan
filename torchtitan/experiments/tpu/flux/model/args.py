@@ -32,10 +32,10 @@ class FluxModelArgs(BaseModelArgs):
       self, job_config: Configurable.Config, **kwargs
   ) -> None:
     # Lazy import to avoid circular dependencies.
-    from torchtitan.experiments.tpu.tpu_job_config import TPUJobConfig
+    from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
     # Check if we are running a TPU Job
-    if isinstance(job_config, TPUJobConfig):
-      logger.info("TPUJobConfig detected for Flux.")
+    if isinstance(job_config, TPUTrainerConfig):
+      logger.info("TPUTrainerConfig detected for Flux.")
       pass
 
   def get_nparams_and_flops(

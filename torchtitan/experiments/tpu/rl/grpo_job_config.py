@@ -43,7 +43,7 @@ class GRPOTrainingConfig(TrainingConfig):
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
-class GRPOJobConfig(torchtitan.experiments.tpu.tpu_job_config.TPUJobConfig):
+class GRPOJobConfig(torchtitan.experiments.tpu.tpu_job_config.TPUTrainerConfig):
   grpo: GRPOConfig = dataclasses.field(default_factory=GRPOConfig)
   sampler: SamplerConfig = dataclasses.field(default_factory=SamplerConfig)
   reference: ReferenceConfig = dataclasses.field(

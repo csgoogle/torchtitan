@@ -173,10 +173,6 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     )
 
 
-# TODO(tbajpai) remove after cleaning up type annotations throughout
-@dataclasses.dataclass(kw_only=True, slots=True)
-class TPUJobConfig(BaseTPUTrainerConfig):
-  tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)

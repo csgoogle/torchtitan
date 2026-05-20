@@ -15,7 +15,7 @@ import torchtitan.tools.logging as torchtitan_logging
 def pallas_cross_entropy_loss(
     pred: torch.Tensor,
     labels: torch.Tensor,
-    job_config: tpu_job_config_module.TPUJobConfig | None = None,
+    job_config: tpu_job_config_module.TPUTrainerConfig | None = None,
 ) -> torch.Tensor:
   """Pallas cross entropy loss with fallback to XLA for unsupported shapes."""
   if isinstance(pred, tuple) and len(pred) == 2:
@@ -62,7 +62,7 @@ def pallas_cross_entropy_loss(
 
 def build_cross_entropy_loss(
     job_config: (
-        torchtitan.trainer.Trainer.Config | tpu_job_config_module.TPUJobConfig
+        torchtitan.trainer.Trainer.Config | tpu_job_config_module.TPUTrainerConfig
     ),
     **kwargs
 ):
