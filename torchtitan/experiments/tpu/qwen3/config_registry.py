@@ -20,6 +20,9 @@ from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.models.qwen3.config_registry import model_registry
+from torchtitan.experiments.tpu.qwen3 import qwen3_configs
+from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 
 
 def qwen3_debugmodel() -> TPUTrainerConfig:
@@ -62,3 +65,25 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
           steps=10,
       ),
   )
+
+
+def qwen3_moe_testmodel() -> TPUTrainerConfig:
+  """Qwen3 MoE test model configuration for TPU."""
+  cfg = qwen3_debugmodel()
+  config = qwen3_configs["testmodel_moe"]
+  cfg.model_spec = ModelSpec(
+      name="qwen3_tpu",
+      flavor="testmodel_moe",
+      model=config,
+      parallelize_fn=tpu_parallelize_qwen3,
+      pipelining_fn=None,
+      post_optimizer_build_fn=None,
+      state_dict_adapter=Qwen3StateDictAdapter,
+  )
+  cfg.model_spec.model.enable_weight_tying = False
+
+  # Override with previous debug_model train_config values
+  cfg.training.seq_len = 128
+  cfg.training.local_batch_size = 4
+
+  return cfg

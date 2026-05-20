@@ -240,8 +240,7 @@ def use_gmm_kernel_patch(
   """
   logger.info("Applying GMM Kernel patch to Torchtitan's MoE module.")
   from torchtitan.experiments.tpu.kernels import gmm  # pylint: disable=g-import-not-at-top
-  import torch.nn.functional as F  # pytype: disable=import-error
-  import torchtitan.models.moe.moe as torchtitan_moe  # pytype: disable=import-error
+  import torchtitan.models.common.moe as torchtitan_moe  # pylint: disable=g-import-not-at-top
 
   # Explicitly intercept and rewrite the Torchtitan inner executor
   # for `_run_experts_grouped_mm`. This is significantly more robust than

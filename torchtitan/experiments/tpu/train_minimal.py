@@ -1,12 +1,4 @@
-"""Minimal trainer for TorchTitan models.
-
-Example run command:
-torchrun --nproc_per_node=4 \
-  -m torchtitan.experiments.tpu.train_minimal \
-  --module=torchtitan.experiments.tpu.qwen3 \
-  --config=qwen3_debugmodel \
-  --splash_attention_kernel.use_splash_attention_kernel
-"""
+"""Minimal trainer for TorchTitan models."""
 
 import argparse
 from collections.abc import Sequence

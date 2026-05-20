@@ -337,17 +337,15 @@ class TrainDistributedTest(
       dict(
           testcase_name="qwen3_fsdp_moe_use_gmm_kernel",
           module="torchtitan.experiments.tpu.qwen3",
-          config="qwen3_debugmodel",
+          config="qwen3_moe_testmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
-              "--model.flavor=testmodel_moe",  # NOTE: this model has use_grouped_mm=True
               "--qwen3.use_gmm_kernel",
           ],
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
-              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
       # TODO(abrauckmann): fill_indices is not in OSS code, update this test once we decide to add it back or remove it.
