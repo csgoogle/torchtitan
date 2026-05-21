@@ -15,12 +15,10 @@ from torchtitan.experiments.tpu.rl.grpo_job_config import (
     GRPOTrainingConfig,
 )
 from torchtitan.protocols.model_spec import ModelSpec
-from torchtitan.experiments.tpu.redacted import redacted_args, parallelize_redacted
 from torchtitan.experiments.tpu.qwen3 import parallelize_qwen3, qwen3_configs
 
 
 def grpo_qwen3_0_6b_glp() -> GRPOJobConfig:
-
   """Qwen3 0.6B model GRPO training with FSDP on GLP."""
   return GRPOJobConfig(
       model_spec=ModelSpec(
@@ -32,9 +30,7 @@ def grpo_qwen3_0_6b_glp() -> GRPOJobConfig:
           post_optimizer_build_fn=None,
           state_dict_adapter=None,
       ),
-
       model=ModelConfig(name="qwen3_tpu", flavor="0.6B"),
-
       training=GRPOTrainingConfig(
           dataset="random",
           seq_len=1024,
@@ -50,7 +46,9 @@ def grpo_qwen3_0_6b_glp() -> GRPOJobConfig:
           use_vllm=False,
           max_new_tokens=128,
           use_separate_sampler_model=False,
-          use_fake_sampler=True,
+          use_fake_sampler=False,
+          vllm_gpu_memory_utilization=0.4,
+          vllm_max_model_len=1024,
       ),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=4),
       metrics=MetricsProcessor.Config(log_freq=1),
@@ -87,6 +85,8 @@ def grpo_qwen3_1_7b_gf() -> GRPOJobConfig:
           max_new_tokens=128,
           use_separate_sampler_model=False,
           use_fake_sampler=False,
+          vllm_gpu_memory_utilization=0.45,
+          vllm_max_model_len=1024,
       ),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=4),
       metrics=MetricsProcessor.Config(log_freq=1),
@@ -123,45 +123,12 @@ def grpo_qwen3_4b_gf() -> GRPOJobConfig:
           max_new_tokens=128,
           use_separate_sampler_model=False,
           use_fake_sampler=False,
+          vllm_gpu_memory_utilization=0.5,
+          vllm_max_model_len=1024,
       ),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=4),
       metrics=MetricsProcessor.Config(log_freq=1),
       grpo=GRPOConfig(group_size=4, grpo_beta=0.1),
   )
 
-
-def grpo_redacted_debugmodel() -> GRPOJobConfig:
-  """redacted debug model GRPO training."""
-  return GRPOJobConfig(
-      model_spec=ModelSpec(
-          name="redacted_tpu",
-          flavor="debugmodel",
-          model=redacted_args["debugmodel"],
-          parallelize_fn=parallelize_redacted,
-          pipelining_fn=None,
-          post_optimizer_build_fn=None,
-          state_dict_adapter=None,
-      ),
-      model=ModelConfig(name="redacted_tpu", flavor="debugmodel"),
-      training=GRPOTrainingConfig(
-          dataset="random",
-          seq_len=1024,
-          steps=8,
-          local_batch_size=2,
-      ),
-      parallelism=ParallelismConfig(
-          data_parallel_shard_degree=-1,
-          data_parallel_replicate_degree=1,
-          fsdp_reshard_after_forward="never",
-      ),
-      sampler=SamplerConfig(
-          use_vllm=False,
-          max_new_tokens=20,
-          use_separate_sampler_model=False,
-          use_fake_sampler=True,
-      ),
-      lr_scheduler=LRSchedulersContainer.Config(warmup_steps=4),
-      metrics=MetricsProcessor.Config(log_freq=1),
-      grpo=GRPOConfig(group_size=4, grpo_beta=0.1),
-  )
 

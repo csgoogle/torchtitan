@@ -26,10 +26,15 @@ from torch.distributed.checkpoint.state_dict import (
 from torchtitan.config import ParallelismConfig
 from torchtitan.config.configs import CompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.tools.utils import get_device_type
 from torchtitan.experiments.rl.models.attention import VLLMAttentionWrapper
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
-from vllm.compilation import codegen as _codegen
+if get_device_type() == "tpu":
+    # TPU-vllm does not need have vllm.compilation.codegen
+    _codegen = None
+else:
+    from vllm.compilation import codegen as _codegen
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -57,31 +62,34 @@ def _dtensor_safe_weak_ref_tensor(tensor):
 _torch_utils.weak_ref_tensor = _dtensor_safe_weak_ref_tensor
 
 
-# NOTE: Monkeypatch vLLM's _node_ref to handle DTensor placement types
-# whose repr() uses unqualified class names not available in the generated
-# code's exec namespace (which only has `import torch`).
-_original_node_ref = _codegen._node_ref
-
-
-# TODO: Followup with core vLLM fix
-# https://github.com/pytorch/torchtitan/issues/3067
-def _patched_node_ref(arg):
-    try:
-        from torch.distributed.tensor.placement_types import Partial, Placement
-
-        if isinstance(arg, Placement):
-            cls = type(arg)
-            # Partial.__repr__ leaves reduce_op unquoted (e.g. "Partial(sum)")
-            # which would resolve to the builtin sum, not the string "sum".
-            if isinstance(arg, Partial):
-                return f"{cls.__module__}.{cls.__name__}({arg.reduce_op!r})"
-            return f"{cls.__module__}.{repr(arg)}"
-    except ImportError:
-        pass
-    return _original_node_ref(arg)
-
-
-_codegen._node_ref = _patched_node_ref
+if get_device_type() == "tpu":
+    pass
+else:
+    # NOTE: Monkeypatch vLLM's _node_ref to handle DTensor placement types
+    # whose repr() uses unqualified class names not available in the generated
+    # code's exec namespace (which only has `import torch`).
+    _original_node_ref = _codegen._node_ref
+    
+    
+    # TODO: Followup with core vLLM fix
+    # https://github.com/pytorch/torchtitan/issues/3067
+    def _patched_node_ref(arg):
+        try:
+            from torch.distributed.tensor.placement_types import Partial, Placement
+    
+            if isinstance(arg, Placement):
+                cls = type(arg)
+                # Partial.__repr__ leaves reduce_op unquoted (e.g. "Partial(sum)")
+                # which would resolve to the builtin sum, not the string "sum".
+                if isinstance(arg, Partial):
+                    return f"{cls.__module__}.{cls.__name__}({arg.reduce_op!r})"
+                return f"{cls.__module__}.{repr(arg)}"
+        except ImportError:
+            pass
+        return _original_node_ref(arg)
+    
+    
+    _codegen._node_ref = _patched_node_ref
 
 
 def create_torchtitan_config_from_vllm_config(
@@ -107,7 +115,12 @@ def create_torchtitan_config_from_vllm_config(
         vLLM doesn't use FSDP sharding (dp_shard=1) or expert parallelism (ep=1)
         in inference. These are set to default values.
     """
-    world_size = dist.get_world_size()
+    if get_device_type() == "tpu":
+        # For collocated RL on TPU, vLLM engine is forced to run on a single device per rank
+        # TODO: enable tp for vllm sampling
+        world_size = 1
+    else:
+        world_size = dist.get_world_size()
     parallel_config = vllm_config.parallel_config
 
     parallel_dims = ParallelDims(
@@ -273,7 +286,15 @@ class TorchTitanVLLMModelWrapper(Module):
             )
 
         # Initial load model weights from HuggingFace checkpoint path
-        self._initial_load_weights(checkpoint_path=vllm_config.model_config.model)
+        if get_device_type() == "tpu":
+            # On TPU with collocated GRPO, the vLLM engine is instantiated with
+            # `load_format="dummy"` and a fake model path to avoid duplicate memory
+            # allocation and disk I/O. Therefore, we must skip loading HF weights here,
+            # as the dummy path contains no weights. Instead, the real weights are synced 
+            # directly from the TorchTitan FSDP policy model via `VLLMSampler.sync_weights()`.
+            pass
+        else:
+            self._initial_load_weights(checkpoint_path=vllm_config.model_config.model)
 
     def _extend_rope_cache(
         self, rope_cache: torch.Tensor, required_len: int
@@ -367,7 +388,6 @@ class TorchTitanVLLMModelWrapper(Module):
         # Pass through transformer layers
         for layer in self.model.layers.values():
             h = layer(h, rope_cache, attention_masks=None, positions=positions)
-
         h = self.model.norm(h)
         # When parallelism is applied, get full tensor before return to vLLM Engine
         if isinstance(h, DTensor):

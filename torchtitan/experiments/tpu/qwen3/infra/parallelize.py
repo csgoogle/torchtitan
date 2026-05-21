@@ -19,6 +19,7 @@ def parallelize_qwen3(
     compile_config: torchtitan.config.CompileConfig,
     ac_config: torchtitan.config.ActivationCheckpointConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ) -> nn.Module:
   """Parallelizes the Qwen3 model based on the job configuration and applies TPU-specific workarounds.
 
@@ -30,6 +31,7 @@ def parallelize_qwen3(
     compile_config: Compile configuration.
     ac_config: Activation checkpointing configuration.
     dump_folder: Folder for dumped artifacts.
+    skip_dp: Whether to skip data parallelism.
   """
   dtensor_parallelize.parallelize_qwen3(
       model,
@@ -38,7 +40,7 @@ def parallelize_qwen3(
       dump_folder=dump_folder,
       parallel_dims=parallel_dims,
       parallelism=parallelism,
-      skip_dp=False,
+      skip_dp=skip_dp,
       training=training,
   )
   return model

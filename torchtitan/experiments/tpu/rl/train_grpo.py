@@ -3,36 +3,26 @@
 r"""Trainer for GRPO on TPU, with optional separate sharded sampler model.
 
 Essentially following torchtitan/experiments/tpu/train_minimal.py
-but changing the SFT task to GRPO, using custom generation loop with padding,
-and adding an optional separate sharded sampler model to isolate FSDP from
-generation.
+but changing the SFT task to GRPO, using vllm for sampling
 
-Example runs:
-  # Qwen3 4B FSDP on TPU v7x ([internal link])
-  rabbit test --norun_validations //torchtitan/experiments/tpu/rl:train_grpo_forge_tpu_tpu_2x2x1 \
-    --test_arg=--module=torchtitan.experiments.tpu.rl \
-    --test_arg=--config=grpo_qwen3_4b_gf
+  ############ on v6e vm ################
+  # Qwen3 0.6B with vLLM (fits comfortably):
+  # Times: Sample=6.97s, Ref=0.07s, Reward=0.00s, Train=1.62s, Total=8.66s
+  torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.rl.train_grpo \
+    --module=torchtitan.experiments.tpu.rl \
+    --config=grpo_qwen3_0_6b_glp \
+    --training.steps=8 \
+    --sampler.use_vllm \
+    --training.local_batch_size=2
 
-  # Qwen3 0.6B FSDP on GLP ([internal link])
-  # xprof: [internal link]
-  rabbit test --norun_validations //torchtitan/experiments/tpu/rl:train_grpo_forge_tpu_tpu_2x4 \
-    --test_arg=--module=torchtitan.experiments.tpu.rl \
-    --test_arg=--config=grpo_qwen3_0_6b_glp \
-    --test_arg=--tpu-config.use-internal-xprof \
-    --test_arg=--profiler.profiler_active=2 \
-    --test_arg=--profiler.profile_freq=5 \
-    --test_arg=--sampler.no-use-fake-sampler \
-    --test_arg=--training.steps=5
-
-  # redacted debug model FSDP on GLP ([internal link])
-  rabbit test --norun_validations //torchtitan/experiments/tpu/rl:train_grpo_forge_tpu_tpu_2x4 \
-    --test_arg=--module=torchtitan.experiments.tpu.rl \
-    --test_arg=--config=grpo_redacted_debugmodel \
-    --test_arg=--tpu-config.use-internal-xprof \
-    --test_arg=--profiler.profiler_active=2 \
-    --test_arg=--profiler.profile_freq=5 \
-    --test_arg=--sampler.no-use-fake-sampler \
-    --test_arg=--training.steps=5
+  # Qwen3 1.7B with vLLM (requires local_batch_size=1):
+  # Times: Sample=7.14s, Ref=0.06s, Reward=0.00s, Train=2.47s, Total=9.67s
+  torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.rl.train_grpo \
+    --module=torchtitan.experiments.tpu.rl \
+    --config=grpo_qwen3_1_7b_gf \
+    --training.steps=8 \
+    --sampler.use_vllm \
+    --training.local_batch_size=1
 """
 
 # pylint: disable=protected-access
@@ -84,6 +74,7 @@ def grpo_step(
     model: torch.nn.Module,
     ref_model: torch.nn.Module | None,
     sampler_model: torch.nn.Module | None,
+    vllm_sampler,
     prompt_ids: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     job_config: grpo_job_config.GRPOJobConfig,
@@ -114,33 +105,45 @@ def grpo_step(
   t_sample_start = time.perf_counter()
 
   with jax_profiler.TraceAnnotation("sampling"):
-    with torch.no_grad():
-      with fsdp.FullyShardedDataParallel.summon_full_params(
-          sampling_model, recurse=True, writeback=False
-      ):
-        if job_config.sampler.use_fake_sampler:
-          completed_ids, token_log_probs = grpo_sampler.generate_fake(
-              sampling_model,
-              prompt_ids_repeated,
-              max_seq_len=job_config.training.seq_len,
-              max_new_tokens=job_config.sampler.max_new_tokens,
-              temperature=job_config.sampler.temperature,
-              top_k=job_config.sampler.top_k
-              if job_config.sampler.top_k > 0
-              else None,
-              vocab_size=vocab_size,
-          )
-        else:
-          completed_ids, token_log_probs = grpo_sampler.generate(
-              sampling_model,
-              prompt_ids_repeated,
-              max_seq_len=job_config.training.seq_len,
-              max_new_tokens=job_config.sampler.max_new_tokens,
-              temperature=job_config.sampler.temperature,
-              top_k=job_config.sampler.top_k
-              if job_config.sampler.top_k > 0
-              else None,
-          )
+    if vllm_sampler is not None:
+      logger.info("Step %d: Generating with vLLM engine...", step)
+      from vllm import SamplingParams
+      sampling_params = SamplingParams(
+          temperature=job_config.sampler.temperature,
+          top_k=job_config.sampler.top_k if job_config.sampler.top_k > 0 else -1,
+          max_tokens=job_config.sampler.max_new_tokens,
+      )
+      
+      completed_ids, token_log_probs = vllm_sampler.generate(prompt_ids_repeated, sampling_params)
+      
+    else:
+      with torch.no_grad():
+        with fsdp.FullyShardedDataParallel.summon_full_params(
+            sampling_model, recurse=True, writeback=False
+        ):
+          if job_config.sampler.use_fake_sampler:
+            completed_ids, token_log_probs = grpo_sampler.generate_fake(
+                sampling_model,
+                prompt_ids_repeated,
+                max_seq_len=job_config.training.seq_len,
+                max_new_tokens=job_config.sampler.max_new_tokens,
+                temperature=job_config.sampler.temperature,
+                top_k=job_config.sampler.top_k
+                if job_config.sampler.top_k > 0
+                else None,
+                vocab_size=vocab_size,
+            )
+          else:
+            completed_ids, token_log_probs = grpo_sampler.generate(
+                sampling_model,
+                prompt_ids_repeated,
+                max_seq_len=job_config.training.seq_len,
+                max_new_tokens=job_config.sampler.max_new_tokens,
+                temperature=job_config.sampler.temperature,
+                top_k=job_config.sampler.top_k
+                if job_config.sampler.top_k > 0
+                else None,
+            )
 
   sampling_model.train()
   torch_tpu._internal.sync.synchronize(completed_ids, wait=True)
@@ -393,19 +396,30 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
 
   # Parallelize first if world_size > 1
   if world_size > 1:
-    train_spec.parallelize_fn(model, parallel_dims, job_config)
+    def call_parallelize(model_to_par, p_dims):
+        return train_spec.parallelize_fn(
+            model=model_to_par,
+            parallel_dims=p_dims,
+            training=job_config.training,
+            parallelism=job_config.parallelism,
+            compile_config=job_config.compile,
+            ac_config=job_config.activation_checkpoint,
+            dump_folder=job_config.dump_folder,
+        )
+
+    call_parallelize(model, parallel_dims)
     logger.info("Parallelized policy model using FSDP.")
 
     if ref_model is not None:
       if job_config.reference.distributed_strategy == "fsdp":
-        train_spec.parallelize_fn(ref_model, parallel_dims, job_config)
+        call_parallelize(ref_model, parallel_dims)
         logger.info("Parallelized reference model using FSDP.")
       else:
         logger.info("Keeping reference model unparallelized.")
 
     if sampler_model is not None:
       if job_config.sampler.distributed_strategy == "fsdp":
-        train_spec.parallelize_fn(sampler_model, parallel_dims, job_config)
+        call_parallelize(sampler_model, parallel_dims)
         logger.info("Parallelized sampler model using FSDP.")
       else:
         logger.info("Keeping sampler model unparallelized.")
@@ -491,6 +505,12 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
 
   warmup_steps = job_config.lr_scheduler.warmup_steps
 
+  if job_config.sampler.use_vllm:
+    from torchtitan.experiments.tpu.rl.grpo_vllm_sampler import VLLMSampler
+    vllm_sampler = VLLMSampler(job_config)
+  else:
+    vllm_sampler = None
+
   maybe_enable_profiling = functools.partial(
       profiler_workaround.maybe_enable_profiling, job_config=job_config
   )
@@ -505,6 +525,10 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
     data_iterator = iter(dataloader)
     for step in range(steps):
       step_start = time.perf_counter()
+      
+      if vllm_sampler is not None:
+        vllm_sampler.sync_weights(model)
+
       step_tokens = local_batch_size * seq_len
       ntokens_seen += step_tokens
       metrics_processor.ntokens_since_last_log += step_tokens
@@ -533,6 +557,7 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
             model=model,
             ref_model=ref_model,
             sampler_model=sampler_model,
+            vllm_sampler=vllm_sampler,
             prompt_ids=prompt_ids,
             optimizer=optimizer,
             job_config=job_config,

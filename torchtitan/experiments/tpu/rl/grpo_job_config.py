@@ -6,7 +6,6 @@ import torchtitan.experiments.tpu.tpu_job_config
 
 
 @dataclasses.dataclass
-
 class SamplerConfig:
   max_new_tokens: int = 20
   temperature: float = 1.0
@@ -15,6 +14,14 @@ class SamplerConfig:
   use_separate_sampler_model: bool = False
   distributed_strategy: str = "fsdp"
   use_fake_sampler: bool = False
+  vllm_gpu_memory_utilization: float = 0.4
+  vllm_max_model_len: int = 1024
+  # TODO: Support tensor_parallel_size > 1 for vLLM sampler.
+  # Currently TPU-vLLM requires TP=1 in collocated setups to avoid crashing workers.
+  vllm_tensor_parallel_size: int = 1
+  # Set enforce_eager to True to avoid compiling for different sequence lengths 
+  # and get to the sampling stage much sooner.
+  vllm_enforce_eager: bool = True
 
 
 @dataclasses.dataclass
