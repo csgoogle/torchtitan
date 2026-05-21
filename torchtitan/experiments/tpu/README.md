@@ -90,8 +90,8 @@ TorchTPU.
 # Package installation sequence matters here due to: https://github.com/openxla/tokamax/issues/240
 pip install "jax[tpu]==0.9.1" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 pip install git+https://github.com/openxla/tokamax.git@8cba6a6a1e52e9efbb7ff8facb66f18f0bfcbe4c
-pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
-pip install libtpu==0.0.40 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
+pip install libtpu==0.0.41 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 ```
 
 In order to install prebuilt TorchTPU wheel, you need to authenticate first.
