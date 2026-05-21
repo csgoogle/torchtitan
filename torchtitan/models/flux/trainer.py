@@ -19,6 +19,7 @@ from torchtitan.models.flux.model.autoencoder import load_ae
 from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
 from torchtitan.models.flux.parallelize import parallelize_encoders
 from torchtitan.models.flux.precomputed_loader import PrecomputedDataloader
+from torchtitan.models.flux.random_loader import RandomDataloader
 from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
 from torchtitan.models.flux.utils import (
     create_position_encoding_for_latents,
@@ -88,15 +89,31 @@ class FluxTrainer(Trainer):
         # computing them as part of the training loop (i.e., skip running the
         # autoencoder and text encoders (T5, CLIP).
         precompute_path = config.flux.precomputed_dataset_path
+        random_dataset = getattr(config.flux, "random_dataset", False)
 
-        if precompute_path is not None:
-            logger.info(f"Loading precomputed embeddings from {precompute_path}")
+        if precompute_path is not None or random_dataset:
             self.autoencoder = None
             self.clip_encoder = None
             self.t5_encoder = None
 
             rank = int(os.environ.get("RANK", 0))
-            self.dataloader = PrecomputedDataloader(precompute_path, config.training.steps, rank=rank)
+            if random_dataset:
+                logger.info("Using RandomDataloader for embeddings")
+
+                self.dataloader = RandomDataloader(
+                    bsz=config.training.local_batch_size,
+                    max_steps=config.training.steps,
+                    img_size=img_size,
+                    max_t5_len=config.tokenizer.max_t5_encoding_len,
+                    t5_dim=model_args.context_in_dim,
+                    clip_dim=model_args.vec_in_dim,
+                )
+            elif precompute_path is not None:
+                logger.info(f"Loading precomputed embeddings from {precompute_path}")
+
+                self.dataloader = PrecomputedDataloader(precompute_path, config.training.steps, rank=rank)
+            else:
+                raise ValueError("Either precomputed_dataset_path or random_dataset must be provided in config.flux.")
         else:
             self.autoencoder = load_ae(
                 config.encoder.autoencoder_path,
