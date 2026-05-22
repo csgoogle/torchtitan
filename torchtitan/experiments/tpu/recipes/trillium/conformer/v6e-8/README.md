@@ -44,7 +44,9 @@ xpk workload create \
     --parallelism.data_parallel_shard_degree=1 \
     --parallelism.data_parallel_replicate_degree=-1 \
     --activation_checkpoint.mode=full \
-    --training.local_batch_size=1024 \
+    --training.local_batch_size=512 \
+    --training.dtype=float32 \
+    --training.mixed_precision_param=bfloat16 \
     --tpu_config.use_simple_fsdp \
     --tpu_config.compile_mode=layer \
     --splash_attention_kernel.use_splash_attention_kernel \
@@ -58,9 +60,9 @@ xpk workload create \
 
 **5/21/26: With this configuration you should observe approximately the following metrics**
 
-- Average TPS/chip: **90,300**
-- Average MFU: **6.09%**
-- Total TPS (8 chips): **722,700**
+- Average TPS/chip: **89,000**
+- Average MFU: **6.00%**
+- Total TPS (8 chips): **712,100**
 
 
 
@@ -91,7 +93,9 @@ xpk workload create \
     --parallelism.data_parallel_shard_degree=1 \
     --parallelism.data_parallel_replicate_degree=-1 \
     --activation_checkpoint.mode=full \
-    --training.local_batch_size=1024 \
+    --training.local_batch_size=512 \
+    --training.dtype=float32 \
+    --training.mixed_precision_param=bfloat16 \
     --tpu_config.use_simple_fsdp \
     --tpu_config.eager_mode=DEFER_AND_FUSE \
     --splash_attention_kernel.use_splash_attention_kernel \
@@ -104,7 +108,7 @@ xpk workload create \
 
 **5/21/26: With this configuration you should observe approximately the following metrics**
 
-- Average TPS/chip: **52,100**
-- Average MFU: **3.51%**
-- Total TPS (8 chips): **416,900**
+- Average TPS/chip: **59,000**
+- Average MFU: **3.98%**
+- Total TPS (8 chips): **472,000**
 
