@@ -53,7 +53,8 @@ def conformer_test() -> TPUTrainerConfig:
           local_batch_size=768,
           seq_len=512,
           steps=10,
-          dtype="bfloat16",
+          dtype="float32",
+          mixed_precision_param="bfloat16",
       ),
       parallelism=TPUTrainerConfig().parallelism.__class__(
           data_parallel_shard_degree=-1,
