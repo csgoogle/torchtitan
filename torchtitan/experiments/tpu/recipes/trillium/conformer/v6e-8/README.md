@@ -17,7 +17,7 @@ export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
 - `--tpu_config.use_simple_fsdp` is enabled.
 - `--compile.enable` is enabled with `--tpu_config.compile_mode=layer`.
 
-## Conformer training with torch.compile
+## DDP with torch.compile
 
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
@@ -54,6 +54,7 @@ xpk workload create \
     --dataloader.dataset=random \
     --training.steps=20
 "
+```
 
 **5/21/26: With this configuration you should observe approximately the following metrics**
 
@@ -62,7 +63,8 @@ xpk workload create \
 - Total TPS (8 chips): **722,700**
 
 
-## FSDP eager mode with AMP
+
+## DDP eager mode
 
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
