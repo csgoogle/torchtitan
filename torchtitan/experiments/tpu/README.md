@@ -132,15 +132,14 @@ python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.2-1B --assets 
 Only small models can run on a single host. The following example demonstrates Llama 3.2 1B running on a `v6e-4` VM using FSDP:
 
 ```bash
-torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train  \
-    --job.config_file=./torchtitan/experiments/tpu/llama3/train_configs/llama3.2_1b.toml \
-    --model.name=llama3_tpu \
-    --model.hf_assets_path=assets/hf/Llama-3.2-1B/ \
+torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
+    --module=torchtitan.experiments.tpu.llama3 \
+    --config=llama3_1b \
+    --hf_assets_path=assets/hf/Llama-3.2-1B/ \
     --training.seq_len=128 \
     --training.steps=10 \
     --training.dtype=bfloat16 \
     --training.mixed_precision_param=bfloat16
-
 ```
 
 **Notes:**
@@ -368,41 +367,42 @@ xpk storage attach my-gcsfuse-storage \
 The following sample demonstrates Llama 8B training on a `v6e-32` using FSDP:
 
 ```bash
-xpk workload create \
-  --workload=torchtitan-llama3-8b-xpk \
-  --cluster=${CLUSTER_NAME}  \
-  --zone=${ZONE} \
-  --project=${PROJECT_ID} \
-  --tpu-type=${ACCELERATOR_TYPE} \
-  --num-slices=1 \
-  --docker-image us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
-  --storage=my-gcsfuse-storage \
-  --env WORKERS_0_HOSTNAME="torchtitan-llama3-8b-xpk-slice-job-0-0.torchtitan-llama3-8b-xpk" \
-  --command "torchrun \
-    --nnodes=8 \
-    --nproc_per_node=4 \
-    --rdzv_backend=static \
-    --rdzv_endpoint=\$(WORKERS_0_HOSTNAME):29501 \
-    --node_rank=\$(TPU_WORKER_ID) \
-    -m \
-    torchtitan.experiments.tpu.train \
-    --job.config_file=./torchtitan/models/llama3/train_configs/llama3_8b.toml \
-    --job.dump_folder=/data/torchtitan-llama3-8b-xpk \
-    --model.name=llama3_tpu \
-    --training.seq_len=512 \
-    --training.dataset=c4_test \
-    --training.dtype=bfloat16 \
-    --training.mixed_precision_param=bfloat16 \
-    --training.steps=10 \
-    --model.hf_assets_path=assets/hf/Llama-3.1-8B/ \
-    --training.dataset_path=tests/assets/c4_test \
-    --metrics.log_freq=5 \
-    --metrics.enable_tensorboard \
-    --profiling.profile_freq=5 \
-    --profiling.profiler_warmup=3 \
-    --profiling.profiler_active=1 \
-    --profiling.enable-profiling"
+export WORKLOAD_NAME=torchtitan-llama3-8b-xpk
 
+xpk workload create \
+    --workload=$WORKLOAD_NAME \
+    --cluster=$CLUSTER_NAME \
+    --zone=$ZONE \
+    --project=$PROJECT_ID \
+    --tpu-type=$ACCELERATOR_TYPE \
+    --num-slices=1 \
+    --docker-image="us-central1-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/torchtitan-container:latest" \
+    --storage=my-gcsfuse-storage \
+    --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
+    --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
+    --command 'torchrun \
+        --nnodes=8 \
+        --nproc_per_node=4 \
+        --rdzv_backend=static \
+        --rdzv_endpoint=$WORKERS_0_HOSTNAME:29501 \
+        --node_rank=$TPU_WORKER_ID \
+        -m torchtitan.experiments.tpu.train \
+        --module=torchtitan.experiments.tpu.llama3 \
+        --config=llama3_8b \
+        --dump_folder=/data/torchtitan-llama3-8b-xpk \
+        --training.seq_len=512 \
+        --dataloader.dataset=c4_test \
+        --training.dtype=bfloat16 \
+        --training.mixed_precision_param=bfloat16 \
+        --training.steps=10 \
+        --hf_assets_path=assets/hf/Llama-3.1-8B/ \
+        --dataloader.dataset_path=tests/assets/c4_test \
+        --metrics.log_freq=5 \
+        --metrics.enable_tensorboard \
+        --profiler.profile_freq=5 \
+        --profiler.profiler_warmup=3 \
+        --profiler.profiler_active=1 \
+        --profiler.enable_profiling'
 ```
 
 **Notes:**
