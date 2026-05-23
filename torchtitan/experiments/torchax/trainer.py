@@ -10,6 +10,7 @@ import jax
 import optax
 import torch
 import torchax
+import torch_xla2.amp as torchax_amp
 import torch_xla2.train  # required for ``torchax.train.make_train_step``
 from torchtitan.components.dataloader import DataloaderExhaustedError
 import torchtitan.components.tokenizer
@@ -31,6 +32,7 @@ _TORCHAX_MODEL_MODULES = {
     'deepseek_v3': 'torchtitan.experiments.torchax.deepseek_v3',
     'redacted': 'torchtitan.experiments.torchax.redacted',
     'redacted': 'torchtitan.experiments.torchax.redacted',
+    'conformer': 'torchtitan.experiments.torchax.conformer',
 }
 from [redacted]._ops.segment_matmul import interface as redacted_segment_matmul_interface
 from [redacted].layers import functional as redacted_functional
@@ -117,6 +119,8 @@ def is_moe_model(job_config) -> bool:
     return 'B-A' in job_config.model_spec.flavor or 'moe' in job_config.model_spec.flavor
   elif job_config.model_spec.name == 'deepseek_v3':
     return True
+  elif job_config.model_spec.name == 'conformer':
+    return False
   else:
     raise ValueError(f'Unsupported model: {job_config.model_spec.name}')
 
@@ -301,27 +305,30 @@ class TorchaxTrainer:
         # REDACTED PT MoE handles RoPE internally; no precomputed embedding constants needed.
         embedding_constants = None
         embedding_constants_key = None
+      elif job_config.model_spec.name == 'conformer':
+        embedding_constants = None
+        embedding_constants_key = None
       else:
         raise ValueError(f'No embedding constant for: {job_config.model_spec.name}')
 
     # Remat: default to recompute everything inside transformer block
     if job_config.activation_checkpoint.mode == 'full':
-        checkpoint_policy = jax.checkpoint_policies.nothing_saveable
+      checkpoint_policy = jax.checkpoint_policies.nothing_saveable
     elif job_config.activation_checkpoint.mode == 'selective':
-        checkpoint_policy = jax.checkpoint_policies.dots_saveable
+      checkpoint_policy = jax.checkpoint_policies.dots_saveable
     elif job_config.activation_checkpoint.mode == 'everything':
-        checkpoint_policy = jax.checkpoint_policies.everything_saveable
+      checkpoint_policy = jax.checkpoint_policies.everything_saveable
     elif job_config.activation_checkpoint.mode == 'offload_dot':
-        checkpoint_policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
+      checkpoint_policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
     elif job_config.activation_checkpoint.mode == 'nothing':
-        checkpoint_policy = None
+      checkpoint_policy = None
     else:
-        checkpoint_policy = jax.checkpoint_policies.nothing_saveable
+      checkpoint_policy = jax.checkpoint_policies.nothing_saveable
 
     if job_config.training.enable_cpu_offload and job_config.torchax_config.offload_keys:
-        offload_keys = job_config.torchax_config.offload_keys.split('|')
-        logger.info('Offloading keys: %s to host.', offload_keys)
-        checkpoint_policy = (
+      offload_keys = job_config.torchax_config.offload_keys.split('|')
+      logger.info('Offloading keys: %s to host.', offload_keys)
+      checkpoint_policy = (
             jax.checkpoint_policies.save_and_offload_only_these_names(
                 names_which_can_be_saved=[],
                 names_which_can_be_offloaded=offload_keys,
@@ -372,7 +379,11 @@ class TorchaxTrainer:
           seg1._modules = new_modules_1
           seg1._side_input_keys = new_side_keys_1
           seg1._side_output_keys = new_output_keys_1
-      if job_config.model_spec.name != 'redacted':
+      if job_config.model_spec.name == 'conformer':
+        model = distributed.ConformerModelWithScan(
+            model, checkpoint_policy
+        )
+      elif job_config.model_spec.name != 'redacted':
         model = distributed.ModelWithScan(
             model, checkpoint_policy, embedding_constants_key
         )
@@ -471,8 +482,18 @@ class TorchaxTrainer:
 
     # model_fn is responsible to shard if needed
     # to do FSDP one shards the first input args and output on the batch dimension
+    use_autocast = (
+        job_config.training.mixed_precision_param == 'bfloat16'
+        and job_config.model_spec.name == 'conformer'
+    )
+    autocast_dtype = torch.bfloat16 if use_autocast else None
+
     def model_fn(weights, buffers, args):
-      return jittable_mod.functional_call('forward', weights, buffers, args)
+      if autocast_dtype is not None:
+        with torchax_amp.autocast('jax', dtype=autocast_dtype):
+          return jittable_mod.functional_call('forward', weights, buffers, args)
+      else:
+        return jittable_mod.functional_call('forward', weights, buffers, args)
 
     loss_fn = job_config.loss.build(compile_config=job_config.compile)
 

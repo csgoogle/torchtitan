@@ -156,9 +156,13 @@ def main(argv):
   # CLI overrides via ``tyro.cli`` with ``default=loaded_config``. This is the
   # same launch surface the torch_tpu lane uses (see ``experiments/tpu/gmain``).
   del argv
+  # When running on TPU via CI, the infra automatically injects some flags
+  # starting with --deepsea_ which are not recognized by tyro, so we filter
+  # them out.
+  clean_args = [arg for arg in sys.argv[1:] if not arg.startswith("--deepsea_")]
   config = typing.cast(
       torchax_job_config.TorchaxJobConfig,
-      ConfigManager().parse_args(sys.argv[1:]),
+      ConfigManager().parse_args(clean_args),
   )
   assert main_train_loop(config), 'training is not successful'
 
