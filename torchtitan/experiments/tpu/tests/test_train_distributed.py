@@ -266,8 +266,6 @@ class TrainDistributedTest(
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
-              # b/515065114 - SplashAttention Pallas kernel doesn't support runtime attention masks
-              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
       # qwen3
@@ -342,8 +340,6 @@ class TrainDistributedTest(
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
-              # b/515065114 - SplashAttention Pallas kernel doesn't support runtime attention masks
-              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
       dict(
