@@ -176,7 +176,7 @@ class TorchaxTrainer:
       train_loader = data_utils.fake_dataloader(
           job_config.training.steps,
           job_config.training.seq_len,
-          job_config.training.global_batch_size,
+          expected_global_batch_size,
       )
       logger.warning('Using fake data loader.')
     else:
