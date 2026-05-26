@@ -17,6 +17,8 @@ export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
 
 ## SimpleFSDP + SplashAttention + torch.compile
 
+### float32 + MixedPrecision bfloat16
+
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 
@@ -42,8 +44,52 @@ xpk workload create \
     --config=flux_dev \
     --optimizer.implementation=foreach \
     --metrics.log_freq=1 \
-    --training.steps=15 \
-    --training.dtype=float32\
+    --training.steps=40 \
+    --training.dtype=float32 \
+    --training.local_batch_size=2 \
+    --dataloader.img_size=1024 \
+    --flux.random_dataset \
+    --parallelism.use_simple_fsdp \
+    --splash-attention-kernel.use-splash-attention-kernel \
+    --compile.enable \
+    --compile.backend=tpu \
+    --activation-checkpoint.no-preserve_rng_state"
+```
+
+**5/21/26: With this configuration you should observe the following metrics**
+
+- Average Step time: **2.70s**
+- Average Step time / PDB: **1.35s**
+
+### bfloat16
+
+```bash
+export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
+
+xpk workload create \
+--workload="$WORKLOAD_NAME" \
+--cluster="$CLUSTER_NAME" \
+--zone="$ZONE" \
+--project="$PROJECT_ID" \
+--tpu-type="v6e-8" \
+--num-slices=1 \
+--docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
+--env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
+--env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
+--command "\
+    torchrun \
+    --nnodes=2 \
+    --nproc_per_node=4 \
+    --rdzv_backend=static \
+    --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
+    --node_rank=\$TPU_WORKER_ID \
+    -m torchtitan.experiments.tpu.train \
+    --module=flux \
+    --config=flux_dev \
+    --optimizer.implementation=foreach \
+    --metrics.log_freq=1 \
+    --training.steps=40 \
+    --training.dtype=bfloat16 \
     --training.local_batch_size=3 \
     --dataloader.img_size=1024 \
     --flux.random_dataset \
@@ -56,10 +102,5 @@ xpk workload create \
 
 **5/21/26: With this configuration you should observe the following metrics**
 
-- **float32 + MixedPrecision bfloat16** (`--training.dtype=float32`):
-  - Average Step time: **3.65s**
-  - Average Step time / PDB: **1.21s**
-
-- **bfloat16** (`--training.dtype=bfloat16`):
-  - Average Step time: **3.15s**
-  - Average Step time / PDB: **1.05s**
+- Average Step time: **3.15s**
+- Average Step time / PDB: **1.05s**
