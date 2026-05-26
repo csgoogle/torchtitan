@@ -18,7 +18,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.experiments.tpu.qwen3 import parallelize_qwen3, qwen3_configs
 
 
-def grpo_qwen3_0_6b_glp() -> GRPOJobConfig:
+def grpo_qwen3_0_6b() -> GRPOJobConfig:
   """Qwen3 0.6B model GRPO training with FSDP on GLP."""
   return GRPOJobConfig(
       model_spec=ModelSpec(
@@ -33,7 +33,7 @@ def grpo_qwen3_0_6b_glp() -> GRPOJobConfig:
       model=ModelConfig(name="qwen3_tpu", flavor="0.6B"),
       training=GRPOTrainingConfig(
           dataset="random",
-          seq_len=1024,
+          seq_len=512,
           steps=8,
           local_batch_size=2,
       ),
@@ -48,7 +48,7 @@ def grpo_qwen3_0_6b_glp() -> GRPOJobConfig:
           use_separate_sampler_model=False,
           use_fake_sampler=False,
           vllm_gpu_memory_utilization=0.4,
-          vllm_max_model_len=1024,
+          vllm_max_model_len=512,
       ),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=4),
       metrics=MetricsProcessor.Config(log_freq=1),
@@ -56,7 +56,7 @@ def grpo_qwen3_0_6b_glp() -> GRPOJobConfig:
   )
 
 
-def grpo_qwen3_1_7b_gf() -> GRPOJobConfig:
+def grpo_qwen3_1_7b() -> GRPOJobConfig:
   """Qwen3 1.7B model GRPO training with FSDP on TPU v7x."""
   return GRPOJobConfig(
       model_spec=ModelSpec(
@@ -94,7 +94,7 @@ def grpo_qwen3_1_7b_gf() -> GRPOJobConfig:
   )
 
 
-def grpo_qwen3_4b_gf() -> GRPOJobConfig:
+def grpo_qwen3_4b() -> GRPOJobConfig:
   """Qwen3 4B model GRPO training with FSDP on TPU v7x."""
   return GRPOJobConfig(
       model_spec=ModelSpec(

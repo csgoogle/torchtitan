@@ -110,7 +110,8 @@ def grpo_step(
       from vllm import SamplingParams
       sampling_params = SamplingParams(
           temperature=job_config.sampler.temperature,
-          top_k=job_config.sampler.top_k if job_config.sampler.top_k > 0 else -1,
+          # From vllm warning: Top-K and Top-P are not yet supported on TPU and will be ignored.
+          # top_k=job_config.sampler.top_k if job_config.sampler.top_k > 0 else -1,
           max_tokens=job_config.sampler.max_new_tokens,
       )
       

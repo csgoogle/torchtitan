@@ -9,6 +9,8 @@ from torch.distributed import fsdp
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TOKENIZER_NAME = "Qwen/Qwen2.5-0.5B"
+
 @contextlib.contextmanager
 def mock_vllm_distributed(tp_size: int):
     """Mocks vLLM's UniProcExecutor to pass the correct LOCAL_RANK instead of 0.
@@ -92,7 +94,7 @@ class VLLMSampler:
         self.vllm_engine = None
         self._init_vllm()
 
-    def _get_dummy_config_dict(self):
+    def _get_config_dict_from_vllm_registry(self):
         """Extract actual config dimensions for accurate KV cache allocation."""
         from torchtitan.experiments.rl.models.vllm_registry import VLLM_MODEL_NAME
         model_args = getattr(self.job_config.model_spec, "model", None) if hasattr(self.job_config, 'model_spec') else None
@@ -119,7 +121,7 @@ class VLLMSampler:
         if hasattr(self.job_config, 'hf_assets_path') and self.job_config.hf_assets_path:
             return self.job_config.hf_assets_path
             
-        return "Qwen/Qwen2.5-0.5B"  # Default fallback if neither is configured
+        return DEFAULT_TOKENIZER_NAME
 
     def _create_dummy_model_config(self):
         """Create a dummy config.json for vLLM to read dimensions from."""
@@ -129,7 +131,7 @@ class VLLMSampler:
         config_path = os.path.join(dummy_model_path, "config.json")
         if not os.path.exists(config_path):
             with open(config_path, "w") as f:
-                json.dump(self._get_dummy_config_dict(), f)
+                json.dump(self._get_config_dict_from_vllm_registry(), f)
         return dummy_model_path
 
     def _init_vllm(self):
@@ -175,7 +177,27 @@ class VLLMSampler:
             self.vllm_engine = None
 
     def sync_weights(self, source_model: torch.nn.Module):
-        """Syncs the torchtitan model weights to the vLLM engine."""
+        """Syncs the torchtitan model weights to the vLLM engine.
+        
+        How weight synchronization works:
+        1. FSDP Gather (ICI Used): It uses FSDP's `summon_full_params` to gather the sharded 
+           model weights across all FSDP ranks into full parameters. This triggers an 
+           all-gather communication operation across the TPUs, which utilizes the high-speed 
+           Inter-Chip Interconnect (ICI) network.
+        2. Direct Copy (No CPU Transfer): It extracts the state dictionaries for both the 
+           source model and the target vLLM model. It then performs a direct, in-place copy 
+           (`target_p.copy_(val)`). Since both models reside on the TPU device, this copy 
+           happens entirely on-device. It does NOT offload to the CPU, meaning it bypasses 
+           the host CPU memory and avoids slow PCIe transfers.
+        3. Memory Management: To prevent Out-Of-Memory (OOM) issues on the TPU during the 
+           gathering phase, it eagerly clears references from the source state dictionary 
+           immediately after each parameter is copied.
+        
+        TODO: Make this per-layer instead of summoning all parameters at once. Currently, 
+        `summon_full_params(recurse=True)` gathers the entire model into HBM simultaneously, 
+        which causes a massive memory spike. A per-layer iteration would keep the memory 
+        overhead small and bounded.
+        """
         if self.vllm_engine is None:
             return
             
@@ -213,6 +235,7 @@ class VLLMSampler:
             
         sampling_params.logprobs = 1
         
+        # TODO: avoid moving to CPU
         prompt_ids_list = prompt_ids_repeated.cpu().tolist()
         prompts = [{"prompt_token_ids": p} for p in prompt_ids_list]
         
