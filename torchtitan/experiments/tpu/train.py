@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from torchtitan.config import ConfigManager, Configurable
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu import profiler_workaround
+import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.redacted  # trigger model registration
@@ -134,9 +134,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     )
     train_config.optimizer.implementation = "foreach"
 
-  torchtitan.train.maybe_enable_profiling = functools.partial(
-      profiler_workaround.maybe_enable_profiling, job_config=train_config
-  )
+  profiler_workaround.init(train_config)
 
   trainer: Optional[torchtitan.trainer.Trainer] = None
   model_spec = train_config.model_spec

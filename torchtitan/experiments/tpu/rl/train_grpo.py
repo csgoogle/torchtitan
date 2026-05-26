@@ -56,9 +56,10 @@ import torchtitan.config.manager
 import torchtitan.distributed
 from torchtitan.distributed import utils as dist_utils
 
-from torchtitan.experiments.tpu import profiler_workaround
+import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 from torchtitan.experiments.tpu import gmain
 from torchtitan.experiments.tpu import utils as tpu_utils
+import torchtitan.tools.profiler as torchtitan_profiler
 
 import torchtitan.experiments.tpu.llama3  # trigger llama3_tpu model registration
 import torchtitan.experiments.tpu.qwen3  # trigger qwen3_tpu model registration
@@ -490,13 +491,10 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
   accumulated_steps = 0
 
   warmup_steps = job_config.lr_scheduler.warmup_steps
-
-  maybe_enable_profiling = functools.partial(
-      profiler_workaround.maybe_enable_profiling, job_config=job_config
-  )
+  profiler_workaround.init(job_config)
 
   ntokens_seen = 0
-  with maybe_enable_profiling(
+  with torchtitan_profiler.Profiler(
       job_config.profiler,
       global_step=0,
       base_folder=job_config.dump_folder,

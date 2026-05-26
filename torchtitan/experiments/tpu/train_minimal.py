@@ -22,13 +22,16 @@ from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
+import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
 import torchtitan.experiments.tpu.workarounds as workarounds
-import torchtitan.trainer
 from torchtitan.tools import utils
 import torchtitan.tools.logging
+import torchtitan.tools.profiler as torchtitan_profiler
+import torchtitan.trainer
 # import torchtitan.tools.profiling  # Deprecated upstream
+
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 JobConfig = torchtitan.trainer.Trainer.Config
@@ -256,17 +259,12 @@ class TrainerMinimal:
       total_tokens = 0
       total_time = 0.0
 
-      import functools
-      from torchtitan.experiments.tpu import profiler_workaround
-      maybe_enable_profiling = functools.partial(
-          profiler_workaround.maybe_enable_profiling, job_config=self.job_config
-      )
-      for step in range(self.job_config.training.steps):
-        with maybe_enable_profiling(
-            self.job_config.profiler,
-            global_step=step,
-            base_folder=self.job_config.dump_folder,
-        ) as torch_profiler:
+      with torchtitan_profiler.Profiler(
+          self.job_config.profiler,
+          global_step=0,
+          base_folder=self.job_config.dump_folder,
+      ) as profiler:
+        for step in range(self.job_config.training.steps):
           step_start_time = time.time()
           self.optimizers.zero_grad()
           tokens, labels = get_batch()
@@ -304,8 +302,8 @@ class TrainerMinimal:
               step_time,
               tokens_per_sec,
           )
-        if torch_profiler:
-          torch_profiler.step()
+          if profiler:
+            profiler.step()
 
       # Calculate average throughput excluding burn-in steps
       avg_throughput = total_tokens / total_time if total_time > 0 else 0
@@ -342,6 +340,10 @@ def start_trainer(config: JobConfig):
     )
     config.optimizer.implementation = "foreach"
 
+  import sys
+  logger.info("JAX LOADED BEFORE INIT: %s", "jax" in sys.modules)
+  profiler_workaround.init(config)
+  logger.info("JAX LOADED AFTER INIT: %s", "jax" in sys.modules)
   try:
     trainer = TrainerMinimal(device, rank, world_size, config)
     if rank == 0:

@@ -32,6 +32,8 @@ import torchtitan.experiments.tpu.utils as tpu_utils
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.tools import utils
 import torchtitan.tools.logging
+import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
+import torchtitan.tools.profiler as torchtitan_profiler
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 ParallelDims = torchtitan.distributed.ParallelDims
@@ -378,15 +380,10 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
 
   warmup_steps = train_config.lr_scheduler.warmup_steps
 
-  import functools
-  from torchtitan.experiments.tpu import profiler_workaround
-
-  maybe_enable_profiling = functools.partial(
-      profiler_workaround.maybe_enable_profiling, job_config=train_config
-  )
+  profiler_workaround.init(train_config)
 
   ntokens_seen = 0
-  with maybe_enable_profiling(
+  with torchtitan_profiler.Profiler(
       train_config.profiler,
       global_step=0,
       base_folder=train_config.dump_folder,
