@@ -1,6 +1,7 @@
 """JAX CTC Loss for Conformer in torchax."""
 
 import dataclasses
+import jax
 import jax.numpy as jnp
 import optax
 import torch
@@ -9,6 +10,7 @@ import torchtitan.components.loss as components_loss
 import torchtitan.config as torchtitan_config
 
 
+@jax.named_call
 def conformer_jax_ctc_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
   """Computes JAX-native CTC loss using optax under Torchax JIT."""
   env = torchax.default_env()
