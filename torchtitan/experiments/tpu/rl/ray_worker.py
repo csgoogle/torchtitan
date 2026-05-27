@@ -227,13 +227,6 @@ class FusedWorker:
         self.peak_flops = utils.get_peak_flops(device_name)
         self.warmup_steps = self.job_config.lr_scheduler.warmup_steps
 
-        # Initialize local dataloader. This allows PyTorch's DistributedSampler to 
-        # correctly handle Data Parallel vs Tensor Parallel dataset sharding.
-        self.dataloader = self.grpo_utils.build_random_dataloader(
-            self.job_config, self.model_args.vocab_size, self.device
-        )
-        self.data_iterator = iter(self.dataloader)
-
         if self.job_config.sampler.use_vllm:
             from torchtitan.experiments.tpu.rl.grpo_vllm_sampler import VLLMSampler
             self.vllm_sampler = VLLMSampler(self.job_config)
@@ -265,12 +258,11 @@ class FusedWorker:
         """
         return True
 
-    def load_next_batch(self):
-        """Loads the next batch of prompts from the local data iterator."""
-        batch = next(self.data_iterator)
-        max_new_tokens = self.job_config.sampler.max_new_tokens
-        prompt_ids = batch[0]["input"][:, : self.seq_len - max_new_tokens]
-        self.current_prompt_ids = prompt_ids.to(self.device)
+    def load_next_batch(self, prompt_ids_list):
+        """Loads the next batch of prompts from the Driver."""
+        self.current_prompt_ids = self.torch.tensor(
+            prompt_ids_list, dtype=self.torch.long, device=self.device
+        )
         return True
 
     def generate_rollouts(self):
@@ -364,22 +356,12 @@ class FusedWorker:
 
         return True
 
-    def train_ppo_step(self, step):
+    def train_ppo_step(self, advantages, step):
         """Executes the PPO optimization loop for the current batch of rollouts."""
         gc.collect()
         self.torch_tpu._internal.sync.synchronize(wait=True)
             
         t_train_start = time.perf_counter()
-        
-        # Calculate local advantages (GRPO normalizes per prompt group)
-        # Note: In the future, replace this dummy reward with a real text-based reward 
-        # using the completions in self.current_completed_ids.
-        batch_size = self.current_completed_ids.shape[0]
-        rewards = self.torch.randn(batch_size, device=self.device)
-        
-        advantages, _ = self.grpo_utils.compute_grpo_advantages(
-            rewards, group_size=self.job_config.grpo.group_size
-        )
         
         advantages = advantages.to(self.device)
 

@@ -3,6 +3,8 @@ import ray
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu.rl.ray_worker import FusedWorker
 
+DEFAULT_TOKENIZER_NAME = "Qwen/Qwen2.5-0.5B"
+
 class GRPOOrchestrator:
     """
     Ray Driver (Orchestrator) for TPU-based GRPO Training.
@@ -75,6 +77,58 @@ class GRPOOrchestrator:
             worker = FusedWorker.options(**actor_options).remote(self.sys_argv)
             self.workers.append(worker)
 
+    def compute_global_grpo_advantages(self, rollout_results, step, tokenizer):
+        """
+        Computes group-relative advantages globally across all completions generated
+        by the cluster, guaranteeing mathematical parity with single-node reference.
+        """
+        import torch
+        from torchtitan.experiments.rl.sum_digits import SumDigitsEnv
+        
+        all_rewards = []
+        local_batch_size = self.job_config.training.local_batch_size
+        group_size = self.job_config.grpo.group_size
+        
+        for w_idx, res in enumerate(rollout_results):
+            completed_ids = res["completed_ids"]
+            batch_size = completed_ids.shape[0]
+            rewards = []
+            for i in range(batch_size):
+                b_idx = i // group_size
+                env_config = SumDigitsEnv.Config()
+                env = SumDigitsEnv(env_config, step=step, group_idx=w_idx * local_batch_size + b_idx)
+                
+                # Decode to text to calculate reward
+                completion_text = tokenizer.decode(completed_ids[i].tolist(), skip_special_tokens=True)
+                step_result = env.step(completion_text)
+                
+                # Sum the specific reward components
+                reward = step_result.rewards.get("correctness", 0.0) + step_result.rewards.get("format", 0.0)
+                rewards.append(reward)
+                
+            all_rewards.append(torch.tensor(rewards, device='cpu', dtype=torch.float32))
+            
+        # Concatenate all rewards
+        global_rewards = torch.cat(all_rewards, dim=0)
+        
+        # Centralized GRPO Math: computing the mean and std across the entire cluster
+        global_rewards_grouped = global_rewards.view(-1, group_size)
+        global_mean = global_rewards_grouped.mean(dim=1, keepdim=True)
+        global_std = global_rewards_grouped.std(dim=1, keepdim=True)
+        
+        global_advantages_grouped = (global_rewards_grouped - global_mean) / (global_std + 1e-4)
+        global_advantages = global_advantages_grouped.view(-1)
+        
+        # Distribute advantages back to workers
+        worker_advantages = []
+        offset = 0
+        for r in all_rewards:
+            size = r.shape[0]
+            worker_advantages.append(global_advantages[offset:offset+size])
+            offset += size
+            
+        return worker_advantages
+
     def run(self):
         """Main training loop."""
         self.setup_workers()
@@ -94,15 +148,64 @@ class GRPOOrchestrator:
         heartbeat_futures = [worker.heartbeat.remote() for worker in self.workers]
         ray.get(heartbeat_futures)
 
+        print("\n@@@ Initializing Environment and Tokenizer on Driver...")
+        import torch
+        from torchtitan.components.tokenizer import HuggingFaceTokenizer
+        from torchtitan.experiments.rl.sum_digits import SumDigitsEnv
+        
+        # We instantiate a local tokenizer on the driver to encode the prompts
+        tokenizer_path = getattr(self.job_config, "hf_assets_path", DEFAULT_TOKENIZER_NAME)
+        if not tokenizer_path:
+            tokenizer_path = DEFAULT_TOKENIZER_NAME
+        tokenizer = HuggingFaceTokenizer(tokenizer_path=tokenizer_path)
+
         print("\n@@@ Starting training loop on driver...")
         steps = self.job_config.training.steps
+        max_new_tokens = self.job_config.sampler.max_new_tokens
+        seq_len = self.job_config.training.seq_len
+        local_batch_size = self.job_config.training.local_batch_size
+        group_size = self.job_config.grpo.group_size
         
         try:
             for step in range(steps):
                 print(f"@@@ Driver initiating Step {step + 1}/{steps} ...")
                 
-                # 1. Load prompts on workers locally (handles DP/TP correctly)
-                ray.get([w.load_next_batch.remote() for w in self.workers])
+                # 1. Fetch prompts from environment (runs on Driver/CPU)
+                prompt_ids_list = []
+                
+                # Flag to swap between SumDigitsEnv and random data for debugging
+                # SumDigitsEnv dataset hang at step 2
+                use_random_data = (self.job_config.training.dataset == "random")
+                
+                if use_random_data:
+                    import random
+                    vocab_size = tokenizer.get_vocab_size()
+                    target_len = seq_len - max_new_tokens
+                    for w_idx in range(len(self.workers)):
+                        batch_prompt_ids = []
+                        for b_idx in range(local_batch_size):
+                            tokens = [random.randint(0, vocab_size - 1) for _ in range(target_len)]
+                            batch_prompt_ids.append(tokens)
+                        prompt_ids_list.append(batch_prompt_ids)
+                else:
+                    for w_idx in range(len(self.workers)):
+                        batch_prompt_ids = []
+                        for b_idx in range(local_batch_size):
+                            env_config = SumDigitsEnv.Config()
+                            env = SumDigitsEnv(env_config, step=step, group_idx=w_idx * local_batch_size + b_idx)
+                            tokens = tokenizer.encode(env.prompt)
+                            # Left pad with EOS token (or 0)
+                            target_len = seq_len - max_new_tokens
+                            if len(tokens) > target_len:
+                                tokens = tokens[-target_len:]
+                            else:
+                                pad_id = getattr(tokenizer, "eos_id", 0)
+                                tokens = [pad_id] * (target_len - len(tokens)) + tokens
+                            batch_prompt_ids.append(tokens)
+                        prompt_ids_list.append(batch_prompt_ids)
+                
+                # 1b. Load prompts on workers
+                ray.get([w.load_next_batch.remote(batch_prompt_ids) for w, batch_prompt_ids in zip(self.workers, prompt_ids_list)])
 
                 # 2. Parallel Rollout Generation on Workers
                 print(f"    - Parallel Rollout Generation...")
@@ -112,14 +215,18 @@ class GRPOOrchestrator:
                 print(f"    - Computing Reference Log Probs...")
                 ray.get([w.compute_ref_log_probs.remote() for w in self.workers])
                 
-                # 4. Trigger PPO Steps on Workers (Advantages are computed locally per-prompt)
-                print(f"    - Triggering PPO Epochs (Local Advantage Math)...")
+                # 4. Centralized Reward Scoring & Global Advantage Math
+                print(f"    - Centralized Reward Scoring & Global Advantage Math...")
+                advantages_list = self.compute_global_grpo_advantages(rollouts, step, tokenizer)
+
+                # 5. Trigger PPO Steps on Workers
+                print(f"    - Triggering PPO Epochs...")
                 metrics = ray.get([
-                    w.train_ppo_step.remote(step) 
-                    for w in self.workers
+                    w.train_ppo_step.remote(advantages_list[i], step) 
+                    for i, w in enumerate(self.workers)
                 ])
                 
-                # 5. Weight Sync
+                # 6. Weight Sync
                 print(f"    - Syncing weights...")
                 ray.get([w.sync_weights.remote() for w in self.workers])
                 
