@@ -148,6 +148,7 @@ class TorchaxTrainer:
     self.num_global_devices = num_global_devices
     self.num_local_devices = num_local_devices
     self.x_sharding = jax.sharding.NamedSharding(self.mesh, P('fsdp'))
+    self.model_args: typing.Any = None
     self.replicated = jax.sharding.NamedSharding(self.mesh, P())
 
     self.job_config = job_config
@@ -177,6 +178,7 @@ class TorchaxTrainer:
           job_config.training.steps,
           job_config.training.seq_len,
           expected_global_batch_size,
+          vocab_size=self.model_args.vocab_size,
       )
       logger.warning('Using fake data loader.')
     else:
