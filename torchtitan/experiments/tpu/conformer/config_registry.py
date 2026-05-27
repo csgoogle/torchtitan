@@ -7,22 +7,12 @@ from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
-from torchtitan.experiments.tpu.conformer import model
+import torchtitan.experiments.tpu.conformer as tpu_conformer
 from torchtitan.experiments.tpu.conformer.infra.parallelize import parallelize_conformer
-
-conformer_args = {
-    "test": model.ConformerModelArgs(
-        vocab_size=64,
-        hidden_dim=512,
-        num_layers=17,
-        num_heads=8,
-        kernel_size=31,
-    )
-}
 
 
 def _conformer_model_spec(flavor: str) -> ModelSpec:
-  model_config = conformer_args[flavor]
+  model_config = tpu_conformer.conformer_args[flavor]
   return ModelSpec(
       name="conformer_tpu",
       flavor=flavor,
@@ -53,7 +43,8 @@ def conformer_test() -> TPUTrainerConfig:
           local_batch_size=768,
           seq_len=512,
           steps=10,
-          dtype="bfloat16",
+          dtype="float32",
+          mixed_precision_param="bfloat16",
       ),
       parallelism=TPUTrainerConfig().parallelism.__class__(
           data_parallel_shard_degree=-1,
@@ -78,3 +69,18 @@ def conformer_test() -> TPUTrainerConfig:
           use_ctc_loss=True,
       ),
   )
+
+
+def conformer_debugmodel() -> TPUTrainerConfig:
+  """Conformer debug model configuration for TPU."""
+  config = conformer_test()
+  config.model_spec = _conformer_model_spec("debugmodel")
+  config.training = config.training.__class__(
+      local_batch_size=4,
+      seq_len=128,
+      steps=3,
+      dtype="float32",
+      mixed_precision_param="bfloat16",
+  )
+  return config
+

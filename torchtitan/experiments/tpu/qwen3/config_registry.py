@@ -87,3 +87,30 @@ def qwen3_moe_testmodel() -> TPUTrainerConfig:
   cfg.training.local_batch_size = 4
 
   return cfg
+
+
+def grpo_qwen3_0_6b() -> TPUTrainerConfig:
+  """Qwen3 0.6B model SFT configuration for TPU."""
+  cfg = qwen3_debugmodel()
+  config = qwen3_configs["0.6B"]
+  cfg.model_spec = ModelSpec(
+      name="qwen3_tpu",
+      flavor="0.6B",
+      model=config,
+      parallelize_fn=tpu_parallelize_qwen3,
+      pipelining_fn=None,
+      post_optimizer_build_fn=None,
+      state_dict_adapter=Qwen3StateDictAdapter,
+  )
+  cfg.model_spec.model.enable_weight_tying = False
+
+  # Override with previous debug_model train_config values
+  cfg.training.seq_len = 512
+  cfg.training.local_batch_size = 2
+  
+  cfg.parallelism.data_parallel_shard_degree = -1
+  cfg.parallelism.data_parallel_replicate_degree = 1
+  cfg.parallelism.pipeline_parallel_schedule = ""
+  cfg.parallelism.tensor_parallel_degree = 1
+
+  return cfg

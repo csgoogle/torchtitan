@@ -204,6 +204,14 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
       ),
       dict(
+          testcase_name="llama3_simple_fsdp",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+      ),
+      dict(
           testcase_name="llama3_fsdp_compile",
           module="torchtitan.experiments.tpu.llama3",
           config="llama3_debugmodel",
@@ -258,8 +266,6 @@ class TrainDistributedTest(
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
-              # b/515065114 - SplashAttention Pallas kernel doesn't support runtime attention masks
-              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
       # qwen3
@@ -334,8 +340,6 @@ class TrainDistributedTest(
           skip_devices=[
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
-              # b/515065114 - SplashAttention Pallas kernel doesn't support runtime attention masks
-              device_type.AcceleratorDeviceType.TPU,
           ],
       ),
       dict(

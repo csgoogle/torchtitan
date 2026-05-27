@@ -17,7 +17,14 @@ conformer_args = {
         num_layers=17,
         num_heads=8,
         kernel_size=31,
-    )
+    ),
+    "debugmodel": model.ConformerModelArgs(
+        vocab_size=64,
+        hidden_dim=64,
+        num_layers=2,
+        num_heads=4,
+        kernel_size=31,
+    ),
 }
 
 train_spec.register_train_spec(

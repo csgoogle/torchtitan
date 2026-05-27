@@ -6,7 +6,7 @@ import os
 from absl.testing import absltest
 from absl.testing import parameterized
 
-from torchtitan.config.manager import ConfigManager
+import torchtitan.config.manager as config_manager_module
 from torchtitan.experiments.torchax import train_minimal
 
 
@@ -39,6 +39,18 @@ class TrainTorchaxTest(parameterized.TestCase):
           config="redacted_debugmodel",
           use_scan=False,
       ),
+      dict(
+          testcase_name="conformer",
+          module="torchtitan.experiments.torchax.conformer",
+          config="conformer_debugmodel",
+          use_scan=False,
+      ),
+      dict(
+          testcase_name="conformer_scan",
+          module="torchtitan.experiments.torchax.conformer",
+          config="conformer_debugmodel",
+          use_scan=True,
+      ),
   ])
   def test_train_torchax(self, module, config, use_scan):
     scan_flag = (
@@ -58,7 +70,7 @@ class TrainTorchaxTest(parameterized.TestCase):
         "--training.local_batch_size=8",
     ]
 
-    job_config = ConfigManager().parse_args(args)
+    job_config = config_manager_module.ConfigManager().parse_args(args)
     success = train_minimal.main_train_loop(job_config)
     self.assertTrue(success)
 

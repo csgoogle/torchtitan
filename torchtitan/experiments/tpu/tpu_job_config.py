@@ -71,6 +71,8 @@ class Qwen3Config:
 class FluxConfig:
     precomputed_dataset_path: str | None = None
     """Path to the precomputed embeddings"""
+    random_dataset: bool = False
+    """Whether to train on random instead of real data"""
 
 
 @dataclasses.dataclass

@@ -33,13 +33,27 @@ def use_splash_attention_patch(
     return {k: v for k, v in kwargs.items() if v is not None}
 
   def _splash_forward(
-      self, q, k, v, *, scale=None, enable_gqa=False, is_causal=True):
+      self,
+      q,
+      k,
+      v,
+      *,
+      scale=None,
+      enable_gqa=False,
+      is_causal=True,
+      **extra_args,
+  ):
     """Replace ScaledDotProductAttention.forward with splash_sdpa.
 
     Reads ``sliding_window_size`` from the patched module if set; otherwise
     behaves as before (causal or full mask depending on ``is_causal``). Most
     torchtitan wrappers don't expose this attribute → defaults to None.
     """
+    if extra_args.get("attention_masks") is not None:
+      raise ValueError(
+          "TPU SplashAttention Pallas kernel does not support runtime"
+          " attention_masks."
+      )
 
     # TorchTitan passes tensors as (B, S, H, D). However, the splash_sdpa Pallas kernel
     # expects (B, H, S, D). We transpose them here to match the kernel's expected layout.
@@ -52,7 +66,7 @@ def use_splash_attention_patch(
 
     local_window_size = getattr(self, "sliding_window_size", None)
 
-    kwargs = _get_kwargs(
+    sa_kwargs = _get_kwargs(
         block_q=block_q,
         block_kv=block_kv,
         block_dkv=block_dkv,
@@ -75,7 +89,7 @@ def use_splash_attention_patch(
         is_causal=is_causal,
         local_window_size=local_window_size,
         enable_gqa=enable_gqa,
-        **kwargs,
+        **sa_kwargs,
     )
     # Transpose back to (B, S, H, D) so the rest of the TorchTitan model receives its expected format
     return out.transpose(1, 2)

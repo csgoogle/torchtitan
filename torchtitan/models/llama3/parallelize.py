@@ -30,6 +30,12 @@ from torchtitan.distributed.fsdp import (
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.tools.logging import logger
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    data_parallel as simple_fsdp_data_parallel,
+)
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
+)
 
 
 def parallelize_llama(
@@ -89,22 +95,40 @@ def parallelize_llama(
     if model_compile_enabled:
         apply_compile(model, compile_config)
 
+    use_simple_fsdp = parallelism.use_simple_fsdp
     names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
     dp_mesh = parallel_dims.get_mesh(names)
-    apply_fsdp(
-        model,
-        dp_mesh,
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        pp_enabled=parallel_dims.pp_enabled,
-        cpu_offload=training.enable_cpu_offload,
-        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-    )
 
-    if parallel_dims.dp_replicate_enabled:
-        logger.info("Applied HSDP to the model")
+    if use_simple_fsdp:
+        dp_mode = (
+            "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
+        )
+        mp_policy = SimpleFSDPMixedPrecisionPolicy(
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        )
+        model = simple_fsdp_data_parallel(
+            model,
+            dp_mesh,
+            mode=dp_mode,
+            mp_policy=mp_policy,
+        )
+        logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
     else:
-        logger.info("Applied FSDP to the model")
+        apply_fsdp(
+            model,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+        )
+
+        if parallel_dims.dp_replicate_enabled:
+            logger.info("Applied HSDP to the model")
+        else:
+            logger.info("Applied FSDP to the model")
 
     if training.enable_cpu_offload:
         logger.info("Applied CPU Offloading to the model")

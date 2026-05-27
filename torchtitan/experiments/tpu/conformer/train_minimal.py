@@ -65,7 +65,8 @@ def train_step(
   with jax_profiler.TraceAnnotation("loss"):
     if use_ctc:
       # CTC loss expects (T, N, C)
-      log_probs = torch.nn.functional.log_softmax(logits, dim=-1).transpose(
+      logits_f32 = logits.float()
+      log_probs = torch.nn.functional.log_softmax(logits_f32, dim=-1).transpose(
           0, 1
       )
       # TODO: b/513607161 - change to torch.nn.CTCLoss when ready.
@@ -210,7 +211,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
 
   tokenizer = typing.cast(
       torchtitan.components.tokenizer.HuggingFaceTokenizer,
-      train_config.tokenizer.build(tokenizer_path=train_config.hf_assets_path)
+      train_config.tokenizer.build(tokenizer_path=train_config.hf_assets_path),
   )
 
   if train_config.dataloader.dataset == "random":
@@ -336,7 +337,10 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       fused=fused,
   )
 
-  if train_config.compile.enable and "optimizer" in train_config.compile.components:
+  if (
+      train_config.compile.enable
+      and "optimizer" in train_config.compile.components
+  ):
     logger.info("Applying torch.compile to optimizer.step")
     optimizer.step = torch.compile(
         optimizer.step,
