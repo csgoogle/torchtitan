@@ -78,10 +78,9 @@ sudo fuser -k /dev/vfio/* 2>/dev/null || true
 export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiments/tpu/rl/ray_train.py \
     --module=torchtitan.experiments.tpu.rl \
     --config=grpo_qwen3_0_6b \
-    --training.dataset=random \
     --sampler.use_vllm \
-    --training.steps=100 2>&1 \
-    | tee ray_train.log \
+    --training.steps=10 2>&1 \
+    | tee ray_train_vllm.log \
     | grep -iE "\[titan\]|@@@" 
 ```
 
@@ -90,18 +89,6 @@ Check progress and metrics
 grep -E "Step [0-9]+: Avg Reward|Training completed|step:\s+[0-9]+" ray_train.log
 ```
 
-Repro hang with the real SumDigitsEnv data
-```bash
-sudo fuser -k /dev/vfio/* 2>/dev/null || true
-export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiments/tpu/rl/ray_train.py \
-    --module=torchtitan.experiments.tpu.rl \
-    --config=grpo_qwen3_0_6b \
-    --training.dataset=SumDigitsEnv \
-    --sampler.use_vllm \
-    --training.steps=100 2>&1 \
-    | tee ray_train.log \
-    | grep -iE "\[titan\]|@@@" 
-```
 
 #### 2. Alternative: Natively with PyTorch FSDP 
 If vLLM is not installed or you wish to sample directly with PyTorch's native FSDP layers (slower autoregressive performance, but useful for testing):
@@ -111,9 +98,8 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --module=torchtitan.experiments.tpu.rl \
     --config=grpo_qwen3_0_6b \
     --sampler.no-use-vllm \
-    --training.dataset=SumDigitsEnv \
     --sampler.use-separate-sampler-model \
-    --training.steps=20 2>&1 \
+    --training.steps=10 2>&1 \
     | tee ray_train.log \
     | grep -iE "\[titan\]|@@@" 
 ```

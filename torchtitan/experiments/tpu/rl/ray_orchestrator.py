@@ -172,12 +172,10 @@ class GRPOOrchestrator:
                 
                 # 1. Fetch prompts from environment (runs on Driver/CPU)
                 prompt_ids_list = []
-                
-                # Flag to swap between SumDigitsEnv and random data for debugging
-                # SumDigitsEnv dataset hang at step 2
-                use_random_data = (self.job_config.training.dataset == "random")
-                
-                if use_random_data:
+                ds = self.job_config.training.dataset.lower() 
+                if ds == "random":
+                    # Use random dataset for debug only
+                    print("Using random dataset for debugging...")
                     import random
                     vocab_size = tokenizer.get_vocab_size()
                     target_len = seq_len - max_new_tokens
@@ -187,7 +185,7 @@ class GRPOOrchestrator:
                             tokens = [random.randint(0, vocab_size - 1) for _ in range(target_len)]
                             batch_prompt_ids.append(tokens)
                         prompt_ids_list.append(batch_prompt_ids)
-                else:
+                elif ds.startswith("sumdigits"):
                     for w_idx in range(len(self.workers)):
                         batch_prompt_ids = []
                         for b_idx in range(local_batch_size):
@@ -199,10 +197,20 @@ class GRPOOrchestrator:
                             if len(tokens) > target_len:
                                 tokens = tokens[-target_len:]
                             else:
-                                pad_id = getattr(tokenizer, "eos_id", 0)
-                                tokens = [pad_id] * (target_len - len(tokens)) + tokens
+                                eos_id = getattr(tokenizer, "eos_id", 0)
+                                # tokens = [eos_id] * (target_len - len(tokens)) + tokens  # <- This causes hang in step 2 
+                                # HACK: pad sequence to be [random tokens] + [EOS] + [prompt tokens]
+                                tokens = [eos_id] + tokens
+                                if len(tokens) < target_len:
+                                    import random
+                                    vocab_size = tokenizer.get_vocab_size()
+                                    pad_tokens = [random.randint(0, vocab_size - 1) for _ in range(target_len - len(tokens))]
+                                    tokens = pad_tokens + tokens
+
                             batch_prompt_ids.append(tokens)
                         prompt_ids_list.append(batch_prompt_ids)
+                else:
+                    raise ValueError("Only sumdigits or random datasets are supported!")
                 
                 # 1b. Load prompts on workers
                 ray.get([w.load_next_batch.remote(batch_prompt_ids) for w, batch_prompt_ids in zip(self.workers, prompt_ids_list)])
@@ -234,7 +242,9 @@ class GRPOOrchestrator:
             ray.get(finish_futures)
             print("\n@@@ Training completed successfully!")
         except Exception as e:
-            print("\n@@@ Training failed with exception:", e)
+            import traceback
+            print("\n@@@ Training failed with exception:")
+            traceback.print_exc()
 
 
 

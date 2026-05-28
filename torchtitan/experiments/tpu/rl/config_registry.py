@@ -32,7 +32,7 @@ def grpo_qwen3_0_6b() -> GRPOJobConfig:
       ),
       model=ModelConfig(name="qwen3_tpu", flavor="0.6B"),
       training=GRPOTrainingConfig(
-          dataset="random",
+          dataset="SumDigitsEnv",
           seq_len=512,
           steps=8,
           local_batch_size=2,
@@ -70,7 +70,7 @@ def grpo_qwen3_1_7b() -> GRPOJobConfig:
       ),
       model=ModelConfig(name="qwen3_tpu", flavor="1.7B"),
       training=GRPOTrainingConfig(
-          dataset="random",
+          dataset="SumDigitsEnv",
           seq_len=1024,
           steps=8,
           local_batch_size=4,
@@ -108,7 +108,7 @@ def grpo_qwen3_4b() -> GRPOJobConfig:
       ),
       model=ModelConfig(name="qwen3_tpu", flavor="4B"),
       training=GRPOTrainingConfig(
-          dataset="random",
+          dataset="SumDigitsEnv",
           seq_len=1024,
           steps=8,
           local_batch_size=4,
