@@ -329,6 +329,12 @@ class Profiler(Configurable):
             # Use PrivateUse1 for TPU until it is fully upstreamed in PyTorch
             # TODO: b/470479047 - confirm torch.profiler working for TPU on Cloud.
             activities.append(torch.profiler.ProfilerActivity.PrivateUse1)
+
+            # TPU profiler C++ backend still relies on the environment variable
+            # to determine where to dump the raw .xplane.pb files.
+            tpu_trace_dir = os.path.join(trace_dir, f"rank_{rank}")
+            os.makedirs(tpu_trace_dir, exist_ok=True)
+            os.environ["TPU_PROFILER_OUTPUT_DIR"] = tpu_trace_dir
         elif torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         elif torch.xpu.is_available():
