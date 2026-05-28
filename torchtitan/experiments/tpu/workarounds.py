@@ -8,29 +8,33 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.tools.logging import logger
 
 
-def use_splash_attention_patch(
-    model: nn.Module,
-    block_q: int | None = None,
-    block_kv: int | None = None,
-    block_dkv: int | None = None,
-    block_kv_compute: int | None = None,
-    block_q_dkv: int | None = None,
-    block_kv_dkv: int | None = None,
-    block_kv_dkv_compute: int | None = None,
-    block_q_dq: int | None = None,
-    block_kv_dq: int | None = None,
-    use_fused_bwd_kernel: bool | None = None,
-    q_layout: str | None = None,
-    k_layout: str | None = None,
-    v_layout: str | None = None,
-) -> None:
+_SPLASH_KEYS = {
+    "block_q", "block_kv", "block_dkv", "block_kv_compute",
+    "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute",
+    "block_q_dq", "block_kv_dq", "use_fused_bwd_kernel",
+    "use_vmap_bwd", "q_layout", "k_layout", "v_layout"
+}
+
+
+def _extract_splash_kwargs(sa_config: Any) -> dict[str, Any]:
+  """Safe prefix-mapping helper to map sa_config attributes to standard names."""
+  if sa_config is None:
+    return {}
+  kwargs = {}
+  for k in _SPLASH_KEYS:
+    val = getattr(sa_config, f"sa_{k}", getattr(sa_config, k, None))
+    if val is not None:
+      kwargs[k] = val
+  return kwargs
+
+
+def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
   """Patches splash attention into the model."""
-  from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa as standard_splash_sdpa  # pylint: disable=g-import-not-at-top
   import types
 
-  # Helper to filter out None values so we don't override defaults in splash_sdpa
-  def _get_kwargs(**kwargs):
-    return {k: v for k, v in kwargs.items() if v is not None}
+  # Extract parameters internally using our safe prefix mapper
+  sa_kwargs = _extract_splash_kwargs(sa_config)
 
   def _splash_forward(
       self,
@@ -66,22 +70,8 @@ def use_splash_attention_patch(
 
     local_window_size = getattr(self, "sliding_window_size", None)
 
-    sa_kwargs = _get_kwargs(
-        block_q=block_q,
-        block_kv=block_kv,
-        block_dkv=block_dkv,
-        block_kv_compute=block_kv_compute,
-        block_q_dkv=block_q_dkv,
-        block_kv_dkv=block_kv_dkv,
-        block_kv_dkv_compute=block_kv_dkv_compute,
-        block_q_dq=block_q_dq,
-        block_kv_dq=block_kv_dq,
-        use_fused_bwd_kernel=use_fused_bwd_kernel,
-        q_layout=q_layout,
-        k_layout=k_layout,
-        v_layout=v_layout,
-    )
-    out = splash_sdpa(
+
+    out = standard_splash_sdpa(
         q,
         k,
         v,
@@ -135,23 +125,8 @@ def use_splash_attention_patch(
     # default to None ⇒ same behavior as before this change.
     local_window_size = getattr(self, "sliding_window_size", None)
 
-    call_kwargs = _get_kwargs(
-        block_q=block_q,
-        block_kv=block_kv,
-        block_dkv=block_dkv,
-        block_kv_compute=block_kv_compute,
-        block_q_dkv=block_q_dkv,
-        block_kv_dkv=block_kv_dkv,
-        block_kv_dkv_compute=block_kv_dkv_compute,
-        block_q_dq=block_q_dq,
-        block_kv_dq=block_kv_dq,
-        use_fused_bwd_kernel=use_fused_bwd_kernel,
-        q_layout=q_layout,
-        k_layout=k_layout,
-        v_layout=v_layout,
-    )
     # splash_sdpa expects enable_gqa=False as heads are already tiled.
-    out = splash_sdpa(
+    out = standard_splash_sdpa(
         query,
         key,
         value,
@@ -159,7 +134,7 @@ def use_splash_attention_patch(
         is_causal=True,
         local_window_size=local_window_size,
         enable_gqa=False,
-        **call_kwargs,
+        **sa_kwargs,
     )
     # Transpose back to match [redacted]'s expected layout
     return out.transpose(-3, -2).contiguous()
@@ -192,6 +167,125 @@ def use_splash_attention_patch(
   else:
     logger.info(
         "Splash attention ENABLED: patched %d attention modules "
+        "(causal=%d, sliding-window=%d)",
+        _patched, _causal, _windowed,
+    )
+
+
+def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None:
+  """Patches zero-overhead Tokamax layout-fused splash attention into the model."""
+  from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import TokamaxConfig  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import splash_sdpa as tokamax_splash_sdpa  # pylint: disable=g-import-not-at-top
+  import types
+
+  # Update core JAX trace compilation configs internally from config registry
+  TokamaxConfig.update(
+      block_q=getattr(sa_config, "block_q", None),
+      block_kv=getattr(sa_config, "block_kv", None),
+      block_kv_compute=getattr(sa_config, "block_kv_compute", None),
+      block_q_dkv=getattr(sa_config, "block_q_dkv", None),
+      block_kv_dkv=getattr(sa_config, "block_kv_dkv", None),
+      block_kv_dkv_compute=getattr(sa_config, "block_kv_dkv_compute", None),
+      block_q_dq=getattr(sa_config, "block_q_dq", None),
+      block_kv_dq=getattr(sa_config, "block_kv_dq", None),
+      use_fused_bwd_kernel=getattr(sa_config, "use_fused_bwd_kernel", None),
+      q_layout=getattr(sa_config, "q_layout", None),
+      k_layout=getattr(sa_config, "k_layout", None),
+      v_layout=getattr(sa_config, "v_layout", None),
+  )
+
+  def _get_kwargs(**kwargs):
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+  def _filter_splash_kwargs(kwargs_dict):
+    return {k: v for k, v in kwargs_dict.items() if k in _SPLASH_KEYS}
+
+  # Extract parameters dynamically using our shared prefix mapper helper!
+  sa_kwargs = _extract_splash_kwargs(sa_config)
+
+  def _splash_forward(
+      self,
+      q,
+      k,
+      v,
+      *,
+      scale=None,
+      enable_gqa=False,
+      is_causal=True,
+      **extra_args,
+  ):
+    if extra_args.get("attention_masks") is not None:
+      raise ValueError(
+          "TPU SplashAttention Pallas kernel does not support runtime"
+          " attention_masks."
+      )
+
+    local_window_size = getattr(self, "sliding_window_size", None)
+
+    # Tokamax JAX-side transpositions path (Direct pass-through of contiguous layouts)
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    combined_args = {**extra_args, **sa_kwargs}
+    forward_kwargs = _filter_splash_kwargs(combined_args)
+    out = tokamax_splash_sdpa(
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=is_causal,
+        local_window_size=local_window_size,
+        enable_gqa=enable_gqa,
+        **forward_kwargs,
+    )
+    return out
+
+  def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
+    query, key, value = self._maybe_tile_qkv_for_gqa(query, key, value)
+    local_window_size = getattr(self, "sliding_window_size", None)
+
+    # Tokamax JAX-side transpositions path (Direct pass-through of GQA tiled buffers)
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    combined_args = {**kwargs, **sa_kwargs}
+    forward_kwargs = _filter_splash_kwargs(combined_args)
+    out = tokamax_splash_sdpa(
+        query,
+        key,
+        value,
+        scale=scale,
+        is_causal=True,
+        local_window_size=local_window_size,
+        enable_gqa=False,
+        **forward_kwargs,
+    )
+    return out
+
+  _patched = 0
+  _windowed = 0
+  _causal = 0
+  for _, module in model.named_modules():
+    cls_name = type(module).__name__
+    if cls_name == "ScaledDotProductAttention":
+      if "[redacted]" in type(module).__module__:
+        module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
+      else:
+        module.forward = types.MethodType(_splash_forward, module)
+      _patched += 1
+      if getattr(module, "sliding_window_size", None) is not None:
+        _windowed += 1
+      else:
+        _causal += 1
+
+  if _patched == 0:
+    raise ValueError(
+        "Tokamax splash attention patch was requested but NO matching "
+        "attention modules (ScaledDotProductAttention) were found in the model."
+    )
+  else:
+    logger.info(
+        "Tokamax splash attention ENABLED: patched %d attention modules "
         "(causal=%d, sliding-window=%d)",
         _patched, _causal, _windowed,
     )
@@ -318,11 +412,12 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   use_cpu_safe_histc_patch()
 
   # Splash Attention Patch
-  if (
-      hasattr(job_config, "splash_attention_kernel")
-      and job_config.splash_attention_kernel.use_splash_attention_kernel
-  ):
-    use_splash_attention_patch(model)
+  if hasattr(job_config, "splash_attention_kernel"):
+    sa_config = job_config.splash_attention_kernel
+    if sa_config.use_tokamax_splash_attention_kernel:
+      use_tokamax_splash_attention_patch(model, sa_config)
+    elif sa_config.use_splash_attention_kernel:
+      use_splash_attention_patch(model)
 
   # Pallas Loss Patch (Output Projection)
   if (

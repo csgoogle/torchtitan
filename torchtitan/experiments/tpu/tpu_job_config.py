@@ -69,10 +69,10 @@ class Qwen3Config:
 
 @dataclasses.dataclass
 class FluxConfig:
-    precomputed_dataset_path: str | None = None
-    """Path to the precomputed embeddings"""
-    random_dataset: bool = False
-    """Whether to train on random instead of real data"""
+  precomputed_dataset_path: str | None = None
+  """Path to the precomputed embeddings"""
+  random_dataset: bool = False
+  """Whether to train on random instead of real data"""
 
 
 @dataclasses.dataclass
@@ -90,6 +90,7 @@ class LoRAConfig:
 @dataclasses.dataclass
 class SplashAttentionKernelConfig:
   use_splash_attention_kernel: bool = False
+  use_tokamax_splash_attention_kernel: bool = False
   use_vmap_bwd: bool = False
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
@@ -173,8 +174,6 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
         **{name: getattr(src, name) for name in shared},
         **overrides,
     )
-
-
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
