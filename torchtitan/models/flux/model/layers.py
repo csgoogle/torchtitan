@@ -162,7 +162,9 @@ class SelfAttention(Module):
 
     def forward(self, x: Tensor, pe: Tensor) -> Tensor:
         qkv = self.qkv(x)
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.num_heads)
+        B, L, _ = qkv.shape
+        qkv = qkv.view(B, L, 3, self.num_heads, -1)
+        q, k, v = torch.unbind(qkv, dim=2)
         q, k = self.norm(q, k, v)
         q, k = apply_rope(q, k, pe)
         x = self.inner_attention(q, k, v, is_causal=False)
@@ -264,18 +266,18 @@ class DoubleStreamBlock(Module):
         img_modulated = self.img_norm1(img)
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
         img_qkv = self.img_attn.qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(
-            img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.num_heads
-        )
+        B, L, _ = img_qkv.shape
+        img_qkv = img_qkv.view(B, L, 3, self.num_heads, -1)
+        img_q, img_k, img_v = torch.unbind(img_qkv, dim=2)
         img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
         # prepare txt for attention
         txt_modulated = self.txt_norm1(txt)
         txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
         txt_qkv = self.txt_attn.qkv(txt_modulated)
-        txt_q, txt_k, txt_v = rearrange(
-            txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.num_heads
-        )
+        B, L, _ = txt_qkv.shape
+        txt_qkv = txt_qkv.view(B, L, 3, self.num_heads, -1)
+        txt_q, txt_k, txt_v = torch.unbind(txt_qkv, dim=2)
         txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
         # run actual attention
@@ -353,7 +355,9 @@ class SingleStreamBlock(Module):
         qkv = self.lin_qkv(x_mod)
         mlp = self.lin_mlp(x_mod)
 
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.num_heads)
+        B, L, _ = qkv.shape
+        qkv = qkv.view(B, L, 3, self.num_heads, -1)
+        q, k, v = torch.unbind(qkv, dim=2)
         q, k = self.norm(q, k, v)
 
         # compute attention
