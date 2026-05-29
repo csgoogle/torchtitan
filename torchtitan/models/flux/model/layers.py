@@ -26,19 +26,32 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     scale = torch.arange(0, dim, 2, dtype=pos.dtype, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
     out = torch.einsum("...n,d->...nd", pos, omega)
-    out = torch.stack(
-        [torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1
-    )
-    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
-    return out.float()
-
+    # Return cos and sin separately to avoid tiny dimensions
+    cos = torch.cos(out).float()
+    sin = torch.sin(out).float()
+    return torch.stack([cos, sin], dim=-1) # Just pass cos and sin together
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
-    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
-    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+    # freqs_cis has shape (..., d/2, 2), where [..., 0] is cos and [..., 1] is sin
+    cos = freqs_cis[..., 0]
+    sin = freqs_cis[..., 1]
+
+    # xq shape: (..., d). We reshape to (..., d/2, 2)
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 2)
+
+    xq_0, xq_1 = xq_[..., 0], xq_[..., 1]
+    xk_0, xk_1 = xk_[..., 0], xk_[..., 1]
+
+    xq_out_0 = xq_0 * cos - xq_1 * sin
+    xq_out_1 = xq_0 * sin + xq_1 * cos
+
+    xk_out_0 = xk_0 * cos - xk_1 * sin
+    xk_out_1 = xk_0 * sin + xk_1 * cos
+
+    xq_out = torch.stack([xq_out_0, xq_out_1], dim=-1).reshape(*xq.shape).type_as(xq)
+    xk_out = torch.stack([xk_out_0, xk_out_1], dim=-1).reshape(*xk.shape).type_as(xk)
+    return xq_out, xk_out
 
 
 class EmbedND(Module):
@@ -58,7 +71,7 @@ class EmbedND(Module):
         n_axes = ids.shape[-1]
         emb = torch.cat(
             [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
-            dim=-3,
+            dim=-2,
         )
 
         return emb.unsqueeze(2)
