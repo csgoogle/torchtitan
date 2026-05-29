@@ -30,11 +30,13 @@ from torchtitan.tools.utils import get_device_type
 from torchtitan.experiments.rl.models.attention import VLLMAttentionWrapper
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
-if get_device_type() == "tpu":
-    # TPU-vllm does not need have vllm.compilation.codegen
-    _codegen = None
-else:
+# vllm.compilation.codegen depends on GPU/CUDA-specific Triton compilation tools 
+# which are completely absent on TPU or CPU-only vLLM container environments.
+# Wrapping the import in a try-except block guarantees multi-architecture portability.
+try:
     from vllm.compilation import codegen as _codegen
+except ImportError:
+    _codegen = None
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -62,7 +64,12 @@ def _dtensor_safe_weak_ref_tensor(tensor):
 _torch_utils.weak_ref_tensor = _dtensor_safe_weak_ref_tensor
 
 
-if get_device_type() == "tpu":
+# We bypass GPU-specific codegen monkeypatching in two key Ray scenarios:
+# 1. On Ray TPU Workers: They run a TPU/CPU-focused build of vLLM where Triton 
+#    and GPU codegen tools are absent, causing the _codegen import to fall back to None.
+# 2. On Ray CPU Head Node / CPU Actors: Non-accelerator VM environments do not 
+#    load GPU compilation dependencies.
+if get_device_type() == "tpu" or _codegen is None:
     pass
 else:
     # NOTE: Monkeypatch vLLM's _node_ref to handle DTensor placement types

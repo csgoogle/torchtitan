@@ -5,6 +5,47 @@ from torchtitan.experiments.tpu.rl.ray_worker import FusedWorker
 
 DEFAULT_TOKENIZER_NAME = "Qwen/Qwen2.5-0.5B"
 
+# Global TPU Hardware Topology Registry
+TPU_TOPOLOGY_REGISTRY = {
+    # Google Cloud TPU v6e - v6e-16 slice (4x v6e-4 hosts)
+    "v6e-16": {
+        "TORCH_TPU_TOPOLOGY": "4,4,1",
+        "TPU_HOST_BOUNDS": "4,4,1",
+        "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
+        "HOST_BOUNDS": "4,4,1",
+        "CHIPS_PER_HOST_BOUNDS": "1,1,1",
+        "CHIPS_PER_HOST": "4"
+    },
+    # Google Cloud TPU v6e - v6e-8 slice (2x v6e-4 hosts)
+    "v6e-8": {
+        "TORCH_TPU_TOPOLOGY": "2,4,1",
+        "TPU_HOST_BOUNDS": "2,2,1",
+        "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
+        "HOST_BOUNDS": "2,2,1",
+        "CHIPS_PER_HOST_BOUNDS": "1,1,1",
+        "CHIPS_PER_HOST": "4"
+    },
+    # Google Cloud TPU v5e - v5e-8 slice (1x v5e-8 host)
+    "v5e-8": {
+        "TORCH_TPU_TOPOLOGY": "2,4,1",
+        "TPU_HOST_BOUNDS": "1,1,1",
+        "TPU_CHIPS_PER_HOST_BOUNDS": "2,4,1",
+        "HOST_BOUNDS": "1,1,1",
+        "CHIPS_PER_HOST_BOUNDS": "2,4,1",
+        "CHIPS_PER_HOST": "4"
+    },
+    # Google Cloud TPU v4 - v4-16 slice (2x v4-8 hosts)
+    "v4-16": {
+        "TORCH_TPU_TOPOLOGY": "2,2,4",
+        "TPU_HOST_BOUNDS": "2,1,1",
+        "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1",
+        "HOST_BOUNDS": "2,1,1",
+        "CHIPS_PER_HOST_BOUNDS": "2,2,1",
+        "CHIPS_PER_HOST": "4"
+    }
+}
+
+
 class GRPOOrchestrator:
     """
     Ray Driver (Orchestrator) for TPU-based GRPO Training.
@@ -30,13 +71,15 @@ class GRPOOrchestrator:
   │  - TPU Chip 0    │      │  - TPU Chip 1    │      │  - TPU Chip 2    │
   └──────────────────┘      └──────────────────┘      └──────────────────┘
     """
-    def __init__(self, sys_argv, world_size, tpu_resources, master_addr, master_port, sb_addresses):
+    def __init__(self, sys_argv, world_size, tpu_resources, master_addr, master_port, sb_addresses, tpu_nodes, tpu_type):
         self.sys_argv = sys_argv
         self.world_size = world_size
         self.tpu_resources = tpu_resources
         self.master_addr = master_addr
         self.master_port = master_port
         self.sb_addresses = sb_addresses
+        self.tpu_nodes = tpu_nodes
+        self.tpu_type = tpu_type
         self.workers = []
         
         # Parse torchtitan configs
@@ -45,33 +88,62 @@ class GRPOOrchestrator:
         
     def setup_workers(self):
         """Spawns Ray Actor workers for each physical TPU chip."""
+        unique_hostnames = list(dict.fromkeys([addr.split(":")[0] for addr in self.sb_addresses]))
+        tpu_worker_hostnames = ",".join(unique_hostnames)
+        rank0_hostname = unique_hostnames[0]
+
+        topology_config = TPU_TOPOLOGY_REGISTRY.get(self.tpu_type, TPU_TOPOLOGY_REGISTRY["v6e-16"])
+        chips_per_host = int(topology_config.get("CHIPS_PER_HOST", 4))
+
         for rank in range(self.world_size):
             # TODO: config those env var automatically
+            # Dynamic ports for SliceBuilder and PJRT process port
+            local_chip_index = rank % chips_per_host
+            process_port = 8471 + local_chip_index
+            tpu_worker_addresses_str = ",".join(self.sb_addresses) if isinstance(self.sb_addresses, list) else self.sb_addresses
+
             env_vars = {
                 "WORLD_SIZE": str(self.world_size),
                 "RANK": str(rank),
-                "LOCAL_RANK": str(rank),
-                "MASTER_ADDR": self.master_addr,
+                "LOCAL_RANK": str(local_chip_index),
+                "MASTER_ADDR": rank0_hostname,
                 "MASTER_PORT": str(self.master_port),
-                "TORCH_TPU_SLICEBUILDER_ADDRESSES": self.sb_addresses,
+                "TORCH_TPU_SLICEBUILDER_ADDRESSES": tpu_worker_addresses_str,
                 
+                # Mandatory distributed PJRT/XLA variables to resolve hanging
+                "TPU_PROCESS_ADDRESSES": tpu_worker_addresses_str,
+                "TPU_PROCESS_PORT": str(process_port),
+                "CLOUD_TPU_TASK_ID": str(rank),
+                "TPU_WORKER_HOSTNAMES": tpu_worker_hostnames,
+
                 # Disable eager memory pre-allocation to prevent OOM
                 "JAX_MEM_FRACTION": "0.45",
                 "JAX_THREE_G_MEM_ALLOC_ON_FREE": "true",
                 "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                 "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.45",
-                
-                # TPU Topology and configuration for v6e-4 VM
-                # TODO: support other topology
-                "TORCH_TPU_TOPOLOGY": "2,2,1",
-                "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1",
             }
+            
+            # Inject low-level physical hardware coordinates based on the cluster TPU type!
+            env_vars.update(topology_config)
             
             actor_options = {
                 "runtime_env": {"env_vars": env_vars},
             }
             if self.tpu_resources:
-                actor_options["resources"] = self.tpu_resources
+                # Enforce strict node-specific resource pinning to align virtual rank layout with physical nodes!
+                host_index = rank // chips_per_host
+                if host_index >= len(self.tpu_nodes):
+                    raise ValueError(
+                        f"Not enough TPU nodes: rank {rank} requires host {host_index}, "
+                        f"but only {len(self.tpu_nodes)} nodes available."
+                    )
+                node_ip = self.tpu_nodes[host_index]
+                actor_options["resources"] = {
+                    "TPU": 1,
+                    # Request a fraction (< 1 / CHIPS_PER_HOST) of the custom node resource so that
+                    # multiple workers (one per TPU chip) can be scheduled on the same physical host.
+                    f"node:{node_ip}": 0.01,
+                }
 
             print(f"@@@ Spawning FusedWorker Rank {rank} with env: {env_vars}")
             worker = FusedWorker.options(**actor_options).remote(self.sys_argv)
@@ -172,8 +244,9 @@ class GRPOOrchestrator:
         from torchtitan.experiments.rl.sum_digits import SumDigitsEnv
         
         # We instantiate a local tokenizer on the driver to encode the prompts
-        tokenizer_path = getattr(self.job_config, "hf_assets_path", DEFAULT_TOKENIZER_NAME)
-        if not tokenizer_path:
+        tokenizer_path = getattr(self.job_config.checkpoint, "initial_load_path", DEFAULT_TOKENIZER_NAME)
+        import os
+        if not tokenizer_path or not os.path.exists(tokenizer_path):
             tokenizer_path = DEFAULT_TOKENIZER_NAME
         tokenizer = HuggingFaceTokenizer(tokenizer_path=tokenizer_path)
 
