@@ -182,4 +182,7 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()
-    self.dump_folder = "/tmp/outputs"
+    # Set the default location of dump_folder. Allow the runtime CLI
+    # configuration (i.e. --job.dump_folder=...) to override this parameter.
+    if not self.dump_folder:
+      self.dump_folder = "/tmp/outputs"
