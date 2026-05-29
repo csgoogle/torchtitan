@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import math
+import einops
 import torch
 import torch.nn as nn
 from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
@@ -87,10 +88,27 @@ class PatchedMHA(nn.Module):
       average_attn_weights=True,
       is_causal=False,
   ):
-    bsz, tgt_len, hidden_dim = query.shape
-    w = self.in_proj.weight.view(3, self.num_heads, self.head_dim, hidden_dim)
-    qkv = torch.einsum("btd,nhkd->nbhtk", query, w)
-    q, k, v = qkv[0], qkv[1], qkv[2]
+    _, _, hidden_dim = query.shape
+    w_q, w_k, w_v = self.in_proj.weight.chunk(3, dim=0)
+    w_q_flat = w_q.reshape(self.embed_dim, hidden_dim)
+    w_k_flat = w_k.reshape(self.embed_dim, hidden_dim)
+    w_v_flat = w_v.reshape(self.embed_dim, hidden_dim)
+
+    q = einops.rearrange(
+        torch.matmul(query, w_q_flat.t()),
+        "b t (h d) -> b h t d",
+        h=self.num_heads,
+    ).contiguous()
+    k = einops.rearrange(
+        torch.matmul(query, w_k_flat.t()),
+        "b t (h d) -> b h t d",
+        h=self.num_heads,
+    ).contiguous()
+    v = einops.rearrange(
+        torch.matmul(query, w_v_flat.t()),
+        "b t (h d) -> b h t d",
+        h=self.num_heads,
+    ).contiguous()
 
     if self.use_splash:
       attn_output = splash_sdpa(q, k, v, is_causal=is_causal, use_vmap_bwd=self.use_vmap_bwd)
@@ -105,15 +123,11 @@ class PatchedMHA(nn.Module):
       )
 
     w = self.out_proj.weight.view(self.out_proj.out_features, self.num_heads, self.head_dim)
-    outputs = []
-    for i in range(self.num_heads):
-        x_i = attn_output[:, i, :, :]
-        w_i = w[:, i, :].t().unsqueeze(0).expand(bsz, -1, -1)
-        head_out = torch.bmm(x_i, w_i)
-        outputs.append(head_out)
-    attn_output = sum(outputs)
+
+    # Vectorized mh projection via einsum
+    attn_output = torch.einsum("bhtd,ohd->bto", attn_output, w)
     if self.out_proj.bias is not None:
-        attn_output = attn_output + self.out_proj.bias
+      attn_output = attn_output + self.out_proj.bias
     return attn_output, None
 
 
