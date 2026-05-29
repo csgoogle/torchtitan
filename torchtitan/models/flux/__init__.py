@@ -166,9 +166,15 @@ def _make_single_block_config(
         hidden_size=hs,
         num_heads=num_heads,
         mlp_ratio=mlp_ratio,
-        linear1=Linear.Config(
+        lin_qkv=Linear.Config(
             in_features=hs,
-            out_features=hs * 3 + mlp_hidden_dim,
+            out_features=hs * 3,
+            bias=True,
+            param_init=_XAVIER_LINEAR,
+        ),
+        lin_mlp=Linear.Config(
+            in_features=hs,
+            out_features=mlp_hidden_dim,
             bias=True,
             param_init=_XAVIER_LINEAR,
         ),

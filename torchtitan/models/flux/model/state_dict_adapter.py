@@ -91,6 +91,8 @@ class FluxStateDictAdapter(StateDictAdapter):
             "single_transformer_blocks.{}.norm.linear.weight": "single_blocks.{}.modulation.lin.weight",
             "single_transformer_blocks.{}.proj_out.bias": "single_blocks.{}.linear2.bias",
             "single_transformer_blocks.{}.proj_out.weight": "single_blocks.{}.linear2.weight",
+            "single_transformer_blocks.{}.proj_mlp.bias": "single_blocks.{}.lin_mlp.bias",
+            "single_transformer_blocks.{}.proj_mlp.weight": "single_blocks.{}.lin_mlp.weight",
             "transformer_blocks.{}.attn.norm_added_k.weight": "double_blocks.{}.txt_attn.norm.key_norm.weight",
             "transformer_blocks.{}.attn.norm_added_q.weight": "double_blocks.{}.txt_attn.norm.query_norm.weight",
             "transformer_blocks.{}.attn.norm_k.weight": "double_blocks.{}.img_attn.norm.key_norm.weight",
@@ -115,17 +117,15 @@ class FluxStateDictAdapter(StateDictAdapter):
 
         # combination plan to keep track of the order of layers to be combined
         self.combination_plan = {
-            "single_blocks.{}.linear1.bias": [
+            "single_blocks.{}.lin_qkv.bias": [
                 "single_transformer_blocks.{}.attn.to_q.bias",
                 "single_transformer_blocks.{}.attn.to_k.bias",
                 "single_transformer_blocks.{}.attn.to_v.bias",
-                "single_transformer_blocks.{}.proj_mlp.bias",
             ],
-            "single_blocks.{}.linear1.weight": [
+            "single_blocks.{}.lin_qkv.weight": [
                 "single_transformer_blocks.{}.attn.to_q.weight",
                 "single_transformer_blocks.{}.attn.to_k.weight",
                 "single_transformer_blocks.{}.attn.to_v.weight",
-                "single_transformer_blocks.{}.proj_mlp.weight",
             ],
             "double_blocks.{}.txt_attn.qkv.bias": [
                 "transformer_blocks.{}.attn.add_q_proj.bias",
@@ -200,30 +200,10 @@ class FluxStateDictAdapter(StateDictAdapter):
 
             elif key in self.combination_plan:
                 # handle splitting layers
-                if key in [
-                    "single_blocks.{}.linear1.bias",
-                    "single_blocks.{}.linear1.weight",
-                ]:
-                    mlp_hidden_dim = int(
-                        self.model_config.hidden_size * self.model_config.mlp_ratio
-                    )
-                    split_plan = [
-                        self.model_config.hidden_size,
-                        self.model_config.hidden_size,
-                        self.model_config.hidden_size,
-                        mlp_hidden_dim,
-                    ]
-                    # split into q, k, v, mlp
-                    split_vals = torch.split(
-                        value,
-                        split_plan,
-                        dim=0,
-                    )
-                else:
-                    # split into q, k, v
-                    split_vals = torch.split(
-                        value, self.model_config.hidden_size, dim=0
-                    )
+                # split into q, k, v
+                split_vals = torch.split(
+                    value, self.model_config.hidden_size, dim=0
+                )
 
                 new_keys = (
                     abstract_key.format(layer_num)

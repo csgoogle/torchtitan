@@ -300,7 +300,8 @@ class SingleStreamBlock(Module):
     class Config(Module.Config):
         hidden_size: int
         num_heads: int
-        linear1: Linear.Config
+        lin_qkv: Linear.Config
+        lin_mlp: Linear.Config
         linear2: Linear.Config
         modulation: Modulation.Config
         norm: QKNorm.Config
@@ -316,7 +317,8 @@ class SingleStreamBlock(Module):
 
         self.mlp_hidden_dim = int(config.hidden_size * config.mlp_ratio)
         # qkv and mlp_in
-        self.linear1 = config.linear1.build()
+        self.lin_qkv = config.lin_qkv.build()
+        self.lin_mlp = config.lin_mlp.build()
         # proj and mlp_out
         self.linear2 = config.linear2.build()
 
@@ -334,9 +336,9 @@ class SingleStreamBlock(Module):
     def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
         mod, _ = self.modulation(vec)
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
-        qkv, mlp = torch.split(
-            self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
-        )
+        # TODO(b/517661974): Add support for loading split linear layer weights.
+        qkv = self.lin_qkv(x_mod)
+        mlp = self.lin_mlp(x_mod)
 
         q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
