@@ -497,6 +497,12 @@ class TorchaxTrainer:
       else:
         return jittable_mod.functional_call('forward', weights, buffers, args)
 
+    if job_config.model_spec.name == 'conformer':
+      if job_config.conformer.use_ctc_loss:
+        import torchtitan.experiments.torchax.conformer.loss as conformer_loss
+        logger.info('Overriding Conformer loss to CTCLoss.')
+        job_config.loss = conformer_loss.CTCLoss.Config()
+
     loss_fn = job_config.loss.build(compile_config=job_config.compile)
 
     jax_optimizer, opt_state = self.setup_optimizer(
