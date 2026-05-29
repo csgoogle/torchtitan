@@ -321,6 +321,7 @@ python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets 
 
 #### Build the Docker image
 
+Run from the root of the torchtitan repository for the following operations.
 ```bash
 docker build -t torchtitan-container:latest -f torchtitan/experiments/tpu/Dockerfile .
 
@@ -369,6 +370,10 @@ The following sample demonstrates Llama 8B training on a `v6e-32` using FSDP:
 ```bash
 export WORKLOAD_NAME=torchtitan-llama3-8b-xpk
 
+# if using GCSFUSE, set the following parameters:
+# --dump_folder="/data/assets/hf/Llama-3.1-8B"
+# --dataloader.dataset_path="/data/assets/hf/Llama-3.1-8B"
+# --hf_assets_path="/data/assets/hf/Llama-3.1-8B"
 xpk workload create \
     --workload=$WORKLOAD_NAME \
     --cluster=$CLUSTER_NAME \
@@ -389,13 +394,13 @@ xpk workload create \
         -m torchtitan.experiments.tpu.train \
         --module=torchtitan.experiments.tpu.llama3 \
         --config=llama3_8b \
-        --dump_folder=/data/torchtitan-llama3-8b-xpk \
         --training.seq_len=512 \
         --dataloader.dataset=c4_test \
         --training.dtype=bfloat16 \
         --training.mixed_precision_param=bfloat16 \
         --training.steps=10 \
         --hf_assets_path=assets/hf/Llama-3.1-8B/ \
+        # if using GCSFUSE, use "/data/assets/hf/Llama-3.1-8B"
         --dataloader.dataset_path=tests/assets/c4_test \
         --metrics.log_freq=5 \
         --metrics.enable_tensorboard \

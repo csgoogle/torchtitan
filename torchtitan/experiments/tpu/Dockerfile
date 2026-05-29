@@ -10,9 +10,9 @@ RUN pip install portpicker absl-py numpy gcsfs frozendict triton fairscale
 COPY torch_tpu-0.1.0.dev0-cp312-cp312-manylinux_2_31_x86_64.whl ./torch_tpu-0.1.0.dev0-cp312-cp312-manylinux_2_31_x86_64.whl
 RUN pip install --no-deps ./torch_tpu-0.1.0.dev0-cp312-cp312-manylinux_2_31_x86_64.whl
 
-COPY torchtitan/requirements.txt .
+COPY requirements.txt .
 RUN pip install -r requirements.txt
-COPY torchtitan/.ci/docker/requirements-flux.txt .
+COPY .ci/docker/requirements-flux.txt .
 RUN pip install -r requirements-flux.txt
 
 # Restore typeguard to the version tokamax pins (setup.py says ==2.13.3).
@@ -25,5 +25,10 @@ RUN pip install -r requirements-flux.txt
 # in any environment (docker, local conda, fresh pip), not just here.
 RUN pip install 'typeguard==2.13.3'
 
-COPY torchtitan ./torchtitan
-WORKDIR ./torchtitan
+COPY torchtitan /torchtitan
+# only need to copy assets and tests when using local tokenizers and datasets
+COPY assets /torchtitan/assets
+COPY tests /tests
+
+WORKDIR /torchtitan
+ENV PYTHONPATH=/
