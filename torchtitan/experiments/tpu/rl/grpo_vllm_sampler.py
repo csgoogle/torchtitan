@@ -178,25 +178,18 @@ class VLLMSampler:
 
     def sync_weights(self, source_model: torch.nn.Module):
         """Syncs the torchtitan model weights to the vLLM engine.
-        
-        How weight synchronization works:
-        1. FSDP Gather (ICI Used): It uses FSDP's `summon_full_params` to gather the sharded 
-           model weights across all FSDP ranks into full parameters. This triggers an 
-           all-gather communication operation across the TPUs, which utilizes the high-speed 
-           Inter-Chip Interconnect (ICI) network.
-        2. Direct Copy (No CPU Transfer): It extracts the state dictionaries for both the 
-           source model and the target vLLM model. It then performs a direct, in-place copy 
-           (`target_p.copy_(val)`). Since both models reside on the TPU device, this copy 
-           happens entirely on-device. It does NOT offload to the CPU, meaning it bypasses 
-           the host CPU memory and avoids slow PCIe transfers.
-        3. Memory Management: To prevent Out-Of-Memory (OOM) issues on the TPU during the 
-           gathering phase, it eagerly clears references from the source state dictionary 
-           immediately after each parameter is copied.
-        
-        TODO: Make this per-layer instead of summoning all parameters at once. Currently, 
-        `summon_full_params(recurse=True)` gathers the entire model into HBM simultaneously, 
-        which causes a massive memory spike. A per-layer iteration would keep the memory 
-        overhead small and bounded.
+
+        Instead of using FSDP's `summon_full_params(recurse=True)` which gathers
+        the ENTIRE model into TPU HBM at once (causing a massive memory spike and
+        OOM for larger models), we iterate over the model's state dictionary
+        parameter by parameter.
+
+        For each `DTensor` parameter, calling `.full_tensor()` triggers an
+        all-gather over the TPU's Inter-Chip Interconnect (ICI) network to
+        reconstruct only that specific parameter. We then copy it directly
+        into the vLLM model's target buffer (on-device) and eagerly clear the
+        reference (`source_sd[name] = None`) to free the gathered memory
+        before moving to the next parameter.
         """
         if self.vllm_engine is None:
             return
@@ -204,30 +197,25 @@ class VLLMSampler:
         logger.info("Syncing weights to vLLM engine...")
         
         vllm_model = self.vllm_engine.llm_engine.model_executor.driver_worker.get_model()
-        
-        with fsdp.FullyShardedDataParallel.summon_full_params(
-            source_model, recurse=True, writeback=False
-        ):
-            # Use state_dict but iterate it immediately to avoid keeping large dict alive
-            source_sd = source_model.state_dict()
-            
-            # vLLM model is a wrapper around the actual model
-            target_model = getattr(vllm_model, "model", vllm_model)
-            target_sd = target_model.state_dict()
+        target_model = getattr(vllm_model, "model", vllm_model)
+        target_sd = target_model.state_dict()
 
-            with torch.no_grad():
-                for name, source_p in source_sd.items():
-                    if name in target_sd:
-                        target_p = target_sd[name]
-                        val = source_p
-                        if hasattr(val, "full_tensor"):
-                            val = val.full_tensor()
-                        elif hasattr(val, "to_local"):
-                            val = val.to_local()
-                        target_p.copy_(val)
-                    source_sd[name] = None # Clear memory immediately
-            del source_sd
-            del target_sd
+        source_sd = source_model.state_dict()
+        with torch.no_grad():
+            for name, source_p in source_sd.items():
+                if name in target_sd:
+                    target_p = target_sd[name]
+                    val = source_p
+                    if hasattr(val, "full_tensor"):
+                        val = val.full_tensor()
+                    elif hasattr(val, "to_local"):
+                        val = val.to_local()
+                    target_p.copy_(val)
+                source_sd[name] = None
+        
+        import torch_tpu
+        torch_tpu._internal.sync.synchronize(wait=True)
+
 
     def generate(self, prompt_ids_repeated: torch.Tensor, sampling_params) -> tuple[torch.Tensor, torch.Tensor]:
         if self.vllm_engine is None:
@@ -256,9 +244,8 @@ class VLLMSampler:
                 else:
                     step_logprobs.append(0.0)
             token_log_probs_list.append(step_logprobs)
-            
+
         completions_tensor = torch.tensor(completions, device=prompt_ids_repeated.device, dtype=torch.long)
         completed_ids = torch.cat([prompt_ids_repeated, completions_tensor], dim=1)
-        token_log_probs = torch.tensor(token_log_probs_list, device=prompt_ids_repeated.device, dtype=torch.float32)
-                                      
+        token_log_probs = torch.tensor(token_log_probs_list, device=prompt_ids_repeated.device, dtype=torch.float32)                     
         return completed_ids, token_log_probs

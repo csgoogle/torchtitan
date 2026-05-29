@@ -1,10 +1,12 @@
 # Copyright 2026 The TorchTitan Authors. All Rights Reserved.
 
 import dataclasses
+from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.config.configs import ParallelismConfig
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import OptimizersContainer
 
 from torchtitan.experiments.tpu.rl.grpo_job_config import (
     GRPOConfig,
@@ -16,6 +18,7 @@ from torchtitan.experiments.tpu.rl.grpo_job_config import (
 )
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.experiments.tpu.qwen3 import parallelize_qwen3, qwen3_configs
+from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 
 
 def grpo_qwen3_0_6b() -> GRPOJobConfig:
@@ -28,7 +31,7 @@ def grpo_qwen3_0_6b() -> GRPOJobConfig:
           parallelize_fn=parallelize_qwen3,
           pipelining_fn=None,
           post_optimizer_build_fn=None,
-          state_dict_adapter=None,
+          state_dict_adapter=Qwen3StateDictAdapter,
       ),
       model=ModelConfig(name="qwen3_tpu", flavor="0.6B"),
       training=GRPOTrainingConfig(
@@ -36,6 +39,7 @@ def grpo_qwen3_0_6b() -> GRPOJobConfig:
           seq_len=512,
           steps=8,
           local_batch_size=2,
+          max_norm=1.0,
       ),
       parallelism=ParallelismConfig(
           data_parallel_shard_degree=-1,
@@ -51,8 +55,15 @@ def grpo_qwen3_0_6b() -> GRPOJobConfig:
           vllm_max_model_len=512,
       ),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=4),
+      optimizer=OptimizersContainer.Config(lr=1e-6),
       metrics=MetricsProcessor.Config(log_freq=1),
       grpo=GRPOConfig(group_size=4, grpo_beta=0.1),
+      hf_assets_path="assets/hf/Qwen3-0.6B",
+      checkpoint=CheckpointManager.Config(
+          initial_load_path="assets/hf/Qwen3-0.6B",
+          initial_load_model_only=True,
+          initial_load_in_hf=True,
+      ),
   )
 
 

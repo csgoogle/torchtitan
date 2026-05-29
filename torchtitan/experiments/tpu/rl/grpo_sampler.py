@@ -70,8 +70,6 @@ def generate_next_token(
     logits = outputs
 
   logits_last = logits[:, cur_len - 1, :]
-  # Hack to force non-zero gradients: add noise to logits!
-  logits_last = logits_last + torch.randn_like(logits_last) * 10.0
 
   probs = logits_to_probs(logits_last, temperature, top_k)
   next_token = multinomial_sample_one(probs, rng=rng)

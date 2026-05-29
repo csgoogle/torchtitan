@@ -13,7 +13,7 @@ This implementation is highly inspired by `verl` but is tailored specifically fo
 
 #### 0. Setup env
 
-Following https://github.com/google-pytorch/torchtitan/blob/main/torchtitan/experiments/tpu/README.md to install torch_tpu/torchtitan dependency
+Following `torchtitan/experiments/tpu/README.md` to install torch_tpu / torchtitan dependency
 
 ```bash
 uv venv tpu_rl_env --python 3.12
@@ -35,22 +35,33 @@ uv pip install -r .ci/docker/requirements-flux.txt
 uv pip install portpicker absl-py numpy gcsfs frozendict triton fairscale
 ```
 
-Following https://github.com/google-pytorch/torchtpu-vllm#2-install-torchtpu-vllm-and-dependencies to install vllm with TPU
-
-Note that at this moment, vllm pinged the following versions, which dose NOT support dcp.
+Clone torchtpu-vllm project
 ```
-libtpu==0.0.40
-torch==2.10.0+cpu
-torch-tpu==0.1.1.dev20260515095303
-```
-
-Specifically, 
-
-```bash
+cd ..
 git clone https://github.com/google-pytorch/torchtpu-vllm.git
 cd torchtpu-vllm
+```
 
+We need to hack `torchtpu-vllm/pyproject.toml` to be use the `torch-tpu`/`libtpu` version for `dcp`
+```diff
+@@ -25,10 +25,10 @@ dependencies = [
+     "portpicker",
+     "pathwaysutils",
+     "vllm==0.19.0",
+-    "torch-tpu==0.1.1.dev20260515095303",
++    "torch-tpu==0.1.1.dev20260527102151",
+     # Keep the PJRT runtime pinned with the torch-tpu wheel. libtpu 0.0.41
+     # regresses GDN compilation with scoped VMEM OOMs in CI.
+-    "libtpu==0.0.40",
++    "libtpu==0.0.41",
+     "ray[default]",
+     "ray[data]",
+ ]
+```
 
+Now install vllm (and ray)
+
+```bash
 export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
 
 git clone --depth 1 --branch v0.19.0 https://github.com/vllm-project/vllm.git ../vllm
@@ -63,13 +74,20 @@ SETUPTOOLS_SCM_PRETEND_VERSION=0.19.0 VLLM_TARGET_DEVICE="tpu" uv pip install -e
 uv pip install --pre -e .
 ```
 
-Dry run with pretraining:
+Dry run with pretraining and verify dcp works:
 
 ```bash
-torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train  \
+torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
   --module=torchtitan.experiments.tpu.qwen3 \
   --config=grpo_qwen3_0_6b \
-  --training.steps=2 
+  --training.steps=2 \
+  --optimizer.lr=0.0 \
+  --checkpoint.enable \
+  --checkpoint.folder="assets/dcp/Qwen3-0.6B" \
+  --checkpoint.initial_load_path="assets/hf/Qwen3-0.6B" \
+  --checkpoint.initial_load_model_only \
+  --checkpoint.initial_load_in_hf \
+  --checkpoint.interval=2
 ```
 
 #### 1. With High-Performance vLLM Sampling
@@ -79,6 +97,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --module=torchtitan.experiments.tpu.rl \
     --config=grpo_qwen3_0_6b \
     --sampler.use_vllm \
+    --checkpoint.enable \
     --training.steps=10 2>&1 \
     | tee ray_train_vllm.log \
     | grep -iE "\[titan\]|@@@" 
@@ -86,7 +105,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
 
 Check progress and metrics
 ```
-grep -E "Step [0-9]+: Avg Reward|Training completed|step:\s+[0-9]+" ray_train.log
+grep -E "Step [0-9]+: Times|Training completed|step:\s+[0-9]+" ray_train_vllm.log
 ```
 
 
@@ -99,6 +118,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --config=grpo_qwen3_0_6b \
     --sampler.no-use-vllm \
     --sampler.use-separate-sampler-model \
+    --checkpoint.enable \
     --training.steps=10 2>&1 \
     | tee ray_train.log \
     | grep -iE "\[titan\]|@@@" 

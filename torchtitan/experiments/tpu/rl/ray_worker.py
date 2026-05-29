@@ -186,24 +186,42 @@ class FusedWorker:
             if self.sampler_model is not None:
                 self.sampler_model.init_weights()
 
+        optimizers_container = self.job_config.optimizer.build(model_parts=[self.model])
+        
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.job_config.optimizer.lr,
+            eps=self.job_config.optimizer.eps,
+            foreach=True,   # Fused optimizer is not supported on TPU, set foreach=True
+        )
+        optimizers_container.optimizers[0] = self.optimizer
+
+        if hasattr(self.job_config, "checkpoint") and self.job_config.checkpoint.enable:
+            self.checkpointer = self.job_config.checkpoint.build(
+                dataloader=None,
+                model_parts=[self.model],
+                optimizers=optimizers_container,
+                lr_schedulers=None,
+                states={},
+                base_folder=self.job_config.dump_folder,
+                sd_adapter=train_spec.state_dict_adapter(
+                    self.model_args, self.job_config.hf_assets_path
+                ) if train_spec.state_dict_adapter else None,
+            )
+            self.checkpointer.load(step=self.job_config.checkpoint.load_step)
+
         if self.ref_model is not None:
             try:
                 with fsdp.FullyShardedDataParallel.summon_full_params(self.ref_model, recurse=True, writeback=True):
                     self.ref_model.load_state_dict(self.model.state_dict())
             except Exception as e:
                 self.ref_model.load_state_dict(self.model.state_dict())
+
         if self.sampler_model is not None:
-            grpo_utils.sync_model_weights(self.model, self.sampler_model, self.parallel_dims)
+            self.sampler_model.load_state_dict(self.model.state_dict())
             for p in self.sampler_model.parameters():
                 p.requires_grad = False
-
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.job_config.optimizer.lr,
-            eps=self.job_config.optimizer.eps,
-            foreach=True,
-        )
 
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -284,6 +302,7 @@ class FusedWorker:
                 sampling_params = SamplingParams(
                     temperature=self.job_config.sampler.temperature,
                     max_tokens=self.job_config.sampler.max_new_tokens,
+                    ignore_eos=True,   # HACK: make the completion from vllm same length
                 )
                 completed_ids, token_log_probs = self.vllm_sampler.generate(prompt_ids_repeated, sampling_params)
             else:
@@ -356,7 +375,7 @@ class FusedWorker:
 
         return True
 
-    def train_ppo_step(self, advantages, step):
+    def train_ppo_step(self, advantages, step, avg_correctness=0.0, avg_format=0.0):
         """Executes the PPO optimization loop for the current batch of rollouts."""
         gc.collect()
         self.torch_tpu._internal.sync.synchronize(wait=True)
@@ -426,6 +445,7 @@ class FusedWorker:
             self.total_tokens += step_tokens
             self.total_time += t_total
 
+        # TODO: move the metrics handling out of train_ppo_step
         should_log = (step + 1) % self.log_freq == 0 or step == (self.steps - 1)
         if should_log:
             average_step_time = self.accumulated_time / self.accumulated_steps
@@ -448,8 +468,8 @@ class FusedWorker:
 
             import torchtitan.tools.logging
             torchtitan.tools.logging.logger.info(
-                "Step %d: Times: Sample=%.2fs, Ref=%.2fs, Train=%.2fs, Total=%.2fs",
-                step + 1, self.current_t_sample, self.current_t_ref, train_time, t_total
+                "Step %d: Times: Sample=%.2fs, Ref=%.2fs, Train=%.2fs, Total=%.2fs | Reward: Format=%.4f, Correctness=%.4f",
+                step + 1, self.current_t_sample, self.current_t_ref, train_time, t_total, avg_format, avg_correctness
             )
 
             # Dataloader runs on the driver now, so we add a dummy value to avoid ZeroDivisionError
@@ -483,7 +503,7 @@ class FusedWorker:
         if self.vllm_sampler is not None:
             self.vllm_sampler.sync_weights(self.model)
         elif self.sampler_model is not None:
-            self.grpo_utils.sync_model_weights(self.model, self.sampler_model, self.parallel_dims)
+            self.sampler_model.load_state_dict(self.model.state_dict())
         return True
 
     def finish(self):
