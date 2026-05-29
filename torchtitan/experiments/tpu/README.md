@@ -319,6 +319,13 @@ python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets 
 
 ```
 
+Upload the tokenizer to the GCS bucket
+
+```bash
+gcloud storage cp --recursive ./assets/hf gs://${BUCKET_NAME}/assets/hf
+gcloud storage cp --recursive ./tests gs://${BUCKET_NAME}/tests
+```
+
 #### Build the Docker image
 
 Run from the root of the torchtitan repository for the following operations.
