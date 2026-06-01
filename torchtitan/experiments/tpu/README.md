@@ -407,7 +407,6 @@ xpk workload create \
         --training.mixed_precision_param=bfloat16 \
         --training.steps=10 \
         --hf_assets_path=assets/hf/Llama-3.1-8B/ \
-        # if using GCSFUSE, use "/data/assets/hf/Llama-3.1-8B"
         --dataloader.dataset_path=tests/assets/c4_test \
         --metrics.log_freq=5 \
         --metrics.enable_tensorboard \
