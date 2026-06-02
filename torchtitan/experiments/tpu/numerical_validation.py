@@ -7,6 +7,21 @@ from torch import nn
 from torchtitan.experiments.tpu import test_utils
 
 
+def clean_parameter_name(name: str) -> str:
+  """Removes wrapper prefixes (like activation checkpointing) from parameter names.
+
+  This ensures that weights and gradients can be compared and loaded between
+  models that have checkpointing enabled and those that do not.
+
+  Args:
+      name: The original parameter name.
+
+  Returns:
+      The cleaned parameter name.
+  """
+  return name.replace("_checkpoint_wrapped_module.", "")
+
+
 CaptureFn = Callable[[nn.Module, torch.Tensor], Dict[str, Any]]
 
 
@@ -41,9 +56,20 @@ class StateRecorderCallback:
     self.history: Dict[int, Any] = {}
     self.capture_fn = capture_fn
 
-  def on_step(self, step: int, model: nn.Module, loss: torch.Tensor):
+  def on_step(
+      self,
+      step: int,
+      model: nn.Module,
+      loss: torch.Tensor,
+      inputs: torch.Tensor = None,
+      labels: torch.Tensor = None,
+  ):
     """Records the state at the current step."""
     self.history[step] = self.capture_fn(model, loss)
+    if inputs is not None:
+      self.history[step]["inputs"] = inputs.detach().cpu().clone()
+    if labels is not None:
+      self.history[step]["labels"] = labels.detach().cpu().clone()
 
   def get_history(self) -> Dict[int, Any]:
     """Returns the recorded state history."""
@@ -65,6 +91,7 @@ class StateValidatorCallback:
       self,
       recorded_history: Dict[int, Any],
       capture_fn: CaptureFn = capture_local_state,
+      init_state: Dict[str, Any] = None,
       loss_atol: float = 1e-3,
       loss_rtol: float = 1e-3,
       grad_atol: float = 1e-3,
@@ -76,6 +103,7 @@ class StateValidatorCallback:
   ):
     self.recorded_history = recorded_history
     self.capture_fn = capture_fn
+    self.init_state = init_state
     self.loss_atol = loss_atol
     self.loss_rtol = loss_rtol
     self.grad_atol = grad_atol
@@ -100,7 +128,14 @@ class StateValidatorCallback:
     if self.errors:
       raise AssertionError("\n".join(self.errors))
 
-  def on_step(self, step: int, model: nn.Module, loss: torch.Tensor):
+  def on_step(
+      self,
+      step: int,
+      model: nn.Module,
+      loss: torch.Tensor,
+      inputs: torch.Tensor = None,
+      labels: torch.Tensor = None,
+  ):
     """Validates the current state against the reference history."""
     if not self.in_context:
       raise RuntimeError("on_step can only be called within a 'with' context.")
@@ -125,10 +160,12 @@ class StateValidatorCallback:
       self.errors.append(str(e))
 
     for name, rec_grad in recorded_state["grads"].items():
-      if name in current_state["grads"]:
+      # Strip activation checkpointing wrappers to align parameter names
+      cleaned_name = clean_parameter_name(name)
+      if cleaned_name in current_state["grads"]:
         try:
           test_utils.check_equivalence(
-              tensor_test=current_state["grads"][name],
+              tensor_test=current_state["grads"][cleaned_name],
               tensor_reference=rec_grad,
               check_name=f"Gradient ({name})",
               step=step,
@@ -141,10 +178,12 @@ class StateValidatorCallback:
           self.errors.append(str(e))
 
     for name, rec_param in recorded_state["params"].items():
-      if name in current_state["params"]:
+      # Strip activation checkpointing wrappers to align parameter names
+      cleaned_name = clean_parameter_name(name)
+      if cleaned_name in current_state["params"]:
         try:
           test_utils.check_equivalence(
-              tensor_test=current_state["params"][name],
+              tensor_test=current_state["params"][cleaned_name],
               tensor_reference=rec_param,
               check_name=f"Parameter ({name})",
               step=step,

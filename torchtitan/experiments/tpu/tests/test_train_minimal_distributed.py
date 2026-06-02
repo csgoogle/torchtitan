@@ -62,12 +62,12 @@ class TrainMinimalDistributedTest(
           config="llama3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
-          loss_atol=1e2,
-          loss_rtol=5e-3,
-          grad_atol=1.5e1,
-          grad_rtol=5e-2,
-          param_atol=5e-2,
-          param_rtol=5e-2,
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
       ),
       dict(
           testcase_name="llama3_fsdp",
@@ -75,14 +75,12 @@ class TrainMinimalDistributedTest(
           config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          # b/495494788: Trainer/parallelize differences causing large
-          # numerical discrepancies.
-          loss_atol=1e2,
-          loss_rtol=5e-2,
-          grad_atol=6e2,
-          grad_rtol=5e-2,
-          param_atol=5e-1,
-          param_rtol=5e-2,
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=5e-4,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
       ),
       # qwen3
       dict(
@@ -91,18 +89,12 @@ class TrainMinimalDistributedTest(
           config="qwen3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
-          skip_devices=[
-              # TODO(tbajpai): Re-examine cause of b/513645397
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-              device_type.AcceleratorDeviceType.TPU,
-          ],
-          loss_atol=1e2,
-          loss_rtol=5e-3,
-          grad_atol=1e1,
-          grad_rtol=5e-2,
-          param_atol=5e-2,
-          param_rtol=5e-2,
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
       ),
       dict(
           testcase_name="qwen3_fsdp",
@@ -110,20 +102,12 @@ class TrainMinimalDistributedTest(
           config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          skip_devices=[
-              # TODO(tbajpai): Re-examine cause of b/513645397
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-              device_type.AcceleratorDeviceType.TPU,
-          ],
-          # b/495494788: Trainer/parallelize differences causing large
-          # numerical discrepancies.
-          loss_atol=2000.0,
-          loss_rtol=5e-2,
-          grad_atol=10000.0,
-          grad_rtol=5e-2,
-          param_atol=5e1,
-          param_rtol=5e-2,
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=2e-3,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
       ),
   ])
   def test_train_minimal_distributed_parity(

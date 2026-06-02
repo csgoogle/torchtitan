@@ -4,6 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from functools import partial
+from typing import cast
+from torch import nn
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
@@ -16,20 +19,30 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.experiments.tpu.qwen3 import qwen3_configs
+from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.models.qwen3.config_registry import model_registry
-from torchtitan.experiments.tpu.qwen3 import qwen3_configs
-from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
+from torchtitan.protocols.model_spec import ModelSpec
 
 
 def qwen3_debugmodel() -> TPUTrainerConfig:
   """Qwen3 debug model configuration for TPU."""
+
   model_spec = model_registry("debugmodel")
   model_spec.parallelize_fn = tpu_parallelize_qwen3
-  model_spec.model.enable_weight_tying = False
+
+  model_config = cast(Qwen3Model.Config, model_spec.model)
+  # Disable weight tying to mimic the configuration of larger Qwen3 models
+  # (e.g. 8B, 14B, 32B). Note that this is different from the non-TPU
+  # "debugmodel" in the config registry.
+  model_config.enable_weight_tying = False
+  model_config.tok_embeddings.param_init = {
+      "weight": partial(nn.init.normal_, std=1.0)
+  }
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",

@@ -434,8 +434,8 @@ def _capture_distributed_state(
 
   # Perform reduction if needed (on device)
   if input_distribution == InputDistribution.SPLIT_BATCH and world_size > 1:
-    # Average across ranks (e.g. for FSDP split batch)
-    dist.all_reduce(loss_on_device, op=dist.ReduceOp.AVG)
+    # Sum across ranks (loss is already globally scaled by tokens)
+    dist.all_reduce(loss_on_device, op=dist.ReduceOp.SUM)
 
   # Move result
   loss_cpu = loss_on_device.cpu()
@@ -519,6 +519,7 @@ def _run_cpu_verification(
   validator = numerical_validation.StateValidatorCallback(
       recorded_history=recorded_history,
       capture_fn=numerical_validation.capture_local_state,
+      init_state=init_state,
       loss_atol=loss_atol,
       loss_rtol=loss_rtol,
       grad_atol=grad_atol,
@@ -541,15 +542,44 @@ def _run_cpu_verification(
     current_cpu_dict = trainer_cpu.model.state_dict()
 
     for name, param in init_state["params"].items():
-      if name in current_cpu_dict:
+      # Strip wrapper prefixes (e.g. checkpointing) to match CPU reference model
+      cleaned_name = numerical_validation.clean_parameter_name(name)
+      if cleaned_name in current_cpu_dict:
+        cpu_param = current_cpu_dict[cleaned_name]
         with torch.no_grad():
-          current_cpu_dict[name].copy_(param)
+          cpu_param.copy_(param)
+        after_diff = torch.max(torch.abs(cpu_param - param))
+        if after_diff > 0.0:
+          logging.error(
+              "INIT COPY FAILED for %s! Remaining Diff: %e",
+              cleaned_name,
+              after_diff,
+          )
       else:
         logging.warning(
-            "Param %s from distributed run not found in CPU model.", name
+            "Param %s (cleaned: %s) from distributed run not found in CPU"
+            " model.",
+            name,
+            cleaned_name,
         )
 
     logging.info("CPU model initialized with distributed weights.")
+
+    # Build mock dataloader from recorded inputs/labels to ensure exact data parity
+    mock_dataloader = []
+    for step in sorted(recorded_history.keys()):
+      if "inputs" in recorded_history[step] and "labels" in recorded_history[step]:
+        mock_dataloader.append(
+            (
+                {"input": recorded_history[step]["inputs"]},
+                recorded_history[step]["labels"],
+            )
+        )
+      else:
+        raise RuntimeError(f"Step {step} missing recorded inputs/labels!")
+
+    trainer_cpu.dataloader = mock_dataloader
+
     trainer_cpu.train()
 
   logging.info("[Child Process] Parity Test Passed Successfully.")

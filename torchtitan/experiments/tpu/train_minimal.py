@@ -12,10 +12,12 @@ from typing import Callable, List, Optional, Tuple
 from absl import flags
 from absl.flags import argparse_flags
 import torch
+import torch.distributed as dist
 from torch import nn
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
 from torchtitan.experiments.tpu import utils as tpu_utils
@@ -38,7 +40,25 @@ JobConfig = torchtitan.trainer.Trainer.Config
 ParallelDims = torchtitan.distributed.ParallelDims
 logger = torchtitan.tools.logging.logger
 
-TrainStepCallback = Callable[[int, nn.Module, torch.Tensor], None]
+TrainStepCallback = Callable[[int, nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], None]
+
+
+def _gather_along_first_dim(tensor: torch.Tensor, group) -> torch.Tensor:
+  """Gathers a standard PyTorch tensor along its first (batch) dimension across ranks.
+
+  This is used to reconstruct the full global batch of tokens/labels from the sharded
+  local batches on each rank, allowing the step callback to record/verify the global state.
+  """
+  world_size = dist.get_world_size(group)
+  if world_size <= 1:
+    return tensor
+
+  output_shape = list(tensor.shape)
+  output_shape[0] *= world_size
+  output_tensor = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
+
+  dist.all_gather_into_tensor(output_tensor, tensor, group=group)
+  return output_tensor
 
 
 class TrainerMinimal:
@@ -94,11 +114,12 @@ class TrainerMinimal:
 
     # Workaround if we run without distrubuted training.
     batch_degree, batch_rank = 1, 0
+    self.batch_mesh = None
     if world_size > 1:
       if self.parallel_dims.dp_enabled:
-        batch_mesh = self.parallel_dims.get_mesh("batch")
+        self.batch_mesh = self.parallel_dims.get_mesh("batch")
         batch_degree, batch_rank = (
-            batch_mesh.size(), batch_mesh.get_local_rank())
+            self.batch_mesh.size(), self.batch_mesh.get_local_rank())
       else:
         batch_degree, batch_rank = 1, 0
 
@@ -268,11 +289,28 @@ class TrainerMinimal:
           step_start_time = time.time()
           self.optimizers.zero_grad()
           tokens, labels = get_batch()
+
+          # In distributed settings, we sum locally calculated valid tokens
+          # across all data-parallel ranks to get the global token count,
+          # which is used to scale the loss and gradients.
+          # We need this global count because TorchTitan's FSDP
+          # implementation disables automatic gradient division in favor of
+          # global token-based scaling.
+          # Valid tokens exclude those marked with IGNORE_INDEX (pytorch
+          # default is -100), representing padding or ignored tokens.
+          local_valid_tokens = (labels != IGNORE_INDEX).sum().to(self.device)
+          if self.world_size > 1 and self.parallel_dims.dp_enabled:
+            global_valid_tokens = dist_utils.dist_sum(
+                local_valid_tokens, self.batch_mesh
+            )
+          else:
+            global_valid_tokens = local_valid_tokens.float()
+
           # train_context would take care of converting labels to DTensors using
           # https://docs.pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.loss_parallel
           with self.train_context():  # pytype: disable=not-callable
             pred = self.model(tokens)
-            loss = self.loss_fn(pred, labels)
+            loss = self.loss_fn(pred, labels, global_valid_tokens)
             # need to free pred before bwd to avoid peaking memory
             del pred
             loss.backward()
@@ -281,7 +319,13 @@ class TrainerMinimal:
           step_time = time.time() - step_start_time
 
           if self.step_callback is not None:
-            self.step_callback(step, self.model, loss)
+            gathered_tokens = tokens
+            gathered_labels = labels
+            if self.batch_mesh is not None:
+              dp_group = self.batch_mesh.get_group()
+              gathered_tokens = _gather_along_first_dim(tokens, dp_group)
+              gathered_labels = _gather_along_first_dim(labels, dp_group)
+            self.step_callback(step, self.model, loss, gathered_tokens, gathered_labels)
 
           if step >= self.job_config.lr_scheduler.warmup_steps:
             total_tokens += (
