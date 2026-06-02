@@ -116,9 +116,16 @@ def create_torchtitan_config_from_vllm_config(
         in inference. These are set to default values.
     """
     if get_device_type() == "tpu":
-        # For collocated RL on TPU, vLLM engine is forced to run on a single device per rank
-        # TODO: enable tp for vllm sampling
-        world_size = 1
+        if vllm_config.parallel_config.tensor_parallel_size > 1:
+            world_size = dist.get_world_size()
+        else:
+            # vLLM engine is forced to run on a single device per rank for TP = 1
+            logger.info(
+                "TPU hack for vllm with tp=1"
+                "We set world_size = 1, so"
+                "vLLM engine is forced to run on a single device per rank."
+            )
+            world_size = 1
     else:
         world_size = dist.get_world_size()
     parallel_config = vllm_config.parallel_config
@@ -153,11 +160,30 @@ def create_torchtitan_config_from_vllm_config(
     return parallel_dims, parallelism
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": 0,
-    }
+# TPU hack for removing the decorator for TorchTitanVLLMModelWrapper class below
+def apply_if(condition, decorator):
+    """Applies a decorator only if the condition is True."""
+    def meta_decorator(target):
+        if condition:
+            return decorator(target)
+        return target
+    return meta_decorator
+
+
+# @support_torch_compile(
+#     dynamic_arg_dims={
+#         "input_ids": 0,
+#         "positions": 0,
+#     }
+# )
+@apply_if(
+    condition=get_device_type() != "tpu",  # remove decorator if on TPU
+    decorator=support_torch_compile(       # The original decorator to apply if True
+        dynamic_arg_dims={
+            "input_ids": 0,
+            "positions": 0,
+        }
+    )
 )
 class TorchTitanVLLMModelWrapper(Module):
     """
@@ -244,8 +270,14 @@ class TorchTitanVLLMModelWrapper(Module):
             )
         )
 
-        # TODO: Check if it's possible to apply meta init
-        self.model = self.config.build()
+        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
+            # For TPU vllm with TP, we need to init model in meta and then apply sharding
+            # otherwise it will lead to hang at Pre-built RPA kernels
+            with torch.device("meta"):
+                self.model = self.config.build()
+        else:
+            # TODO: Check if it's possible to apply meta init
+            self.model = self.config.build()
 
         # RoPE config from model for cache extension
         self.rope_config = self.config.rope
@@ -274,6 +306,11 @@ class TorchTitanVLLMModelWrapper(Module):
             dump_folder="",
             skip_dp=True,
         )
+
+        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
+            # put the model into device if it was at meta
+            device = vllm_config.device_config.device            
+            self.model = self.model.to_empty(device=device)
 
         # Pre-extend RoPE cache to cover vLLM's max model length (profiling
         # may use up to 2x max_seq_len, so use max_model_len which already
@@ -378,12 +415,27 @@ class TorchTitanVLLMModelWrapper(Module):
         # Convert vLLM interface to TorchTitan interface
         # vLLM: [total_tokens] → TorchTitan: [batch_size, seq_len]
         tokens_2d = input_ids.unsqueeze(0)
+        
+        # When TP is enabled, model expects DTensors
+        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
+            tokens_2d = DTensor.from_local(
+                tokens_2d,
+                device_mesh=self.parallel_dims.get_mesh("tp"),
+                placements=[Replicate()],
+            )
 
         # Get embeddings
         h = self.model.tok_embeddings(tokens_2d)
 
         rope_cache = self.model.freqs_cis
         positions = positions.unsqueeze(0)
+        
+        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
+            positions = DTensor.from_local(
+                positions,
+                device_mesh=self.parallel_dims.get_mesh("tp"),
+                placements=[Replicate()],
+            )
 
         # Pass through transformer layers
         for layer in self.model.layers.values():
