@@ -36,7 +36,7 @@ jobs:
         password: ${{ secrets.GAR_JSON_KEY }}
       # Pass your specific Docker flags here. 
       # (GitHub Actions automatically handles mounting the workspace, so we removed those flags)
-      options: --privileged --net host -v /dev/shm:/dev/shm
+      options: --privileged --net host --shm-size=8gb
 
     # 2. SET ENVIRONMENT VARIABLES FOR THE JOB
     env:
