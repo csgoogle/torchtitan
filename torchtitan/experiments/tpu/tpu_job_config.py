@@ -56,6 +56,7 @@ class redactedConfig:
 @dataclasses.dataclass
 class ConformerConfig:
   use_ctc_loss: bool = False
+  use_jax_ctc_loss: bool = False
   # Target sequence length for synthetic data generation when CTC loss is enabled.
   # Input sequence length must be >= target sequence length.
   ctc_loss_target_len: int = 30

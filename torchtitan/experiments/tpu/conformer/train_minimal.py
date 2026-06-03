@@ -53,10 +53,15 @@ def train_step(
     loss_fn,
     graph_split: bool = False,
     use_ctc: bool = False,
+    use_jax_ctc: bool = False,
     output_lengths: torch.Tensor = None,
     target_lengths: torch.Tensor = None,
 ) -> torch.Tensor:
   """Single training step."""
+  if use_ctc and use_jax_ctc:
+    raise ValueError(
+        "Only one of use_ctc and use_jax_ctc can be enabled at the same time."
+    )
   with jax_profiler.TraceAnnotation("optimizer.zero_grad"):
     optimizer.zero_grad()
 
@@ -65,8 +70,17 @@ def train_step(
 
   logits = model(inputs.to(torch.long))
   with jax_profiler.TraceAnnotation("loss"):
-    if use_ctc:
-      # CTC loss expects (T, N, C)
+    if use_jax_ctc:
+      from torchtitan.experiments.tpu.conformer import jax_ctc_loss  # pylint: disable=g-import-not-at-top
+      # JAX CTC loss expects batch-first layouts:
+      #   logits: (B, T, C) where B=batch, T=time/frames, C=vocabulary
+      #   targets: (B, L) where L=target text label length
+      # Conformer outputs logits as (B, S, C) where sequence length S is identical to T.
+      loss = jax_ctc_loss.jax_ctc_loss(logits, targets)
+    elif use_ctc:
+      # PyTorch CTC loss expects time-first layouts:
+      #   log_probs: (T, B, C) where T=time/frames, B=batch, C=vocabulary
+      # We transpose Conformer's batch-first logits (B, S, C) to time-first (T, B, C).
       logits_f32 = logits.float()
       log_probs = torch.nn.functional.log_softmax(logits_f32, dim=-1).transpose(
           0, 1
@@ -104,11 +118,12 @@ def build_random_dataloader(train_config, vocab_size, device):
   # Inputs should be token IDs for the embedding layer
   x = torch.randint(0, vocab_size, (local_batch_size, seq_len), device=device)
 
-  use_ctc = (
-      hasattr(train_config, "conformer") and train_config.conformer.use_ctc_loss
+  is_any_ctc_loss_enabled = hasattr(train_config, "conformer") and (
+      train_config.conformer.use_ctc_loss
+      or train_config.conformer.use_jax_ctc_loss
   )
 
-  if use_ctc:
+  if is_any_ctc_loss_enabled:
     # Make targets shorter for CTC loss (input length must be >= target length)
     target_len = getattr(train_config.conformer, "ctc_loss_target_len", 30)
     targets = torch.randint(
@@ -418,6 +433,10 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
             hasattr(train_config, "conformer")
             and train_config.conformer.use_ctc_loss
         )
+        use_jax_ctc = (
+            hasattr(train_config, "conformer")
+            and train_config.conformer.use_jax_ctc_loss
+        )
         loss = train_step(
             model,
             inputs,
@@ -426,6 +445,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
             loss_fn,
             graph_split=use_graph_split,
             use_ctc=use_ctc,
+            use_jax_ctc=use_jax_ctc,
             output_lengths=torch.full(
                 (inputs.size(0),),
                 inputs.size(1),
