@@ -52,10 +52,12 @@ jobs:
           set -e
           ulimit -n 65536
 
-          # --- DIAGNOSTIC CHECK ---
-          echo "=== ACTUAL SHARED MEMORY ALLOCATION ==="
-          df -h /dev/shm
-          echo "======================================="
+          # --- THE SYMLINK HACK: Reroute cache to physical disk ---
+          echo "Rerouting XLA cache from 64MB RAM to physical disk..."
+          rm -rf /dev/shm/torch_tpu_cache
+          mkdir -p /tmp/torch_tpu_cache
+          ln -s /tmp/torch_tpu_cache /dev/shm/torch_tpu_cache
+          # --------------------------------------------------------
 
           # --- Core Distributed Tests ---
           python -m torchtitan.experiments.tpu.tests.test_train_distributed --device=tpu
