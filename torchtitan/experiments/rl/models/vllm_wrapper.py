@@ -311,6 +311,7 @@ class TorchTitanVLLMModelWrapper(Module):
             # put the model into device if it was at meta
             device = vllm_config.device_config.device            
             self.model = self.model.to_empty(device=device)
+            self.model.init_states(buffer_device=device)
 
         # Pre-extend RoPE cache to cover vLLM's max model length (profiling
         # may use up to 2x max_seq_len, so use max_model_len which already

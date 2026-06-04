@@ -174,10 +174,13 @@ class FusedWorker:
 
         if not self.job_config.training.enable_cpu_offload:
             self.model = self.model.to_empty(device=self.device)
+            self.model.init_states(buffer_device=self.device)
             if self.ref_model is not None:
                 self.ref_model = self.ref_model.to_empty(device=self.device)
+                self.ref_model.init_states(buffer_device=self.device)
             if self.sampler_model is not None:
                 self.sampler_model = self.sampler_model.to_empty(device=self.device)
+                self.sampler_model.init_states(buffer_device=self.device)
 
         with torch.no_grad():
             self.model.init_weights()
