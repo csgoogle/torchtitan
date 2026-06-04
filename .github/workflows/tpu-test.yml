@@ -52,6 +52,11 @@ jobs:
           set -e
           ulimit -n 65536
 
+          # --- DIAGNOSTIC CHECK ---
+          echo "=== ACTUAL SHARED MEMORY ALLOCATION ==="
+          df -h /dev/shm
+          echo "======================================="
+
           # --- Core Distributed Tests ---
           python -m torchtitan.experiments.tpu.tests.test_train_distributed --device=tpu
           python -m torchtitan.experiments.tpu.tests.test_model_distributed --device=tpu
