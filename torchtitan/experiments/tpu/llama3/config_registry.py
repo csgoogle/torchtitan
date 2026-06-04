@@ -151,6 +151,12 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
+          use_graph_split=True,
+      ),
+      compile=CompileConfig(
+          enable=True,
+          backend="tpu",
+          components=["model"],
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,

@@ -7,7 +7,6 @@
 """Trainer compatible with TorchTpu."""
 
 import argparse
-import contextlib
 import functools
 import json
 import tempfile
@@ -58,16 +57,6 @@ class TPUTrainer(torchtitan.train.Trainer):
       tpu_config = job_config.tpu_config
       if not tpu_config.enable_amp:
         logger.info("AMP is disabled, using uniform precision training.")
-        self.maybe_enable_amp = contextlib.nullcontext()
-      if self.parallel_dims.dp_replicate_enabled and self.device.type == "tpu":
-        # TODO b/494360665: remove this once torch.autocast is supported on TPU.
-        # DDP-replicate on TPU uses fully_shard instead of autocast.
-        logger.info(
-            "Mixed precision training is handled by fully_shard (TPU replicate,"
-            f"param={self.config.training.mixed_precision_param}, "
-            f"reduce={self.config.training.mixed_precision_reduce})"
-        )
-        self.maybe_enable_amp = contextlib.nullcontext()
 
   def forward_backward_step(
       self,
@@ -101,10 +90,9 @@ class TPUTrainer(torchtitan.train.Trainer):
     )
 
     with self.train_context():
-      with self.maybe_enable_amp:
-        pred = self.model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-        loss_sum = self.loss_fn(pred, labels)
-        loss = loss_sum / global_valid_tokens
+      pred = self.model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+      loss_sum = self.loss_fn(pred, labels)
+      loss = loss_sum / global_valid_tokens
       del pred
 
       # Materialize the forward graph without waiting for execution to
