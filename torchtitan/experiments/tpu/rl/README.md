@@ -99,7 +99,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --sampler.use_vllm \
     --sampler.vllm_tensor_parallel_size=1 \
     --checkpoint.enable \
-    --training.steps=10 2>&1 \
+    --training.steps=25 2>&1 \
     | tee ray_train_vllm_tp_1.log \
     | grep -iE "\[titan\]|@@@" 
 ```
@@ -109,7 +109,22 @@ Check progress and metrics
 grep -E "Step [0-9]+: Times|Training completed|step:\s+[0-9]+" ray_train_vllm_tp_1.log
 ```
 
-#### 2. With Tensor Parallelism (TP=4) vLLM Sampling
+#### 2. With Tensor Parallelism (TP=2) vLLM Sampling
+To run the sampler with Tensor Parallelism=2 (which distributes the vLLM engine across 2 chips, running 2 replicas in parallel over 4 chips total):
+```bash
+sudo fuser -k /dev/vfio/* 2>/dev/null || true
+export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiments/tpu/rl/ray_train.py \
+    --module=torchtitan.experiments.tpu.rl \
+    --config=grpo_qwen3_0_6b \
+    --sampler.use_vllm \
+    --sampler.vllm_tensor_parallel_size=2 \
+    --checkpoint.enable \
+    --training.steps=25 2>&1 \
+    | tee ray_train_vllm_tp_2.log \
+    | grep -iE "\[titan\]|@@@" 
+```
+
+#### 3. With Tensor Parallelism (TP=4) vLLM Sampling
 To run the sampler with Tensor Parallelism=4 (which distributes the vLLM engine across all 4 chips instead of a single chip):
 ```bash
 sudo fuser -k /dev/vfio/* 2>/dev/null || true
@@ -119,7 +134,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --sampler.use_vllm \
     --sampler.vllm_tensor_parallel_size=4 \
     --checkpoint.enable \
-    --training.steps=10 2>&1 \
+    --training.steps=25 2>&1 \
     | tee ray_train_vllm_tp_4.log \
     | grep -iE "\[titan\]|@@@" 
 ```
