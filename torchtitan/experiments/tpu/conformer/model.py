@@ -41,10 +41,45 @@ class ConformerModelArgs(BaseModel.Config):
       self, model: nn.Module, seq_len: int
   ) -> tuple[int, int]:
     nparams = sum(p.numel() for p in model.parameters())
-    # Dummy flops for now to avoid crash in metrics processor
-    # redacted uses 6 * N * seq_len as rough estimate
-    flops_per_token = 6 * nparams
-    return nparams, flops_per_token
+
+    t = seq_len
+    d = self.hidden_dim
+    k = self.kernel_size
+    ffn_dim = 4 * d  # Based on ffn_dim=4*config.hidden_dim
+    l = self.num_layers
+
+    # 1. Feed Forward Networks (one in beginning, one at end of each layer)
+    # 2 linear layers per FFN (D -> FFN_dim, and FFN_dim -> D).
+    # MatMul FLOPs = 2 * T * in_dim * out_dim
+    ffn_flops = 2 * (2 * t * d * ffn_dim) * 2
+
+    # 2. Attention Module (PatchedMHA)
+    # QKV Projections + Output Projection: 4 * (2 * T * D^2)
+    # QK^T and AV Matrix Multiplications: 2 * (2 * T^2 * D)
+    attn_flops = (8 * t * (d**2)) + (4 * (t**2) * d)
+
+    # 3. Convolution Module
+    # Pointwise 1 (D -> 2D) + Pointwise 2 (D -> D) = 6 * T * D^2
+    # Depthwise Conv: 2 * T * D * K
+    conv_flops = (6 * t * (d**2)) + (2 * t * d * k)
+
+    # Total FLOPs for all Conformer layers
+    flops_per_layer = ffn_flops + attn_flops + conv_flops
+    total_layer_flops = l * flops_per_layer
+
+    # Final FC classifier layer
+    fc_flops = 2 * t * d * self.vocab_size
+
+    # Total Forward FLOPs
+    forward_flops = total_layer_flops + fc_flops
+
+    # Total Training FLOPs = Forward (1x) + Backward (2x) = 3x total
+    total_training_flops = forward_flops * 3
+
+    # Return FLOPs normalized per token to match downstream metric processor
+    flops_per_token = total_training_flops // t
+
+    return nparams, int(flops_per_token)
 
 
 # --- TPU-compatible GLU Fix ---
