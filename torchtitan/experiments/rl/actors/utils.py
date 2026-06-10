@@ -24,8 +24,25 @@ def create_varlen_metadata(seq_lens: list[int], device: torch.device) -> VarlenM
         [0] + list(itertools.accumulate(seq_lens)), dtype=torch.int32, device=device
     )
     max_len = max(seq_lens)
+
+    doc_indices = []
+    token_indices = []
+    for i, l in enumerate(seq_lens):
+        doc_indices.extend([i] * l)
+        token_indices.extend(range(l))
+
+    doc_indices_tensor = torch.tensor(doc_indices, dtype=torch.long, device=device)
+    token_indices_tensor = torch.tensor(token_indices, dtype=torch.long, device=device)
+    num_docs = len(seq_lens)
+
     return VarlenMetadata(
-        cu_seq_q=cu_seqs, cu_seq_k=cu_seqs, max_q=max_len, max_k=max_len
+        cu_seq_q=cu_seqs,
+        cu_seq_k=cu_seqs,
+        max_q=max_len,
+        max_k=max_len,
+        doc_indices=doc_indices_tensor,
+        token_indices=token_indices_tensor,
+        num_docs=num_docs,
     )
 
 
@@ -63,7 +80,7 @@ def extract_response_logprobs(
         # (seq_start + prompt_len - 1) in the logprobs tensor.
         s = seq_start + prompt_lens[i] - 1
         e = s + response_lens[i]
-        result.append(packed_logprobs[0, s:e])
+        result.append(packed_logprobs[0, s:e].clone())
         seq_start += seq_lens[i]
     return result
 
@@ -113,7 +130,7 @@ def verify_logprob_identity(
         # Convert vLLM log probs to tensor
         vllm_tensor = torch.tensor(vllm_lps, dtype=torch.float32)
         # Convert titan log probs to float32 for comparison
-        titan_tensor = titan_lps.detach().cpu().float()
+        titan_tensor = titan_lps.detach().clone().cpu().float()
 
         num_tokens = len(vllm_lps)
         result["total_tokens_checked"] += num_tokens

@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: grpo-controller
+  namespace: default
+  labels:
+    app: grpo-controller
+  annotations:
+    gke-gcsfuse/volumes: "true"
+spec:
+  nodeName: gke-pw-v6e-16x4-default-pool-b8aa7d33-lxk4
+  serviceAccountName: xpk-sa
+  containers:
+  - name: controller
+    image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/monarch-gke:060309
+    command: ["/bin/sh", "-c", "sleep infinity"]
+    readinessProbe:
+      exec:
+        command: ["python3", "-c", "import monarch"]
+      initialDelaySeconds: 5
+      periodSeconds: 3
+    volumeMounts:
+    - name: gcs-volume
+      mountPath: /data
+  volumes:
+  - name: gcs-volume
+    csi:
+      driver: gcsfuse.csi.storage.gke.io
+      volumeAttributes:
+        bucketName: wenjun-ray
+        mountOptions: "implicit-dirs"

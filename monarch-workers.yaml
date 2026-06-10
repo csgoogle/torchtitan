@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: monarch-worker-headless
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: monarch-worker
+  ports:
+  - port: 26600
+    name: monarch-port
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: monarch-worker
+  namespace: default
+spec:
+  serviceName: monarch-worker-headless
+  replicas: 4
+  selector:
+    matchLabels:
+      app: monarch-worker
+  template:
+    metadata:
+      labels:
+        app: monarch-worker
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      serviceAccountName: xpk-sa
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "4x4"
+        cloud.google.com/gke-nodepool: pw-v6e-16x4-np-2
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      - name: worker
+        image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/monarch-gke:060309
+        command:
+          - /bin/bash
+          - -c
+          - |
+            mkdir -p /tmp/root && touch /tmp/root/monarch_log.log
+            tail -n 0 -F /tmp/root/monarch_log.log &
+            exec python3 -u /app/start_worker.py
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: RUST_LOG
+          value: debug
+        - name: HYPERACTOR_LOG_LEVEL
+          value: debug
+        - name: PYTHONPATH
+          value: "/data:/app"
+        - name: TPU_WORKER_HOSTNAMES
+          value: "monarch-worker-0.monarch-worker-headless.default.svc.cluster.local,monarch-worker-1.monarch-worker-headless.default.svc.cluster.local,monarch-worker-2.monarch-worker-headless.default.svc.cluster.local,monarch-worker-3.monarch-worker-headless.default.svc.cluster.local"
+        ports:
+        - containerPort: 26600
+          name: monarch-port
+        resources:
+          limits:
+            google.com/tpu: 4
+            memory: 200Gi
+          requests:
+            google.com/tpu: 4
+            memory: 200Gi
+        volumeMounts:
+        - name: gcs-volume
+          mountPath: /data
+      volumes:
+      - name: gcs-volume
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeAttributes:
+            bucketName: wenjun-ray
+            mountOptions: "implicit-dirs"

@@ -5,13 +5,24 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-import os as os
+import os
+
+# Environment MASTER_ADDR and MASTER_PORT are configured by grpo.py in the spawned process environment.
+
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.distributed.checkpoint as dcp
-import torchstore as ts
+# torchstore is an optional dependency used in some environments for distributed
+# metadata/weight caching. We wrap it in a try-except to allow graceful fallback 
+# in open-source and TPU-based environments (where standard PyTorch distributed 
+# stores or custom RPC mechanisms are used instead).
+try:
+    import torchstore as ts
+except ImportError:
+    ts = None
+
 from monarch.actor import Actor, endpoint
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -96,56 +107,79 @@ class PolicyTrainer(Actor, Configurable):
         self.config = config
         self.compile_config = compile_config
         self.loss_fn = config.loss.build()
+        self.model_spec = model_spec
+        self.hf_assets_path = hf_assets_path
+        self.generator_dtype = generator_dtype
+
+    # Lifecycle Separation:
+    # __init__ only eagerly stores configuration parameters. This asynchronous setup() 
+    # endpoint handles all active initialization (staggered device boots, FSDP model building,
+    # and distributed process groups), ensuring safe and coordinated startup across both 
+    # GPU and TPU environments.
+    @endpoint
+    async def setup(self, barrier: Any = None) -> None:
 
         # Only cast if generator dtype differs from training dtype, otherwise
         # staging buffers would be allocated for a no-op cast.
-        training_dtype = TORCH_DTYPE_MAP[config.training.dtype]
-        gen_dtype = TORCH_DTYPE_MAP[generator_dtype] if generator_dtype else None
+        training_dtype = TORCH_DTYPE_MAP[self.config.training.dtype]
+        gen_dtype = TORCH_DTYPE_MAP[self.generator_dtype] if self.generator_dtype else None
         self._transfer_dtype = gen_dtype if gen_dtype != training_dtype else None
 
         # Device setup
-        device_module, device_type = utils.device_module, utils.device_type
-        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
-        device_module.set_device(self.device)
+        device_type = utils.get_device_type()
+        if device_type == "tpu":
+            self.device = torch.device("tpu")
+            # Force PJRT client initialization explicitly in a staggered sequence
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            if local_rank > 0:
+                import asyncio
+                await asyncio.sleep(local_rank * 0.1)
+
+            # Allocating a dummy tensor on TPU forces the deferred PJRT initialization to run
+            _ = torch.zeros(1, device=self.device)
+        else:
+            device_module = utils.get_device_module()
+            self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+            device_module.set_device(self.device)
 
         # Enable batch-invariant mode BEFORE init_distributed
-        set_batch_invariance(config.debug.batch_invariant)
+        set_batch_invariance(self.config.debug.batch_invariant)
 
-        world_size = dist_utils.init_distributed(config.comm)
+        world_size = dist_utils.init_distributed(self.config.comm)
 
-        self.parallel_dims = ParallelDims.from_config(config.parallelism, world_size)
+        self.parallel_dims = ParallelDims.from_config(self.config.parallelism, world_size)
 
         # Set determinism flags and seed via core torchtitan utility
         dist_utils.set_determinism(
             self.parallel_dims,
             self.device,
-            config.debug,
+            self.config.debug,
             distinct_seed_mesh_dims=["pp"],
         )
 
         # Initialize state dict adapter for HF checkpoint loading
-        if model_spec.state_dict_adapter is not None:
-            self.sd_adapter = model_spec.state_dict_adapter(
-                model_spec.model, hf_assets_path
+        if self.model_spec.state_dict_adapter is not None:
+            self.sd_adapter = self.model_spec.state_dict_adapter(
+                self.model_spec.model, self.hf_assets_path
             )
         else:
             self.sd_adapter = None
 
         # Create training policy model
-        model = self._build_model(model_spec, config, device_type, hf_assets_path)
+        model = self._build_model(self.model_spec, self.config, device_type, self.hf_assets_path)
         model.train()
         self.model = model
         self.model_parts = [model]
 
         # Build optimizer and LR scheduler
-        self.optimizers = config.optimizer.build(model_parts=self.model_parts)
-        self.lr_schedulers = config.lr_scheduler.build(
+        self.optimizers = self.config.optimizer.build(model_parts=self.model_parts)
+        self.lr_schedulers = self.config.lr_scheduler.build(
             optimizers=self.optimizers,
-            training_steps=config.training.steps,
+            training_steps=self.config.training.steps,
         )
 
         self.policy_version = 0
-        self.generator: Any | None = None
+        self.generator = None
 
         # Data parallelism: mesh is available after _build_model triggers build_mesh
         self.dp_enabled = self.parallel_dims.dp_enabled
@@ -317,8 +351,8 @@ class PolicyTrainer(Actor, Configurable):
 
         return {
             "loss": loss.item(),
-            "advantage_mean": advantages.mean().item(),
-            "advantage_std": advantages.std().item(),
+            "advantage_mean": local_batch.advantages.mean().item(),
+            "advantage_std": local_batch.advantages.std().item(),
             "logprob_diff_mean": verification_result["logprob_diff_mean"],
             "logprob_diff_max": verification_result["logprob_diff_max"],
             "logprob_max_delta": verification_result["logprob_max_delta"],
@@ -389,11 +423,29 @@ class PolicyTrainer(Actor, Configurable):
         from the source's GPU memory".
 
         """
-        from monarch.rdma import is_rdma_available
+        if utils.get_device_type() == "tpu":
+            import os
+            import torch.distributed as dist
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
-        await ts.put_state_dict(
-            self.model.state_dict(),
-            "model_state_dict",
-            direct_rdma=is_rdma_available(),
-            transfer_dtype=self._transfer_dtype,
-        )
+            rank = dist.get_rank()
+            state_dict_options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            state_dict_cpu = get_model_state_dict(self.model, options=state_dict_options)
+
+            # Only Rank 0 saves the consolidated weights to prevent file corruption
+            # from concurrent writes on the shared network filesystem.
+            if rank == 0:
+                os.makedirs("/data/torchtitan_rl", exist_ok=True)
+                torch.save(state_dict_cpu, "/data/torchtitan_rl/model_state_dict.pt")
+
+            # Block all ranks until Rank 0 finishes writing the weights to disk,
+            # preventing downstream processes from loading a partial/corrupted file.
+            dist.barrier()
+        else:
+            from monarch.rdma import is_rdma_available
+            await ts.put_state_dict(
+                self.model.state_dict(),
+                "model_state_dict",
+                direct_rdma=is_rdma_available(),
+                transfer_dtype=self._transfer_dtype,
+            )

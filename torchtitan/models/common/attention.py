@@ -66,9 +66,157 @@ class VarlenMetadata(NamedTuple):
     cu_seq_k: torch.Tensor
     max_q: int
     max_k: int
+    doc_indices: torch.Tensor | None = None
+    token_indices: torch.Tensor | None = None
+    num_docs: int = 0
 
 
 AttentionMasksType = dict[str, BlockMask] | BlockMask | VarlenMetadata
+
+
+def _create_varlen_attention_mask(
+    padding_mask_q: torch.Tensor,
+    padding_mask_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    window_size: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Builds a combined causal, padding, and sliding window attention mask."""
+    # 1. Base causal mask (lower triangular)
+    causal_mask = torch.tril(torch.ones(max_q, max_k, device=device, dtype=torch.bool))
+
+    # 2. Apply sliding window mask if window size is configured
+    left, _ = window_size
+    if left >= 0:
+        q_indices = torch.arange(max_q, device=device).unsqueeze(1)
+        k_indices = torch.arange(max_k, device=device).unsqueeze(0)
+        window_mask = (k_indices >= q_indices - left)
+        causal_mask = causal_mask & window_mask
+
+    # 3. Combine with batch padding masks
+    q_mask = padding_mask_q.unsqueeze(2)  # [num_docs, max_q, 1]
+    k_mask = padding_mask_k.unsqueeze(1)  # [num_docs, 1, max_k]
+    valid_mask = q_mask & k_mask           # [num_docs, max_q, max_k]
+
+    # Return formatted as [num_docs, 1, max_q, max_k] for PyTorch SDPA
+    return (valid_mask & causal_mask).unsqueeze(1)
+
+
+def varlen_attn_tpu_parallel(
+    xq_packed: torch.Tensor,
+    xk_packed: torch.Tensor,
+    xv_packed: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    doc_indices: torch.Tensor,
+    token_indices: torch.Tensor,
+    num_docs: int,
+    scale: float | None = None,
+    window_size: tuple[int, int] = (-1, 0),
+) -> torch.Tensor:
+    """Fast TPU path for variable-length attention using pre-calculated index tensors."""
+    device = xq_packed.device
+    dtype = xq_packed.dtype
+    num_heads, head_dim = xq_packed.shape[1], xq_packed.shape[2]
+    num_kv_heads = xk_packed.shape[1]
+
+    # Pre-allocate padded tensors directly on TPU device memory
+    xq_padded = torch.zeros(num_docs, max_q, num_heads, head_dim, device=device, dtype=dtype)
+    padding_mask_q = torch.zeros(num_docs, max_q, device=device, dtype=torch.bool)
+    xq_padded[doc_indices, token_indices] = xq_packed
+    padding_mask_q[doc_indices, token_indices] = True
+
+    xk_padded = torch.zeros(num_docs, max_k, num_kv_heads, head_dim, device=device, dtype=dtype)
+    xv_padded = torch.zeros(num_docs, max_k, num_kv_heads, head_dim, device=device, dtype=dtype)
+    padding_mask_k = torch.zeros(num_docs, max_k, device=device, dtype=torch.bool)
+    xk_padded[doc_indices, token_indices] = xk_packed
+    xv_padded[doc_indices, token_indices] = xv_packed
+    padding_mask_k[doc_indices, token_indices] = True
+
+    # Construct the attention mask
+    attn_mask = _create_varlen_attention_mask(
+        padding_mask_q, padding_mask_k, max_q, max_k, window_size, device
+    )
+
+    out_padded = F.scaled_dot_product_attention(
+        xq_padded.transpose(1, 2),
+        xk_padded.transpose(1, 2),
+        xv_padded.transpose(1, 2),
+        attn_mask=attn_mask,
+        scale=scale,
+    )
+
+    out_padded = out_padded.transpose(1, 2)
+    out_packed = out_padded[doc_indices, token_indices]
+    return out_packed
+
+
+@torch._dynamo.disable
+def varlen_attn_tpu_eager_fallback(
+    xq_packed: torch.Tensor,
+    xk_packed: torch.Tensor,
+    xv_packed: torch.Tensor,
+    cu_seq_q: torch.Tensor,
+    cu_seq_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    scale: float | None = None,
+    window_size: tuple[int, int] = (-1, 0),
+) -> torch.Tensor:
+    """Eager fallback path using CPU loop iteration for padding/packing mapping."""
+    device = xq_packed.device
+    dtype = xq_packed.dtype
+    num_heads, head_dim = xq_packed.shape[1], xq_packed.shape[2]
+    num_kv_heads = xk_packed.shape[1]
+
+    # Resolve document counts on CPU
+    cu_seq_q_cpu = cu_seq_q.to("cpu")
+    cu_seq_k_cpu = cu_seq_k.to("cpu")
+    num_docs = len(cu_seq_q_cpu) - 1
+
+    # Map packed sequence matrices to padded documents via CPU loops
+    xq_padded = torch.zeros(num_docs, max_q, num_heads, head_dim, device=device, dtype=dtype)
+    padding_mask_q = torch.zeros(num_docs, max_q, device=device, dtype=torch.bool)
+    for i in range(num_docs):
+        start, end = int(cu_seq_q_cpu[i]), int(cu_seq_q_cpu[i+1])
+        length = end - start
+        xq_padded[i, :length] = xq_packed[start:end]
+        padding_mask_q[i, :length] = True
+
+    xk_padded = torch.zeros(num_docs, max_k, num_kv_heads, head_dim, device=device, dtype=dtype)
+    xv_padded = torch.zeros(num_docs, max_k, num_kv_heads, head_dim, device=device, dtype=dtype)
+    padding_mask_k = torch.zeros(num_docs, max_k, device=device, dtype=torch.bool)
+    for i in range(num_docs):
+        start, end = int(cu_seq_k_cpu[i]), int(cu_seq_k_cpu[i+1])
+        length = end - start
+        xk_padded[i, :length] = xk_packed[start:end]
+        xv_padded[i, :length] = xv_packed[start:end]
+        padding_mask_k[i, :length] = True
+
+    # Construct the attention mask
+    attn_mask = _create_varlen_attention_mask(
+        padding_mask_q, padding_mask_k, max_q, max_k, window_size, device
+    )
+
+    out_padded = F.scaled_dot_product_attention(
+        xq_padded.transpose(1, 2),
+        xk_padded.transpose(1, 2),
+        xv_padded.transpose(1, 2),
+        attn_mask=attn_mask,
+        scale=scale,
+    )
+
+    out_padded = out_padded.transpose(1, 2)
+
+    # Re-pack back into original un-padded layout
+    out_packed = torch.zeros_like(xq_packed)
+    for i in range(num_docs):
+        start, end = int(cu_seq_q_cpu[i]), int(cu_seq_k_cpu[i+1])
+        length = end - start
+        out_packed[start:end] = out_padded[i, :length]
+
+    return out_packed
 
 
 class VarlenAttention(Module):
@@ -115,6 +263,9 @@ class VarlenAttention(Module):
         cu_seq_k = attention_masks.cu_seq_k
         max_q = attention_masks.max_q
         max_k = attention_masks.max_k
+        doc_indices = attention_masks.doc_indices
+        token_indices = attention_masks.token_indices
+        num_docs = attention_masks.num_docs
 
         batch_size, seq_len, _, head_dim = xq.shape
 
@@ -143,18 +294,48 @@ class VarlenAttention(Module):
         if kwargs.get("enable_gqa", False):
             varlen_kwargs["enable_gqa"] = True
 
-        out_packed = varlen_attn(
-            xq_packed,
-            xk_packed,
-            xv_packed,
-            cu_seq_q,
-            cu_seq_k,
-            max_q,
-            max_k,
-            scale=scale,
-            window_size=self.window_size,
-            **varlen_kwargs,  # pyrefly: ignore [bad-argument-type]
-        )
+        device_type = xq_packed.device.type
+        if device_type in ("xla", "tpu", "cpu"):
+            if doc_indices is not None and token_indices is not None and num_docs > 0:
+                # Compile-safe parallel TPU path (no host copies/graph breaks)
+                out_packed = varlen_attn_tpu_parallel(
+                    xq_packed=xq_packed,
+                    xk_packed=xk_packed,
+                    xv_packed=xv_packed,
+                    max_q=max_q,
+                    max_k=max_k,
+                    doc_indices=doc_indices,
+                    token_indices=token_indices,
+                    num_docs=num_docs,
+                    scale=scale,
+                    window_size=self.window_size,
+                )
+            else:
+                # Eager fallback CPU-copy path
+                out_packed = varlen_attn_tpu_eager_fallback(
+                    xq_packed=xq_packed,
+                    xk_packed=xk_packed,
+                    xv_packed=xv_packed,
+                    cu_seq_q=cu_seq_q,
+                    cu_seq_k=cu_seq_k,
+                    max_q=max_q,
+                    max_k=max_k,
+                    scale=scale,
+                    window_size=self.window_size,
+                )
+        else:
+            out_packed = varlen_attn(
+                xq_packed,
+                xk_packed,
+                xv_packed,
+                cu_seq_q,
+                cu_seq_k,
+                max_q,
+                max_k,
+                scale=scale,
+                window_size=self.window_size,
+                **varlen_kwargs,  # pyrefly: ignore [bad-argument-type]
+            )
         assert isinstance(out_packed, torch.Tensor)
         # Reshape back to the format expected by GQAttention.forward()
         out = out_packed.view(batch_size, seq_len, -1, head_dim)
@@ -417,18 +598,23 @@ def create_varlen_metadata_for_document(
     """
     batch_size, seq_len = input_batch.shape
     device = input_batch.device
+
+    # Run the metadata construction on CPU to support TPU/XLA devices
+    # which lack certain operators like unique_consecutive or nonzero.
+    input_batch_cpu = input_batch.to("cpu")
+
     cu_seqlens_list, all_seq_lengths = [], []
     offset = 0
     max_seqlen = 0
 
     for b in range(batch_size):
-        tokens = input_batch[b]
+        tokens = input_batch_cpu[b]
         eos_positions = (tokens == eos_id).nonzero(as_tuple=True)[0].to(torch.int32)
         sample_cu_seqlens = torch.cat(
             [
-                torch.tensor([0], dtype=torch.int32, device=device),
+                torch.tensor([0], dtype=torch.int32, device="cpu"),
                 eos_positions + 1,
-                torch.tensor([seq_len], dtype=torch.int32, device=device),
+                torch.tensor([seq_len], dtype=torch.int32, device="cpu"),
             ]
         )
         sample_cu_seqlens = torch.unique_consecutive(sample_cu_seqlens)
@@ -442,7 +628,7 @@ def create_varlen_metadata_for_document(
         offset += seq_len
 
     packed_cu_seqlens = torch.cat(
-        cu_seqlens_list + [torch.tensor([offset], dtype=torch.int32, device=device)]
+        cu_seqlens_list + [torch.tensor([offset], dtype=torch.int32, device="cpu")]
     )
 
     max_seqlen: int = 0
@@ -452,9 +638,11 @@ def create_varlen_metadata_for_document(
         # pyrefly: ignore[bad-assignment]
         max_seqlen = all_seq_lengths.max().item()
 
+    packed_cu_seqlens_device = packed_cu_seqlens.to(device)
+
     return VarlenMetadata(
-        cu_seq_q=packed_cu_seqlens,
-        cu_seq_k=packed_cu_seqlens,
+        cu_seq_q=packed_cu_seqlens_device,
+        cu_seq_k=packed_cu_seqlens_device,
         max_q=max_seqlen,
         max_k=max_seqlen,
     )

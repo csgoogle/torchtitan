@@ -21,22 +21,41 @@ python3 torchtitan/experiments/rl/grpo.py \
     --hf_assets_path=<path_to_model_checkpoint>
 """
 
+import multiprocessing
+# Force 'spawn' start method to prevent deadlocks with shared GPU/TPU driver contexts.
+# Wrap in try-except in case the context has already been initialized by other modules.
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
 import asyncio
 import logging
 import math
 import os as os
+# Configure Monarch transport BEFORE importing any monarch module to ensure
+# that all local agents/mailboxes are created with TCP transport instead of IPC.
+if os.getenv("MONARCH_WORKERS"):
+    from monarch.config import configure, ChannelTransport
+    configure(default_transport=ChannelTransport.TcpWithHostname)
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Annotated, Any
+import tyro
 
 import torch
-import torchstore as ts
-from monarch.actor import this_host
-from monarch.spmd import setup_torch_elastic_env_async
-
 from torchtitan.config import Configurable, ParallelismConfig
 from torchtitan.config.configs import CompileConfig
 from torchtitan.config.manager import ConfigManager
+from torchtitan.tools.utils import get_device_type
+# TPU is not support torchstore. We skip it for now.
+try:
+    import torchstore as ts
+except ImportError:
+    ts = None
+from monarch.actor import this_host
+from monarch.spmd import setup_torch_elastic_env_async
+from monarch.tools.network import AddrType
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.types import (
@@ -94,38 +113,291 @@ class GRPOLoss(Configurable):
         return pg_loss, metrics
 
 
-class Provisioner:
-    """Allocates non-overlapping GPU ranges for Monarch proc meshes.
+def _default_python_bootstrap() -> None:
+    import sys
+    # Enforce loading modified codebase from /app and remove /data to prevent stale file handles
+    sys.path = [p for p in sys.path if p not in ("/data", "/data/torchtitan")]
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    print("@@@ MONARCH BOOTSTRAP sys.path:", sys.path, flush=True)
 
-    In non-colocated mode, the trainer and generator run on separate GPU
-    meshes (e.g. GPUs 0-3 for training, GPUs 4-7 for generation). Each
-    call to ``allocate(n)`` reserves the next *n* GPUs and returns a
-    bootstrap callable that sets ``CUDA_VISIBLE_DEVICES`` before CUDA
-    initializes in the spawned process, ensuring each mesh only sees its
-    own devices.
+
+def _resolve_tpu_host_ips(mesh_hosts: list[str] | None) -> list[str]:
+    """Resolves headless worker hostnames to IP addresses for TPU communication."""
+    import socket
+    import os
+    active_hosts = mesh_hosts if mesh_hosts else [os.getenv("WORKERS_0_HOSTNAME", "localhost")]
+    ip_hosts = []
+    for h in active_hosts:
+        if h == "localhost" or h == "127.0.0.1" or h.replace('.', '').isdigit():
+            ip_hosts.append(h)
+        else:
+            fqdn = h
+            if ".monarch-worker-headless" not in h:
+                fqdn = f"{h}.monarch-worker-headless.default.svc.cluster.local"
+            try:
+                ip = socket.gethostbyname(fqdn)
+                ip_hosts.append(ip)
+            except Exception:
+                ip_hosts.append(fqdn)
+    return ip_hosts
+
+
+def _build_tpu_topology_mapping(
+    ip_hosts: list[str],
+    num_gpus: int,
+    host_rank: int,
+    local_rank: int,
+) -> tuple[list[str], int, str, str, int, int]:
+    """Calculates the physical TPU 2D/3D torus grid coordinates, ranks, and ports.
+    
+    Returns:
+        tuple containing:
+        - tpu_worker_addresses (list[str]): List of all worker address ports.
+        - global_rank (int): Global rank of the current process.
+        - tpu_topology (str): Topology boundary string (host_x, host_y, 1).
+        - tpu_process_bounds (str): Process boundary string.
+        - host_x_dim (int): Host dimension along X.
+        - host_y_dim (int): Host dimension along Y.
+    """
+    num_hosts = len(ip_hosts)
+    
+    if num_gpus == 1:
+        tpu_worker_addresses = [f"{host_ip}:8471" for host_ip in ip_hosts]
+        global_rank = host_rank
+        tpu_topology = f"{num_hosts},1,1"
+        tpu_process_bounds = f"{num_hosts},1,1"
+        return tpu_worker_addresses, global_rank, tpu_topology, tpu_process_bounds, num_hosts, 1
+
+    elif num_gpus == 2:
+        tpu_worker_addresses = [None] * (num_hosts * 2)
+        for h_rank, host_ip in enumerate(ip_hosts):
+            for l_rank in range(2):
+                p_x = h_rank * 2 + l_rank
+                tpu_worker_addresses[p_x] = f"{host_ip}:{8471 + l_rank}"
+        
+        global_rank = host_rank * 2 + local_rank
+        tpu_topology = f"{num_hosts * 2},1,1"
+        tpu_process_bounds = f"{num_hosts * 2},1,1"
+        return tpu_worker_addresses, global_rank, tpu_topology, tpu_process_bounds, num_hosts * 2, 1
+
+    elif num_gpus == 4:
+        if num_hosts == 4:
+            host_x_dim, host_y_dim = 2, 2
+        elif num_hosts == 2:
+            host_x_dim, host_y_dim = 2, 1
+        elif num_hosts == 8:
+            host_x_dim, host_y_dim = 4, 2
+        else:
+            host_x_dim, host_y_dim = num_hosts, 1
+            
+        tpu_worker_addresses = [None] * (num_hosts * 4)
+        for h_rank, host_ip in enumerate(ip_hosts):
+            hx = h_rank % host_x_dim
+            hy = h_rank // host_x_dim
+            for l_rank in range(4):
+                lx = l_rank % 2
+                ly = l_rank // 2
+                X = hx * 2 + lx
+                Y = hy * 2 + ly
+                g_rank = Y * (host_x_dim * 2) + X
+                tpu_worker_addresses[g_rank] = f"{host_ip}:{8471 + l_rank}"
+        
+        hx = host_rank % host_x_dim
+        hy = host_rank // host_x_dim
+        lx = local_rank % 2
+        ly = local_rank // 2
+        X = hx * 2 + lx
+        Y = hy * 2 + ly
+        global_rank = Y * (host_x_dim * 2) + X
+        tpu_topology = f"{host_x_dim},{host_y_dim},1"
+        tpu_process_bounds = f"{host_x_dim * 2},{host_y_dim * 2},1"
+        return tpu_worker_addresses, global_rank, tpu_topology, tpu_process_bounds, host_x_dim, host_y_dim
+
+    else:
+        raise ValueError(f"Unsupported num_gpus per host: {num_gpus}")
+
+
+def _build_tpu_distributed_env(
+    num_gpus: int,
+    gpu_ids: list[int],
+    host_rank: int,
+    local_rank: int,
+    mesh_hosts: list[str] | None,
+    master_port: str,
+) -> dict[str, str]:
+    """Generates all process-level environment variables for distributed TPU coordination."""
+    env = {}
+    env["TPU_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+    env["TPU_VISIBLE_CHIPS"] = ",".join(str(g) for g in gpu_ids)
+    env["PJRT_DEVICE"] = "TPU"
+
+    # 1. Resolve headless hosts to GKE internal IPs
+    ip_hosts = _resolve_tpu_host_ips(mesh_hosts)
+    num_hosts = len(ip_hosts)
+
+    # 2. Build worker address port mapping and ranks
+    tpu_worker_addresses, global_rank, tpu_topology, tpu_process_bounds, host_x_dim, host_y_dim = (
+        _build_tpu_topology_mapping(ip_hosts, num_gpus, host_rank, local_rank)
+    )
+
+    tpu_worker_addresses_str = ",".join(tpu_worker_addresses)
+    world_size = num_hosts * num_gpus
+    master_addr = ip_hosts[0]
+
+    env["WORLD_SIZE"] = str(world_size)
+    env["RANK"] = str(global_rank)
+    env["LOCAL_RANK"] = str(local_rank)
+    env["LOCAL_WORLD_SIZE"] = str(num_gpus)
+    env["MASTER_ADDR"] = master_addr
+    env["MASTER_PORT"] = master_port
+    env["PYTHONUNBUFFERED"] = "1"
+
+    if num_hosts > 1:
+        env["TPU_PROCESS_ADDRESSES"] = tpu_worker_addresses_str
+        env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = tpu_worker_addresses_str
+        env["CLOUD_TPU_TASK_ID"] = str(host_rank)
+        env["TPU_TASK_ID"] = str(host_rank)
+        env["TPU_WORKER_HOSTNAMES"] = ",".join(ip_hosts)
+        env["GLOG_v"] = "2"
+        env["TF_CPP_MIN_LOG_LEVEL"] = "0"
+        env["PT_XLA_DEBUG"] = "1"
+        env["TORCH_DISTRIBUTED_DEBUG"] = "OFF"
+
+        if num_gpus == 4:
+            env["TPU_PROCESS_PORT"] = str(8471 + local_rank)
+            env["TPU_HOST_BOUNDS"] = tpu_topology
+            x_chips = host_x_dim * 2
+            y_chips = host_y_dim * 2
+            env["TPU_PROCESS_BOUNDS"] = f"{x_chips},{y_chips},1"
+            env["TPU_CHIPS_PER_HOST_BOUNDS"] = "2,2,1"
+            env["TPU_CHIPS_PER_PROCESS_BOUNDS"] = "1,1,1"
+            env["TORCH_TPU_TOPOLOGY"] = f"{x_chips},{y_chips},1"
+            
+            env["HOST_BOUNDS"] = tpu_topology
+            env["CHIPS_PER_HOST_BOUNDS"] = "2,2,1"
+        else:
+            env["TPU_PROCESS_PORT"] = str(8471 + local_rank)
+            env["TORCH_TPU_TOPOLOGY"] = tpu_topology
+            env["TPU_HOST_BOUNDS"] = tpu_topology
+            env["TPU_PROCESS_BOUNDS"] = tpu_process_bounds
+            env["TPU_CHIPS_PER_HOST_BOUNDS"] = "1,1,1"
+            env["TPU_CHIPS_PER_PROCESS_BOUNDS"] = "1,1,1"
+            env["HOST_BOUNDS"] = tpu_topology
+            env["CHIPS_PER_HOST_BOUNDS"] = "1,1,1"
+    else:
+        visible_devs = ",".join(str(g) for g in gpu_ids)
+        env["TPU_VISIBLE_DEVICES"] = visible_devs
+        env["TPU_VISIBLE_CHIPS"] = visible_devs
+        env["TPU_WORKER_HOSTNAMES"] = "127.0.0.1"
+        env["GLOG_v"] = "2"
+        env["TF_CPP_MIN_LOG_LEVEL"] = "0"
+
+        env["TPU_HOST_BOUNDS"] = "1,1,1"
+        env["HOST_BOUNDS"] = "1,1,1"
+        env["TPU_CHIPS_PER_PROCESS_BOUNDS"] = "1,1,1"
+
+        if num_gpus == 4:
+            env["TORCH_TPU_TOPOLOGY"] = "2,2,1"
+            env["TPU_CHIPS_PER_HOST_BOUNDS"] = "2,2,1"
+            env["CHIPS_PER_HOST_BOUNDS"] = "2,2,1"
+            env["TPU_PROCESS_BOUNDS"] = "2,2,1"
+        else:
+            tpu_topology = f"{num_gpus},1,1"
+            env["TORCH_TPU_TOPOLOGY"] = tpu_topology
+            env["TPU_CHIPS_PER_HOST_BOUNDS"] = tpu_topology
+            env["CHIPS_PER_HOST_BOUNDS"] = tpu_topology
+            env["TPU_PROCESS_BOUNDS"] = tpu_topology
+    return env
+
+
+class Provisioner:
+    """Allocates non-overlapping GPU/TPU ranges for Monarch proc meshes.
+
+    In non-colocated mode, the trainer and generator run on separate device
+    meshes (e.g. devices 0-3 for training, devices 4-7 for generation). Each
+    call to ``allocate(n)`` reserves the next *n* devices and returns a
+    bootstrap command builder that sets process-level environment variables
+    before initialization.
     """
 
-    def __init__(self, total_gpus: int = 8):
+    def __init__(self, total_gpus: int = 8, mesh_hosts: list[str] | None = None):
         self.total_gpus = total_gpus
         self.next_gpu = 0
+        self.mesh_hosts = mesh_hosts
 
     @property
     def available(self) -> int:
         return self.total_gpus - self.next_gpu
 
-    def allocate(self, num_gpus: int) -> Callable[[], None]:
+    def allocate(self, num_gpus: int, device_dim: str, master_port: str = "29500", is_trainer: bool = False) -> Callable[[Any], Any]:
         if num_gpus > self.available:
             raise RuntimeError(
-                f"Requested {num_gpus} GPUs but only {self.available} "
+                f"Requested {num_gpus} devices but only {self.available} "
                 f"available (total={self.total_gpus}, allocated={self.next_gpu})"
             )
         gpu_ids = list(range(self.next_gpu, self.next_gpu + num_gpus))
         self.next_gpu += num_gpus
+        mesh_hosts = self.mesh_hosts
 
-        def _bootstrap():
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+        from monarch._src.actor.host_mesh import default_bootstrap_cmd
 
-        return _bootstrap
+        def _get_cmd(point) -> Any:
+            labels = point.keys()
+            host_rank = point["hosts"] if "hosts" in labels else 0
+            local_rank = point[device_dim] if device_dim in labels else 0
+
+            is_tpu = os.environ.get("FORCE_DEVICE") == "tpu" or "TPU_HOST_BOUNDS" in os.environ
+            
+            env = {}
+            if is_tpu:
+                env = _build_tpu_distributed_env(
+                    num_gpus=num_gpus,
+                    gpu_ids=gpu_ids,
+                    host_rank=host_rank,
+                    local_rank=local_rank,
+                    mesh_hosts=mesh_hosts,
+                    master_port=master_port,
+                )
+            else:
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[local_rank])
+                if mesh_hosts:
+                    world_size = len(mesh_hosts) * num_gpus
+                    global_rank = host_rank * num_gpus + local_rank
+                    master_addr = mesh_hosts[0]
+                    env["WORLD_SIZE"] = str(world_size)
+                    env["RANK"] = str(global_rank)
+                    env["LOCAL_RANK"] = str(local_rank)
+                    env["MASTER_ADDR"] = master_addr
+                    env["MASTER_PORT"] = master_port
+                    env["PYTHONUNBUFFERED"] = "1"
+
+            if is_tpu:
+                # GKE auto-injects default TPU_TOPOLOGY (e.g. 4x4) and TPU_ACCELERATOR_TYPE.
+                # Since we partition the physical cluster into separate non-overlapping meshes
+                # (Trainer vs Generator), these defaults will conflict with our manually sharded 
+                # settings (e.g. TORCH_TPU_TOPOLOGY). We unset them at shell level right before
+                # spawning Python so PJRT is forced to use our process-level configurations.
+                cmd = default_bootstrap_cmd()
+                cmd.program = "/bin/bash"
+                cmd.args = [
+                    "-c",
+                    (
+                        "unset TPU_TOPOLOGY; unset TPU_ACCELERATOR_TYPE; "
+                        "exec python3 -u -c \""
+                        "from monarch.config import configure, ChannelTransport; "
+                        "configure(default_transport=ChannelTransport.TcpWithHostname); "
+                        "from monarch._src.actor.bootstrap_main import invoke_main; "
+                        "invoke_main()\" "
+                        "\"$@\" > /tmp/monarch_bash_child_\\$\\$.log 2>&1"
+                    ),
+                    "--"
+                ]
+                return cmd.with_env(env)
+            else:
+                return default_bootstrap_cmd().with_env(env)
+
+        return _get_cmd
 
 
 def _mean_rewards(steps: list[Step]) -> dict[str, float]:
@@ -163,7 +435,7 @@ class RLTrainer(Configurable):
     class Config(Configurable.Config):
         """Top-level config for RL training."""
 
-        model_spec: ModelSpec | None = None
+        model_spec: Annotated[ModelSpec | None, tyro.conf.Suppress] = None
         """Model specification shared by trainer and generator.
         Set programmatically via config_registry (not from CLI)."""
 
@@ -242,19 +514,20 @@ class RLTrainer(Configurable):
                 pass
         self._proc_meshes = []
 
-    def _get_rank_0_value(self, result, has_gpus: bool = True):
+    def _get_rank_0_value(self, result, has_devices: bool = True):
         """Extract rank 0 result, handling both single and multi-node meshes.
 
         Monarch actor endpoints return results from all ranks in the mesh.
-        This picks out rank 0's result by indexing into the host and GPU
+        This picks out rank 0's result by indexing into the host and device
         dimensions as needed (multi-node meshes have an extra host dimension).
         This should be used in cases where all ranks return the same result.
         """
         kwargs = {}
         if self._multi_node:
             kwargs["hosts"] = 0
-        if has_gpus:
-            kwargs["gpus"] = 0
+        if has_devices:
+            device_dim = "tpus" if get_device_type() == "tpu" else "gpus"
+            kwargs[device_dim] = 0
         return result.item(**kwargs)
 
     @staticmethod
@@ -307,6 +580,7 @@ class RLTrainer(Configurable):
         trainer_nodes: int | None = None,
         generator_nodes: int | None = None,
         gpus_per_node: int | None = None,
+        mesh_hosts: list[str] | None = None,
     ):
         """Spawn Monarch actors on separate meshes and initialize weights.
 
@@ -325,8 +599,10 @@ class RLTrainer(Configurable):
             gpus_per_node: GPUs per node, assumed to be the same across all
                 nodes (no heterogeneous node configurations). Required when
                 host_mesh is provided.
+            mesh_hosts: Optional list of all worker pod hostnames in the GKE cluster.
         """
         config = self.config
+        barrier = None
 
         self.trainer_world_size = self._compute_world_size(config.trainer.parallelism)
         self.generator_world_size = self._compute_world_size(
@@ -347,6 +623,7 @@ class RLTrainer(Configurable):
         self._multi_node = host_mesh is not None
 
         if host_mesh is not None:
+
             # Multi-node mode: dedicate whole nodes to trainer vs generator
             if (
                 trainer_nodes is None
@@ -377,83 +654,102 @@ class RLTrainer(Configurable):
                 hosts=slice(trainer_nodes, trainer_nodes + generator_nodes)
             )
 
+            trainer_mesh_hosts = mesh_hosts[:trainer_nodes] if mesh_hosts else None
+            generator_mesh_hosts = mesh_hosts[trainer_nodes:trainer_nodes + generator_nodes] if mesh_hosts else None
+
             # Use Provisioner to set CUDA_VISIBLE_DEVICES so each role
             # only sees its own GPUs and doesn't conflict with other
             # processes on the node
-            trainer_provisioner = Provisioner(total_gpus=gpus_per_node)
-            generator_provisioner = Provisioner(total_gpus=gpus_per_node)
+            trainer_provisioner = Provisioner(total_gpus=gpus_per_node, mesh_hosts=trainer_mesh_hosts)
+            generator_provisioner = Provisioner(total_gpus=gpus_per_node, mesh_hosts=generator_mesh_hosts)
 
+            device_dim = "tpus" if get_device_type() == "tpu" else "gpus"
             trainer_mesh = trainer_host_mesh.spawn_procs(
-                per_host={"gpus": trainer_gpus_per_node},
-                bootstrap=trainer_provisioner.allocate(trainer_gpus_per_node),
+                per_host={device_dim: trainer_gpus_per_node},
+                bootstrap=_default_python_bootstrap,
+                bootstrap_command=trainer_provisioner.allocate(trainer_gpus_per_node, device_dim, master_port="29500", is_trainer=True),
             )
             generator_mesh = generator_host_mesh.spawn_procs(
-                per_host={"gpus": generator_gpus_per_node},
-                bootstrap=generator_provisioner.allocate(generator_gpus_per_node),
+                per_host={device_dim: generator_gpus_per_node},
+                bootstrap=_default_python_bootstrap,
+                bootstrap_command=generator_provisioner.allocate(generator_gpus_per_node, device_dim, master_port="29501", is_trainer=False),
             )
         else:
-            # Single-node mode: partition GPUs on this_host() via
-            # CUDA_VISIBLE_DEVICES
+            # Single-node mode: partition GPUs/TPUs on this_host()
+            device_dim = "tpus" if get_device_type() == "tpu" else "gpus"
             provisioner = Provisioner(total_gpus=total_gpus)
             trainer_mesh = this_host().spawn_procs(
-                per_host={"gpus": self.trainer_world_size},
-                bootstrap=provisioner.allocate(self.trainer_world_size),
+                per_host={device_dim: self.trainer_world_size},
+                bootstrap=_default_python_bootstrap,
+                bootstrap_command=provisioner.allocate(self.trainer_world_size, device_dim, master_port="29500", is_trainer=True),
             )
             generator_mesh = this_host().spawn_procs(
-                per_host={"gpus": self.generator_world_size},
-                bootstrap=provisioner.allocate(self.generator_world_size),
+                per_host={device_dim: self.generator_world_size},
+                bootstrap=_default_python_bootstrap,
+                bootstrap_command=provisioner.allocate(self.generator_world_size, device_dim, master_port="29501", is_trainer=False),
             )
 
         # Store proc meshes for cleanup
         self._proc_meshes = [trainer_mesh, generator_mesh]
 
-        await setup_torch_elastic_env_async(trainer_mesh)
-        await setup_torch_elastic_env_async(generator_mesh)
+        # Ranks and networking environment variables are pre-configured by Provisioner.allocate().
+        # Bypassing sequential elastic rank setup to prevent TPU rank-to-IP mismatches.
+        # await setup_torch_elastic_env_async(trainer_mesh, use_ipaddr=AddrType.IPv4)
+        # await setup_torch_elastic_env_async(generator_mesh, use_ipaddr=AddrType.IPv4)
 
         # Spawn actors on their respective meshes
-        self.trainer = trainer_mesh.spawn(
-            "trainer",
-            PolicyTrainer,
-            config.trainer,
-            model_spec=config.model_spec,
-            hf_assets_path=config.hf_assets_path,
-            generator_dtype=config.generator.model_dtype,
-            compile_config=config.compile,
-        )
-
-        self.generator = generator_mesh.spawn(
-            "generator",
-            VLLMGenerator,
-            config.generator,
-            model_spec=config.model_spec,
-            model_path=config.hf_assets_path,
-            compile_config=config.compile,
-            max_num_seqs=max(
-                config.num_prompts_per_step * config.generator.sampling.n,
-                config.num_validation_samples,
+        # Spawn actors concurrently on their respective meshes to avoid PJRT deadlock on TPU
+        import asyncio
+        self.trainer, self.generator = await asyncio.gather(
+            asyncio.to_thread(
+                trainer_mesh.spawn,
+                "trainer",
+                PolicyTrainer,
+                config.trainer,
+                model_spec=config.model_spec,
+                hf_assets_path=config.hf_assets_path,
+                generator_dtype=config.generator.model_dtype,
+                compile_config=config.compile,
             ),
+            asyncio.to_thread(
+                generator_mesh.spawn,
+                "generator",
+                VLLMGenerator,
+                config.generator,
+                model_spec=config.model_spec,
+                model_path=config.hf_assets_path,
+                compile_config=config.compile,
+                max_num_seqs=max(
+                    config.num_prompts_per_step * config.generator.sampling.n,
+                    config.num_validation_samples,
+                ),
+            )
         )
 
-        # Initialize TorchStore for weight sync between trainer and generator.
+        # Setup trainer processes with staggered sleep to avoid TPU JIT/vbar deadlocks
+        await self.trainer.setup.call()
+
+        # Initialize TorchStore for weight sync between trainer and generator (bypassed on TPU).
         # StorageVolumes are spawned on the trainer mesh so they are colocated
         # with the weight source for faster data access in the non-RDMA path.
         # LocalRankStrategy: routes each process to a storage volume based on
         #   LOCAL_RANK, so colocated processes share the same volume.
         # https://github.com/meta-pytorch/torchstore
-        await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
+        if get_device_type() != "tpu":
+            await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
 
         # push weights from trainer
-        self.trainer.push_model_state_dict.call().get()
+        await self.trainer.push_model_state_dict.call()
         # pull weights for policy version 0 (initial weights)
-        self.generator.pull_model_state_dict.call(0).get()
+        await self.generator.pull_model_state_dict.call(0)
 
-    def _collect_rollouts(self, num_groups: int, step: int) -> list[Trajectory]:
+    async def _collect_rollouts(self, num_groups: int, step: int) -> list[Trajectory]:
         """Collect group rollouts: one single-use env per group, scored and returned."""
         envs = [
             self.config.env.build(step=step, group_idx=i) for i in range(num_groups)
         ]
         completions = self._get_rank_0_value(
-            self.generator.generate.call([env.prompt for env in envs]).get()
+            await self.generator.generate.call([env.prompt for env in envs])
         )
         trajectories: list[Trajectory] = []
         for c in completions:
@@ -506,9 +802,9 @@ class RLTrainer(Configurable):
             max_tokens=self.config.generator.sampling.max_tokens,
         )
         completions = self._get_rank_0_value(
-            self.generator.generate.call(
+            await self.generator.generate.call(
                 [env.prompt for env in envs], sampling_config=greedy
-            ).get()
+            )
         )
 
         steps = [env.step(completions[i].text) for i, env in enumerate(envs)]
@@ -534,7 +830,7 @@ class RLTrainer(Configurable):
             step_start = time.perf_counter()
 
             # --- Collect data and create episodes --- #
-            trajectories = self._collect_rollouts(num_groups, step=step)
+            trajectories = await self._collect_rollouts(num_groups, step=step)
             episodes = self._build_episodes(trajectories)
 
             if self.config.log_samples:
@@ -546,16 +842,16 @@ class RLTrainer(Configurable):
                 for per_rank_episodes in self._shard_episodes(episodes)
             ]
             fwd_bwd_metrics = self._get_rank_0_value(
-                self.trainer.forward_backward.call(batches).get()
+                await self.trainer.forward_backward.call(batches)
             )
-            optim_metrics = self._get_rank_0_value(self.trainer.optim_step.call().get())
+            optim_metrics = self._get_rank_0_value(await self.trainer.optim_step.call())
             metrics = {**fwd_bwd_metrics, **optim_metrics}
 
             # --- Weight sync --- #
             t0 = time.perf_counter()
-            self.trainer.push_model_state_dict.call().get()
+            await self.trainer.push_model_state_dict.call()
             t_push = time.perf_counter() - t0
-            self.generator.pull_model_state_dict.call(metrics["policy_version"]).get()
+            await self.generator.pull_model_state_dict.call(metrics["policy_version"])
             t_sync = time.perf_counter() - t0
             logger.info(f"Weight sync: push={t_push:.3f}s, total={t_sync:.3f}s")
 
@@ -586,9 +882,68 @@ class RLTrainer(Configurable):
 
 async def main():
     """Run the distributed RL training loop using Monarch."""
+    import logging
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+        handler = logging.StreamHandler()
+        root_logger.addHandler(handler)
+    import os
+    if os.getenv("FORCE_DEVICE") == "tpu":
+        from torchtitan.tools.utils import set_device_type
+        set_device_type("tpu")
+        logger.info("Forced device type to TPU")
+
     config = ConfigManager().parse_args()
     rl_trainer = RLTrainer(config)
-    await rl_trainer.setup()
+
+    # Automatically detect GKE or Slurm multi-node cluster environment
+    import os
+    workers_env = os.getenv("MONARCH_WORKERS")
+    if workers_env:
+        try:
+            from monarch.actor import attach_to_workers
+            workers = [w.strip() for w in workers_env.split(",") if w.strip()]
+            logger.info(f"Connecting to remote monarch workers: {workers}")
+            host_mesh = attach_to_workers(ca="trust_all_connections", workers=workers)
+
+            # Parse hostnames out of the worker endpoints
+            mesh_hosts = []
+            for w in workers:
+                h = w
+                if h.startswith("tcp://"):
+                    h = h[len("tcp://"):]
+                if ":" in h:
+                    h = h.split(":")[0]
+                mesh_hosts.append(h)
+
+            # Derive node counts and device configuration
+            gpus_per_node = int(os.getenv("LOCAL_WORLD_SIZE", "4"))
+            total_nodes = len(workers)
+
+            # Split cluster nodes between Trainer and Generator meshes, defaulting to 50/50
+            trainer_nodes = int(os.getenv("TRAINER_NODES", str(total_nodes // 2)))
+            generator_nodes = int(os.getenv("GENERATOR_NODES", str(total_nodes - trainer_nodes)))
+            assert trainer_nodes + generator_nodes == total_nodes, f"Sum of trainer_nodes ({trainer_nodes}) and generator_nodes ({generator_nodes}) must equal total_nodes ({total_nodes})"
+
+            logger.info(
+                f"Distributed GKE HostMesh initialized with {total_nodes} nodes. "
+                f"Allocating {trainer_nodes} hosts to training and {generator_nodes} hosts to sampling."
+            )
+
+            await rl_trainer.setup(
+                host_mesh=host_mesh,
+                trainer_nodes=trainer_nodes,
+                generator_nodes=generator_nodes,
+                gpus_per_node=gpus_per_node,
+                mesh_hosts=mesh_hosts,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize remote GKE workers: {e}. Falling back to single-node.")
+            await rl_trainer.setup()
+    else:
+        await rl_trainer.setup()
+
     await rl_trainer.train()
 
 

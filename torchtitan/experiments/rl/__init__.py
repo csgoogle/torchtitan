@@ -4,21 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""
-Unified approach for running TorchTitan models with vLLM inference.
+"""Unified approach for running TorchTitan models with vLLM inference."""
 
-To register TorchTitan models with vLLM:
-    from torchtitan.experiments.rl.models.vllm_registry import register_model_to_vllm_model_registry
-    register_model_to_vllm_model_registry(model_spec)
-"""
-
-from torchtitan.experiments.rl.models.vllm_registry import (
-    register_model_to_vllm_model_registry,
-)
-from torchtitan.experiments.rl.models.vllm_wrapper import TorchTitanVLLMModelWrapper
-
-
-__all__ = [
-    "TorchTitanVLLMModelWrapper",
-    "register_model_to_vllm_model_registry",  # Export register function for manual use
-]
+# Eager imports of model wrappers and registry functions are removed from this
+# package-level init to prevent import-time dependency crashes.
+# Importing these wrappers directly pulls in vllm/CUDA libraries, which fail 
+# on accelerator nodes that only run training (like CPU/TPU Trainer processes
+# which do not have vllm or CUDA libraries installed).

@@ -50,6 +50,7 @@ def generate_next_token(
     temperature: float = 1.0,
     top_k: int | None = None,
     rng: torch.Generator | None = None,
+    tokenizer = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Generates the next token and its log probability.
   
@@ -63,7 +64,12 @@ def generate_next_token(
   else:
     padded_x = x
 
-  outputs = model(padded_x)
+  if tokenizer is not None and hasattr(model, "get_attention_masks"):
+    attention_masks = model.get_attention_masks(padded_x, tokenizer)
+  else:
+    attention_masks = None
+
+  outputs = model(padded_x, attention_masks=attention_masks)
   if isinstance(outputs, tuple):
     logits = outputs[0]
   else:
@@ -91,6 +97,7 @@ def generate(
     temperature: float = 1.0,
     top_k: int | None = None,
     seed: int | None = None,
+    tokenizer = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Generates a sequence of tokens autoregressively."""
   if input_ids.ndim == 1:
@@ -108,6 +115,7 @@ def generate(
         temperature=temperature,
         top_k=top_k,
         rng=rng,
+        tokenizer = tokenizer,
     )
     generated_tokens = torch.cat([generated_tokens, next_token], dim=1)
     all_token_log_probs.append(token_log_prob)

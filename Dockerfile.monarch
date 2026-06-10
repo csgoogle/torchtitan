@@ -1,0 +1,73 @@
+# Dockerfile.monarch - Custom GKE TPU v6e container image for Monarch RL jobs
+FROM python:3.12-slim
+
+# Install basic system dependencies
+RUN apt-get update && apt-get install -y \
+    libopenblas-dev \
+    libopenmpi-dev \
+    libomp-dev \
+    git \
+    sudo \
+    curl \
+    openssh-client \
+    clang \
+    liblzma-dev \
+    libunwind-dev \
+    libibverbs-dev \
+    librdmacm-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install GCP keyring auth helper
+RUN pip install keyrings.google-artifactregistry-auth pandas==2.3.3
+
+# Install requirements of Torchtitan first so they do not overwrite our custom TPU build
+COPY requirements.txt ./
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+ARG AUTH_TOKEN
+# Set the PIP_INDEX_URL to download pre-release XLA / PyTorch TPU packages securely
+ENV PIP_INDEX_URL="https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+
+# Clone vLLM and copy the customized Google PyTorch TPU backend for vLLM
+RUN git clone --depth 1 --branch v0.19.0 https://github.com/vllm-project/vllm.git /app/vllm-src
+COPY torchtpu-vllm /app/torchtpu-vllm
+
+# Patch vLLM's TPU requirements file to accept our custom local repository
+RUN sed -i '/tpu-inference/d' /app/vllm-src/requirements/tpu.txt
+
+# Install vLLM and torchtpu-vllm in editable mode (fixing tools version to prevent prerelease mismatch)
+WORKDIR /app/torchtpu-vllm
+RUN pip install torch==2.12.0+cpu && \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.19.0 VLLM_TARGET_DEVICE="tpu" pip install --extra-index-url https://pypi.org/simple -e ../vllm-src && \
+    pip install --pre --extra-index-url https://pypi.org/simple -e .
+
+# Install JAX TPU, Tokamax, and corresponding low-level library versions
+WORKDIR /
+RUN pip install --extra-index-url https://pypi.org/simple "jax[tpu]==0.9.1" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+RUN pip install --extra-index-url https://pypi.org/simple git+https://github.com/openxla/tokamax.git@8cba6a6a1e52e9efbb7ff8facb66f18f0bfcbe4c
+RUN pip install --extra-index-url https://pypi.org/simple libtpu==0.0.41 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Copy and install the high-speed local PyTorch TPU package
+COPY torch_tpu-0.1.1-cp312-cp312-manylinux_2_31_x86_64.whl ./
+RUN pip install --no-deps ./torch_tpu-0.1.1-cp312-cp312-manylinux_2_31_x86_64.whl && \
+    rm ./torch_tpu-0.1.1-cp312-cp312-manylinux_2_31_x86_64.whl
+
+# Install Monarch engine and TorchAX compilation optimizations (matching active cluster versions)
+RUN pip install --extra-index-url https://pypi.org/simple "torchmonarch[kubernetes]==0.5.0" "torchx[kubernetes]" torchax==0.0.11
+
+# Restore typeguard compatibility
+RUN pip install --extra-index-url https://pypi.org/simple 'typeguard==2.13.3'
+
+# Set up workspace and copy the customized torchtitan codebase
+WORKDIR /app
+COPY torchtitan ./torchtitan
+COPY start_worker.py ./start_worker.py
+RUN chmod +x ./start_worker.py
+
+# Force reinstall torch to match controller and fix ABI issues (installed at the end to prevent package overrides)
+RUN pip install torch==2.12.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu --force-reinstall
+
+# Add python paths so all module layout imports work seamlessly across GKE nodes
+ENV PYTHONPATH="/app:/app/torchtitan"

@@ -41,7 +41,10 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
             seed=99, correctness_reward=1.0, format_reward=0.3
         ),
         trainer=PolicyTrainer.Config(
-            optimizer=OptimizersContainer.Config(lr=2e-6),
+            # 'foreach' implementation compiles parameter updates in vectorized batches,
+            # which is required on TPU VM nodes to prevent NotImplementedError crashes from
+            # the default 'fused' GPU kernels, and prevents huge JIT compile hangs.
+            optimizer=OptimizersContainer.Config(lr=2e-6, implementation="foreach"),
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=2,
                 decay_type="linear",
@@ -85,7 +88,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
             seed=99, correctness_reward=1.0, format_reward=0.3
         ),
         trainer=PolicyTrainer.Config(
-            optimizer=OptimizersContainer.Config(lr=2e-6),
+            optimizer=OptimizersContainer.Config(lr=2e-6, implementation="foreach"),
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=2,
                 decay_type="linear",
@@ -130,7 +133,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
             seed=99, correctness_reward=1.0, format_reward=0.3
         ),
         trainer=PolicyTrainer.Config(
-            optimizer=OptimizersContainer.Config(lr=1e-6),
+            optimizer=OptimizersContainer.Config(lr=1e-6, implementation="foreach"),
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=2,
                 decay_type="linear",
@@ -164,6 +167,7 @@ def rl_grpo_qwen3_debug() -> RLTrainer.Config:
     group_size = 4
     return RLTrainer.Config(
         model_spec=model_registry("debugmodel", attn_backend="varlen"),
+        hf_assets_path="/data/torchtitan/tests/assets/tokenizer",
         num_steps=5,
         num_prompts_per_step=5,
         num_validation_samples=20,
@@ -173,7 +177,7 @@ def rl_grpo_qwen3_debug() -> RLTrainer.Config:
             seed=99, correctness_reward=1.0, format_reward=0.3
         ),
         trainer=PolicyTrainer.Config(
-            optimizer=OptimizersContainer.Config(lr=8e-4),
+            optimizer=OptimizersContainer.Config(lr=8e-4, implementation="foreach"),
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=2,
                 decay_type="linear",
@@ -182,14 +186,14 @@ def rl_grpo_qwen3_debug() -> RLTrainer.Config:
             parallelism=ParallelismConfig(
                 data_parallel_shard_degree=1,
                 tensor_parallel_degree=1,
-                data_parallel_replicate_degree=1,
+                data_parallel_replicate_degree=2,
             ),
             loss=GRPOLoss.Config(),
         ),
         generator=VLLMGenerator.Config(
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=1,
-                data_parallel_replicate_degree=1,
+                data_parallel_replicate_degree=2,
             ),
             sampling=SamplingConfig(
                 n=group_size,
@@ -220,7 +224,7 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
             seed=99, correctness_reward=1.0, format_reward=0.3
         ),
         trainer=PolicyTrainer.Config(
-            optimizer=OptimizersContainer.Config(lr=2e-6),
+            optimizer=OptimizersContainer.Config(lr=2e-6, implementation="foreach"),
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=2,
                 decay_type="linear",
