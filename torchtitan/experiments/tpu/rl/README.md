@@ -9,7 +9,7 @@ This implementation is highly inspired by `verl` but is tailored specifically fo
 *   **`ray_worker.py`**: The Ray Actor running on each TPU chip. It holds the PyTorch FSDP models, VLLM engine, and executes forward/backward passes.
 *   **`ray_train.py`**: The lightweight entrypoint script.
 
-### Running GRPO Training
+### Running GRPO Training on a VM
 
 #### 0. Setup env
 
@@ -156,6 +156,29 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
 
 *Note: For rapid testing of the orchestration loop without waiting for slow autoregressive FSDP generation, append `--sampler.use-fake-sampler` to generate dummy completions.*
 
+### Running GRPO training on a TPU Cluster with Ray
+
+#### 1. Get the ray head pod name:
+```bash
+   kubectl get pods -n default | grep ray.*head
+   # Example output: ray-tpu-cluster-head-zvq25
+```
+
+#### 2. Export the head node name and local path:
+```bash
+   export HEAD_NODE=ray-tpu-cluster-head-zvq25
+   export RL_PATH="/your/local/path/of/torchtitan"
+```
+
+#### 3. Copy this file to the head container:
+```bash
+   kubectl cp $RL_PATH/torchtitan/experiments/tpu/rl/ray_train.py $HEAD_NODE:/app/experiments/tpu/rl/ray_train.py -c ray-head
+```
+
+#### 4. Submit the Ray Job:
+```bash
+   kubectl exec $HEAD_NODE -c ray-head -- bash -c "cd /app && ray job submit --address http://localhost:8265 -- python -m experiments.tpu.rl.ray_train --module=torchtitan.experiments.tpu.rl --config=grpo_qwen3_0_6b --sampler.use_vllm --checkpoint.initial_load_path=/data/assets/hf/Qwen3-0.6B --training.steps=10"
+```
 
 ### Running Unit Tests
 

@@ -24,7 +24,9 @@ class TestGRPOOrchestrator(unittest.TestCase):
             tpu_resources={"TPU": 1},
             master_addr="127.0.0.1",
             master_port="12345",
-            sb_addresses="localhost:1001,localhost:1002"
+            sb_addresses="localhost:1001,localhost:1002",
+            tpu_nodes=["127.0.0.1"],
+            tpu_type="v6e-16"
         )
         
         orchestrator.setup_workers()

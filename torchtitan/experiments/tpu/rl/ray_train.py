@@ -1,20 +1,5 @@
 """
 Dynamic distributed RL training on TPU with Ray.
-
-How to run on Ray Cluster:
-1. Get the ray head pod name:
-   kubectl get pods -n default | grep ray.*head
-   # Example output: ray-tpu-cluster-head-zvq25
-
-2. Export the head node name and local path:
-   export HEAD_NODE=ray-tpu-cluster-head-zvq25
-   export RL_PATH="/your/local/path/of/torchtitan"
-
-3. Copy this file to the head container:
-   kubectl cp $RL_PATH/torchtitan/experiments/tpu/rl/ray_train.py $HEAD_NODE:/app/experiments/tpu/rl/ray_train.py -c ray-head
-
-4. Submit the Ray Job:
-   kubectl exec $HEAD_NODE -c ray-head -- bash -c "cd /app && ray job submit --address http://localhost:8265 -- python -m experiments.tpu.rl.ray_train --module=torchtitan.experiments.tpu.rl --config=grpo_qwen3_0_6b --sampler.use_vllm --checkpoint.initial_load_path=/data/assets/hf/Qwen3-0.6B --training.steps=10"
 """
 
 import sys
@@ -40,9 +25,6 @@ def main():
 
     master_addr = ray.util.get_node_ip_address()
     # Use a fixed port that is whitelisted/allowed in network policies across TPU VM hosts.
-    # A dynamic 'get_free_port()' helper (using socket.bind('', 0)) does not work because it finds
-    # a free port on the local driver/CPU head node, which might be occupied or blocked on the
-    # remote TPU worker hosts (where PyTorch Rank 0 is actually spawned).
     master_port = 8450
 
     # Construct SliceBuilder addresses dynamically from TPU nodes in the Ray cluster
@@ -54,7 +36,7 @@ def main():
     chips_per_host = int(tpu_nodes_info[0]["Resources"].get("TPU", 4)) if tpu_nodes_info else 4
     
     # Use GKE's headless service DNS names to satisfy libtpu routing
-    headless_service = "ray-tpu-singlehost-cluster-headless"
+    headless_service = "ray-tpu-cluster-headless"
     sb_addresses = []
     for node in tpu_nodes_info:
         replica_index = node["Labels"].get("replicaIndex", "tpu-group-0")
@@ -90,7 +72,7 @@ def main():
         master_addr=master_addr,
         master_port=master_port,
         sb_addresses=sb_addresses,
-        tpu_node_ips=tpu_node_ips,
+        tpu_nodes=tpu_node_ips,
         tpu_type=tpu_type,
     )
     

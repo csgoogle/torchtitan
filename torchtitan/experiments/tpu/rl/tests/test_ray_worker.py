@@ -26,16 +26,13 @@ class TestFusedWorker(unittest.TestCase):
     def test_load_next_batch(self, mock_config_manager):
         worker = OriginalFusedWorker(sys_argv=self.sys_argv)
         worker.device = torch.device("cpu")
-        worker.seq_len = 10
-        worker.job_config = MagicMock()
-        worker.job_config.sampler.max_new_tokens = 5
+        worker.torch = torch
         
-        # Fake prompt_ids tensor
-        prompt_ids = torch.zeros((2, 10))
-        worker.data_iterator = iter([({"input": prompt_ids}, None)])
-        worker.load_next_batch()
+        prompt_ids_list = [[1, 2, 3], [4, 5, 6]]
+        worker.load_next_batch(prompt_ids_list)
         
-        self.assertTrue(torch.allclose(worker.current_prompt_ids, prompt_ids[:, :5]))
+        expected_tensor = torch.tensor(prompt_ids_list, dtype=torch.long, device=torch.device("cpu"))
+        self.assertTrue(torch.allclose(worker.current_prompt_ids, expected_tensor))
 
 if __name__ == "__main__":
     unittest.main()
