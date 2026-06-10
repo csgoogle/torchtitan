@@ -100,3 +100,60 @@ def qwen3_moe_testmodel() -> TPUTrainerConfig:
   cfg.training.local_batch_size = 4
 
   return cfg
+
+
+def qwen3_moe_30b() -> TPUTrainerConfig:
+  """Qwen3 30B MoE model configuration for TPU."""
+  model_spec = model_registry("30B-A3B")
+  model_spec.parallelize_fn = tpu_parallelize_qwen3
+
+  model_config = cast(Qwen3Model.Config, model_spec.model)
+  model_config.enable_weight_tying = False
+  model_config.tok_embeddings.param_init = {
+      "weight": partial(nn.init.normal_, std=1.0)
+  }
+  return TPUTrainerConfig(
+      loss=CrossEntropyLoss.Config(),
+      hf_assets_path="./assets/hf/Qwen3-30B-A3B",
+      model_spec=model_spec,
+      optimizer=OptimizersContainer.Config(lr=8e-4),
+      lr_scheduler=LRSchedulersContainer.Config(
+          warmup_steps=600,
+          decay_ratio=0.8,
+          decay_type="linear",
+          min_lr_factor=0.0,
+      ),
+      training=TrainingConfig(
+          local_batch_size=2,
+          seq_len=4096,
+          steps=3000,
+      ),
+      dataloader=HuggingFaceTextDataLoader.Config(
+          dataset="c4",
+      ),
+      metrics=MetricsProcessor.Config(log_freq=10),
+      parallelism=ParallelismConfig(
+          pipeline_parallel_schedule="Interleaved1F1B"
+      ),
+      checkpoint=CheckpointManager.Config(
+          interval=500,
+          last_save_model_only=False,
+      ),
+      activation_checkpoint=ActivationCheckpointConfig(
+          mode="full",
+      ),
+      validator=Validator.Config(
+          freq=5,
+          steps=10,
+      ),
+  )
+
+
+def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
+  """Proxy model for Qwen3 30B MoE (4 layers instead of 48) for testing/iterations."""
+  cfg = qwen3_moe_30b()
+  assert cfg.model_spec is not None
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  # Slice layers to only keep 4 layers to save memory and compile time
+  model_config.layers = model_config.layers[:4]
+  return cfg

@@ -109,6 +109,7 @@ qwen3_configs = {
     "1.7B": qwen3_models.qwen3_configs["1.7B"]("sdpa"),
     "4B": qwen3_models.qwen3_configs["4B"]("sdpa"),
     "32B": qwen3_models.qwen3_configs["32B"]("sdpa"),
+    "30B-A3B": qwen3_models.qwen3_configs["30B-A3B"]("sdpa"),
 }
 
 # pytype: disable=wrong-arg-types

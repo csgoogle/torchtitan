@@ -197,7 +197,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         device_module, device_type = utils.get_device_module(), utils.get_device_type()
         # pyrefly: ignore [read-only]
-        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+        if device_type in ["cpu", "tpu"]:
+            self.device = torch.device(device_type)
+        else:
+            self.device = torch.device(
+                f"{device_type}:{int(os.environ['LOCAL_RANK'])}"
+            )
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
 
@@ -838,7 +843,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
                 # reduce timeout after first train step for faster signal
                 # (assuming lazy init and compilation are finished)
-                if self.step == 1:
+                if (
+                    self.step == 1
+                    and self.device.type != "tpu"
+                    and self.device.type != "cpu"
+                ):
+                    # TODO(alekseyv): TPU doesn't support set_pg_timeouts yet.
                     dist_utils.set_pg_timeouts(
                         timeout=timedelta(seconds=config.comm.train_timeout_seconds),
                         parallel_dims=self.parallel_dims,
