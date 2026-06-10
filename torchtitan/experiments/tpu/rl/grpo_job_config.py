@@ -32,7 +32,8 @@ class ReferenceConfig:
 
 @dataclasses.dataclass
 class GRPOConfig:
-  group_size: int = 4
+  global_prompt_batch_size: int = 32 # Total prompts generated across the cluster per step
+  group_size: int = 4 # Number of rollouts (completions) generated per prompt
   grpo_beta: float = 0.1
   ppo_clip_eps: float = 0.2
   ppo_epochs: int = 4

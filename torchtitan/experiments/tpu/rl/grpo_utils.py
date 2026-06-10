@@ -94,8 +94,15 @@ def compute_grpo_loss(
   prompt_len = prompt_ids.shape[1]
   gen_logits = logits[:, prompt_len - 1 : -1, :]
   gen_targets = completed_ids[:, prompt_len:]
-  log_probs = F.log_softmax(gen_logits, dim=-1)
-  token_log_probs = log_probs.gather(2, gen_targets.unsqueeze(-1)).squeeze(-1)
+  
+  # TPU specific patch: Avoid log_softmax + gather which causes XLA compiler crash (IsFusibleUnalignedDUS)
+  # due to unaligned DynamicUpdateSlice on large vocab sizes. Use cross_entropy instead.
+  ce_loss = F.cross_entropy(
+      gen_logits.reshape(-1, gen_logits.size(-1)), 
+      gen_targets.reshape(-1), 
+      reduction='none'
+  )
+  token_log_probs = -ce_loss.view(gen_targets.shape)
 
   # Importance sampling ratio uses old_log_probs
   if old_log_probs is None:

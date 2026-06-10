@@ -75,8 +75,12 @@ def generate_next_token(
   next_token = multinomial_sample_one(probs, rng=rng)
 
   # Compute log prob of the sampled token
-  log_probs = F.log_softmax(logits_last, dim=-1)
-  token_log_prob = log_probs.gather(1, next_token)
+  ce_loss = F.cross_entropy(
+      logits_last.reshape(-1, logits_last.size(-1)), 
+      next_token.reshape(-1), 
+      reduction='none'
+  )
+  token_log_prob = -ce_loss.view(next_token.shape)
 
   return next_token, token_log_prob
 
