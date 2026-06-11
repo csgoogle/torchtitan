@@ -360,14 +360,35 @@ class FusedWorker:
 
         if self.ref_model is not None:
             self.ref_model.eval()
+            
+            total_bsz = self.current_completed_ids.shape[0]
+            mbsz = self.job_config.training.local_batch_size
+            if mbsz <= 0:
+                mbsz = total_bsz
+                
+            all_ref_token_log_probs = []
+            
             with self.jax_profiler.TraceAnnotation("reference_forward"):
                 with self.torch.no_grad():
-                    outputs = self.ref_model(self.current_completed_ids)
-                    logits = outputs[0] if isinstance(outputs, tuple) else outputs
-                    gen_ref_logits = logits[:, prompt_len - 1 : -1, :]
-                    gen_targets = self.current_completed_ids[:, prompt_len:]
-                    ref_log_probs = self.F.log_softmax(gen_ref_logits, dim=-1)
-                    ref_token_log_probs = ref_log_probs.gather(2, gen_targets.unsqueeze(-1)).squeeze(-1)
+                    for start_idx in range(0, total_bsz, mbsz):
+                        end_idx = min(start_idx + mbsz, total_bsz)
+                        mb_completed_ids = self.current_completed_ids[start_idx:end_idx]
+                        
+                        outputs = self.ref_model(mb_completed_ids)
+                        logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                        gen_ref_logits = logits[:, prompt_len - 1 : -1, :]
+                        gen_targets = mb_completed_ids[:, prompt_len:]
+                        
+                        ce_loss = self.F.cross_entropy(
+                            gen_ref_logits.reshape(-1, gen_ref_logits.size(-1)), 
+                            gen_targets.reshape(-1), 
+                            reduction='none'
+                        )
+                        ref_token_log_probs_mb = -ce_loss.view(gen_targets.shape)
+                        
+                        all_ref_token_log_probs.append(ref_token_log_probs_mb)
+                        
+            ref_token_log_probs = self.torch.cat(all_ref_token_log_probs, dim=0)
         else:
             ref_token_log_probs = self.current_token_log_probs
 
@@ -391,26 +412,48 @@ class FusedWorker:
         grad_norm = self.torch.tensor(0.0, device=self.device)
         loss = self.torch.tensor(0.0, device=self.device)
 
+        import contextlib
         for epoch in range(self.job_config.grpo.ppo_epochs):
             t_epoch_start = time.perf_counter()
 
             with self.jax_profiler.TraceAnnotation("optimizer.zero_grad"):
                 self.optimizer.zero_grad()
 
-            with self.jax_profiler.TraceAnnotation("grpo_loss"):
-                loss = self.grpo_utils.compute_grpo_loss(
-                    self.model,
-                    self.current_prompt_ids_repeated,
-                    self.current_completed_ids,
-                    ref_log_probs=self.current_ref_token_log_probs,
-                    advantages=advantages,
-                    old_log_probs=self.current_token_log_probs,
-                    ppo_clip_eps=self.job_config.grpo.ppo_clip_eps,
-                    grpo_beta=self.job_config.grpo.grpo_beta,
-                )
+            total_bsz = self.current_prompt_ids_repeated.shape[0]
+            mbsz = self.job_config.training.local_batch_size
+            if mbsz <= 0:
+                mbsz = total_bsz
 
-            with self.jax_profiler.TraceAnnotation("loss.backward"):
-                loss.backward()
+            loss_val = self.torch.tensor(0.0, device=self.device)
+            
+            for start_idx in range(0, total_bsz, mbsz):
+                end_idx = min(start_idx + mbsz, total_bsz)
+                chunk_ratio = (end_idx - start_idx) / total_bsz
+                is_last_microbatch = (end_idx == total_bsz)
+                
+                mb_prompt_ids = self.current_prompt_ids_repeated[start_idx:end_idx]
+                mb_completed_ids = self.current_completed_ids[start_idx:end_idx]
+                mb_ref_log_probs = self.current_ref_token_log_probs[start_idx:end_idx]
+                mb_advantages = advantages[start_idx:end_idx]
+                mb_old_log_probs = self.current_token_log_probs[start_idx:end_idx]
+
+                with self.jax_profiler.TraceAnnotation("grpo_loss"):
+                    mb_loss = self.grpo_utils.compute_grpo_loss(
+                        self.model,
+                        mb_prompt_ids,
+                        mb_completed_ids,
+                        ref_log_probs=mb_ref_log_probs,
+                        advantages=mb_advantages,
+                        old_log_probs=mb_old_log_probs,
+                        ppo_clip_eps=self.job_config.grpo.ppo_clip_eps,
+                        grpo_beta=self.job_config.grpo.grpo_beta,
+                    )
+                    
+                mb_loss = mb_loss * chunk_ratio
+                loss_val = loss_val + mb_loss.detach()
+                
+                with self.jax_profiler.TraceAnnotation("loss.backward"):
+                    mb_loss.backward()
 
             if self.job_config.training.max_norm > 0.0:
                 with self.jax_profiler.TraceAnnotation("grad_norm"):
@@ -421,13 +464,13 @@ class FusedWorker:
             with self.jax_profiler.TraceAnnotation("optimizer.step"):
                 self.optimizer.step()
                 
-            self.torch_tpu._internal.sync.synchronize(loss, wait=True)
+            self.torch_tpu._internal.sync.synchronize(loss_val, wait=True)
             train_time += time.perf_counter() - t_epoch_start
 
         self.torch_tpu._internal.sync.synchronize(grad_norm, wait=True)
         try:
             grad_norm_val = grad_norm.item()
-            loss_cpu = loss.cpu().item()
+            loss_cpu = loss_val.cpu().item()
         except:
             grad_norm_val = 0.0
             loss_cpu = 0.0
@@ -448,32 +491,23 @@ class FusedWorker:
             self.total_tokens += step_tokens
             self.total_time += t_total
 
-        # TODO: move the metrics handling out of train_ppo_step
+        average_step_time = self.accumulated_time / self.accumulated_steps if self.accumulated_steps > 0 else 0.0
+
+        extra_metrics = {
+            "lr": self.optimizer.param_groups[0]["lr"],
+            "n_tokens_seen": self.ntokens_seen,
+            "avg_step_time": average_step_time,
+            "sampling_time": self.current_t_sample,
+            "ref_time": self.current_t_ref,
+            "train_time": train_time,
+            "total_step_time": t_total,
+        }
+
         should_log = (step + 1) % self.log_freq == 0 or step == (self.steps - 1)
         if should_log:
-            average_step_time = self.accumulated_time / self.accumulated_steps
             self.accumulated_tokens = 0
             self.accumulated_time = 0.0
             self.accumulated_steps = 0
-
-            extra_metrics = {
-                "lr": self.optimizer.param_groups[0]["lr"],
-                "n_tokens_seen": self.ntokens_seen,
-                "avg_step_time": average_step_time,
-                "sampling_time": self.current_t_sample,
-                "ref_time": self.current_t_ref,
-                "train_time": train_time,
-                "total_step_time": t_total,
-            }
-            if grad_norm_val == 0.0:
-                import torchtitan.tools.logging
-                torchtitan.tools.logging.logger.info("Step %d: Grad Norm: %s", step + 1, grad_norm_val)
-
-            import torchtitan.tools.logging
-            torchtitan.tools.logging.logger.info(
-                "Step %d: Times: Sample=%.2fs, Ref=%.2fs, Train=%.2fs, Total=%.2fs | Reward: Format=%.4f, Correctness=%.4f",
-                step + 1, self.current_t_sample, self.current_t_ref, train_time, t_total, avg_format, avg_correctness
-            )
 
             # Dataloader runs on the driver now, so we add a dummy value to avoid ZeroDivisionError
             self.metrics_processor.data_loading_times.append(0.0)
@@ -500,7 +534,11 @@ class FusedWorker:
                 avg_mfu,
             )
 
-        return True
+        return {
+            "loss": loss_cpu,
+            "grad_norm": grad_norm_val,
+            "extra_metrics": extra_metrics
+        }
 
     def sync_weights(self):
         if self.vllm_sampler is not None:

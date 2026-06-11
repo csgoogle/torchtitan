@@ -37,8 +37,8 @@ def grpo_qwen3_0_6b() -> GRPOJobConfig:
       training=GRPOTrainingConfig(
           dataset="SumDigitsEnv",
           seq_len=512,
-          steps=8,
-          local_batch_size=2,
+          steps=200,
+          local_batch_size=4,
           max_norm=1.0,
       ),
       parallelism=ParallelismConfig(
@@ -48,16 +48,16 @@ def grpo_qwen3_0_6b() -> GRPOJobConfig:
       ),
       sampler=SamplerConfig(
           use_vllm=False,
-          max_new_tokens=128,
+          max_new_tokens=256,
           use_separate_sampler_model=False,
           use_fake_sampler=False,
           vllm_gpu_memory_utilization=0.4,
           vllm_max_model_len=512,
       ),
-      lr_scheduler=LRSchedulersContainer.Config(warmup_steps=4),
+      lr_scheduler=LRSchedulersContainer.Config(warmup_steps=10),
       optimizer=OptimizersContainer.Config(lr=1e-6),
       metrics=MetricsProcessor.Config(log_freq=1),
-      grpo=GRPOConfig(group_size=4, grpo_beta=0.1),
+      grpo=GRPOConfig(global_prompt_batch_size=32, group_size=4, grpo_beta=0.1),
       hf_assets_path="assets/hf/Qwen3-0.6B",
       checkpoint=CheckpointManager.Config(
           initial_load_path="assets/hf/Qwen3-0.6B",

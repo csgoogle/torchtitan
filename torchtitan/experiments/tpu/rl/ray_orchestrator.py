@@ -160,9 +160,13 @@ class GRPOOrchestrator:
         all_rewards = []
         all_correctness = []
         all_format = []
-        local_batch_size = self.job_config.training.local_batch_size
         group_size = self.job_config.grpo.group_size
+        global_prompt_batch_size = getattr(self.job_config.grpo, "global_prompt_batch_size", 16)
+        num_workers = len(self.workers)
+        prompts_per_worker = global_prompt_batch_size // num_workers
         
+        sample_prompt = ""
+        sample_completion = ""
         for w_idx, res in enumerate(rollout_results):
             completed_ids = res["completed_ids"]
             batch_size = completed_ids.shape[0]
@@ -170,15 +174,15 @@ class GRPOOrchestrator:
             for i in range(batch_size):
                 b_idx = i // group_size
                 env_config = SumDigitsEnv.Config()
-                env = SumDigitsEnv(env_config, step=step, group_idx=w_idx * local_batch_size + b_idx)
+                env = SumDigitsEnv(env_config, step=step, group_idx=w_idx * prompts_per_worker + b_idx)
                 
                 # Decode to text to calculate reward
                 target_len = self.job_config.training.seq_len - self.job_config.sampler.max_new_tokens
                 completion_text = tokenizer.decode(completed_ids[i][target_len:].tolist(), skip_special_tokens=True)
                 
-                # TODO: move logging outside compute_global_grpo_advantages method
                 if w_idx == 0 and i == 0:
-                    print(f"\n[titan] @@@ Sample Output Step {step + 1} @@@\nPrompt: {env.prompt}\nCompletion:\n{completion_text}\n===========================\n")
+                    sample_prompt = env.prompt
+                    sample_completion = completion_text
                 
                 step_result = env.step(completion_text)
                 
@@ -198,12 +202,11 @@ class GRPOOrchestrator:
         avg_reward = global_rewards.mean().item()
         avg_correctness_val = sum(all_correctness) / len(all_correctness) if all_correctness else 0.0
         avg_format_val = sum(all_format) / len(all_format) if all_format else 0.0
-        print(f"\n[titan] @@@ Step {step + 1} Global Average Reward: {avg_reward:.4f} @@@\n")
         
         # Centralized GRPO Math: computing the mean and std across the entire cluster
         global_rewards_grouped = global_rewards.view(-1, group_size)
         global_mean = global_rewards_grouped.mean(dim=1, keepdim=True)
-        global_std = global_rewards_grouped.std(dim=1, keepdim=True)
+        global_std = global_rewards_grouped.std(dim=1, unbiased=False, keepdim=True)
         
         global_advantages_grouped = (global_rewards_grouped - global_mean) / (global_std + 1e-4)
         global_advantages = global_advantages_grouped.view(-1)
@@ -216,8 +219,7 @@ class GRPOOrchestrator:
             worker_advantages.append(global_advantages[offset:offset+size])
             offset += size
             
-        # TODO: better consolidate the metrics flow in orchestrator
-        return worker_advantages, avg_correctness_val, avg_format_val
+        return worker_advantages, avg_correctness_val, avg_format_val, avg_reward, sample_prompt, sample_completion
 
     def run(self):
         """Main training loop."""
@@ -256,6 +258,9 @@ class GRPOOrchestrator:
         seq_len = self.job_config.training.seq_len
         local_batch_size = self.job_config.training.local_batch_size
         group_size = self.job_config.grpo.group_size
+        global_prompt_batch_size = getattr(self.job_config.grpo, "global_prompt_batch_size", 16)
+        num_workers = len(self.workers)
+        prompts_per_worker = global_prompt_batch_size // num_workers
         
         try:
             for step in range(steps):
@@ -270,18 +275,18 @@ class GRPOOrchestrator:
                     import random
                     vocab_size = tokenizer.get_vocab_size()
                     target_len = seq_len - max_new_tokens
-                    for w_idx in range(len(self.workers)):
+                    for w_idx in range(num_workers):
                         batch_prompt_ids = []
-                        for b_idx in range(local_batch_size):
+                        for b_idx in range(prompts_per_worker):
                             tokens = [random.randint(0, vocab_size - 1) for _ in range(target_len)]
                             batch_prompt_ids.append(tokens)
                         prompt_ids_list.append(batch_prompt_ids)
                 elif ds.startswith("sumdigits"):
-                    for w_idx in range(len(self.workers)):
+                    for w_idx in range(num_workers):
                         batch_prompt_ids = []
-                        for b_idx in range(local_batch_size):
+                        for b_idx in range(prompts_per_worker):
                             env_config = SumDigitsEnv.Config()
-                            env = SumDigitsEnv(env_config, step=step, group_idx=w_idx * local_batch_size + b_idx)
+                            env = SumDigitsEnv(env_config, step=step, group_idx=w_idx * prompts_per_worker + b_idx)
                             tokens = tokenizer.encode(env.prompt)
                             # Left pad with EOS token (or 0)
                             target_len = seq_len - max_new_tokens
@@ -316,7 +321,9 @@ class GRPOOrchestrator:
                 
                 # 4. Centralized Reward Scoring & Global Advantage Math
                 print(f"    - Centralized Reward Scoring & Global Advantage Math...")
-                advantages_list, avg_correctness, avg_format = self.compute_global_grpo_advantages(rollouts, step, tokenizer)
+                advantages_list, avg_correctness, avg_format, avg_reward, sample_prompt, sample_completion = self.compute_global_grpo_advantages(rollouts, step, tokenizer)
+                print(f"\n[titan] @@@ Sample Output Step {step + 1} @@@\nPrompt: {sample_prompt}\nCompletion:\n{sample_completion}\n===========================\n")
+                print(f"\n[titan] @@@ Step {step + 1} Global Average Reward: {avg_reward:.4f} @@@\n")
 
                 # 5. Trigger PPO Steps on Workers
                 print(f"    - Triggering PPO Epochs...")
@@ -324,6 +331,15 @@ class GRPOOrchestrator:
                     w.train_ppo_step.remote(advantages_list[i], step, avg_correctness, avg_format) 
                     for i, w in enumerate(self.workers)
                 ])
+                
+                m = metrics[0]
+                log_freq = getattr(getattr(self.job_config, "metrics", None), "log_freq", 1)
+                should_log = (step + 1) % log_freq == 0 or step == (steps - 1)
+                if should_log:
+                    print(f"\n[titan] @@@ Step {step + 1} Metrics @@@")
+                    print(f"Loss: {m['loss']:.4f} | Grad Norm: {m['grad_norm']:.4f}")
+                    print(f"Times: Sample={m['extra_metrics']['sampling_time']:.2f}s, Ref={m['extra_metrics']['ref_time']:.2f}s, Train={m['extra_metrics']['train_time']:.2f}s, Total={m['extra_metrics']['total_step_time']:.2f}s")
+                    print(f"Reward: Format={avg_format:.4f}, Correctness={avg_correctness:.4f}\n")
                 
                 # 6. Weight Sync
                 print(f"    - Syncing weights...")

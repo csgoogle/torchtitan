@@ -99,7 +99,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --sampler.use_vllm \
     --sampler.vllm_tensor_parallel_size=1 \
     --checkpoint.enable \
-    --training.steps=25 2>&1 \
+    --training.steps=200 2>&1 \
     | tee ray_train_vllm_tp_1.log \
     | grep -iE "\[titan\]|@@@" 
 ```
@@ -118,8 +118,10 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --config=grpo_qwen3_0_6b \
     --sampler.use_vllm \
     --sampler.vllm_tensor_parallel_size=2 \
+    --sampler.max_new_tokens=64 \
     --checkpoint.enable \
-    --training.steps=25 2>&1 \
+    --training.steps=5 \
+    --grpo.global_prompt_batch_size=4 2>&1 \
     | tee ray_train_vllm_tp_2.log \
     | grep -iE "\[titan\]|@@@" 
 ```
@@ -133,8 +135,10 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --config=grpo_qwen3_0_6b \
     --sampler.use_vllm \
     --sampler.vllm_tensor_parallel_size=4 \
+    --sampler.max_new_tokens=64 \
     --checkpoint.enable \
-    --training.steps=25 2>&1 \
+    --training.steps=5 \
+    --grpo.global_prompt_batch_size=4 2>&1 \
     | tee ray_train_vllm_tp_4.log \
     | grep -iE "\[titan\]|@@@" 
 ```
