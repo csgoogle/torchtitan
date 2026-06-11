@@ -417,7 +417,7 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
     if sa_config.use_tokamax_splash_attention_kernel:
       use_tokamax_splash_attention_patch(model, sa_config)
     elif sa_config.use_splash_attention_kernel:
-      use_splash_attention_patch(model)
+      use_splash_attention_patch(model, sa_config)
 
   # Pallas Loss Patch (Output Projection)
   if (
