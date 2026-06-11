@@ -20,6 +20,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
     TPUTrainerConfig,
+    LossKernelConfig,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama as tpu_parallelize_llama
@@ -169,6 +170,9 @@ def llama3_8b() -> TPUTrainerConfig:
           sa_block_kv_dkv_compute=2048,
           sa_block_q_dq=2048,
           sa_block_kv_dq=2048,
+      ),
+      loss_kernel=LossKernelConfig(
+          use_loss_kernel=True,
       ),
   )
 

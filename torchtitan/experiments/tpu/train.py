@@ -54,6 +54,9 @@ class TPUTrainer(torchtitan.train.Trainer):
     super().__init__(job_config)
 
     if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
+      from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
+      self.loss_fn = build_cross_entropy_loss(job_config)
+
       tpu_config = job_config.tpu_config
       if not tpu_config.enable_amp:
         logger.info("AMP is disabled, using uniform precision training.")

@@ -307,20 +307,21 @@ def use_output_projection_patch(
     model: nn.Module,
 ) -> None:
   """Replaces model.output with an identity-like module that returns (x, weight)."""
-  if hasattr(model, "output") or hasattr(model, "output_transform"):
-    if isinstance(model.output, nn.Linear):
-      model.output = PallasLossLinear(model.output)
-      logger.info("Patched model.output to return (x, weight) for Pallas loss")
-    elif model.output is None:
-      logger.warning("model.output is None, cannot wrap for Pallas loss")
-    else:
-      logger.warning(
-          "model.output is of type %s, not nn.Linear, "
-          "cannot wrap for Pallas loss",
-          type(model.output),
-      )
+  if hasattr(model, "output") and isinstance(model.output, nn.Linear):
+    model.output = PallasLossLinear(model.output)
+    logger.info("Patched model.output to return (x, weight) for Pallas loss")
+  elif hasattr(model, "output_transform") and isinstance(model.output_transform, nn.Linear):
+    # redacted uses output_transform as output projection layer
+    model.output_transform = PallasLossLinear(model.output_transform)
+    logger.info(
+        "Patched model.output_transform to return (x, weight) for Pallas loss"
+    )
+  elif hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Linear):
+    # Original torchtitan models (e.g. Llama) use lm_head for output projection
+    model.lm_head = PallasLossLinear(model.lm_head)
+    logger.info("Patched model.lm_head to return (x, weight) for Pallas loss")
   else:
-    logger.warning("model has no output attribute, cannot wrap for Pallas loss")
+    logger.warning("Failed to patch output projection layer. Model output projection layer not found (output, output_transform, or lm_head) or is not nn.Linear.")
 
 
 def use_gmm_kernel_patch(
