@@ -310,13 +310,21 @@ def data_parallel(
 
     for p_name, p in params_dict.items():
       if p is not None and p.numel() > 0:
+        # Check if the parameter is smaller than the device mesh dimension.
+        # If so, replicate it instead of sharding it.
+        actual_sharding = list(param_sharding)
+        for i, placement in enumerate(actual_sharding):
+          if isinstance(placement, Shard) and p.shape[placement.dim] < device_mesh.size(i):
+            actual_sharding[i] = Replicate()
+        actual_sharding = tuple(actual_sharding)
+
         distribute_tensor_func = (
             _distribute_dtensor if isinstance(p, DTensor) else distribute_tensor
         )
         mod.register_parameter(
             p_name,
             nn.Parameter(
-                distribute_tensor_func(p, device_mesh, param_sharding),
+                distribute_tensor_func(p, device_mesh, actual_sharding),
                 requires_grad=p.requires_grad,
             ),
         )
