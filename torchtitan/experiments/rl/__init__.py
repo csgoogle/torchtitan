@@ -12,10 +12,18 @@ To register TorchTitan models with vLLM:
     register_model_to_vllm_model_registry(model_spec)
 """
 
+from torchtitan.tools.utils import get_device_type
 from torchtitan.experiments.rl.models.vllm_registry import (
     register_model_to_vllm_model_registry,
 )
-from torchtitan.experiments.rl.models.vllm_wrapper import TorchTitanVLLMModelWrapper
+if get_device_type() == "tpu":
+    # With TPU, if we are NOT using vllm sampler, we skip vllm import
+    try:
+        from torchtitan.experiments.rl.models.vllm_wrapper import TorchTitanVLLMModelWrapper
+    except:
+        pass
+else:
+    from torchtitan.experiments.rl.models.vllm_wrapper import TorchTitanVLLMModelWrapper
 
 
 __all__ = [

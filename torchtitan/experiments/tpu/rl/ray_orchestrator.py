@@ -12,8 +12,6 @@ TPU_TOPOLOGY_REGISTRY = {
         "TORCH_TPU_TOPOLOGY": "4,4,1",
         "TPU_HOST_BOUNDS": "4,4,1",
         "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-        "HOST_BOUNDS": "4,4,1",
-        "CHIPS_PER_HOST_BOUNDS": "1,1,1",
         "CHIPS_PER_HOST": "4"
     },
     # Google Cloud TPU v6e - v6e-8 slice (2x v6e-4 hosts)
@@ -21,26 +19,13 @@ TPU_TOPOLOGY_REGISTRY = {
         "TORCH_TPU_TOPOLOGY": "2,4,1",
         "TPU_HOST_BOUNDS": "2,2,1",
         "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-        "HOST_BOUNDS": "2,2,1",
-        "CHIPS_PER_HOST_BOUNDS": "1,1,1",
         "CHIPS_PER_HOST": "4"
     },
-    # Google Cloud TPU v5e - v5e-8 slice (1x v5e-8 host)
-    "v5e-8": {
-        "TORCH_TPU_TOPOLOGY": "2,4,1",
+    # Google Cloud TPU v6e - v6e-4 local vm (1x v6e-4 host)
+    "v6e-4": {
+        "TORCH_TPU_TOPOLOGY": "2,2,1",
         "TPU_HOST_BOUNDS": "1,1,1",
-        "TPU_CHIPS_PER_HOST_BOUNDS": "2,4,1",
-        "HOST_BOUNDS": "1,1,1",
-        "CHIPS_PER_HOST_BOUNDS": "2,4,1",
-        "CHIPS_PER_HOST": "4"
-    },
-    # Google Cloud TPU v4 - v4-16 slice (2x v4-8 hosts)
-    "v4-16": {
-        "TORCH_TPU_TOPOLOGY": "2,2,4",
-        "TPU_HOST_BOUNDS": "2,1,1",
         "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1",
-        "HOST_BOUNDS": "2,1,1",
-        "CHIPS_PER_HOST_BOUNDS": "2,2,1",
         "CHIPS_PER_HOST": "4"
     }
 }
@@ -92,7 +77,7 @@ class GRPOOrchestrator:
         tpu_worker_hostnames = ",".join(unique_hostnames)
         rank0_hostname = unique_hostnames[0]
 
-        topology_config = TPU_TOPOLOGY_REGISTRY.get(self.tpu_type, TPU_TOPOLOGY_REGISTRY["v6e-16"])
+        topology_config = TPU_TOPOLOGY_REGISTRY.get(self.tpu_type, TPU_TOPOLOGY_REGISTRY["v6e-4"])
         chips_per_host = int(topology_config.get("CHIPS_PER_HOST", 4))
 
         for rank in range(self.world_size):
@@ -352,6 +337,3 @@ class GRPOOrchestrator:
             import traceback
             print("\n@@@ Training failed with exception:")
             traceback.print_exc()
-
-
-

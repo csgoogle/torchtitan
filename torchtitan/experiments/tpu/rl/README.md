@@ -99,7 +99,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --sampler.use_vllm \
     --sampler.vllm_tensor_parallel_size=1 \
     --checkpoint.enable \
-    --training.steps=200 2>&1 \
+    --training.steps=20 2>&1 \
     | tee ray_train_vllm_tp_1.log \
     | grep -iE "\[titan\]|@@@" 
 ```
@@ -143,7 +143,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     | grep -iE "\[titan\]|@@@" 
 ```
 
-#### 3. Alternative: Natively with PyTorch FSDP 
+#### 4. Alternative: Natively with PyTorch FSDP 
 If vLLM is not installed or you wish to sample directly with PyTorch's native FSDP layers (slower autoregressive performance, but useful for testing):
 ```bash
 sudo fuser -k /dev/vfio/* 2>/dev/null || true
@@ -152,36 +152,77 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
     --config=grpo_qwen3_0_6b \
     --sampler.no-use-vllm \
     --sampler.use-separate-sampler-model \
-    --checkpoint.enable \
-    --training.steps=10 2>&1 \
+    --sampler.max_new_tokens=64 \
+    --checkpoint.no-enable \
+    --grpo.global_prompt_batch_size=4 \
+    --training.steps=5 2>&1 \
     | tee ray_train.log \
     | grep -iE "\[titan\]|@@@" 
 ```
 
 *Note: For rapid testing of the orchestration loop without waiting for slow autoregressive FSDP generation, append `--sampler.use-fake-sampler` to generate dummy completions.*
 
-### Running GRPO training on a TPU Cluster with Ray
+### Running GRPO Training on a GKE Cluster with KubeRay
 
-#### 1. Get the ray head pod name:
+The following instructions have been tested on a `v6e-8` GKE cluster. You may need to adjust the configuration parameters depending on your specific cluster topology.
+
+#### 1. Set Up the KubeRay Cluster
+First, authenticate with your GKE cluster and ensure the Ray Operator addon is enabled:
+
 ```bash
-   kubectl get pods -n default | grep ray.*head
-   # Example output: ray-tpu-cluster-head-zvq25
+export CLUSTER_NAME="my-cluster-name"
+export REGION="my-cluster-region"
+export PROJECT="my-project"
+
+gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT --dns-endpoint
+gcloud container clusters update $CLUSTER_NAME \
+    --location=$REGION \
+    --project=$PROJECT \
+    --update-addons=RayOperator=ENABLED 
+
+kubectl apply -f torchtitan/experiments/tpu/rl/ray-v6e8-5.yaml
 ```
 
-#### 2. Export the head node name and local path:
+#### 2. Start Port-Forwarding (Background Process)
+To allow your local machine to submit jobs to the remote Ray cluster, port-forward the Ray head service in a separate terminal:
+
 ```bash
-   export HEAD_NODE=ray-tpu-cluster-head-zvq25
-   export RL_PATH="/your/local/path/of/torchtitan"
+# Verify your pods are running
+kubectl get pods
+
+# Forward the Ray dashboard and client ports
+kubectl port-forward svc/ray-tpu-v6e-cluster-head-svc 8265:8265 10001:10001
 ```
 
-#### 3. Copy this file to the head container:
+#### 3. Submit the Ray Training Job
+With the port-forward active, submit the training job from your local machine.
+
+*Note: Exporting `RAY_RUNTIME_ENV_IGNORE_GITIGNORE=1` is crucial. It forces the local Ray packager to ignore your `.gitignore` file and respect `.rayignore` instead, ensuring that tiny tokenizer metadata files inside `assets/hf/` are uploaded to the cluster without copying massive `.safetensors` model weights.*
+
 ```bash
-   kubectl cp $RL_PATH/torchtitan/experiments/tpu/rl/ray_train.py $HEAD_NODE:/app/experiments/tpu/rl/ray_train.py -c ray-head
+export RAY_ADDRESS="http://127.0.0.1:8265"
+export RAY_RUNTIME_ENV_IGNORE_GITIGNORE=1
+
+ray job submit \
+  --working-dir . \
+  --runtime-env-json '{"env_vars": {"PYTHONPATH": ".", "PYTHONUNBUFFERED": "1"}}' \
+  -- \
+  python torchtitan/experiments/tpu/rl/ray_train.py \
+    --module=torchtitan.experiments.tpu.rl \
+    --config=grpo_qwen3_0_6b \
+    --sampler.no-use-vllm \
+    --sampler.use-separate-sampler-model \
+    --sampler.max_new_tokens=64 \
+    --checkpoint.no-enable \
+    --grpo.global_prompt_batch_size=8 \
+    --training.steps=5
 ```
 
-#### 4. Submit the Ray Job:
+#### 4. Monitor Training Logs
+After submission, the CLI will output a unique job ID (e.g., `raysubmit_xxxxxxxx`). You can tail the logs or save them to a file:
+
 ```bash
-   kubectl exec $HEAD_NODE -c ray-head -- bash -c "cd /app && ray job submit --address http://localhost:8265 -- python -m experiments.tpu.rl.ray_train --module=torchtitan.experiments.tpu.rl --config=grpo_qwen3_0_6b --sampler.use_vllm --checkpoint.initial_load_path=/data/assets/hf/Qwen3-0.6B --training.steps=10"
+ray job logs raysubmit_xxxxxxxxx > ray.log
 ```
 
 ### Running Unit Tests
