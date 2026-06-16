@@ -23,9 +23,22 @@ class RayRLTrainer(RLTrainer):
             
         logger.info("Spawning 1-TPU Ray Worker Groups...")
         
+        # Calculate world sizes and DP degree dynamically from config
+        self.trainer_world_size = self._compute_world_size(config.trainer.parallelism)
+        self.generator_world_size = self._compute_world_size(config.generator.parallelism)
+        self.world_size = self.trainer_world_size
+        assert self.trainer_world_size == self.generator_world_size, (
+            f"Trainer world size ({self.trainer_world_size}) must match Generator world size ({self.generator_world_size}) for direct rank-to-rank sync."
+        )
+
+        trainer_parallelism = config.trainer.parallelism
+        dp_shard = max(trainer_parallelism.data_parallel_shard_degree, 1)
+        self.trainer_dp_degree = (
+            trainer_parallelism.data_parallel_replicate_degree * dp_shard
+        )
+
         # We use Ray's node IP for master synchronization of PyTorch XLA process groups
         master_addr = ray.util.get_node_ip_address()
-        self.world_size = 4 # Adjust as needed (e.g. 4 for TP-4/DP-4)
         
         # Trainer process group uses master port 29500
         self.trainer_workers = [

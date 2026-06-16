@@ -96,7 +96,8 @@ class RayPolicyTrainerWorker:
             ports = [master_port + i for i in range(world_size)]
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join([f"{master_addr}:{p}" for p in ports])
         if "TORCH_TPU_TOPOLOGY" not in os.environ:
-            os.environ["TORCH_TPU_TOPOLOGY"] = "2,2,1"  # Default 4-chip VM topology
+            topo_map = {1: "1,1,1", 2: "2,1,1", 4: "2,2,1", 8: "2,2,2"}
+            os.environ["TORCH_TPU_TOPOLOGY"] = topo_map.get(world_size, "2,2,1")
 
         # Apply SFT hacks
         if tpu_utils.get_device_type() == "tpu" and config.optimizer.implementation == "fused":
@@ -150,7 +151,8 @@ class RayVLLMGeneratorWorker:
             ports = [master_port + i for i in range(world_size)]
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join([f"{master_addr}:{p}" for p in ports])
         if "TORCH_TPU_TOPOLOGY" not in os.environ:
-            os.environ["TORCH_TPU_TOPOLOGY"] = "2,2,1"  # Default 4-chip VM topology
+            topo_map = {1: "1,1,1", 2: "2,1,1", 4: "2,2,1", 8: "2,2,2"}
+            os.environ["TORCH_TPU_TOPOLOGY"] = topo_map.get(world_size, "2,2,1")
 
         self.generator = VLLMGenerator(
             config,

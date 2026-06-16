@@ -12,15 +12,16 @@ logger = init_logger(__name__)
 def create_parser():
     parser = argparse.ArgumentParser(description="Minimal vLLM TPU Ray test")
     parser.add_argument("--tensor-parallel-size", type=int, default=4, help="Tensor parallel degree")
+    parser.add_argument("--data-parallel-size", type=int, default=1, help="Data parallel degree")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name or path")
     return parser
 
 
-@ray.remote(resources={"TPU": 4})
+@ray.remote
 class RayVLLMTPUActor:
-    """Minimal Ray Actor wrapping vLLM execution on 4 TPUs."""
+    """Minimal Ray Actor wrapping vLLM execution on TPUs."""
 
-    def __init__(self, model: str, tensor_parallel_size: int):
+    def __init__(self, model: str, tensor_parallel_size: int, data_parallel_size: int):
         os.environ['SKIP_JAX_PRECOMPILE'] = '1'
 
         # Permanent monkeypatching for disagg engine core in the Ray worker process
@@ -31,10 +32,11 @@ class RayVLLMTPUActor:
             vllm.v1.engine.core.EngineCore = DisaggEngineCore
             vllm.v1.engine.core.EngineCoreProc = DisaggEngineCoreProc
 
-        logger.info(f"Initializing vLLM LLM Engine ({model}, TP={tensor_parallel_size}) on TPU host inside Ray Actor...")
+        logger.info(f"Initializing vLLM LLM Engine ({model}, TP={tensor_parallel_size}, DP={data_parallel_size}) on TPU host inside Ray Actor...")
         self.llm = LLM(
             model=model,
             tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
             trust_remote_code=True,
             enforce_eager=True,
         )
@@ -59,9 +61,14 @@ def main():
 
     parser = create_parser()
     args = parser.parse_args()
+    total_chips = args.tensor_parallel_size * args.data_parallel_size
 
-    logger.info(f"Deploying RayVLLMTPUActor to TPU host (requesting TPU: 4, Model: {args.model})...")
-    vllm_actor = RayVLLMTPUActor.remote(model=args.model, tensor_parallel_size=args.tensor_parallel_size)
+    logger.info(f"Deploying RayVLLMTPUActor to TPU host (requesting TPU: {total_chips}, Model: {args.model})...")
+    vllm_actor = RayVLLMTPUActor.options(resources={"TPU": total_chips}).remote(
+        model=args.model, 
+        tensor_parallel_size=args.tensor_parallel_size,
+        data_parallel_size=args.data_parallel_size
+    )
 
     prompts = [
         "Hello, my name is",

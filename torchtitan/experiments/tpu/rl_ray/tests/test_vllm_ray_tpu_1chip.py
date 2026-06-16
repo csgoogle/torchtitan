@@ -12,6 +12,7 @@ logger = init_logger(__name__)
 def create_parser():
     parser = argparse.ArgumentParser(description="Minimal vLLM TPU Ray 1-chip worker test")
     parser.add_argument("--tensor-parallel-size", type=int, default=4, help="Tensor parallel degree")
+    parser.add_argument("--data-parallel-size", type=int, default=1, help="Data parallel degree")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name or path")
     return parser
 
@@ -20,7 +21,7 @@ def create_parser():
 class RayVLLM1ChipWorker:
     """Ray Worker representing a single vLLM rank on 1 TPU chip."""
 
-    def __init__(self, rank: int, world_size: int, master_addr: str, master_port: int, model: str):
+    def __init__(self, rank: int, world_size: int, tensor_parallel_size: int, data_parallel_size: int, master_addr: str, master_port: int, model: str):
         os.environ['SKIP_JAX_PRECOMPILE'] = '1'
         os.environ["VLLM_TARGET_DEVICE"] = "tpu"
         os.environ["TPU_MULTIHOST_BACKEND"] = "ray"
@@ -38,7 +39,8 @@ class RayVLLM1ChipWorker:
             ports = [master_port + i for i in range(world_size)]
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join([f"{master_addr}:{p}" for p in ports])
         if "TORCH_TPU_TOPOLOGY" not in os.environ:
-            os.environ["TORCH_TPU_TOPOLOGY"] = "2,2,1"  # Default 4-chip VM topology
+            topo_map = {1: "1,1,1", 2: "2,1,1", 4: "2,2,1", 8: "2,2,2"}
+            os.environ["TORCH_TPU_TOPOLOGY"] = topo_map.get(world_size, "2,2,1")
 
         # Permanent monkeypatching for disagg engine core in the Ray worker process
         if disagg_utils.is_disagg_enabled():
@@ -48,10 +50,11 @@ class RayVLLM1ChipWorker:
             vllm.v1.engine.core.EngineCore = DisaggEngineCore
             vllm.v1.engine.core.EngineCoreProc = DisaggEngineCoreProc
 
-        logger.info(f"Rank {rank}: Initializing vLLM LLMEngine ({model}, TP={world_size}) via external_launcher...")
+        logger.info(f"Rank {rank}: Initializing vLLM LLMEngine ({model}, TP={tensor_parallel_size}, DP={data_parallel_size}) via external_launcher...")
         engine_args = EngineArgs(
             model=model,
-            tensor_parallel_size=world_size,
+            tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
             trust_remote_code=True,
             enforce_eager=True,
             distributed_executor_backend="external_launcher",
@@ -87,7 +90,7 @@ def main():
 
     parser = create_parser()
     args = parser.parse_args()
-    world_size = args.tensor_parallel_size
+    world_size = args.tensor_parallel_size * args.data_parallel_size
 
     master_addr = ray.util.get_node_ip_address()
     master_port = 29600
@@ -97,6 +100,8 @@ def main():
         RayVLLM1ChipWorker.remote(
             rank=i,
             world_size=world_size,
+            tensor_parallel_size=args.tensor_parallel_size,
+            data_parallel_size=args.data_parallel_size,
             master_addr=master_addr,
             master_port=master_port,
             model=args.model
