@@ -69,9 +69,6 @@ FULL_MODEL_TEST_CONFIGS = [
 ]
 
 
-@absltest.skip(
-    "TODO(b/519195149): Disabled due to failing under new buffer assignment."
-)
 class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
   """Tests for Qwen3 model components (Dense and MoE) on CPU and accelerator devices.
 
@@ -200,7 +197,7 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
               p_cpu.grad,
               atol=5e-2,
               rtol=5e-2,
-              check_name=f"Attention Param Grad: {name}"
+              check_name=f"Attention Param Grad: {name}",
           )
 
   def test_qwen_rmsnorm_cpu_device_parity(self):
