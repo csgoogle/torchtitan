@@ -144,26 +144,6 @@ class Profiler(Configurable):
         This is used to configure torch.profiler.schedule.
         """
 
-        profiler_repeat: int | None = None
-        """
-        The number of times to repeat the profiling cycle
-
-        This is used to configure torch.profiler.schedule.
-        """
-
-        profiler_skip_first: int | None = None
-        """
-        The number of initial profiling cycles to skip
-
-        This is used to configure torch.profiler.schedule.
-        """
-
-        profiler_skip_first_wait: int | None = None
-        """
-        The number of initial profiling cycles to skip the wait time
-
-        This is used to configure torch.profiler.schedule.
-        """
 
         enable_memory_snapshot: bool = False
         """Whether to dump memory snapshot."""
@@ -326,9 +306,7 @@ class Profiler(Configurable):
         device_type = get_device_type()
         activities = [torch.profiler.ProfilerActivity.CPU]
         if device_type == "tpu":
-            # Use PrivateUse1 for TPU until it is fully upstreamed in PyTorch
-            # TODO: b/470479047 - confirm torch.profiler working for TPU on Cloud.
-            activities.append(torch.profiler.ProfilerActivity.PrivateUse1)
+            activities.append(torch.profiler.ProfilerActivity.TPU)  # type: ignore
 
             # TPU profiler C++ backend still relies on the environment variable
             # to determine where to dump the raw .xplane.pb files.
