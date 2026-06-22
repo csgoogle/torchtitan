@@ -109,6 +109,20 @@ class TrainMinimalDistributedTest(
           param_atol=5e-3,
           param_rtol=1e-3,
       ),
+      dict(
+          testcase_name="qwen3_simplefsdp",
+          module="qwen3",
+          config="qwen3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=2e-3,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
+      ),
   ])
   def test_train_minimal_distributed_parity(
       self,
@@ -125,6 +139,7 @@ class TrainMinimalDistributedTest(
       param_rtol=5e-3,
       optimizer_implementation="foreach",
       enable_compile=False,
+      args=None,
   ):
     """Runs a distributed parameter and gradient parity test against a CPU reference.
 
@@ -152,7 +167,7 @@ class TrainMinimalDistributedTest(
             "--training.mixed_precision_param=float32",
             "--training.mixed_precision_reduce=float32",
             "--training.local_batch_size=4",
-        ],
+        ] + (args or []),
         tensor_parallel_degree=tensor_parallel_degree,
         data_parallel_shard_degree=data_parallel_shard_degree,
         skip_devices=skip_devices,

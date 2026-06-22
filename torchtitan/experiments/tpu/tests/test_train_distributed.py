@@ -298,6 +298,14 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
       ),
       dict(
+          testcase_name="qwen3_simplefsdp",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+      ),
+      dict(
           testcase_name="qwen3_fsdp_compile",
           module="torchtitan.experiments.tpu.qwen3",
           config="qwen3_debugmodel",
