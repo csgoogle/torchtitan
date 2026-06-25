@@ -259,6 +259,22 @@ class TorchTitanVLLMModelWrapper(Module):
         self.parallel_dims, parallelism = create_torchtitan_config_from_vllm_config(
             vllm_config
         )
+        
+        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
+            # Initialize distributed environment and mesh if not already done
+            import torch.distributed as dist
+            if not dist.is_initialized():
+                from torchtitan.experiments.tpu import utils as tpu_utils
+                import os
+                # This should have been done by vLLM TPUWorker but just in case
+                dist.init_process_group(
+                    backend="tpu_dist",
+                    rank=int(os.environ.get("RANK", 0)),
+                    world_size=int(os.environ.get("WORLD_SIZE", 1))
+                )
+            
+            # For TP>1, the mesh must be built to allow get_mesh("tp") calls
+            self.parallel_dims.build_mesh()
 
         # Fill sharding configs on the config BEFORE build so every sub-module
         # is constructed with its ShardingConfig attached (required by the
@@ -301,7 +317,7 @@ class TorchTitanVLLMModelWrapper(Module):
         # too low; exceeding it fails under
         # fullgraph=True so set to 10 for now
         if compile_config.enable:
-            torch._dynamo.config.recompile_limit = 10
+            torch._dynamo.config.recompile_limit = 100
 
         self.model = self.parallelize_fn(
             model=self.model,
@@ -318,7 +334,11 @@ class TorchTitanVLLMModelWrapper(Module):
             # put the model into device if it was at meta
             device = vllm_config.device_config.device            
             self.model = self.model.to_empty(device=device)
-            self.model.init_states(buffer_device=device)
+            # Skip init_states to prevent thousands of eager TPU compilations!
+            # We will copy the weights from the trainer anyway.
+            # But we MUST initialize the RoPE cache, otherwise it will output garbage!
+            extended_rope = self.rope_config.build()
+            self.model.freqs_cis = extended_rope.cache.to(device=device, dtype=self.model.tok_embeddings.weight.dtype)
 
         # Pre-extend RoPE cache to cover vLLM's max model length (profiling
         # may use up to 2x max_seq_len, so use max_model_len which already

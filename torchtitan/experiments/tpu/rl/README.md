@@ -191,7 +191,7 @@ To allow your local machine to submit jobs to the remote Ray cluster, port-forwa
 kubectl get pods
 
 # Forward the Ray dashboard and client ports
-kubectl port-forward svc/ray-tpu-v6e-cluster-head-svc 8265:8265 10001:10001
+kubectl port-forward svc/ray-tpu-v6e-cluster-head-svc 8266:8266 10001:10001
 ```
 
 #### 3. Submit the Ray Training Job
@@ -200,7 +200,7 @@ With the port-forward active, submit the training job from your local machine.
 *Note: Exporting `RAY_RUNTIME_ENV_IGNORE_GITIGNORE=1` is crucial. It forces the local Ray packager to ignore your `.gitignore` file and respect `.rayignore` instead, ensuring that tiny tokenizer metadata files inside `assets/hf/` are uploaded to the cluster without copying massive `.safetensors` model weights.*
 
 ```bash
-export RAY_ADDRESS="http://127.0.0.1:8265"
+export RAY_ADDRESS="http://127.0.0.1:8266"
 export RAY_RUNTIME_ENV_IGNORE_GITIGNORE=1
 
 ray job submit \

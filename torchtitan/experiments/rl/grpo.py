@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 
 import torch
 import torchstore as ts
+import typing
+import tyro
 from monarch.actor import this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
@@ -163,7 +165,7 @@ class RLTrainer(Configurable):
     class Config(Configurable.Config):
         """Top-level config for RL training."""
 
-        model_spec: ModelSpec | None = None
+        model_spec: typing.Annotated[typing.Any, tyro.conf.Suppress] = None  # Seems to be a torchtitan bug. see https://github.com/google-pytorch/torchtitan/blob/main/torchtitan/trainer.py#L61
         """Model specification shared by trainer and generator.
         Set programmatically via config_registry (not from CLI)."""
 
@@ -534,13 +536,16 @@ class RLTrainer(Configurable):
             step_start = time.perf_counter()
 
             # --- Collect data and create episodes --- #
+            t_gen_start = time.perf_counter()
             trajectories = self._collect_rollouts(num_groups, step=step)
             episodes = self._build_episodes(trajectories)
+            t_gen_total = time.perf_counter() - t_gen_start
 
             if self.config.log_samples:
                 _log_samples(episodes)
 
             # --- Train step --- #
+            t_train_start = time.perf_counter()
             batches = [
                 self._collate_episodes(per_rank_episodes)
                 for per_rank_episodes in self._shard_episodes(episodes)
@@ -549,6 +554,7 @@ class RLTrainer(Configurable):
                 self.trainer.forward_backward.call(batches).get()
             )
             optim_metrics = self._get_rank_0_value(self.trainer.optim_step.call().get())
+            t_train_total = time.perf_counter() - t_train_start
             metrics = {**fwd_bwd_metrics, **optim_metrics}
 
             # --- Weight sync --- #
@@ -569,7 +575,8 @@ class RLTrainer(Configurable):
                 f"Avg tokens: {avg_tokens:>3.0f} | "
                 f"Logprob diff: mean={metrics['logprob_diff_mean']:.4e}, "
                 f"max={metrics['logprob_diff_max']:.4e} | "
-                f"Time: {time.perf_counter() - step_start:.1f}s"
+                f"Time: {time.perf_counter() - step_start:.1f}s | "
+                f"Gen Time: {t_gen_total:.1f}s | Train Time: {t_train_total:.1f}s"  # Maybe worth upstream this change.
             )
 
             if not math.isfinite(metrics["loss"]):
