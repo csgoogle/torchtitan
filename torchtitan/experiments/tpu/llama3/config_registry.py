@@ -176,3 +176,71 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
   )
 
+
+def llama3_70b() -> TPUTrainerConfig:
+  """Llama3 70B model configuration for TPU."""
+  model_spec = model_registry("70B")
+  model_spec.parallelize_fn = tpu_parallelize_llama
+  return TPUTrainerConfig(
+      loss=CrossEntropyLoss.Config(),
+      hf_assets_path="./tests/assets/tokenizer",
+      model_spec=model_spec,
+      optimizer=OptimizersContainer.Config(lr=3e-4),
+      lr_scheduler=LRSchedulersContainer.Config(
+          warmup_steps=2,
+          decay_ratio=0.8,
+          decay_type="linear",
+          min_lr_factor=0.0,
+      ),
+      training=TrainingConfig(
+          local_batch_size=1,
+          seq_len=8192,
+          steps=1000,
+      ),
+      dataloader=HuggingFaceTextDataLoader.Config(
+          dataset="c4_test",
+      ),
+      metrics=MetricsProcessor.Config(log_freq=5),
+      parallelism=ParallelismConfig(use_simple_fsdp=True),
+      checkpoint=CheckpointManager.Config(
+          enable=False,
+          interval=500,
+          last_save_model_only=True,
+      ),
+      activation_checkpoint=ActivationCheckpointConfig(
+          mode="full",
+      ),
+      validator=Validator.Config(
+          enable=False,
+          freq=500,
+          steps=1200,
+          dataloader=HuggingFaceTextDataLoader.Config(
+              dataset="c4_test",
+          ),
+      ),
+      tpu_config=TPUConfig(
+          eager_mode="DEFER_AND_FUSE",
+          use_graph_split=False,
+      ),
+      compile=CompileConfig(
+          enable=True,
+          backend="tpu",
+          components=["model"],
+      ),
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          use_splash_attention_kernel=True,
+          sa_block_q=2048,
+          sa_block_kv=2048,
+          sa_block_dkv=2048,
+          sa_block_kv_compute=2048,
+          sa_block_q_dkv=2048,
+          sa_block_kv_dkv=2048,
+          sa_block_kv_dkv_compute=2048,
+          sa_block_q_dq=2048,
+          sa_block_kv_dq=2048,
+      ),
+      loss_kernel=LossKernelConfig(
+          use_loss_kernel=True,
+      ),
+  )
+
