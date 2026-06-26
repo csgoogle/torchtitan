@@ -54,7 +54,7 @@ spec:
                 cpu: "6"
                 memory: "24Gi"
   workerGroupSpecs:
-    - replicas: 5 # use all 5 slices
+    - replicas: 2 # take only 2 slices
       numOfHosts: 2 # 2 host v6e8 chips 
       groupName: tpu-group
       rayStartParams: {}

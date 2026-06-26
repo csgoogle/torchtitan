@@ -35,11 +35,12 @@ uv pip install -r .ci/docker/requirements-flux.txt
 uv pip install portpicker absl-py numpy gcsfs frozendict triton fairscale
 ```
 
-Clone torchtpu-vllm project
+Clone torchtpu-vllm project and checkout the specific commit to ensure reproducibility.
 ```
 cd ..
 git clone https://github.com/google-pytorch/torchtpu-vllm.git
 cd torchtpu-vllm
+git checkout 98536189411258e7307f261759edfb6fc8df8a60 
 ```
 
 We need to hack `torchtpu-vllm/pyproject.toml` to be use the `torch-tpu`/`libtpu` version for `dcp`
@@ -92,6 +93,7 @@ torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
 
 #### 1. With High-Performance vLLM Sampling
 ```bash
+unset RAY_ADDRESS
 sudo fuser -k /dev/vfio/* 2>/dev/null || true
 export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiments/tpu/rl/ray_train.py \
     --module=torchtitan.experiments.tpu.rl \
@@ -112,6 +114,7 @@ grep -E "Step [0-9]+: Times|Training completed|step:\s+[0-9]+" ray_train_vllm_tp
 #### 2. With Tensor Parallelism (TP=2) vLLM Sampling
 To run the sampler with Tensor Parallelism=2 (which distributes the vLLM engine across 2 chips, running 2 replicas in parallel over 4 chips total):
 ```bash
+unset RAY_ADDRESS
 sudo fuser -k /dev/vfio/* 2>/dev/null || true
 export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiments/tpu/rl/ray_train.py \
     --module=torchtitan.experiments.tpu.rl \
@@ -129,6 +132,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
 #### 3. With Tensor Parallelism (TP=4) vLLM Sampling
 To run the sampler with Tensor Parallelism=4 (which distributes the vLLM engine across all 4 chips instead of a single chip):
 ```bash
+unset RAY_ADDRESS
 sudo fuser -k /dev/vfio/* 2>/dev/null || true
 export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiments/tpu/rl/ray_train.py \
     --module=torchtitan.experiments.tpu.rl \
@@ -146,6 +150,7 @@ export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiment
 #### 4. Alternative: Natively with PyTorch FSDP 
 If vLLM is not installed or you wish to sample directly with PyTorch's native FSDP layers (slower autoregressive performance, but useful for testing):
 ```bash
+unset RAY_ADDRESS
 sudo fuser -k /dev/vfio/* 2>/dev/null || true
 export PYTHONPATH=$PYTHONPATH:.; PYTHONUNBUFFERED=1 python torchtitan/experiments/tpu/rl/ray_train.py \
     --module=torchtitan.experiments.tpu.rl \
@@ -194,8 +199,8 @@ kubectl get pods
 kubectl port-forward svc/ray-tpu-v6e-cluster-head-svc 8266:8266 10001:10001
 ```
 
-#### 3. Submit the Ray Training Job
-With the port-forward active, submit the training job from your local machine.
+#### 3. Submit the Ray Training Job (Collocated)
+With the port-forward active, submit the training job from your local machine. This runs Trainer and Sampler collocated on the exact same TPU chips.
 
 *Note: Exporting `RAY_RUNTIME_ENV_IGNORE_GITIGNORE=1` is crucial. It forces the local Ray packager to ignore your `.gitignore` file and respect `.rayignore` instead, ensuring that tiny tokenizer metadata files inside `assets/hf/` are uploaded to the cluster without copying massive `.safetensors` model weights.*
 
@@ -218,7 +223,32 @@ ray job submit \
     --training.steps=5
 ```
 
-#### 4. Monitor Training Logs
+#### 4. Submit the Ray Training Job (Noncolocated)
+If you have a multi-slice setup (e.g. at least 2 distinct TPU slices in your cluster, grouped by `ray.io/tpu-slice-name` labels), you can run Trainer and Sampler on physically distinct slices over Data Center Network (DCN). 
+
+Simply append the `--noncolocated` flag to your run command:
+
+```bash
+export RAY_ADDRESS="http://127.0.0.1:8265"
+export RAY_RUNTIME_ENV_IGNORE_GITIGNORE=1
+
+ray job submit \
+  --working-dir . \
+  --runtime-env-json '{"env_vars": {"PYTHONPATH": ".", "PYTHONUNBUFFERED": "1"}}' \
+  -- \
+  python torchtitan/experiments/tpu/rl/ray_train.py \
+    --module=torchtitan.experiments.tpu.rl \
+    --config=grpo_qwen3_0_6b \
+    --sampler.use-vllm \
+    --sampler.vllm_tensor_parallel_size=2 \
+    --sampler.max_new_tokens=64 \
+    --checkpoint.no-enable \
+    --grpo.global_prompt_batch_size=8 \
+    --training.steps=5 \
+    --noncolocated
+```
+
+#### 5. Monitor Training Logs
 After submission, the CLI will output a unique job ID (e.g., `raysubmit_xxxxxxxx`). You can tail the logs or save them to a file:
 
 ```bash

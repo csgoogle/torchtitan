@@ -56,83 +56,109 @@ class GRPOOrchestrator:
   │  - TPU Chip 0    │      │  - TPU Chip 1    │      │  - TPU Chip 2    │
   └──────────────────┘      └──────────────────┘      └──────────────────┘
     """
-    def __init__(self, sys_argv, world_size, tpu_resources, master_addr, master_port, sb_addresses, tpu_nodes, tpu_type):
+    def __init__(self, sys_argv, world_size, tpu_resources, master_addr, master_port, sb_addresses, tpu_nodes, tpu_type, sampler_world_size=None, sampler_sb_addresses=None, sampler_tpu_nodes=None):
         self.sys_argv = sys_argv
         self.world_size = world_size
+        self.sampler_world_size = sampler_world_size if sampler_world_size is not None else world_size
         self.tpu_resources = tpu_resources
         self.master_addr = master_addr
         self.master_port = master_port
         self.sb_addresses = sb_addresses
+        self.sampler_sb_addresses = sampler_sb_addresses if sampler_sb_addresses is not None else sb_addresses
         self.tpu_nodes = tpu_nodes
+        self.sampler_tpu_nodes = sampler_tpu_nodes if sampler_tpu_nodes is not None else tpu_nodes
         self.tpu_type = tpu_type
-        self.workers = []
+        
+        # We might have separate trainers and samplers
+        self.trainers = []
+        self.samplers = []
+        self.is_collocated = (self.sb_addresses == self.sampler_sb_addresses)
+        
+        if not self.is_collocated:
+            assert self.world_size == self.sampler_world_size, "Noncolocated mode requires identical slice sizes for Trainer and Sampler."
         
         # Parse torchtitan configs
         config_manager = ConfigManager()
         self.job_config = config_manager.parse_args(args=self.sys_argv[1:])
         
-    def setup_workers(self):
-        """Spawns Ray Actor workers for each physical TPU chip."""
-        unique_hostnames = list(dict.fromkeys([addr.split(":")[0] for addr in self.sb_addresses]))
+    def _spawn_workers(self, role, world_size, sb_addresses, tpu_nodes, master_port_offset=0):
+        unique_hostnames = list(dict.fromkeys([addr.split(":")[0] for addr in sb_addresses]))
         tpu_worker_hostnames = ",".join(unique_hostnames)
         rank0_hostname = unique_hostnames[0]
 
         topology_config = TPU_TOPOLOGY_REGISTRY.get(self.tpu_type, TPU_TOPOLOGY_REGISTRY["v6e-4"])
         chips_per_host = int(topology_config.get("CHIPS_PER_HOST", 4))
 
-        for rank in range(self.world_size):
-            # TODO: config those env var automatically
-            # Dynamic ports for SliceBuilder and PJRT process port
+        workers = []
+        for rank in range(world_size):
             local_chip_index = rank % chips_per_host
             process_port = 8471 + local_chip_index
-            tpu_worker_addresses_str = ",".join(self.sb_addresses) if isinstance(self.sb_addresses, list) else self.sb_addresses
+            tpu_worker_addresses_str = ",".join(sb_addresses) if isinstance(sb_addresses, list) else sb_addresses
 
             env_vars = {
-                "WORLD_SIZE": str(self.world_size),
+                "WORKER_ROLE": role,
+                "IS_NONCOLLOCATED": "1" if not self.is_collocated else "0",
+                "WORLD_SIZE": str(world_size),
                 "RANK": str(rank),
                 "LOCAL_RANK": str(local_chip_index),
                 "MASTER_ADDR": rank0_hostname,
-                "MASTER_PORT": str(self.master_port),
+                "MASTER_PORT": str(self.master_port + master_port_offset),
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES": tpu_worker_addresses_str,
                 
-                # Mandatory distributed PJRT/XLA variables to resolve hanging
                 "TPU_PROCESS_ADDRESSES": tpu_worker_addresses_str,
                 "TPU_PROCESS_PORT": str(process_port),
                 "CLOUD_TPU_TASK_ID": str(rank),
                 "TPU_WORKER_HOSTNAMES": tpu_worker_hostnames,
 
-                # Disable eager memory pre-allocation to prevent OOM
                 "JAX_MEM_FRACTION": "0.45",
                 "JAX_THREE_G_MEM_ALLOC_ON_FREE": "true",
                 "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                 "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.45",
             }
             
-            # Inject low-level physical hardware coordinates based on the cluster TPU type!
             env_vars.update(topology_config)
             
             actor_options = {
                 "runtime_env": {"env_vars": env_vars},
             }
             if self.tpu_resources:
-                # Enforce strict node-specific resource pinning to align virtual rank layout with physical nodes!
                 host_index = rank // chips_per_host
-                if host_index >= len(self.tpu_nodes):
+                if host_index >= len(tpu_nodes):
                     raise ValueError(
                         f"Not enough TPU nodes: rank {rank} requires host {host_index}, "
-                        f"but only {len(self.tpu_nodes)} nodes available."
+                        f"but only {len(tpu_nodes)} nodes available."
                     )
-                node_ip = self.tpu_nodes[host_index]
+                node_ip = tpu_nodes[host_index]
                 actor_options["resources"] = {
                     "TPU": 1,
-                    # Request a fraction (< 1 / CHIPS_PER_HOST) of the custom node resource so that
-                    # multiple workers (one per TPU chip) can be scheduled on the same physical host.
                     f"node:{node_ip}": 0.01,
                 }
 
-            print(f"@@@ Spawning FusedWorker Rank {rank} with env: {env_vars}")
+            print(f"@@@ Spawning FusedWorker Rank {rank} ({role}) with env: {env_vars}")
             worker = FusedWorker.options(**actor_options).remote(self.sys_argv)
-            self.workers.append(worker)
+            workers.append(worker)
+        return workers
+
+    def setup_workers(self):
+        """Spawns Ray Actor workers for each physical TPU chip."""
+        self.trainers = self._spawn_workers(
+            "Trainer", 
+            self.world_size, 
+            self.sb_addresses, 
+            self.tpu_nodes, 
+            master_port_offset=0
+        )
+        
+        if self.is_collocated:
+            self.samplers = self.trainers
+        else:
+            self.samplers = self._spawn_workers(
+                "Sampler", 
+                self.sampler_world_size, 
+                self.sampler_sb_addresses, 
+                self.sampler_tpu_nodes, 
+                master_port_offset=100  # Offset master port to avoid collision if on same node (though they are on diff nodes)
+            )
 
     def compute_global_grpo_advantages(self, rollout_results, step, tokenizer):
         """
@@ -147,7 +173,7 @@ class GRPOOrchestrator:
         all_format = []
         group_size = self.job_config.grpo.group_size
         global_prompt_batch_size = getattr(self.job_config.grpo, "global_prompt_batch_size", 16)
-        num_workers = len(self.workers)
+        num_workers = len(self.samplers)
         prompts_per_worker = global_prompt_batch_size // num_workers
         
         sample_prompt = ""
@@ -218,11 +244,12 @@ class GRPOOrchestrator:
         # task to all workers simultaneously, achieving true parallel execution.
         # `ray.get(...)` then acts as a barrier synchronization, pausing the driver until 
         # all workers have completed their tasks.
-        init_futures = [worker.init_models.remote() for worker in self.workers]
+        all_actors = self.trainers + (self.samplers if not self.is_collocated else [])
+        init_futures = [worker.init_models.remote() for worker in all_actors]
         ray.get(init_futures)
         
         print("\n@@@ Checking heartbeat on all workers...")
-        heartbeat_futures = [worker.heartbeat.remote() for worker in self.workers]
+        heartbeat_futures = [worker.heartbeat.remote() for worker in all_actors]
         ray.get(heartbeat_futures)
 
         print("\n@@@ Initializing Environment and Tokenizer on Driver...")
@@ -237,6 +264,16 @@ class GRPOOrchestrator:
             tokenizer_path = DEFAULT_TOKENIZER_NAME
         tokenizer = HuggingFaceTokenizer(tokenizer_path=tokenizer_path)
 
+        # Initial Weight Sync for Non-Collocated Samplers
+        # The Trainer loads the checkpoint during init_models, but the Sampler does not.
+        # We must sync the pretrained weights from Trainer to Sampler BEFORE the first step!
+        if not self.is_collocated:
+            print("\n@@@ Performing initial weight sync to Samplers...")
+            state_dicts = ray.get([w.get_full_state_dict.remote() for w in self.trainers])
+            full_sd = next((sd for sd in state_dicts if sd is not None), None)
+            if full_sd is not None:
+                ray.get([w.load_full_state_dict.remote(full_sd) for w in self.samplers])
+
         print("\n@@@ Starting training loop on driver...")
         steps = self.job_config.training.steps
         max_new_tokens = self.job_config.sampler.max_new_tokens
@@ -244,7 +281,7 @@ class GRPOOrchestrator:
         local_batch_size = self.job_config.training.local_batch_size
         group_size = self.job_config.grpo.group_size
         global_prompt_batch_size = getattr(self.job_config.grpo, "global_prompt_batch_size", 16)
-        num_workers = len(self.workers)
+        num_workers = len(self.samplers)
         prompts_per_worker = global_prompt_batch_size // num_workers
         
         try:
@@ -294,15 +331,25 @@ class GRPOOrchestrator:
                     raise ValueError("Only sumdigits or random datasets are supported!")
                 
                 # 1b. Load prompts on workers
-                ray.get([w.load_next_batch.remote(batch_prompt_ids) for w, batch_prompt_ids in zip(self.workers, prompt_ids_list)])
+                ray.get([w.load_next_batch.remote(batch_prompt_ids) for w, batch_prompt_ids in zip(self.samplers, prompt_ids_list)])
+                if not self.is_collocated:
+                    ray.get([w.load_next_batch.remote(batch_prompt_ids) for w, batch_prompt_ids in zip(self.trainers, prompt_ids_list)])
 
                 # 2. Parallel Rollout Generation on Workers
                 print(f"    - Parallel Rollout Generation...")
-                rollouts = ray.get([w.generate_rollouts.remote() for w in self.workers])
+                rollouts = ray.get([w.generate_rollouts.remote() for w in self.samplers])
+                
+                # If non-collocated, we must transfer the rollouts to the trainers
+                if not self.is_collocated:
+                    print(f"    - Transferring Rollouts to Trainers...")
+                    ray.get([
+                        t.set_rollout_data.remote(r["completed_ids"], r["token_log_probs"], r["sampling_time"]) 
+                        for t, r in zip(self.trainers, rollouts)
+                    ])
                 
                 # 3. Compute reference log-probs
                 print(f"    - Computing Reference Log Probs...")
-                ray.get([w.compute_ref_log_probs.remote() for w in self.workers])
+                ray.get([w.compute_ref_log_probs.remote() for w in self.trainers])
                 
                 # 4. Centralized Reward Scoring & Global Advantage Math
                 print(f"    - Centralized Reward Scoring & Global Advantage Math...")
@@ -314,7 +361,7 @@ class GRPOOrchestrator:
                 print(f"    - Triggering PPO Epochs...")
                 metrics = ray.get([
                     w.train_ppo_step.remote(advantages_list[i], step, avg_correctness, avg_format) 
-                    for i, w in enumerate(self.workers)
+                    for i, w in enumerate(self.trainers)
                 ])
                 
                 m = metrics[0]
@@ -322,15 +369,29 @@ class GRPOOrchestrator:
                 should_log = (step + 1) % log_freq == 0 or step == (steps - 1)
                 if should_log:
                     print(f"\n[titan] @@@ Step {step + 1} Metrics @@@")
-                    print(f"Loss: {m['loss']:.4f} | Grad Norm: {m['grad_norm']:.4f}")
-                    print(f"Times: Sample={m['extra_metrics']['sampling_time']:.2f}s, Ref={m['extra_metrics']['ref_time']:.2f}s, Train={m['extra_metrics']['train_time']:.2f}s, Total={m['extra_metrics']['total_step_time']:.2f}s")
-                    print(f"Reward: Format={avg_format:.4f}, Correctness={avg_correctness:.4f}\n")
+                    print(f"[titan] Loss: {m['loss']:.4f} | Grad Norm: {m['grad_norm']:.4f}")
+                    print(f"[titan] Times: Sample={m['extra_metrics']['sampling_time']:.2f}s, Ref={m['extra_metrics']['ref_time']:.2f}s, Train={m['extra_metrics']['train_time']:.2f}s, Total={m['extra_metrics']['total_step_time']:.2f}s")
+                    print(f"[titan] Reward: Format={avg_format:.4f}, Correctness={avg_correctness:.4f}\n")
                 
                 # 6. Weight Sync
                 print(f"    - Syncing weights...")
-                ray.get([w.sync_weights.remote() for w in self.workers])
                 
-            finish_futures = [worker.finish.remote() for worker in self.workers]
+                # Fetch weights from trainers and sync to samplers if non-collocated
+                if not self.is_collocated:
+                    # In a real DCN environment we'd serialize the weights from Trainer Rank 0 and send to Sampler Rank 0, 
+                    # but with Ray we can rely on ray.get/ray.put to handle the object store transfers.
+                    # First, we fetch the full sharded state dict from rank 0 of the trainers.
+                    state_dicts = ray.get([w.get_full_state_dict.remote() for w in self.trainers])
+                    # rank 0 state dict is not None
+                    full_sd = next((sd for sd in state_dicts if sd is not None), None)
+                    if full_sd is not None:
+                        # Then, we push it to all the samplers. They will shard it internally via FSDP if necessary.
+                        ray.get([w.load_full_state_dict.remote(full_sd) for w in self.samplers])
+                else:
+                    # If collocated, the worker can simply copy the weights from the trainer model to the sampler model internally
+                    ray.get([w.sync_weights.remote() for w in self.trainers])
+                
+            finish_futures = [worker.finish.remote() for worker in self.trainers + (self.samplers if not self.is_collocated else [])]
             ray.get(finish_futures)
             print("\n@@@ Training completed successfully!")
         except Exception as e:

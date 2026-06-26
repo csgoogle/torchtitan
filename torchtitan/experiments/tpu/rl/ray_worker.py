@@ -38,6 +38,9 @@ class FusedWorker:
         self.num_flops_per_token = 0
         self.peak_flops = 0
 
+        self.current_t_sample = 0.0
+        self.current_t_ref = 0.0
+
     def init_models(self):
         # We put all heavy imports here so they are evaluated AFTER runtime_env is set
         import typing
@@ -75,6 +78,21 @@ class FusedWorker:
         sys.argv = self.sys_argv
         config_manager = ConfigManager()
         self.job_config = config_manager.parse_args(args=self.sys_argv[1:])
+
+        self.role = os.environ.get("WORKER_ROLE", "Collocated")
+        self.is_noncolocated = os.environ.get("IS_NONCOLLOCATED", "0") == "1"
+
+        # Memory Optimization for Noncolocated Mode:
+        # If Trainer and Sampler are separated, we can safely disable components 
+        # on the respective workers to save massive amounts of TPU HBM.
+        if self.is_noncolocated:
+            if self.role == "Trainer":
+                # Trainer doesn't generate, so it doesn't need vLLM engine or sampler model
+                self.job_config.sampler.use_vllm = False
+                self.job_config.sampler.use_separate_sampler_model = False
+            elif self.role == "Sampler":
+                # Sampler doesn't train or compute reference logits, so it doesn't need ref_model
+                self.job_config.reference.use_reference_model = False
 
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -189,18 +207,25 @@ class FusedWorker:
             if self.sampler_model is not None:
                 self.sampler_model.init_weights()
 
-        optimizers_container = self.job_config.optimizer.build(model_parts=[self.model])
-        
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.job_config.optimizer.lr,
-            eps=self.job_config.optimizer.eps,
-            foreach=True,   # Fused optimizer is not supported on TPU, set foreach=True
-        )
-        optimizers_container.optimizers[0] = self.optimizer
+        if self.role != "Sampler":
+            optimizers_container = self.job_config.optimizer.build(model_parts=[self.model])
+            
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            self.optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=self.job_config.optimizer.lr,
+                eps=self.job_config.optimizer.eps,
+                foreach=True,   # Fused optimizer is not supported on TPU, set foreach=True
+            )
+            optimizers_container.optimizers[0] = self.optimizer
+        else:
+            self.optimizer = None
+            optimizers_container = None
+            # Disable gradients completely on the Sampler to save memory
+            for p in self.model.parameters():
+                p.requires_grad = False
 
-        if hasattr(self.job_config, "checkpoint") and self.job_config.checkpoint.enable:
+        if self.role != "Sampler" and hasattr(self.job_config, "checkpoint") and self.job_config.checkpoint.enable:
             self.checkpointer = self.job_config.checkpoint.build(
                 dataloader=None,
                 model_parts=[self.model],
@@ -284,6 +309,9 @@ class FusedWorker:
         self.current_prompt_ids = self.torch.tensor(
             prompt_ids_list, dtype=self.torch.long, device=self.device
         )
+        self.current_prompt_ids_repeated = self.current_prompt_ids.repeat_interleave(
+            self.job_config.grpo.group_size, dim=0
+        )
         return True
 
     def generate_rollouts(self):
@@ -292,9 +320,7 @@ class FusedWorker:
 
         t_sample_start = time.perf_counter()
         
-        group_size = self.job_config.grpo.group_size
-        prompt_ids_repeated = self.current_prompt_ids.repeat_interleave(group_size, dim=0)
-        self.current_prompt_ids_repeated = prompt_ids_repeated
+        prompt_ids_repeated = self.current_prompt_ids_repeated
 
         sampling_model = self.sampler_model if self.sampler_model is not None else self.model
         sampling_model.eval()
@@ -351,7 +377,15 @@ class FusedWorker:
             # TPU ICI (Inter-Chip Interconnect) to bypass the host, worker-to-driver 
             # communication always goes through host CPU memory.
             "completed_ids": completed_ids.cpu(),  
+            "token_log_probs": token_log_probs.cpu() if token_log_probs is not None else None,
+            "sampling_time": self.current_t_sample,
         }
+
+    def set_rollout_data(self, completed_ids, token_log_probs, sampling_time):
+        self.current_completed_ids = completed_ids.to(self.device)
+        self.current_token_log_probs = token_log_probs.to(self.device) if token_log_probs is not None else None
+        self.current_t_sample = sampling_time
+        return True
 
     def compute_ref_log_probs(self):
         t_ref_start = time.perf_counter()
@@ -539,6 +573,45 @@ class FusedWorker:
             "grad_norm": grad_norm_val,
             "extra_metrics": extra_metrics
         }
+
+    def get_full_state_dict(self):
+        import torch
+        import os
+        import torch_tpu
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+        
+        torch_tpu._internal.sync.synchronize(wait=True)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+            
+        sd = get_model_state_dict(self.model, options=StateDictOptions(full_state_dict=True, cpu_offload=False))
+        
+        res = None
+        if int(os.environ.get("RANK", 0)) == 0:
+            res = {k: (v.to_local() if hasattr(v, "to_local") else v).cpu().clone() 
+                   for k, v in sd.items() if v is not None}
+        
+        torch_tpu._internal.sync.synchronize(wait=True)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+            
+        return res
+
+    def load_full_state_dict(self, state_dict):
+        if self.vllm_sampler is not None:
+            self.vllm_sampler.sync_weights(state_dict=state_dict)
+        elif self.sampler_model is not None:
+            self.sampler_model.load_state_dict(state_dict)
+        else:
+            import torch
+            from torch.distributed import fsdp
+            try:
+                with fsdp.FullyShardedDataParallel.summon_full_params(self.model, recurse=True, writeback=True):
+                    self.model.load_state_dict(state_dict)
+            except Exception:
+                self.model.load_state_dict(state_dict)
+            self.sync_weights()
+        return True
 
     def sync_weights(self):
         if self.vllm_sampler is not None:

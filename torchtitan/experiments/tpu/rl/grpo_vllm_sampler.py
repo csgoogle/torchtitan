@@ -12,6 +12,9 @@ from torch.distributed import fsdp
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOKENIZER_NAME = "Qwen/Qwen2.5-0.5B"
+ZMQ_BASE_PORT = 9500
+DEFAULT_MASTER_ADDR = "127.0.0.1"
+DEFAULT_MASTER_PORT = "12345"
 
 try:
     import zmq
@@ -40,7 +43,17 @@ try:
             for i in range(1, tp_size):
                 worker_rank = actual_rank + i
                 sock = self.zmq_ctx.socket(zmq.PAIR)
-                sock_path = f"ipc:///tmp/vllm-cmd-rank-{worker_rank}.sock"
+                
+                addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES", "").split(",")
+                if len(addresses) > worker_rank and addresses[worker_rank]:
+                    host = addresses[worker_rank].split(":")[0]
+                    my_host = addresses[actual_rank].split(":")[0]
+                    if host == my_host:
+                        host = DEFAULT_MASTER_ADDR
+                    port = ZMQ_BASE_PORT + worker_rank
+                    sock_path = f"tcp://{host}:{port}"
+                else:
+                    sock_path = f"ipc:///tmp/vllm-cmd-rank-{worker_rank}.sock"
                 sock.connect(sock_path)
                 self.cmd_sockets.append(sock)
 
@@ -105,8 +118,8 @@ def mock_vllm_distributed(tp_size: int):
         original_init_device = TPUWorker.init_device
         def patched_init_device(self):
             if self.distributed_init_method == "env://":
-                host = os.environ.get('MASTER_ADDR', '127.0.0.1')
-                port = os.environ.get('MASTER_PORT', '12345')
+                host = os.environ.get('MASTER_ADDR', DEFAULT_MASTER_ADDR)
+                port = os.environ.get('MASTER_PORT', DEFAULT_MASTER_PORT)
                 self.distributed_init_method = f"tcp://{host}:{port}"
             original_init_device(self)
         patch_tpu_worker = unittest.mock.patch.object(TPUWorker, 'init_device', new=patched_init_device)
@@ -124,9 +137,9 @@ def mock_vllm_distributed(tp_size: int):
             # to this global rank, rather than letting it assume it owns the whole 
             # host topology. Otherwise XLA collectives will deadlock between FSDP and vLLM.
             local_devices = list(jax.local_devices())
-            global_rank = int(os.environ.get("RANK", "0"))
-            if len(local_devices) > global_rank:
-                target_device = local_devices[global_rank]
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            if len(local_devices) > local_rank:
+                target_device = local_devices[local_rank]
             else:
                 target_device = local_devices[0]
             mesh_devices = np.asarray([target_device]).reshape((1, 1))
@@ -146,8 +159,8 @@ def mock_vllm_distributed(tp_size: int):
             distributed_init_method, rank, local_rank = original_distributed_args(self)
             actual_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
             actual_rank = int(os.environ.get("RANK", "0"))
-            host = os.environ.get('MASTER_ADDR', '127.0.0.1')
-            port = int(os.environ.get('MASTER_PORT', '12345'))
+            host = os.environ.get('MASTER_ADDR', DEFAULT_MASTER_ADDR)
+            port = int(os.environ.get('MASTER_PORT', DEFAULT_MASTER_PORT))
             return f"tcp://{host}:{port}", actual_rank, actual_local_rank
 
         patch_uni = unittest.mock.patch.object(UniProcExecutor, '_distributed_args', new=mock_distributed_args)
@@ -337,13 +350,19 @@ class VLLMSampler:
         """
         Initializes a ZeroMQ PAIR socket for the current worker rank to receive commands from the driver.
         """
-        import zmq
         zmq_ctx = zmq.Context()
         self.zmq_sock = zmq_ctx.socket(zmq.PAIR)
-        sock_path = f"ipc:///tmp/vllm-cmd-rank-{self.rank}.sock"
-        if os.path.exists(sock_path):
-            os.unlink(sock_path)
-        self.zmq_sock.bind(sock_path)
+
+        addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES", "").split(",")
+        if len(addresses) > self.rank and addresses[self.rank]:
+            port = ZMQ_BASE_PORT + self.rank
+            sock_path = f"tcp://0.0.0.0:{port}"
+            self.zmq_sock.bind(sock_path)
+        else:
+            sock_path = f"ipc:///tmp/vllm-cmd-rank-{self.rank}.sock"
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+            self.zmq_sock.bind(sock_path)
 
     def _worker_loop_zmq(self, stop_cmd):
         """
@@ -385,14 +404,27 @@ class VLLMSampler:
         tokenizer_name = self._get_tokenizer_name()
 
         # Patch vLLM's ParallelConfig check so it allows tp_size < world_size
-        import torch.distributed as dist
-        world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", "4"))
         from vllm.config import ParallelConfig
         original_post_init = ParallelConfig.__post_init__
-        def patched_post_init(self):
-            original_post_init(self)
-            self.world_size = world_size
+        def patched_post_init(self_config):
+            original_post_init(self_config)
+            actual_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            self_config.world_size = actual_world_size
+            self_config.data_parallel_size = actual_world_size // (self_config.tensor_parallel_size * getattr(self_config, "pipeline_parallel_size", 1))
         ParallelConfig.__post_init__ = patched_post_init
+
+        try:
+            from vllm.config import SchedulerConfig
+            original_get_scheduler_cls = SchedulerConfig.get_scheduler_cls
+            def patched_get_scheduler_cls(self):
+                cls = original_get_scheduler_cls(self)
+                if cls.__name__ == 'DPScheduler':
+                    import vllm.v1.core.sched.scheduler as vllm_scheduler
+                    return vllm_scheduler.Scheduler
+                return cls
+            SchedulerConfig.get_scheduler_cls = patched_get_scheduler_cls
+        except ImportError:
+            pass
 
         try:
             from vllm.engine.arg_utils import EngineArgs
@@ -517,7 +549,7 @@ class VLLMSampler:
         """Helper method to remove wrapper prefixes from module names."""
         return name.replace("_fsdp_wrapped_module.", "").replace("_checkpoint_wrapped_module.", "").replace("module.", "")
 
-    def sync_weights(self, source_model: torch.nn.Module):
+    def sync_weights(self, source_model: torch.nn.Module = None, state_dict: dict = None):
         """
         Synchronizes the parameters from the active FSDP TorchTitan model directly into 
         the collocated vLLM engine's memory.
@@ -530,6 +562,7 @@ class VLLMSampler:
 
         Args:
             source_model (torch.nn.Module): The TorchTitan FSDP model to pull weights from.
+            state_dict (dict): Optional pre-fetched state dict to load from directly.
         """
         if self.vllm_engine is None and not hasattr(self, "worker_wrapper"):
             return
@@ -546,7 +579,12 @@ class VLLMSampler:
         target_sd = target_model.state_dict()
 
         synced_keys = []
-        source_sd = source_model.state_dict()
+        if state_dict is not None:
+            source_sd = state_dict
+        elif source_model is not None:
+            source_sd = source_model.state_dict()
+        else:
+            raise ValueError("Must provide either source_model or state_dict")
         
         tok_key = next((k for k in source_sd.keys() if "tok_embeddings.weight" in k), None)
         lm_key = next((k for k in source_sd.keys() if "lm_head.weight" in k), None)
@@ -590,7 +628,7 @@ class VLLMSampler:
 
     def generate(self, prompt_ids_repeated: torch.Tensor, sampling_params) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Generates completions for a batch of prompts using the collocated vLLM engine.
+        Generates completions for a batch of prompts using vLLM engine, for both colocated and non-colocated cases.
 
         If TP > 1, the driver rank controls the generation loop while other ranks execute the worker 
         loop via ZMQ commands. Once generation completes, the driver rank broadcasts the generated 
@@ -611,24 +649,45 @@ class VLLMSampler:
             
         sampling_params.logprobs = 1
         
+        local_prompts_list = prompt_ids_repeated.cpu().tolist()
+        
         if self.tp_size > 1:
-            import torch.distributed as dist
-            world_size = dist.get_world_size()
-            
-            if not hasattr(self, "tp_group"):
-                for i in range(0, world_size, self.tp_size):
-                    ranks = list(range(i, i + self.tp_size))
-                    group = dist.new_group(ranks)
-                    if self.rank in ranks:
-                        self.tp_group = group
-            
-            local_prompts = prompt_ids_repeated.clone()
-            group_prompts = [torch.zeros_like(local_prompts) for _ in range(self.tp_size)]
-            dist.all_gather(group_prompts, local_prompts, group=self.tp_group)
-            all_prompt_ids = torch.cat(group_prompts, dim=0)
-            global_prompt_ids_list = all_prompt_ids.cpu().tolist()
+            use_zmq_broadcast = int(os.environ.get("VLLM_USE_ZMQ_BROADCAST", "1")) == 1
+            if use_zmq_broadcast:
+                if self.is_driver:
+                    import pickle
+                    engine = getattr(self.vllm_engine, "llm_engine", self.vllm_engine)
+                    executor = getattr(engine, "model_executor", None)
+                    sockets = getattr(executor, "cmd_sockets", [])
+                    
+                    global_prompt_ids_list = list(local_prompts_list)
+                    for sock in sockets:
+                        payload = sock.recv()
+                        worker_prompts = pickle.loads(payload)
+                        global_prompt_ids_list.extend(worker_prompts)
+                else:
+                    import pickle
+                    payload = pickle.dumps(local_prompts_list)
+                    self.zmq_sock.send(payload)
+                    global_prompt_ids_list = None
+            else:
+                import torch.distributed as dist
+                world_size = dist.get_world_size()
+                
+                if not hasattr(self, "tp_group"):
+                    for i in range(0, world_size, self.tp_size):
+                        ranks = list(range(i, i + self.tp_size))
+                        group = dist.new_group(ranks)
+                        if self.rank in ranks:
+                            self.tp_group = group
+                
+                local_prompts = prompt_ids_repeated.clone()
+                group_prompts = [torch.zeros_like(local_prompts) for _ in range(self.tp_size)]
+                dist.all_gather(group_prompts, local_prompts, group=self.tp_group)
+                all_prompt_ids = torch.cat(group_prompts, dim=0)
+                global_prompt_ids_list = all_prompt_ids.cpu().tolist()
         else:
-            global_prompt_ids_list = prompt_ids_repeated.cpu().tolist()
+            global_prompt_ids_list = local_prompts_list
         
         completions = []
         token_log_probs_list = []
@@ -698,36 +757,68 @@ class VLLMSampler:
         elif getattr(self, "worker_wrapper", None) is not None:
             self._worker_loop_zmq("stop")
                     
-        # Broadcast the results from the driver rank to all other ranks within the TP subgroup via TPU ICI.
         if self.tp_size > 1:
-            import torch.distributed as dist
-            import torch_tpu
-            # Ensure all TPU ops from vLLM generation are finished before running PyTorch collectives
-            torch_tpu._internal.sync.synchronize(wait=True)
-            dist.barrier()
-            
-            max_new_tokens = sampling_params.max_tokens
-            batch_size_per_group = len(prompt_ids_repeated) * self.tp_size
-            
-            if self.is_driver:
-                comp_t = torch.tensor(completions, dtype=torch.long, device="tpu")
-                probs_t = torch.tensor(token_log_probs_list, dtype=torch.float32, device="tpu")
-            else:
-                comp_t = torch.zeros((batch_size_per_group, max_new_tokens), dtype=torch.long, device="tpu")
-                probs_t = torch.zeros((batch_size_per_group, max_new_tokens), dtype=torch.float32, device="tpu")
-                
-            driver_rank = self.rank - (self.rank % self.tp_size)
-            dist.broadcast(comp_t, src=driver_rank, group=self.tp_group)
-            dist.broadcast(probs_t, src=driver_rank, group=self.tp_group)
-            
-            # Slice the completions and logprobs back down to the local worker's batch size
+            use_zmq_broadcast = int(os.environ.get("VLLM_USE_ZMQ_BROADCAST", "1")) == 1
             local_batch_size = len(prompt_ids_repeated)
-            local_idx_in_group = self.rank % self.tp_size
-            start_idx = local_idx_in_group * local_batch_size
-            end_idx = start_idx + local_batch_size
-            
-            completions_tensor = comp_t[start_idx:end_idx]
-            token_log_probs = probs_t[start_idx:end_idx]
+            if use_zmq_broadcast:
+                # Use ZMQ for broadcasting. dist.broadcast does not work for multihost cases
+                # because the XLA collectives will deadlock between FSDP and vLLM.
+                if self.is_driver:
+                    import pickle
+                    engine = getattr(self.vllm_engine, "llm_engine", self.vllm_engine)
+                    executor = getattr(engine, "model_executor", None)
+                    sockets = getattr(executor, "cmd_sockets", [])
+                    
+                    for i, sock in enumerate(sockets):
+                        worker_idx = i + 1
+                        start_idx = worker_idx * local_batch_size
+                        end_idx = start_idx + local_batch_size
+                        
+                        worker_completions = completions[start_idx:end_idx]
+                        worker_log_probs = token_log_probs_list[start_idx:end_idx]
+                        
+                        payload = pickle.dumps((worker_completions, worker_log_probs))
+                        sock.send(payload)
+                    
+                    completions_slice = completions[:local_batch_size]
+                    token_log_probs_slice = token_log_probs_list[:local_batch_size]
+                else:
+                    import pickle
+                    payload = self.zmq_sock.recv()
+                    completions_slice, token_log_probs_slice = pickle.loads(payload)
+                    
+                completions_tensor = torch.tensor(completions_slice, device=prompt_ids_repeated.device, dtype=torch.long)
+                token_log_probs = torch.tensor(token_log_probs_slice, device=prompt_ids_repeated.device, dtype=torch.float32)
+            else:
+                # Broadcast the results from the driver rank to all other ranks within the TP subgroup via TPU ICI.
+                # this seems causing hang with multihost, need to investigate
+                import torch.distributed as dist
+                import torch_tpu
+                # Ensure all TPU ops from vLLM generation are finished before running PyTorch collectives
+                torch_tpu._internal.sync.synchronize(wait=True)
+                dist.barrier()
+                
+                max_new_tokens = sampling_params.max_tokens
+                batch_size_per_group = len(prompt_ids_repeated) * self.tp_size
+                
+                if self.is_driver:
+                    comp_t = torch.tensor(completions, dtype=torch.long, device="tpu")
+                    probs_t = torch.tensor(token_log_probs_list, dtype=torch.float32, device="tpu")
+                else:
+                    comp_t = torch.zeros((batch_size_per_group, max_new_tokens), dtype=torch.long, device="tpu")
+                    probs_t = torch.zeros((batch_size_per_group, max_new_tokens), dtype=torch.float32, device="tpu")
+                    
+                driver_rank = self.rank - (self.rank % self.tp_size)
+                dist.broadcast(comp_t, src=driver_rank, group=self.tp_group)
+                dist.broadcast(probs_t, src=driver_rank, group=self.tp_group)
+                
+                # Slice the completions and logprobs back down to the local worker's batch size
+                local_idx_in_group = self.rank % self.tp_size
+                start_idx = local_idx_in_group * local_batch_size
+                end_idx = start_idx + local_batch_size
+                
+                completions_tensor = comp_t[start_idx:end_idx]
+                token_log_probs = probs_t[start_idx:end_idx]
         else:
             completions_tensor = torch.tensor(completions, device=prompt_ids_repeated.device, dtype=torch.long)
             token_log_probs = torch.tensor(token_log_probs_list, device=prompt_ids_repeated.device, dtype=torch.float32)
