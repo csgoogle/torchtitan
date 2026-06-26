@@ -204,7 +204,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
       ),
       dict(
-          testcase_name="llama3_simple_fsdp",
+          testcase_name="llama3_simplefsdp",
           module="torchtitan.experiments.tpu.llama3",
           config="llama3_debugmodel",
           data_parallel_shard_degree=-1,

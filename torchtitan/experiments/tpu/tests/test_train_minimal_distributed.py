@@ -82,6 +82,20 @@ class TrainMinimalDistributedTest(
           param_atol=5e-3,
           param_rtol=1e-3,
       ),
+      dict(
+          testcase_name="llama3_simplefsdp",
+          module="llama3",
+          config="llama3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=5e-4,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
+      ),
       # qwen3
       dict(
           testcase_name="qwen3_tp",
