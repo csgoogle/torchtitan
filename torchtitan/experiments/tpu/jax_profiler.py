@@ -24,9 +24,11 @@ class JaxProfiler:
     if local_rank == 0:
       # pytype: disable=attribute-error
       # pylint: disable=protected-access
-      trace_dir = os.path.join(
-          self.prof._base_folder, self.prof._config.save_traces_folder
-      )
+      save_folder = self.prof._config.save_traces_folder
+      if "://" in save_folder or os.path.isabs(save_folder):
+        trace_dir = save_folder
+      else:
+        trace_dir = os.path.join(self.prof._base_folder, save_folder)
       curr_trace_dir = os.path.join(
           trace_dir,
           f"iteration_{self.prof.tpu_step_num}",
