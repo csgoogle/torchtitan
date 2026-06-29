@@ -9,8 +9,6 @@ but overrides `setup()` to spawn Ray actors instead of Monarch procs. Uses proxy
 (`RayTrainerProxy`, `RayGeneratorProxy`) to transparently translate Monarch `.call().get()` 
 RPCs into Ray `.remote()` and `ray.get()` futures. Pins the trainer to CPU and the 
 generator to TPU to bypass PJRT client deadlock limitations.
-
-TODO (jialei): move the ray hacks to a separate file.
 """
 
 import asyncio
@@ -29,6 +27,12 @@ from torchtitan.experiments.rl.grpo import RLTrainer
 from torchtitan.experiments.tpu.rl_nc_ray.trainer import RayTPUPolicyTrainer
 from torchtitan.experiments.tpu.rl_nc_ray.generator import RayVLLMGenerator
 from torchtitan.tools.logging import init_logger
+
+from torchtitan.experiments.tpu.rl_nc_ray.tpu_env_utils import (
+    discover_tpu_cluster_layout,
+    build_trainer_env_vars,
+    build_generator_env_vars,
+)
 
 
 class FutureProxy:
@@ -108,7 +112,13 @@ class RayGeneratorProxy:
                     for trainer in self.trainers:
                         refs.append(getattr(trainer, "get_model_state_dict").remote())
                     
-                    return FutureProxy([self.generator.load_model_state_dict.remote(version, refs[0])])
+                    # [TPU HACK / OPTIMIZATION]
+                    # Why: Passing refs[0] directly to the remote actor auto-resolves/deserializes it on the generator driver.
+                    # This double-serialization on the generator driver CPU causes massive CPU/memory bottlenecks.
+                    # Solution: Wrap refs[0] in a list [refs[0]] to bypass auto-resolution, passing raw ObjectRef.
+                    # TODO: Remove this container-wrapping hack once Ray supports a cleaner way to pass
+                    # unresolved ObjectRefs directly.
+                    return FutureProxy([self.generator.load_model_state_dict.remote(version, [refs[0]])])
                 method = getattr(self.generator, name)
                 return FutureProxy([method.remote(*args, **kwargs)])
         return MethodProxy(self.ray_generator, self.ray_trainers)
@@ -123,108 +133,30 @@ class RayRLTrainer(RLTrainer):
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
 
-        all_tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
+        # 1. Discover physical TPU cluster nodes, topology layout, bounds, and process counts
+        layout = discover_tpu_cluster_layout(config)
         
-        if all_tpu_nodes:
-            slices = {}
-            for n in all_tpu_nodes:
-                slice_name = n.get("Labels", {}).get("ray.io/tpu-slice-name", "default")
-                slices.setdefault(slice_name, []).append(n)
-            
-            slice_names = list(slices.keys())
-            trainer_nodes_info = slices[slice_names[0]]
-            
-            if len(slice_names) > 1:
-                sampler_nodes_info = slices[slice_names[1]]
-            else:
-                sampler_nodes_info = trainer_nodes_info
-            
-            tpu_type = trainer_nodes_info[0].get("Labels", {}).get("ray.io/tpu-pod-type")
-            trainer_tpu_count = int(sum([n.get("Resources", {}).get("TPU", 0) for n in trainer_nodes_info]))
-            sampler_tpu_count = int(sum([n.get("Resources", {}).get("TPU", 0) for n in sampler_nodes_info]))
-        else:
-            trainer_nodes_info = []
-            sampler_nodes_info = []
-            trainer_tpu_count = 0
-            sampler_tpu_count = 0
-            tpu_type = None
+        is_local_run = layout["is_local_run"]
+        sampler_nodes_info = layout["sampler_nodes_info"]
+        chips_per_host = layout["chips_per_host"]
 
-        is_local_run = os.environ.get("LOCAL_VM_RUN") == "1"
-
-        self.trainer_world_size = 1 if is_local_run else (trainer_tpu_count if trainer_tpu_count > 0 else 4)
-        self.generator_world_size = config.generator.parallelism.tensor_parallel_degree
+        self.trainer_world_size = layout["trainer_world_size"]
+        self.generator_world_size = layout["generator_world_size"]
         self.trainer_dp_degree = self.trainer_world_size
         self._multi_node = False
         
-        trainer_device_type = "cpu" if is_local_run else "tpu"
-        generator_device_type = "tpu"
-        
-        trainer_nodes_info.sort(key=lambda n: int(n["Labels"].get("ray.io/tpu-worker-id", "0")))
-        trainer_node_ips = [node["NodeManagerAddress"] for node in trainer_nodes_info] if trainer_nodes_info else ["127.0.0.1"]
-        sampler_nodes_info.sort(key=lambda n: int(n["Labels"].get("ray.io/tpu-worker-id", "0")))
-        sampler_node_ips = [node["NodeManagerAddress"] for node in sampler_nodes_info] if sampler_nodes_info else ["127.0.0.1"]
+        trainer_device_type = layout["trainer_device_type"]
+        generator_device_type = layout["generator_device_type"]
 
-        chips_per_host = int(trainer_nodes_info[0]["Resources"].get("TPU", 4)) if trainer_nodes_info else 4
-        
-        trainer_sb_addresses = []
-        if trainer_nodes_info:
-            for node in trainer_nodes_info:
-                dns_name = node["NodeManagerAddress"]
-                for chip_idx in range(chips_per_host):
-                    trainer_sb_addresses.append(f"{dns_name}:{8471 + chip_idx}")
-        else:
-            for chip_idx in range(chips_per_host):
-                trainer_sb_addresses.append(f"127.0.0.1:{8471 + chip_idx}")
-
-        trainer_actors = []
-        
-        # Compute absolute paths for the worker environment
+        # Compute absolute paths for the worker runtime environment
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
         dummy_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "dummy_modules"))
         worker_pythonpath = f"{dummy_dir}:{base_dir}"
 
+        # 2. Launch Ray Trainer actors with worker-specific layout environments
+        trainer_actors = []
         for rank in range(self.trainer_world_size):
-            local_chip_index = rank % chips_per_host
-            host_index = rank // chips_per_host
-            host_ip = trainer_node_ips[host_index]
-            
-            env_vars = {
-                "TORCHTITAN_DEVICE_TYPE": trainer_device_type,
-                "RANK": str(rank),
-                "LOCAL_RANK": str(local_chip_index),
-                "WORLD_SIZE": str(self.trainer_world_size),
-                "MASTER_ADDR": trainer_node_ips[0],
-                "MASTER_PORT": "8450",
-                "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(trainer_sb_addresses),
-                "TPU_PROCESS_ADDRESSES": ",".join(trainer_sb_addresses),
-                "TPU_PROCESS_PORT": str(8471 + local_chip_index),
-                "CLOUD_TPU_TASK_ID": str(rank),
-                "TPU_WORKER_HOSTNAMES": ",".join(trainer_node_ips),
-                "JAX_MEM_FRACTION": "0.45",
-                "JAX_THREE_G_MEM_ALLOC_ON_FREE": "true",
-                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.45",
-                "TORCH_DYNAMO_RECOMPILE_LIMIT": "100",
-                "PYTHONPATH": worker_pythonpath,
-            }
-            if tpu_type == "v6e-8":
-                env_vars.update({
-                    "TORCH_TPU_TOPOLOGY": "2,4,1" if self.trainer_world_size == 8 else ("2,2,1" if self.trainer_world_size == 4 else "1,1,1"),
-                    "TPU_HOST_BOUNDS": "2,4,1" if self.trainer_world_size == 8 else ("2,2,1" if self.trainer_world_size == 4 else "1,1,1"),
-                    "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-                    "CHIPS_PER_HOST": "4",
-                })
-            else:
-                env_vars.update({
-                    "TORCH_TPU_TOPOLOGY": "2,2,1" if self.trainer_world_size == 4 else "1,1,1",
-                    "TPU_HOST_BOUNDS": "1,1,1",
-                    "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1" if self.trainer_world_size == 4 else "1,1,1",
-                    "CHIPS_PER_HOST": "4",
-                })
-                
-            trainer_resources = {f"node:{host_ip}": 0.01}
-            if trainer_device_type == "tpu":
-                trainer_resources["TPU"] = 1
+            env_vars, host_ip = build_trainer_env_vars(rank, layout, worker_pythonpath)
                 
             trainer_resources = {f"node:{host_ip}": 0.01}
             if trainer_device_type == "tpu":
@@ -242,36 +174,8 @@ class RayRLTrainer(RLTrainer):
             )
             trainer_actors.append(trainer_actor)
 
-        generator_sb_addresses = []
-        if sampler_nodes_info:
-            for node in sampler_nodes_info:
-                dns_name = node["NodeManagerAddress"]
-                for chip_idx in range(chips_per_host):
-                    generator_sb_addresses.append(f"{dns_name}:{8070 + chip_idx}")
-        else:
-            for chip_idx in range(chips_per_host):
-                generator_sb_addresses.append(f"127.0.0.1:{8070 + chip_idx}")
-
-        generator_env_vars = {
-            "TORCHTITAN_DEVICE_TYPE": generator_device_type,
-            "SKIP_JAX_PRECOMPILE": "1",
-            "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
-            # Pre-emptively set TPU env vars to prevent torchtpu-vllm from guessing wrong bounds
-            "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-            "TPU_HOST_BOUNDS": "2,4,1" if self.generator_world_size == 8 else ("2,2,1" if self.generator_world_size == 4 else "1,1,1"),
-            "TORCH_TPU_TOPOLOGY": "2,4,1" if self.generator_world_size == 8 else ("2,2,1" if self.generator_world_size == 4 else "1,1,1"),
-            "CHIPS_PER_HOST": "4",
-            # Pass correct slicebuilder addresses for the generator slice only
-            "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(generator_sb_addresses),
-            "TPU_PROCESS_ADDRESSES": ",".join(generator_sb_addresses),
-            # Set LIBTPU_INIT_ARGS to prevent torchtpu-vllm from appending megachip_tccontrol
-            "LIBTPU_INIT_ARGS": "--xla_tpu_use_enhanced_launch_barrier=false",
-            # Dynamo recompile limit needs to be increased because vLLM passes layer_name strings
-            "TORCH_DYNAMO_RECOMPILE_LIMIT": "100",
-            "PYTHONPATH": worker_pythonpath,
-        }
-        if config.generator.parallelism.tensor_parallel_degree > 1:
-            generator_env_vars["TPU_MULTIHOST_BACKEND"] = "ray"
+        # 3. Launch Ray Generator actor
+        generator_env_vars = build_generator_env_vars(layout, worker_pythonpath)
             
         generator_resources = {}
         if not is_local_run and self.generator_world_size <= chips_per_host:
@@ -297,7 +201,7 @@ class RayRLTrainer(RLTrainer):
             ),
         )
 
-        # Wrap them in Monarch-compatible proxies
+        # 4. Wrap actors in Monarch-compatible proxies
         self.trainer = RayTrainerProxy(trainer_actors)
         self.generator = RayGeneratorProxy(generator_actor, trainer_actors)
         

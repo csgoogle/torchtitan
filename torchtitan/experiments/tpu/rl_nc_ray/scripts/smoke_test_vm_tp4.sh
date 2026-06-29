@@ -13,10 +13,10 @@ python3 torchtitan/experiments/tpu/rl_nc_ray/grpo.py \
     --module rl \
     --config rl_grpo_qwen3_0_6b \
     --hf_assets_path assets/hf/Qwen3-0.6B \
-    --num_steps 5 \
+    --num_steps 3 \
     --num_prompts_per_step 1 \
     --num_validation_samples 1 \
-    --trainer.training.steps 5 \
+    --trainer.training.steps 3 \
     --trainer.parallelism.tensor_parallel_degree 1 \
     --generator.parallelism.tensor_parallel_degree 4 \
     --generator.sampling.n 2 \

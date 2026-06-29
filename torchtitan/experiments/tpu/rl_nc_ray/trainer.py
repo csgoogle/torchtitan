@@ -5,20 +5,24 @@ Inherits from `PolicyTrainer` but is wrapped with `@ray.remote` instead of Monar
 Runs exclusively on CPU to decouple from the TPU Generator, patching `VarlenAttention` to use CPU 
 SDPA. Replaces `torchstore` weight pushing with `get_model_state_dict()`, extracting CPU tensors for 
 Ray to send to the Generator. Implements DTensor workarounds for CPU Gloo checkpoint loading.
-
-TODO (jialei): consider dropping support for CPU to make code (e.g., weight sync) simpler. 
 """
 
 import copy
 import logging
 import os
 import torch
-import torch.nn.functional as F
 import ray
 import torch.distributed.checkpoint as dcp
 import torch_tpu
 
 import torchtitan.experiments.tpu.rl_nc_ray  # Ensure mock runs first
+from torchtitan.experiments.tpu.rl_nc_ray.weight_transfer_utils import (
+    prepare_trainer_state_dict,
+)
+from torchtitan.experiments.tpu.rl_nc_ray.padding_packing_utils import (
+    pad_train_batch_to_static,
+    patch_varlen_attention,
+)
 
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 from torch.distributed.tensor import DTensor
@@ -26,7 +30,6 @@ from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.types import TrainBatch
 from torchtitan.experiments.tpu import utils as tpu_utils
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.models.common.attention import VarlenAttention
 from torchtitan.tools import utils
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
@@ -38,9 +41,88 @@ from torchtitan.experiments.rl.actors.utils import (
 
 logger = logging.getLogger(__name__)
 
-# TPU Hack Constants for Static Padding
+# --- GLOBAL CONFIGURATION / CONSTANTS ---
 PAD_LEN = 4096
 MAX_SEQS = 64
+
+
+def patch_torch_and_dist_for_trainer(target_device: str) -> None:
+    """
+    Apply TPU/CPU-specific PyTorch and distributed backend monkey-patches to PolicyTrainer.
+    """
+    import torch._dynamo
+    # PyTorch Dynamo specializes on the tensor type. In TP overlap, collectives 
+    # return AsyncCollectiveTensor or a plain Tensor depending on timing. 
+    # Each switch triggers a recompile. We must increase the limit to prevent crashes.
+    torch._dynamo.config.recompile_limit = 100
+    
+    if target_device == "tpu":
+        # =====================================================================
+        # TPU vs GPU Kernel Implementation Gaps:
+        # On GPU/CUDA, `torch.std` is backed by native, highly optimized CUDA kernels
+        # supporting variance correction parameters natively.
+        # TorchTPU lacks a direct implementation for `aten::std.correction`,
+        # which throws a hardware runtime error when executing reward normalization.
+        # We bypass this gap by monkey-patching `std()` with an explicit eager-form
+        # mathematical calculation of variance, preserving numerical precision and safety.
+        # =====================================================================
+        orig_std = torch.Tensor.std
+        def patched_std(self, *args, **kwargs):
+            mean = self.mean()
+            if kwargs.get("unbiased", True) and self.numel() > 1:
+                var = ((self - mean) ** 2).sum() / (self.numel() - 1)
+            else:
+                var = ((self - mean) ** 2).mean()
+            return torch.sqrt(var)
+        torch.Tensor.std = patched_std
+        
+    # Monkey patch distributed backend lookup
+    if target_device == "cpu":
+        dist_utils._get_distributed_backend = lambda x: "gloo"
+
+
+def load_initial_hf_weights_on_cpu(model, torchtitan_state_dict: dict) -> None:
+    """
+    Manually copies initial HF state dict tensors into model's DTensors on CPU.
+    """
+    model_sd = model.state_dict()
+    with torch.no_grad():
+        for k, v in torchtitan_state_dict.items():
+            if k in model_sd:
+                orig_v = model_sd[k]
+                
+                def handle_dtensor_copy(target_dtensor, source_tensor):
+                    target_local = target_dtensor.to_local() if hasattr(target_dtensor, "to_local") else target_dtensor
+                    
+                    if hasattr(source_tensor, "to_local"):
+                        source_tensor = source_tensor.to_local()
+                    elif isinstance(source_tensor, torch.nn.Parameter) and hasattr(source_tensor.data, "to_local"):
+                        source_tensor = source_tensor.data.to_local()
+                    elif isinstance(source_tensor, torch.nn.Parameter):
+                        source_tensor = source_tensor.data
+                        
+                    if target_local.shape == source_tensor.shape:
+                        target_local.copy_(source_tensor)
+                    else:
+                        for dim in range(len(target_dtensor.shape)):
+                            if target_dtensor.shape[dim] != target_local.shape[dim]:
+                                shard_size = target_local.shape[dim]
+                                rank = int(os.environ.get("LOCAL_RANK", 0)) if os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu") == "cpu" else int(os.environ.get("RANK", 0))
+                                rank_offset = shard_size * rank
+                                indices = [slice(None)] * len(target_dtensor.shape)
+                                indices[dim] = slice(rank_offset, rank_offset + shard_size)
+                                target_local.copy_(source_tensor[tuple(indices)])
+                                return
+                        # Fallback if no dim diff found but shape mismatch
+                        target_local.copy_(source_tensor)
+
+                if isinstance(orig_v, DTensor):
+                    handle_dtensor_copy(orig_v, v)
+                elif isinstance(orig_v, torch.nn.Parameter) and isinstance(orig_v.data, DTensor):
+                    handle_dtensor_copy(orig_v.data, v)
+                else:
+                    orig_v.copy_(v)
+
 
 @ray.remote
 class RayTPUPolicyTrainer(PolicyTrainer):
@@ -56,29 +138,10 @@ class RayTPUPolicyTrainer(PolicyTrainer):
         target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
         tpu_utils.set_device_type(target_device)
         
-        import torch._dynamo
-        # PyTorch Dynamo specializes on the tensor type. In TP overlap, collectives 
-        # return AsyncCollectiveTensor or a plain Tensor depending on timing. 
-        # Each switch triggers a recompile. We must increase the limit to prevent crashes.
-        # See: https://github.com/pytorch/torchtitan/blob/main/torchtitan/experiments/rl/models/vllm_wrapper.py#L207
-        torch._dynamo.config.recompile_limit = 100
+        # Apply trainer-specific PyTorch and distributed backend patches
+        patch_torch_and_dist_for_trainer(target_device)
         
-        if target_device == "tpu":
-            # Patch std() to avoid aten::std.correction which is unimplemented on TPU
-            orig_std = torch.Tensor.std
-            def patched_std(self, *args, **kwargs):
-                mean = self.mean()
-                if kwargs.get("unbiased", True) and self.numel() > 1:
-                    var = ((self - mean) ** 2).sum() / (self.numel() - 1)
-                else:
-                    var = ((self - mean) ** 2).mean()
-                return torch.sqrt(var)
-            torch.Tensor.std = patched_std
-            
         # Monkey patch torchtitan utils before super().__init__ calls it
-        if target_device == "cpu":
-            dist_utils._get_distributed_backend = lambda x: "gloo"  
-
         if not hasattr(utils, "device_module"):
             utils.device_module = utils.get_device_module()  
             utils.device_type = target_device  
@@ -105,59 +168,8 @@ class RayTPUPolicyTrainer(PolicyTrainer):
         target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
         print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Patching VarlenAttention for target_device={target_device}")
         
-        if target_device == "cpu":
-            # Monkey-patch `VarlenAttention` for CPU execution.
-            def cpu_varlen_forward(self, xq, xk, xv, *, attention_masks, scale=None, **kwargs):
-                cu_seqs = attention_masks.cu_seq_q.tolist()
-                out = torch.zeros_like(xq)
-                for i in range(len(cu_seqs) - 1):
-                    start, end = cu_seqs[i], cu_seqs[i+1]
-                    if start == end: continue
-                    q = xq[:, start:end, :, :].transpose(1, 2)
-                    k = xk[:, start:end, :, :].transpose(1, 2)
-                    v = xv[:, start:end, :, :].transpose(1, 2)
-                    
-                    if q.shape[1] != k.shape[1]:
-                        num_repeat = q.shape[1] // k.shape[1]
-                        k = k.repeat_interleave(num_repeat, dim=1)
-                        v = v.repeat_interleave(num_repeat, dim=1)
-                        
-                    attn_out = F.scaled_dot_product_attention(
-                        q, k, v, is_causal=True, scale=scale
-                    )
-                    out[:, start:end, :, :] = attn_out.transpose(1, 2)
-                return out
-            VarlenAttention.forward = cpu_varlen_forward
-        else:
-            # We MUST monkey-patch VarlenAttention for TPU because `aten::_flash_attention_forward` 
-            # is not implemented for TPU.
-            def tpu_varlen_forward(self, xq, xk, xv, *, attention_masks, scale=None, **kwargs):
-                total_tokens = xq.shape[1]
-                cu_seqs = attention_masks.cu_seq_q
-                
-                positions = torch.arange(total_tokens, device=xq.device)
-                seq_indices = (positions.unsqueeze(1) >= cu_seqs.unsqueeze(0)).sum(dim=1) - 1
-                same_seq_mask = seq_indices.unsqueeze(1) == seq_indices.unsqueeze(0)
-                causal_mask = positions.unsqueeze(1) >= positions.unsqueeze(0)
-                
-                mask = same_seq_mask & causal_mask
-                mask = mask.unsqueeze(0).unsqueeze(0)
-                
-                q = xq.transpose(1, 2)
-                k = xk.transpose(1, 2)
-                v = xv.transpose(1, 2)
-                
-                if q.shape[1] != k.shape[1]:
-                    num_repeat = q.shape[1] // k.shape[1]
-                    k = k.repeat_interleave(num_repeat, dim=1)
-                    v = v.repeat_interleave(num_repeat, dim=1)
-                    
-                attn_out = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=mask, scale=scale
-                )
-                return attn_out.transpose(1, 2)
-                
-            VarlenAttention.forward = tpu_varlen_forward
+        # Apply VarlenAttention patched forward method
+        patch_varlen_attention(target_device)
             
         return super()._build_model(model_spec, config, device_type, hf_assets_path)
 
@@ -174,47 +186,9 @@ class RayTPUPolicyTrainer(PolicyTrainer):
         dcp.load(hf_state_dict, storage_reader=storage_reader)
         torchtitan_state_dict = self.sd_adapter.from_hf(hf_state_dict)
 
-        # Fix DTensor copy issue on CPU manually
-        model_sd = model.state_dict()
-        with torch.no_grad():
-            for k, v in torchtitan_state_dict.items():
-                if k in model_sd:
-                    orig_v = model_sd[k]
-                    
-                    def handle_dtensor_copy(target_dtensor, source_tensor):
-                        target_local = target_dtensor.to_local() if hasattr(target_dtensor, "to_local") else target_dtensor
-                        
-                        if hasattr(source_tensor, "to_local"):
-                            source_tensor = source_tensor.to_local()
-                        elif isinstance(source_tensor, torch.nn.Parameter) and hasattr(source_tensor.data, "to_local"):
-                            source_tensor = source_tensor.data.to_local()
-                        elif isinstance(source_tensor, torch.nn.Parameter):
-                            source_tensor = source_tensor.data
-                            
-                        if target_local.shape == source_tensor.shape:
-                            target_local.copy_(source_tensor)
-                        else:
-                            for dim in range(len(target_dtensor.shape)):
-                                if target_dtensor.shape[dim] != target_local.shape[dim]:
-                                    shard_size = target_local.shape[dim]
-                                    rank = int(os.environ.get("LOCAL_RANK", 0)) if os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu") == "cpu" else int(os.environ.get("RANK", 0))
-                                    rank_offset = shard_size * rank
-                                    indices = [slice(None)] * len(target_dtensor.shape)
-                                    indices[dim] = slice(rank_offset, rank_offset + shard_size)
-                                    target_local.copy_(source_tensor[tuple(indices)])
-                                    return
-                            # Fallback if no dim diff found but shape mismatch
-                            target_local.copy_(source_tensor)
-
-                    if isinstance(orig_v, DTensor):
-                        handle_dtensor_copy(orig_v, v)
-                    elif isinstance(orig_v, torch.nn.Parameter) and isinstance(orig_v.data, DTensor):
-                        handle_dtensor_copy(orig_v.data, v)
-                    else:
-                        orig_v.copy_(v)
+        # Fix DTensor copy issue on CPU manually using helper function
+        load_initial_hf_weights_on_cpu(model, torchtitan_state_dict)
         logger.info(f"Loaded initial weights from {checkpoint_path}")
-
-
 
     def get_model_state_dict(self) -> dict:
         """Ray-native weight extraction. Returns state dict on CPU."""
@@ -228,27 +202,12 @@ class RayTPUPolicyTrainer(PolicyTrainer):
                 torch.distributed.barrier()
             print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Barrier 1 done")
             
-            full_sd = get_model_state_dict(self.model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
-            print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: get_model_state_dict done")
-            
-            cpu_sd = None
-            if int(os.environ.get("RANK", "0")) == 0:
-                cpu_sd = {}
-                with torch.no_grad():
-                    for k, v in full_sd.items():
-                        if hasattr(v, "full_tensor"):
-                            cpu_sd[k] = v.full_tensor().detach().cpu().clone().contiguous()
-                        elif hasattr(v, "to_local"): # fallback
-                            cpu_sd[k] = v.to_local().detach().cpu().clone().contiguous()
-                        else:
-                            cpu_sd[k] = v.detach().cpu().clone().contiguous()
-                print("@@@ Trainer Rank 0: Finished extracting full model state dict.")
+            # Use modularized, high-performance weight transfer helper
+            cpu_sd = prepare_trainer_state_dict(self.model)
             
             torch_tpu._internal.sync.synchronize(wait=True)
-            print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Sync 2 done")
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
-            print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Barrier 2 done")
         else:
             cpu_sd = {}
             with torch.no_grad():
@@ -289,44 +248,15 @@ class RayTPUPolicyTrainer(PolicyTrainer):
 
         local_batch = copy.copy(train_data[self.dp_rank])
         device = self.device
-
-        # [TPU HACK] Pad all tensors to a static batch size of 4096 tokens
-        # to avoid Dynamo recompilations from varying sequence shapes across RL steps.
         target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
+
+        # Pad all tensors to a static batch size of 4096 tokens
+        # to avoid Dynamo recompilations from varying sequence shapes across RL steps.
         if target_device == "tpu":
             actual_seqs = len(local_batch.seq_lens)
-            total_tokens = sum(local_batch.seq_lens)
-            
-            if total_tokens > PAD_LEN:
-                raise ValueError(f"Total tokens {total_tokens} exceeds pad_len {PAD_LEN}")
-                
-            if actual_seqs > MAX_SEQS:
-                raise ValueError(f"Number of sequences {actual_seqs} exceeds MAX_SEQS {MAX_SEQS}")
-                
-            token_pad = PAD_LEN - total_tokens
-            seq_pad = MAX_SEQS - actual_seqs
-            
-            dummy_seq_lens = []
-            for _ in range(seq_pad):
-                chunk = min(token_pad, 1024)
-                dummy_seq_lens.append(chunk)
-                token_pad -= chunk
-                
-            if token_pad > 0:
-                raise ValueError(f"Could not absorb padding. token_pad remaining: {token_pad}")
-                
-            token_ids = local_batch.token_ids.to(device)
-            advantages = local_batch.advantages.to(device)
-
-            if PAD_LEN - total_tokens > 0:
-                token_ids = torch.cat([token_ids, torch.zeros((1, PAD_LEN - total_tokens), dtype=token_ids.dtype, device=device)], dim=1)
-                
-            if seq_pad > 0:
-                advantages = torch.cat([advantages, torch.zeros(seq_pad, dtype=advantages.dtype, device=device)], dim=0)
-                local_batch.seq_lens.extend(dummy_seq_lens)
-                local_batch.prompt_lens.extend(dummy_seq_lens)
-                local_batch.response_lens.extend([0] * seq_pad)
-
+            token_ids, advantages, actual_seqs = pad_train_batch_to_static(
+                local_batch, device, PAD_LEN, MAX_SEQS
+            )
             seq_lens = local_batch.seq_lens
             prompt_lens = local_batch.prompt_lens
             response_lens = local_batch.response_lens
