@@ -4,6 +4,8 @@ kind: ServiceAccount
 metadata:
   name: ray-ksa 
   namespace: default # Change this if your Ray cluster is in a different namespace
+  annotations:
+      iam.gke.io/gcp-service-account: ray-tpu-gsa@tpu-pytorch.iam.gserviceaccount.com
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -51,11 +53,11 @@ spec:
               - containerPort: 8000  # OpenAI API
             resources:
               limits:
-                cpu: "6"
-                memory: "24Gi"
+                cpu: "12"
+                memory: "48Gi"
               requests:
-                cpu: "6"
-                memory: "24Gi"
+                cpu: "12"
+                memory: "48Gi"
             volumeMounts:
             - name: gcs-volume
               mountPath: /data
@@ -67,7 +69,7 @@ spec:
               bucketName: torchprime
               mountOptions: "implicit-dirs"
   workerGroupSpecs:
-    - replicas: 3 # use 3 slices
+    - replicas: 2 # use 2 slices
       numOfHosts: 2 # 2 host v6e8 chips 
       groupName: tpu-group
       rayStartParams: {}

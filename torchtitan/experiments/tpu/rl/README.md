@@ -1,5 +1,9 @@
 ## TorchTitan TPU GRPO Orchestrator (Ray)
 
+> [!WARNING]
+> **DEPRECATED:** This (mostly) collocated RL directory is deprecated. It is mostly intended for collocated training setups.
+> For the new, production-ready non-colocated (decoupled) RL training architecture, please use the new **[rl_nc_ray](../rl_nc_ray)** folder and consult its corresponding **[README.md](../rl_nc_ray/README.md)**.
+
 This directory contains a modular, collocated, and synchroized implementation of Group Relative Policy Optimization (GRPO) built on Ray for TPU clusters. 
 
 This implementation is highly inspired by `verl` but is tailored specifically for the constraints and extreme interconnect speed (ICI) of TPU v6e environments. It runs the **Policy Model (PyTorch FSDP)** and the **Sampler (vLLM)** collocated on the exact same TPU chips, using Ray to orchestrate the step loop.

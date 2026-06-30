@@ -145,7 +145,16 @@ def build_trainer_env_vars(rank: int, layout: dict, worker_pythonpath: str) -> t
         "PYTHONPATH": worker_pythonpath,
     }
     
-    if tpu_type == "v6e-8":
+
+    if tpu_type == "v6e-32":
+        # TODO: confirm this actually works for v6e-32
+        env_vars.update({
+            "TORCH_TPU_TOPOLOGY": "4,8,1" if trainer_world_size == 32 else ("2,2,1" if trainer_world_size == 4 else "1,1,1"),
+            "TPU_HOST_BOUNDS": "4,8,1" if trainer_world_size == 32 else ("2,2,1" if trainer_world_size == 4 else "1,1,1"),
+            "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
+            "CHIPS_PER_HOST": "4",
+        })
+    elif tpu_type == "v6e-8":
         env_vars.update({
             "TORCH_TPU_TOPOLOGY": "2,4,1" if trainer_world_size == 8 else ("2,2,1" if trainer_world_size == 4 else "1,1,1"),
             "TPU_HOST_BOUNDS": "2,4,1" if trainer_world_size == 8 else ("2,2,1" if trainer_world_size == 4 else "1,1,1"),
@@ -171,6 +180,7 @@ def build_generator_env_vars(layout: dict, worker_pythonpath: str) -> dict:
     sampler_nodes_info = layout["sampler_nodes_info"]
     generator_world_size = layout["generator_world_size"]
     generator_device_type = layout["generator_device_type"]
+    tpu_type = layout.get("tpu_type")
     
     generator_sb_addresses = []
     if sampler_nodes_info:
@@ -182,13 +192,24 @@ def build_generator_env_vars(layout: dict, worker_pythonpath: str) -> dict:
         for chip_idx in range(chips_per_host):
             generator_sb_addresses.append(f"127.0.0.1:{GENERATOR_BASE_PORT + chip_idx}")
 
+    # Determine correct topology for generator
+    # TODO: remove HACK once the generator/vLLM dynamically scales and handles the topology mapping natively.
+    if tpu_type == "v6e-32" and generator_world_size == 32:
+        topo = "4,8,1"
+    elif generator_world_size == 8:
+        topo = "2,4,1"
+    elif generator_world_size == 4:
+        topo = "2,2,1"
+    else:
+        topo = "1,1,1"
+
     generator_env_vars = {
         "TORCHTITAN_DEVICE_TYPE": generator_device_type,
         "SKIP_JAX_PRECOMPILE": "1",
         "VLLM_ENABLE_V1_MULTIPROCESSING": VLLM_ENABLE_V1_MULTIPROCESSING,
         "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-        "TPU_HOST_BOUNDS": "2,4,1" if generator_world_size == 8 else ("2,2,1" if generator_world_size == 4 else "1,1,1"),
-        "TORCH_TPU_TOPOLOGY": "2,4,1" if generator_world_size == 8 else ("2,2,1" if generator_world_size == 4 else "1,1,1"),
+        "TPU_HOST_BOUNDS": topo,
+        "TORCH_TPU_TOPOLOGY": topo,
         "CHIPS_PER_HOST": "4",
         "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(generator_sb_addresses),
         "TPU_PROCESS_ADDRESSES": ",".join(generator_sb_addresses),

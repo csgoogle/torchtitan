@@ -4,7 +4,7 @@
 export RAY_RUNTIME_ENV_IGNORE_GITIGNORE=1
 
 ray job submit \
-  --address="http://127.0.0.1:8266" \
+  --address="http://127.0.0.1:8265" \
   --working-dir . \
   --runtime-env-json '{"env_vars": {"PYTHONPATH": "torchtitan/experiments/tpu/rl_nc_ray/dummy_modules:.", "PYTHONUNBUFFERED": "1"}}' \
   -- \
