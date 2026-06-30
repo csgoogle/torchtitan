@@ -297,7 +297,12 @@ class PallasLossLinear(nn.Module):
   def __init__(self, original_linear: nn.Linear):
     super().__init__()
     self.original_linear = original_linear
-    self.weight = original_linear.weight
+
+  @property
+  def weight(self) -> torch.Tensor:
+    # Dynamically retrieve the weight to avoid caching a stale, unsharded
+    # reference before FSDP sharding.
+    return self.original_linear.weight
 
   def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return x, self.weight.t()
