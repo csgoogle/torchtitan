@@ -134,7 +134,7 @@ def qwen3_8b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           max_norm=1.0,
-          local_batch_size=1,
+          local_batch_size=2,
           seq_len=2048,
           steps=15,
           mixed_precision_reduce="bfloat16",
@@ -183,7 +183,7 @@ def qwen3_8b() -> TPUTrainerConfig:
           sa_block_kv_dq=512,
       ),
       loss_kernel=LossKernelConfig(
-          use_loss_kernel=False,
+          use_loss_kernel=True,
       ),
       validator=Validator.Config(
           enable=False,
