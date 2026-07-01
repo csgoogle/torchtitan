@@ -13,7 +13,6 @@ import os
 import torch
 import ray
 import torch.distributed.checkpoint as dcp
-import torch_tpu
 
 import torchtitan.experiments.tpu.rl_nc_ray  # Ensure mock runs first
 from torchtitan.experiments.tpu.rl_nc_ray.weight_transfer_utils import (
@@ -128,12 +127,18 @@ def load_initial_hf_weights_on_cpu(model, torchtitan_state_dict: dict) -> None:
 class RayTPUPolicyTrainer(PolicyTrainer):
 
     def __init__(self, *args, **kwargs):
-        # Ray actors don't have torchrun env vars by default.
         os.environ.setdefault("LOCAL_RANK", "0")
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29500")
+        
+        # Raise Dynamo limits locally to prevent serialization issues
+        import sys
+        dynamo_config = sys.modules.get("torch._dynamo.config")
+        if dynamo_config is not None:
+            dynamo_config.recompile_limit = 1024
+            dynamo_config.cache_size_limit = 1024
         
         target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
         tpu_utils.set_device_type(target_device)
@@ -196,6 +201,7 @@ class RayTPUPolicyTrainer(PolicyTrainer):
         
         target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
         if target_device == "tpu":
+            import torch_tpu
             torch_tpu._internal.sync.synchronize(wait=True)
             print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Sync 1 done")
             if torch.distributed.is_initialized():
