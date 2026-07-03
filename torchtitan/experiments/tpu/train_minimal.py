@@ -173,7 +173,7 @@ class TrainerMinimal:
           self.tokenizer.vocab_size,
           self.model_config.vocab_size,
       )
-      self.model_config.vocab_size = self.tokenizer.vocab_size
+      self.model_config.vocab_size = self.tokenizer.vocab_size  # pyrefly: ignore[missing-attribute]
 
     logger.info(
         f"Building {self.model_spec.name} {self.model_spec.flavor}"

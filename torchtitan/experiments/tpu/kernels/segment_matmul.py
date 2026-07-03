@@ -86,7 +86,7 @@ class _RaggedDotAutograd(torch.autograd.Function):
     return cast(torch.Tensor, fwd_op(lhs, rhs, group_sizes))
 
   @staticmethod
-  def backward(ctx, grad_output):
+  def backward(ctx, grad_output):  # pyrefly: ignore[bad-override]
     lhs, rhs, group_sizes = ctx.saved_tensors
     _, bwd_op = _get_ops()
     grad_lhs, grad_rhs = cast(

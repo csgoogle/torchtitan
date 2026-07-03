@@ -263,7 +263,7 @@ class _SplashAttentionFn(torch.autograd.Function):
 
   @staticmethod
   @torch.autograd.function.once_differentiable
-  def backward(ctx, grad_output):
+  def backward(ctx, grad_output):  # pyrefly: ignore[bad-override]
     q, k, v, out, logsumexp = ctx.saved_tensors
     # Direct backward — no extra forward inside JAX.
     grad_q, grad_k, grad_v = ctx.torch_bwd_fn(
@@ -301,7 +301,7 @@ def _get_splash_op_names(**splash_kwargs):
       mutates_args=(),
       schema="(Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor)",
   )
-  torch_fwd_fn.register_fake(
+  torch_fwd_fn.register_fake(  # pyrefly: ignore[missing-attribute]
       # lse: (batch, num_q_heads, q_seq_len, ??)
       lambda q, k, v: (
           torch.empty_like(q),
@@ -324,7 +324,7 @@ def _get_splash_op_names(**splash_kwargs):
           " grad_out) -> (Tensor, Tensor, Tensor)"
       ),
   )
-  torch_bwd_fn.register_fake(
+  torch_bwd_fn.register_fake(  # pyrefly: ignore[missing-attribute]
       lambda q, k, v, out, lse, grad_out: (
           torch.empty_like(q),
           torch.empty_like(k),

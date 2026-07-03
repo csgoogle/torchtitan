@@ -123,10 +123,10 @@ class redactedScannedModule(torch.nn.Module):
     super().__init__()
     assert module_list
     self.c = torchax.train.Container()
-    self.c.one_mod = module_list[0]
+    self.c.one_mod = module_list[0]  # pyrefly: ignore[missing-attribute]
     self.checkpoint_policy = checkpoint_policy
     weights = self._stack_layer_weights(module_list)
-    self.layer_weights_keys = list(self.c.one_mod.state_dict().keys())
+    self.layer_weights_keys = list(self.c.one_mod.state_dict().keys())  # pyrefly: ignore[missing-attribute]
     self.params = torch.nn.ParameterDict(
         {self._param_name_new(k): v for k, v in weights.items()}
     )
@@ -150,7 +150,7 @@ class redactedScannedModule(torch.nn.Module):
 
     def eval_one_layer(args, weight):
       (h,) = args
-      newh = torch.func.functional_call(self.c.one_mod, weight, (h,), kwargs)
+      newh = torch.func.functional_call(self.c.one_mod, weight, (h,), kwargs)  # pyrefly: ignore[missing-attribute]
       return (newh,), None
 
     if self.checkpoint_policy is None:
@@ -188,15 +188,15 @@ class ConformerScannedModule(torch.nn.Module):
     super().__init__()
     assert module_list
     self.c = torchax.train.Container()
-    self.c.one_mod = module_list[0]
+    self.c.one_mod = module_list[0]  # pyrefly: ignore[missing-attribute]
     self.checkpoint_policy = checkpoint_policy
     weights = self._stack_layer_weights(module_list)
-    self.layer_weights_keys = list(self.c.one_mod.state_dict().keys())
+    self.layer_weights_keys = list(self.c.one_mod.state_dict().keys())  # pyrefly: ignore[missing-attribute]
 
     self.params = torch.nn.ParameterDict()
     for k, v in weights.items():
       new_name = self._param_name_new(k)
-      if k in dict(self.c.one_mod.named_parameters()):
+      if k in dict(self.c.one_mod.named_parameters()):  # pyrefly: ignore[missing-attribute]
         if v.is_floating_point() or v.is_complex():
           self.params[new_name] = torch.nn.Parameter(v)
         else:
@@ -227,7 +227,7 @@ class ConformerScannedModule(torch.nn.Module):
 
     def eval_one_layer(args, weight):
       (h,) = args
-      newh = torch.func.functional_call(self.c.one_mod, weight, (h,), kwargs)
+      newh = torch.func.functional_call(self.c.one_mod, weight, (h,), kwargs)  # pyrefly: ignore[missing-attribute]
       return (newh,), weight
 
     if self.checkpoint_policy is None:

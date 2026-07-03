@@ -225,7 +225,7 @@ class TorchLinearLoss(torch.autograd.Function):
     return loss
 
   @staticmethod
-  def backward(ctx, grad_output):
+  def backward(ctx, grad_output):  # pyrefly: ignore[bad-override]
     x, labels, weights, lse = ctx.saved_tensors
     reduction = ctx.reduction
     implementation = ctx.implementation

@@ -12,7 +12,7 @@ def _model_spec(flavor: str) -> ModelSpec:
   return ModelSpec(
       name="llama3",
       flavor=flavor,
-      model=jax_llama3.args[flavor],
+      model=jax_llama3.args[flavor],  # pyrefly: ignore[bad-argument-type]
       parallelize_fn=lambda *args, **kwargs: None,
       pipelining_fn=None,
       post_optimizer_build_fn=None,

@@ -191,7 +191,7 @@ class JaxTrainer:
                     'num_layers.',
                     model_args.num_kv_reuse_layers, scaled,
                 )
-                model_args.num_kv_reuse_layers = scaled
+                model_args.num_kv_reuse_layers = scaled  # pyrefly: ignore[missing-attribute]
 
         # Choose activation checkpoint policy.
         ac_mode = job_config.activation_checkpoint.mode
@@ -269,7 +269,7 @@ class JaxTrainer:
         with jax.default_device(jax.local_devices(backend='cpu')[0]):
             if model_name == 'redacted':
                 model = jax_redacted.Transformer(
-                    model_args,
+                    model_args,  # pyrefly: ignore[bad-argument-type]
                     use_scan=use_scan,
                     attn_fn=attn_fn,
                     checkpoint_policy=checkpoint_policy,
@@ -279,7 +279,7 @@ class JaxTrainer:
                 )
             else:
                 model = jax_model_mod.Transformer(
-                    model_args,
+                    model_args,  # pyrefly: ignore[bad-argument-type]
                     use_scan=use_scan,
                     attn_fn=attn_fn,
                     checkpoint_policy=checkpoint_policy,

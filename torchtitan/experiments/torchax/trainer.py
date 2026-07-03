@@ -397,7 +397,7 @@ class TorchaxTrainer:
     replicated = jax.sharding.NamedSharding(self.mesh, P())
 
     if embedding_constants_key is not None:
-      state_dict[embedding_constants_key] = embedding_constants.to(
+      state_dict[embedding_constants_key] = embedding_constants.to(  # pyrefly: ignore[missing-attribute]
           'jax'
       ).apply_jax(jax.device_put, replicated)
     model.load_state_dict(state_dict, assign=True)
@@ -538,7 +538,7 @@ class TorchaxTrainer:
       else:
         raise ValueError(f'Unsupported MoE model: {job_config.model_spec.name}')
 
-      _, metrics_processor.num_flops_per_token = (
+      _, metrics_processor.num_flops_per_token = (  # pyrefly: ignore[bad-assignment]
           moe_utils.get_moe_model_nparams_and_flops(
               self.model_args, model, head_dims, job_config.training.seq_len
           )
@@ -625,8 +625,8 @@ class TorchaxTrainer:
         # Compile step specifically for the first iteration
         if job_config.torchax_config.split_compile:
           train_step = jit_utils.compile_split_step_func(
-              grad_step,
-              opt_step,
+              grad_step,  # pyrefly: ignore[unbound-name]
+              opt_step,  # pyrefly: ignore[unbound-name]
               jittable_mod.params,
               jittable_mod.buffers,
               opt_state,
@@ -649,7 +649,7 @@ class TorchaxTrainer:
 
       logger.debug('Model input shape: %s', inputs.shape)
 
-      loss, jittable_mod.params, opt_state = train_step(
+      loss, jittable_mod.params, opt_state = train_step(  # pyrefly: ignore[not-callable]
           jittable_mod.params, jittable_mod.buffers, opt_state, inputs, labels
       )
 

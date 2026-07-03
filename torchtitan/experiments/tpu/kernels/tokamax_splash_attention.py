@@ -436,7 +436,7 @@ def splash_sdpa(
     v_layout: str = "HEAD_DIM_MINOR",
 ) -> torch.Tensor:
   """Replacement for F.scaled_dot_product_attention using Tokamax splash attention."""
-  del (
+  del (  # pyrefly: ignore[unsupported-delete]
       enable_gqa,
       block_q,
       block_kv,

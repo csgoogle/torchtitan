@@ -38,7 +38,7 @@ class StartTrainerWithLossCapture:
 
       this.metrics_processor.log = patched_log
 
-    TPUTrainer.__init__ = patched_init
+    TPUTrainer.__init__ = patched_init  # pyrefly: ignore[bad-assignment]
 
     start_trainer(config)
 
@@ -112,7 +112,7 @@ class TrainCheckpointVerificationTest(
         config_args=save_args,
         data_parallel_shard_degree=-1,
         tensor_parallel_degree=1,
-        start_trainer=torchtitan.experiments.tpu.train.start_trainer,
+        start_trainer=torchtitan.experiments.tpu.train.start_trainer,  # pyrefly: ignore[bad-argument-type]
     )
 
     # Step 3: Checkpointed Run - Load & Resume (steps 3-5)
@@ -154,5 +154,5 @@ class TrainCheckpointVerificationTest(
 
 
 if __name__ == "__main__":
-  mp.set_start_method("spawn")
+  mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]
   absltest.main()

@@ -25,7 +25,7 @@ def tpu_splash_attention(
 ) -> jax.Array:
   """TPU Flash Attention."""
   if decoder_segment_ids is not None:
-    decoder_segment_ids = splash_attention_kernel.SegmentIds(
+    decoder_segment_ids = splash_attention_kernel.SegmentIds(  # pyrefly: ignore[bad-assignment]
         decoder_segment_ids, decoder_segment_ids)
 
   def wrap_flash_attention(query, key, value, decoder_segment_ids):

@@ -437,11 +437,11 @@ class TrainDistributedTest(
         tensor_parallel_degree=tensor_parallel_degree,
         data_parallel_replicate_degree=data_parallel_replicate_degree,
         skip_devices=skip_devices,
-        start_trainer=torchtitan.experiments.tpu.train.start_trainer,
+        start_trainer=torchtitan.experiments.tpu.train.start_trainer,  # pyrefly: ignore[bad-argument-type]
         enable_compile=enable_compile,
     )
 
 
 if __name__ == "__main__":
-  mp.set_start_method("spawn")
+  mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]
   absltest.main()

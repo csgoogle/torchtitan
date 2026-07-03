@@ -96,5 +96,5 @@ def build_cross_entropy_loss(
   if hasattr(job_config, "loss_kernel") and getattr(
       job_config.loss_kernel, "use_loss_kernel", True
   ):
-    return PallasCrossEntropyLoss(PallasCrossEntropyLoss.Config(), job_config)
+    return PallasCrossEntropyLoss(PallasCrossEntropyLoss.Config(), job_config)  # pyrefly: ignore[bad-argument-type]
   return components_loss.CrossEntropyLoss(components_loss.CrossEntropyLoss.Config())

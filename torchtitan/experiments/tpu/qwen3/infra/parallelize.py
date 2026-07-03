@@ -32,7 +32,7 @@ def parallelize_qwen3(
   if parallelism.use_simple_fsdp:
       # Apply all other parallelisms but skip data parallelism
       dtensor_parallelize.parallelize_qwen3(
-          model,
+          model,  # pyrefly: ignore[bad-argument-type]
           ac_config=ac_config,
           compile_config=compile_config,
           dump_folder=dump_folder,
@@ -61,7 +61,7 @@ def parallelize_qwen3(
       logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
   else:
       dtensor_parallelize.parallelize_qwen3(
-          model,
+          model,  # pyrefly: ignore[bad-argument-type]
           ac_config=ac_config,
           compile_config=compile_config,
           dump_folder=dump_folder,

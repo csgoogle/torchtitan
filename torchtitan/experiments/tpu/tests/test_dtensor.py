@@ -208,10 +208,10 @@ def parallelize_transformer_block_tp(
   parallelized_model = parallel.parallelize_module(
       model,
       device_mesh,
-      parallelize_plan=plan,
+      parallelize_plan=plan,  # pyrefly: ignore[bad-argument-type]
   )
 
-  return parallelized_model
+  return parallelized_model  # pyrefly: ignore[bad-return]
 
 
 def parallelize_transformer_block_tp_sp(
@@ -260,10 +260,10 @@ def parallelize_transformer_block_tp_sp(
   parallelized_model = parallel.parallelize_module(
       model,
       device_mesh,
-      parallelize_plan=plan,
+      parallelize_plan=plan,  # pyrefly: ignore[bad-argument-type]
   )
 
-  return parallelized_model
+  return parallelized_model  # pyrefly: ignore[bad-return]
 
 
 def parallelize_mlp(
@@ -295,10 +295,10 @@ def parallelize_mlp(
   parallelized_model = parallel.parallelize_module(
       model,
       device_mesh,
-      parallelize_plan=plan,
+      parallelize_plan=plan,  # pyrefly: ignore[bad-argument-type]
   )
 
-  return parallelized_model
+  return parallelized_model  # pyrefly: ignore[bad-return]
 
 
 def train_model(
@@ -717,7 +717,7 @@ def _test_transformer_block_compile_view_behavior(
   )
 
   # Compile ONLY the attention block
-  model_parallel.attention = torch.compile(
+  model_parallel.attention = torch.compile(  # pyrefly: ignore[bad-assignment]
       model_parallel.attention, backend=backend, fullgraph=True
   )
   logging.info("Rank %d: Compilation finished.", rank)
@@ -853,5 +853,5 @@ class TrainMLPDTensorTest(
 
 
 if __name__ == "__main__":
-  mp.set_start_method("spawn")
+  mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]
   absltest.main()

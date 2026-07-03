@@ -376,7 +376,7 @@ def use_gmm_kernel_patch(
     )
     return fn
 
-  torchtitan_moe.indices_padding_wrapper = bypassed_padding_wrapper
+  torchtitan_moe.indices_padding_wrapper = bypassed_padding_wrapper  # pyrefly: ignore[missing-attribute]
   torchtitan_moe._run_experts_grouped_mm = _custom_run_experts_grouped_mm
 
 
