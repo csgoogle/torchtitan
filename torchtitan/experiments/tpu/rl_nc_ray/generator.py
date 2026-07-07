@@ -46,19 +46,24 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
     import vllm
     
     try:
+        # Import ray_distributed_executor from vllm_torchtpu directly.
+        try:
+            from vllm_torchtpu.executors import ray_distributed_executor
+        except ImportError as e:
+            logger.warning(f"Failed to import ray_distributed_executor: {e}")
+            ray_distributed_executor = None
+
         # [TPU HACK 10]: `torchtpu-vllm`'s worker blindly imports `init_cached_hf_modules`,
         # which was removed/moved in newer vLLM codebase versions, instantly crashing workers.
         if "vllm.utils.import_utils" not in sys.modules:
             sys.modules["vllm.utils.import_utils"] = types.ModuleType("import_utils")
         sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
         
-        from tpu_inference.executors import ray_distributed_executor
-        
         # [TPU HACK 1]: Force MATH attention backend on driver.
         # TPU v6e (v6e) has limited VMEM. If the Pallas attention kernel requests 
         # exactly 128MB, XLA compilation crashes. Forcing the MATH backend avoids this.
         try:
-            import tpu_inference.platforms.tpu_platform as tpu_platform
+            import vllm_torchtpu.platforms.tpu_platform as tpu_platform
             from vllm.config import AttentionConfig
             from vllm.v1.attention.backends.registry import AttentionBackendEnum
             
@@ -74,8 +79,17 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
         # [TPU HACK 2]: Add missing 4-chip and 8-chip topologies to torchtpu-vllm.
         # The library hardcodes 16-chip multi-host topologies. We must inject our
         # smaller slice topologies for it to correctly dispatch PJRT clients.
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "2,2,1"
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,4,1"
+        try:
+            from vllm_torchtpu.platforms import tpu_platform
+            tpu_platform.TPU_MULTIHOST_TOPOLOGY_MAP[4] = "2,2,1"
+            tpu_platform.TPU_MULTIHOST_TOPOLOGY_MAP[8] = "2,4,1"
+        except Exception as e:
+            logger.warning(f"Failed to inject topologies to vllm_torchtpu: {e}")
+            if ray_distributed_executor is not None and hasattr(ray_distributed_executor, "TPU_TOPOLOGY_MAP"):
+                ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "2,2,1"
+                ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,4,1"
+            else:
+                logger.warning("Could not set topologies on ray_distributed_executor")
 
         # [TPU HACK 3]: Prevent torchtpu-vllm from claiming the entire Ray cluster.
         # torchtpu-vllm assumes it is the only application running on the Ray cluster.
@@ -110,8 +124,11 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
                 return res
             ray.cluster_resources = patched_cluster_resources
 
-        OriginalRayWorkerWrapper = ray_distributed_executor.RayWorkerWrapper
-        original_init_worker = OriginalRayWorkerWrapper.init_worker
+        if ray_distributed_executor is not None:
+            OriginalRayWorkerWrapper = ray_distributed_executor.RayWorkerWrapper
+            original_init_worker = OriginalRayWorkerWrapper.init_worker
+        else:
+            raise RuntimeError("ray_distributed_executor could not be imported from vllm_torchtpu.")
         
         # [TPU HACK 5]: Prevent vLLM from attempting to set CUDA devices on TPU workers.
         # vLLM's `RayWorkerWrapper.setup_device_if_necessary` explicitly accesses 

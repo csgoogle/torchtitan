@@ -121,7 +121,7 @@ def mock_vllm_distributed(tp_size: int):
     environment and allow arbitrary tp_size <= world_size.
     """
     try:
-        from tpu_inference.platforms.tpu_platform import TpuPlatform
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
         original_check = TpuPlatform.check_and_update_config
         def patched_check(cls, vllm_config):
             # Bypass single-host checks which strictly enforce tp_size == world_size
@@ -137,7 +137,7 @@ def mock_vllm_distributed(tp_size: int):
         # vLLM's TPUWorker explicitly requires the distributed_init_method to be a tcp:// URL.
         # If we don't patch this, it crashes instantly with: 
         # ValueError: Expected tcp://<host>:<port> distributed_init_method, got: 'env://'
-        from tpu_inference.worker.tpu_worker import TPUWorker
+        from vllm_torchtpu.worker.tpu_worker import TPUWorker
         original_init_device = TPUWorker.init_device
         def patched_init_device(self):
             if self.distributed_init_method == "env://":
@@ -150,7 +150,7 @@ def mock_vllm_distributed(tp_size: int):
         patch_tpu_worker = contextlib.nullcontext()
         
     try:
-        from tpu_inference.runner.tpu_runner import TPUModelRunner
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
         import jax
         import numpy as np
         from jax.sharding import Mesh
@@ -201,7 +201,7 @@ def mock_vllm_distributed(tp_size: int):
         # Bypass vLLM's complex model loader which attempts to orchestrate
         # multi-host compilations and can trigger deadlocks when FSDP holds locks.
         try:
-            from tpu_inference.runner.tpu_runner import TPUModelRunner
+            from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
             original_load = TPUModelRunner.load_model
             def patched_load(self):
                 self.device_config.device = torch.device("tpu")
@@ -209,7 +209,7 @@ def mock_vllm_distributed(tp_size: int):
                 self.vllm_config.device_config = self.device_config
                 from vllm.model_executor.model_loader import get_model_loader
                 model_loader = get_model_loader(self.load_config)
-                from tpu_inference.models.vllm.vllm_model_wrapper_context import set_vllm_model_wrapper_context
+                from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import set_vllm_model_wrapper_context
                 from vllm.config import set_current_vllm_config
                 with set_vllm_model_wrapper_context(mesh=self.mesh), \
                      set_current_vllm_config(self.vllm_config):

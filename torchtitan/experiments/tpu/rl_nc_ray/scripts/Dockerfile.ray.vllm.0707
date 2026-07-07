@@ -1,0 +1,63 @@
+# Use the latest Ray master as base (pinned to 2026-07-07 build).
+FROM rayproject/ray:nightly.260707.17e0db-py312-tpu
+
+RUN sudo apt-get update && sudo apt-get install -y build-essential libopenblas-base libopenmpi-dev libomp-dev
+RUN pip uninstall -y torch torchvision
+
+RUN pip install keyrings.google-artifactregistry-auth
+RUN pip install pandas==2.3.3
+
+ARG AUTH_TOKEN
+# Set the PIP_INDEX_URL environment variable to point to the Torch TPU virtual registry
+ENV PIP_INDEX_URL="https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+
+# --- Add torchtitan setup from Dockerfile ---
+USER root
+WORKDIR /
+
+RUN pip install "jax[tpu]==0.10.0" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+RUN pip install git+https://github.com/openxla/tokamax.git@8cba6a6a1e52e9efbb7ff8facb66f18f0bfcbe4c
+RUN pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+RUN pip install libtpu==0.0.41 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Pin torch_tpu to matching dependency version 0.1.1.dev20260630090312 to ensure alignment with vllm.
+# TODO: remove HACK once stable torch_tpu releases are published.
+RUN pip install --pre --no-deps torch_tpu==0.1.1.dev20260630090312
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+# COPY /.ci/docker/requirements-flux.txt .
+# RUN pip install -r requirements-flux.txt
+
+RUN pip install 'typeguard==2.13.3'
+RUN pip install portpicker absl-py numpy gcsfs frozendict triton fairscale numba scipy
+
+# --- Install vllm and torchtpu-vllm ---
+ARG GITHUB_USER
+ARG GITHUB_TOKEN
+RUN git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git
+RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/google-pytorch/torchtpu-vllm.git
+
+WORKDIR /torchtpu-vllm
+RUN git checkout 07cb06a
+WORKDIR /
+
+# Patch vLLM's TPU requirements to accept our local workspace in torchtpu-vllm instead of overriding it
+RUN sed -i '/tpu-inference/d' vllm/requirements/tpu.txt
+
+# Install vLLM in editable mode (forcing the 0.19.0 base version to prevent .dev prerelease mismatch during dependency resolution)
+WORKDIR /torchtpu-vllm
+
+# Hack pyproject.toml to pin versions of torch-tpu to match the installed package.
+# TODO: remove HACK once torchtpu-vllm accepts wider dev version bounds.
+RUN sed -i 's/libtpu==[0-9a-zA-Z.]*/libtpu==0.0.41/' pyproject.toml
+
+RUN pip install --upgrade pip && SETUPTOOLS_SCM_PRETEND_VERSION=0.22.1 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
+RUN pip install --pre -e .
+
+WORKDIR /app
+COPY torchtitan ./torchtitan
+# Add both /app and /app/torchtitan to PYTHONPATH so that both
+# standard package style (import torchtitan.*) and standalone module style
+# (import experiments.*) imports work seamlessly on both head and worker nodes.
+ENV PYTHONPATH="${PYTHONPATH}:/app:/app/torchtitan"

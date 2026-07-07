@@ -57,7 +57,7 @@ class VLLMWorker:
             json.dump(get_config_dict(), f)
 
         try:
-            from tpu_inference.executors import ray_distributed_executor
+            from vllm_torchtpu.executors import ray_distributed_executor
             ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "2,2,1"
             ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,4,1"
             
