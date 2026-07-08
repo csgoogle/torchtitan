@@ -60,6 +60,10 @@ class TPUTrainer(torchtitan.train.Trainer):
       tpu_config = job_config.tpu_config
       if not tpu_config.enable_amp:
         logger.info("AMP is disabled, using uniform precision training.")
+      if tpu_config.compile_optimizer:
+        from torchtitan.experiments.tpu.compiled_optimizer import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
+        apply_compiled_optimizer(self)
+
 
   def forward_backward_step(
       self,
@@ -162,6 +166,8 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     from torchtitan.experiments.tpu import workarounds
 
     workarounds.apply_patches(model, train_config)
+    if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
+      kwargs["tpu_compile_mode"] = train_config.tpu_config.compile_mode
     if model_spec.name in (
         "redacted",
         "redacted_tpu",

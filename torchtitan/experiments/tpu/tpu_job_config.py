@@ -17,6 +17,8 @@ class TPUConfig:
   # and the backward pass. This compiles two smaller XLA graphs instead of one
   # monolithic graph, significantly reducing first-step compilation time.
   use_graph_split: bool = False
+  # Compile AdamW step into its own separate FX graph (Q2 optimizer compile).
+  compile_optimizer: bool = False
   # Disable Automatic Mixed Precision (AMP), so all training is done in uniform
   # precision.
   enable_amp: bool = True

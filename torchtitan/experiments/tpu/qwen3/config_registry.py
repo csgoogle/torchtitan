@@ -32,8 +32,6 @@ from torchtitan.models.qwen3.config_registry import model_registry
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
-from torchtitan.tools.profiler import Profiler
-
 
 def qwen3_debugmodel() -> TPUTrainerConfig:
   """Qwen3 debug model configuration for TPU."""
@@ -108,6 +106,84 @@ def qwen3_moe_testmodel() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_1_7b() -> TPUTrainerConfig:
+  """Qwen3 1.7B model configuration for TPU."""
+  model_spec = model_registry("1.7B")
+  model_config = cast(Qwen3Model.Config, model_spec.model)
+  model_config.enable_weight_tying = False
+  model_config.tok_embeddings.param_init = {
+      "weight": partial(nn.init.normal_, std=1.0)
+  }
+  model_spec.parallelize_fn = tpu_parallelize_qwen3
+
+  return TPUTrainerConfig(
+      loss=CrossEntropyLoss.Config(),
+      hf_assets_path="./tests/assets/tokenizer",
+      model_spec=model_spec,
+      optimizer=OptimizersContainer.Config(lr=8e-4),
+      lr_scheduler=LRSchedulersContainer.Config(
+          warmup_steps=600,
+          decay_ratio=0.8,
+          decay_type="linear",
+          min_lr_factor=0.0,
+      ),
+      training=TrainingConfig(
+          max_norm=1.0,
+          local_batch_size=1,
+          seq_len=2048,
+          steps=15,
+          mixed_precision_reduce="bfloat16",
+      ),
+      dataloader=HuggingFaceTextDataLoader.Config(
+          dataset="c4_test",
+      ),
+      metrics=MetricsProcessor.Config(log_freq=1),
+      parallelism=ParallelismConfig(
+          use_simple_fsdp=True,
+      ),
+      checkpoint=CheckpointManager.Config(
+          enable=False,
+          interval=500,
+          last_save_model_only=False,
+      ),
+      activation_checkpoint=ActivationCheckpointConfig(
+          mode="full",
+      ),
+      tpu_config=TPUConfig(
+          eager_mode="DEFER_AND_FUSE",
+          use_graph_split=True,
+          use_jax_profiler=False,
+          compile_optimizer=False,
+          compile_mode="layer",
+      ),
+      compile=CompileConfig(
+          enable=True,
+          backend="tpu",
+          components=["model"],
+      ),
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          use_splash_attention_kernel=True,
+          sa_block_q=512,
+          sa_block_kv=512,
+          sa_block_dkv=512,
+          sa_block_kv_compute=512,
+          sa_block_q_dkv=512,
+          sa_block_kv_dkv=512,
+          sa_block_kv_dkv_compute=512,
+          sa_block_q_dq=512,
+          sa_block_kv_dq=512,
+      ),
+      loss_kernel=LossKernelConfig(
+          use_loss_kernel=False,
+      ),
+      validator=Validator.Config(
+          enable=False,
+          freq=5,
+          steps=10,
+      ),
+  )
+
+
 def qwen3_8b() -> TPUTrainerConfig:
   """Qwen3 8B model configuration for TPU."""
   model_spec = model_registry("8B")
@@ -143,12 +219,6 @@ def qwen3_8b() -> TPUTrainerConfig:
           dataset="c4_test",
       ),
       metrics=MetricsProcessor.Config(log_freq=1),
-      profiler=Profiler.Config(
-          enable_profiling=False,
-          profile_freq=4,
-          profiler_warmup=2,
-          profiler_active=1,
-      ),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
       ),
@@ -163,7 +233,9 @@ def qwen3_8b() -> TPUTrainerConfig:
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
           use_graph_split=True,
-          use_jax_profiler=True,
+          use_jax_profiler=False,
+          compile_optimizer=False,
+          compile_mode="layer",
       ),
       compile=CompileConfig(
           enable=True,

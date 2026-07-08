@@ -1,5 +1,7 @@
 """Parallelization utilities for Qwen3 models on TPU."""
 
+import dataclasses
+import torch
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
@@ -22,6 +24,8 @@ def parallelize_qwen3(
     ac_config: torchtitan.config.ActivationCheckpointConfig,
     dump_folder: str,
     skip_dp: bool = False,
+    tpu_compile_mode: str = "layer",
+    **kwargs,
 ) -> nn.Module:
   """Parallelizes the Qwen3 model, optionally applying Simple FSDP.
 
@@ -29,18 +33,27 @@ def parallelize_qwen3(
   `--parallelism.use_simple_fsdp` is set, it skips upstream Data Parallelism
   and instead applies the TPU-specific Simple FSDP implementation.
   """
+  compile_mode = tpu_compile_mode
+  effective_compile_config = compile_config
+  if compile_mode in ("whole", "fullgraph") and compile_config.enable:
+    effective_compile_config = dataclasses.replace(compile_config, enable=False)
+
   if parallelism.use_simple_fsdp:
       # Apply all other parallelisms but skip data parallelism
       dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]
           ac_config=ac_config,
-          compile_config=compile_config,
+          compile_config=effective_compile_config,
           dump_folder=dump_folder,
           parallel_dims=parallel_dims,
           parallelism=parallelism,
           skip_dp=True,
           training=training,
       )
+
+      if compile_mode in ("whole", "fullgraph") and compile_config.enable:
+          logger.info(f"Applying torch.compile to Whole Qwen3 Model (mode={compile_mode}).")
+          model = torch.compile(model, backend=compile_config.backend, fullgraph=True, dynamic=False)
 
       dp_mesh_names = (
           ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
@@ -63,11 +76,14 @@ def parallelize_qwen3(
       dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]
           ac_config=ac_config,
-          compile_config=compile_config,
+          compile_config=effective_compile_config,
           dump_folder=dump_folder,
           parallel_dims=parallel_dims,
           parallelism=parallelism,
           skip_dp=skip_dp,
           training=training,
       )
+      if compile_mode in ("whole", "fullgraph") and compile_config.enable:
+          logger.info(f"Applying torch.compile to Whole Qwen3 Model (mode={compile_mode}).")
+          model = torch.compile(model, backend=compile_config.backend, fullgraph=True, dynamic=False)
   return model

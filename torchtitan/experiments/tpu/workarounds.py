@@ -1,5 +1,5 @@
 import logging
-from typing import Any
+from typing import Any, Optional
 import torch
 from torch import nn
 from torch.nn.attention import sdpa_kernel
@@ -437,3 +437,6 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
     use_gmm_kernel_patch(model)
   if hasattr(job_config, "qwen3") and job_config.qwen3.use_fill_indices_kernel:
     use_fill_indices_patch(model)
+
+
+
