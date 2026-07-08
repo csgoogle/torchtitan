@@ -310,6 +310,14 @@ class TorchTitanVLLMModelWrapper(Module):
         # through so apply_compile runs per-layer after TP.
         from torchtitan.config import ActivationCheckpointConfig
 
+        # With TP, collectives may return AsyncCollectiveTensor (overlap
+        # path) or plain Tensor (sync path) depending on timing.  Dynamo
+        # specializes on tensor type, so each switch triggers a
+        # recompile.  Because of this, the default recompile_limit (8) is
+        # too low; exceeding it fails under
+        # fullgraph=True so set to 10 for now
+        if compile_config.enable:
+            torch._dynamo.config.recompile_limit = 100
 
         self.model = self.parallelize_fn(
             model=self.model,

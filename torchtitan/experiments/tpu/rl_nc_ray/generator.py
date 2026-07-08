@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # --- GLOBAL CONFIGURATION / CONSTANTS ---
 # TPU Hack Constants for Teleporting Configs to Ray Workers
 VLLM_ARGS_PATH_LOCAL = "/tmp/torchtitan_vllm_args.pkl"
-VLLM_ARGS_PATH_REMOTE = "/data/jialei/torchtitan_vllm_args.pkl"
+VLLM_ARGS_PATH_REMOTE = "/data/assets/torchtitan_vllm_args.pkl"
 VLLM_ARGS_PATH = VLLM_ARGS_PATH_LOCAL if os.environ.get("LOCAL_VM_RUN") == "1" else VLLM_ARGS_PATH_REMOTE
 
 
@@ -198,10 +198,6 @@ class RayVLLMGenerator:
             compile_config=compile_config,
             max_num_seqs=max_num_seqs
         )
-        dynamo_config = sys.modules.get("torch._dynamo.config")
-        if dynamo_config is not None:
-            dynamo_config.recompile_limit = 1024
-            dynamo_config.cache_size_limit = 1024
 
     def generate(self, *args, **kwargs):
         return asyncio.run(self.generator.generate(*args, **kwargs))

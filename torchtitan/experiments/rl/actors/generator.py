@@ -227,6 +227,8 @@ class VLLMGenerator(Actor, Configurable):
             
         from torchtitan.tools.utils import get_device_type
         if get_device_type() == "tpu":
+            # [TPU HACK]: We enforce a strict max sequence length to keep memory utilization safe.
+            # TODO: Remove those hardcoded configs and find a way to pass them through
             max_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "512"))
             engine_kwargs["max_model_len"] = max_len
             engine_kwargs["max_num_batched_tokens"] = max_len
