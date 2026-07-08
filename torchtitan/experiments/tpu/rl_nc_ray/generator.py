@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # --- GLOBAL CONFIGURATION / CONSTANTS ---
 # TPU Hack Constants for Teleporting Configs to Ray Workers
 VLLM_ARGS_PATH_LOCAL = "/tmp/torchtitan_vllm_args.pkl"
-VLLM_ARGS_PATH_REMOTE = "/data/jialei/torchtitan_vllm_args.pkl"
+VLLM_ARGS_PATH_REMOTE = "/data/assets/torchtitan_vllm_args.pkl"
 VLLM_ARGS_PATH = VLLM_ARGS_PATH_LOCAL if os.environ.get("LOCAL_VM_RUN") == "1" else VLLM_ARGS_PATH_REMOTE
 
 

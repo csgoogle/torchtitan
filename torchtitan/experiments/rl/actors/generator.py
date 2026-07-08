@@ -229,10 +229,12 @@ class VLLMGenerator(Actor, Configurable):
         if get_device_type() == "tpu":
             # [TPU HACK]: We enforce a strict max sequence length to keep memory utilization safe.
             # TODO: Remove those hardcoded configs and find a way to pass them through
-            engine_kwargs["max_model_len"] = 512
-            engine_kwargs["max_num_batched_tokens"] = 512
+            max_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "512"))
+            engine_kwargs["max_model_len"] = max_len
+            engine_kwargs["max_num_batched_tokens"] = max_len
             engine_kwargs["load_format"] = "dummy"  # we will load model weights later
             engine_kwargs["tokenizer"] = model_path
+
             
         engine_args = EngineArgs(**engine_kwargs)
 

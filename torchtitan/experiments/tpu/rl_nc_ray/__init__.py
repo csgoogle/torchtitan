@@ -23,19 +23,39 @@ from unittest.mock import MagicMock
 # disarms the monarch Actor base class.
 # =====================================================================
 
-if 'monarch' not in sys.modules:
-    sys.modules['torchstore'] = MagicMock()
-    sys.modules['monarch'] = MagicMock()
-    sys.modules['monarch.actor'] = MagicMock()
-    sys.modules['monarch.spmd'] = MagicMock()
-    sys.modules['monarch.rdma'] = MagicMock()
+class DummyActor:
+    pass
 
-    class DummyActor:
-        pass
+if 'monarch' not in sys.modules:
+    import types
+    sys.modules['torchstore'] = MagicMock()
+    
+    import os
+    real_file = os.path.abspath(__file__)
+    # Create real module objects for monarch instead of MagicMocks so they are serializable by reference
+    monarch = types.ModuleType("monarch")
+    monarch.__file__ = real_file
+    monarch_actor = types.ModuleType("monarch.actor")
+    monarch_actor.__file__ = real_file
+    monarch_spmd = types.ModuleType("monarch.spmd")
+    monarch_spmd.__file__ = real_file
+    monarch_rdma = types.ModuleType("monarch.rdma")
+    monarch_rdma.__file__ = real_file
+    
+    sys.modules['monarch'] = monarch
+    sys.modules['monarch.actor'] = monarch_actor
+    sys.modules['monarch.spmd'] = monarch_spmd
+    sys.modules['monarch.rdma'] = monarch_rdma
 
     def dummy_endpoint(func):
         return func
 
-    sys.modules['monarch.actor'].Actor = DummyActor
-    sys.modules['monarch.actor'].endpoint = dummy_endpoint
-    sys.modules['monarch.actor'].this_host = MagicMock()
+    async def dummy_setup_torch_elastic_env_async(*args, **kwargs):
+        pass
+
+    monarch_actor.Actor = DummyActor
+    monarch_actor.endpoint = dummy_endpoint
+    monarch_actor.this_host = MagicMock()
+    
+    monarch_rdma.is_rdma_available = lambda: False
+    monarch_spmd.setup_torch_elastic_env_async = dummy_setup_torch_elastic_env_async

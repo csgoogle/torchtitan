@@ -77,7 +77,7 @@ def grpo_qwen3_1_7b() -> GRPOJobConfig:
           parallelize_fn=parallelize_qwen3,
           pipelining_fn=None,
           post_optimizer_build_fn=None,
-          state_dict_adapter=None,
+          state_dict_adapter=Qwen3StateDictAdapter,
       ),
       model=ModelConfig(name="qwen3_tpu", flavor="1.7B"),
       training=GRPOTrainingConfig(
@@ -102,6 +102,12 @@ def grpo_qwen3_1_7b() -> GRPOJobConfig:
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=4),
       metrics=MetricsProcessor.Config(log_freq=1),
       grpo=GRPOConfig(group_size=4, grpo_beta=0.1),
+      hf_assets_path="assets/hf/Qwen3-1.7B",
+      checkpoint=CheckpointManager.Config(
+          initial_load_path="assets/hf/Qwen3-1.7B",
+          initial_load_model_only=True,
+          initial_load_in_hf=True,
+      ),
   )
 
 
