@@ -11,10 +11,10 @@ def get_accelerator_short_name(device_kind: str) -> str:
     if 'v4' in device_lower:
         return 'v4'
     # v5e is reported as 'TPU v5 lite'
-    if 'v5 lite' in device_lower:
+    if 'v5e' in device_lower:
         return 'v5e'
     # v5p is reported as 'TPU v5'
-    if device_kind == 'TPU v5':
+    if device_kind == 'TPU v5p':
         return 'v5p'
     if 'v6' in device_lower:
         return 'v6e'
