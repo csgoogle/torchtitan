@@ -230,6 +230,14 @@ class ParallelismConfig:
     pp and dp_replicate are outer dimensions unaffected by this constraint.
     """
 
+    tpu_rank_sorting: Literal["default", "contiguous", "host"] = "default"
+    """
+    Specifies the topology-aware rank sorting logic to use on TPU devices.
+    - "default" uses Torch's default init_device_mesh sorting (no topology sorting).
+    - "contiguous" sorts ranks by coordinates (Z, Y, X row-major) to keep them physically contiguous.
+    - "host" sorts ranks preserving 2x2 TPU host boundaries.
+    """
+
 
 @dataclass(kw_only=True, slots=True)
 class ActivationCheckpointConfig:

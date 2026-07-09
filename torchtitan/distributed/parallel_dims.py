@@ -15,6 +15,109 @@ from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import get_device_type
 
 
+import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from typing import Tuple, Optional
+import math
+import os
+
+
+def init_topology_aware_mesh(
+    device_type: str,
+    mesh_shape: Tuple[int, ...],
+    topology: str,
+    mesh_dim_names: Optional[Tuple[str, ...]] = None,
+) -> DeviceMesh:
+    """
+    A drop-in replacement for `torch.distributed.init_device_mesh` that maps 
+    PyTorch ranks to physically contiguous TPU coordinates or host boundaries.
+    """
+    if topology == "default":
+        return init_device_mesh(device_type, mesh_shape, mesh_dim_names=mesh_dim_names)
+
+    if not dist.is_initialized():
+        dist.init_process_group(device_type)
+
+    world_size = dist.get_world_size()
+    if math.prod(mesh_shape) != world_size:
+        raise ValueError(
+            f"Mesh shape {mesh_shape} product must equal world_size {world_size}"
+        )
+
+    try:
+        import jax
+    except ImportError:
+        raise ImportError("jax is required to discover TPU physical coordinates.")
+
+    # 1. Discover physical coordinates for the local PyTorch rank
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    local_devices = jax.local_devices()
+    local_dev = local_devices[local_rank % len(local_devices)]
+
+    # Ensure coordinates are 4D (x, y, z, core). JAX usually returns [x, y, z, c]
+    # for 4D topologies, or [x, y, z] for 3D coordinates. We pad with 0s up to 4D.
+    coords = list(local_dev.coords)
+    while len(coords) < 4:
+        coords.append(0)
+
+    # 2. Gather coordinates from all PyTorch ranks
+    # Tensor format: [x, y, z, c]
+    t_coords = torch.tensor(coords, dtype=torch.int32, device=device_type)
+    gathered_coords = [torch.zeros_like(t_coords) for _ in range(world_size)]
+    dist.all_gather(gathered_coords, t_coords)
+
+    # 3. Associate each PyTorch rank with its physical coordinates
+    ranks_and_coords = []
+    for rank, data in enumerate(gathered_coords):
+        x, y, z, c = data.tolist()
+        ranks_and_coords.append((rank, x, y, z, c))
+
+    if dist.get_rank() == 0:
+        print("Physical coordinates of ranks:")
+        for rank, x, y, z, c in ranks_and_coords:
+            print(f"Rank {rank}: ({x}, {y}, {z}, {c})")
+
+    # 4. Sort ranks by physical coordinates based on chosen topology strategy
+    if topology == "contiguous":
+        # Sort ranks by physical coordinates (Row-Major: Z, then Y, then X, then C)
+        # This guarantees that the flattened list is physically contiguous.
+        ranks_and_coords.sort(key=lambda item: (item[3], item[2], item[1], item[4]))
+    elif topology == "host":
+        # Sort ranks by physical coordinates, PRESERVING 2x2 host boundaries
+        # Host coords: (Y // 2, X // 2). Chip coords within host: (Y % 2, X % 2)
+        ranks_and_coords.sort(
+            key=lambda item: (
+                item[3],           # Z
+                item[2] // 2,      # Host Y
+                item[1] // 2,      # Host X
+                item[2] % 2,       # Chip Y (inside host)
+                item[1] % 2,       # Chip X (inside host)
+                item[4]            # Core (C)
+            )
+        )
+    else:
+        raise ValueError(f"Unknown TPU topology sort type: {topology}")
+
+    sorted_ranks = [item[0] for item in ranks_and_coords]
+
+    if dist.get_rank() == 0:
+        print("Sorted ranks by physical coordinates:")
+        for rank in sorted_ranks:
+            x, y, z, c = gathered_coords[rank].tolist()
+            print(f"Rank {rank}: ({x}, {y}, {z}, {c})")
+
+    # 5. Build and reshape the DeviceMesh
+    mesh_ids = torch.tensor(sorted_ranks, dtype=torch.int32).view(*mesh_shape)
+
+    if dist.get_rank() == 0:
+        print("mesh_ids:", mesh_ids)
+
+    return DeviceMesh(device_type, mesh_ids, mesh_dim_names=mesh_dim_names)
+
+
+
 __all__ = ["ParallelDims"]
 
 
@@ -27,6 +130,7 @@ class ParallelDims:
     pp: int
     ep: int
     world_size: int
+    tpu_rank_sorting: str = "default"
 
     _meshes: dict[str, DeviceMesh] = field(default_factory=dict)
     _world_mesh: DeviceMesh | None = None
@@ -43,6 +147,7 @@ class ParallelDims:
             pp=parallelism_config.pipeline_parallel_degree,
             ep=parallelism_config.expert_parallel_degree,
             world_size=world_size,
+            tpu_rank_sorting=parallelism_config.tpu_rank_sorting,
         )
 
     def __post_init__(self):
@@ -152,9 +257,19 @@ class ParallelDims:
         fsdp = self.dp_shard * self.cp
         efsdp = fsdp * self.tp // self.ep
 
-        self._world_mesh = init_device_mesh(
-            get_device_type(), (self.world_size,), mesh_dim_names=("world",)
-        )
+        device_type = get_device_type()
+        if device_type != "tpu":
+            self._world_mesh = init_device_mesh(
+                device_type, (self.world_size,), mesh_dim_names=("world",)
+            )
+        else:
+            self._world_mesh = init_topology_aware_mesh(
+                device_type,
+                (self.world_size,),
+                self.tpu_rank_sorting,
+                mesh_dim_names=("world",),
+            )
+
         dataloading_mesh = unflatten_mesh(
             self._world_mesh,
             ("pp", "batch", "cp", "tp"),
