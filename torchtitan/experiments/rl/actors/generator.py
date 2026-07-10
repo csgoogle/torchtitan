@@ -214,7 +214,8 @@ class VLLMGenerator(Actor, Configurable):
         )
         engine_kwargs["max_num_seqs"] = self._max_num_seqs
         # FA2 requires block_size to be a multiple of 256
-        if not has_cuda_capability(9, 0):
+        from torchtitan.tools.utils import get_device_type
+        if get_device_type() != "tpu" and not has_cuda_capability(9, 0):
             engine_kwargs["block_size"] = 256
         vllm_compilation_config = config.cudagraph.get_vllm_compilation_config(
             max_num_seqs=self._max_num_seqs,
@@ -223,6 +224,18 @@ class VLLMGenerator(Actor, Configurable):
             engine_kwargs["compilation_config"] = vllm_compilation_config
         if config.debug.seed is not None:
             engine_kwargs["seed"] = config.debug.seed
+            
+        from torchtitan.tools.utils import get_device_type
+        if get_device_type() == "tpu":
+            # [TPU HACK]: We enforce a strict max sequence length to keep memory utilization safe.
+            # TODO: Remove those hardcoded configs and find a way to pass them through
+            max_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "512"))
+            engine_kwargs["max_model_len"] = max_len
+            engine_kwargs["max_num_batched_tokens"] = max_len
+            engine_kwargs["load_format"] = "dummy"  # we will load model weights later
+            engine_kwargs["tokenizer"] = model_path
+
+            
         engine_args = EngineArgs(**engine_kwargs)
 
         logger.info("Initializing LLMEngine from EngineArgs...")

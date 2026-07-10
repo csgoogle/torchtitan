@@ -16,7 +16,7 @@ from torch.nn.attention import (
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import warn_once
-from torchtitan.tools.utils import has_cuda_capability
+from torchtitan.tools.utils import has_cuda_capability, get_device_type
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn import (
@@ -298,11 +298,18 @@ class VLLMAttentionWrapper(Module):
         """
         batch_size, seq_len, _, head_dim = q.shape
 
-        # vllm attention expects (bs*seqlen, n_heads, head_dim)
-        # (bs, seq, heads, dim) is contiguous, so reshape is zero-copy
-        q = q.reshape(batch_size * seq_len, -1, head_dim)
-        k = k.reshape(batch_size * seq_len, -1, head_dim)
-        v = v.reshape(batch_size * seq_len, -1, head_dim)
+        if get_device_type() == "tpu":
+            # vllm attention expects (bs*seqlen, hidden_dim) on TPU
+            # (bs, seq, heads, dim) is contiguous, so reshape is zero-copy
+            q = q.reshape(batch_size * seq_len, -1)
+            k = k.reshape(batch_size * seq_len, -1)
+            v = v.reshape(batch_size * seq_len, -1)
+        else:
+            # vllm attention expects (bs*seqlen, n_heads, head_dim)
+            # (bs, seq, heads, dim) is contiguous, so reshape is zero-copy
+            q = q.reshape(batch_size * seq_len, -1, head_dim)
+            k = k.reshape(batch_size * seq_len, -1, head_dim)
+            v = v.reshape(batch_size * seq_len, -1, head_dim)
 
         output_flat = self.vllm_attn(q, k, v)
 
