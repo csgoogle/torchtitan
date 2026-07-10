@@ -115,7 +115,53 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
     )
 
 
+def rl_grpo_qwen3_4b() -> RLTrainer.Config:
+    """GRPO training config for Qwen3-4B."""
+    group_size = 8
+    return RLTrainer.Config(
+        model_spec=model_registry("4B", attn_backend="varlen"),
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-4B",
+        num_steps=10,
+        num_prompts_per_step=5,
+        num_validation_samples=20,
+        compile=CompileConfig(enable=True, backend="aot_eager"),
+        env=SumDigitsEnv.Config(seed=42, correctness_reward=1.0, format_reward=0.3),
+        validation_env=SumDigitsEnv.Config(
+            seed=99, correctness_reward=1.0, format_reward=0.3
+        ),
+        trainer=PolicyTrainer.Config(
+            optimizer=OptimizersContainer.Config(lr=2e-6),
+            lr_scheduler=LRSchedulersContainer.Config(
+                warmup_steps=2,
+                decay_type="linear",
+            ),
+            training=TrainingConfig(),
+            parallelism=ParallelismConfig(
+                data_parallel_shard_degree=1,
+                tensor_parallel_degree=2,
+                disable_loss_parallel=True,
+            ),
+            loss=GRPOLoss.Config(),
+        ),
+        generator=VLLMGenerator.Config(
+            model_dtype="bfloat16",
+            parallelism=ParallelismConfig(
+                data_parallel_shard_degree=1,
+                tensor_parallel_degree=4,
+                data_parallel_replicate_degree=1,
+            ),
+            sampling=SamplingConfig(
+                n=group_size,
+                temperature=0.8,
+                top_p=0.95,
+                max_tokens=100,
+            ),
+        ),
+    )
+
+
 def rl_grpo_qwen3_14b() -> RLTrainer.Config:
+
     """GRPO training config for Qwen3-14B (16 GPUs: 8 gen + 8 train)."""
     group_size = 8
     return RLTrainer.Config(
