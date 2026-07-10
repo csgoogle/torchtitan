@@ -17,6 +17,7 @@ import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
 from torchtitan.tools import utils
+from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 
 
 
@@ -34,6 +35,7 @@ def setup_logger():
 def _run_model_distributed(
     train_config: torchtitan.experiments.tpu.tpu_job_config.TPUTrainerConfig,
 ):
+  use_cpu_safe_histc_patch()
   device = tpu_utils.get_device()
   world_size = int(os.environ.get("WORLD_SIZE", 1))
   if world_size > 1:
@@ -163,12 +165,6 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
-          skip_devices=[
-              # b/501466433 - Bug with torch.compile
-              device_type.AcceleratorDeviceType.TPU,
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-          ],
       ),
       dict(
           testcase_name="qwen3_tp_dtensor",
@@ -184,12 +180,6 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
-          skip_devices=[
-              # b/501466433 - Bug with torch.compile
-              device_type.AcceleratorDeviceType.TPU,
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-          ],
       ),
       dict(
           testcase_name="deepseek_v3_tp_dtensor",
@@ -208,8 +198,6 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           skip_devices=[
               # b/501466433 - Bug with torch.compile
               device_type.AcceleratorDeviceType.TPU,
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
       dict(
@@ -220,10 +208,6 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
-          skip_devices=[
-              # b/501467380 - Error during backward pass
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
       dict(
           testcase_name="flux_tp_dtensor_compile",
@@ -234,12 +218,6 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
-          skip_devices=[
-              # b/501466433 - Bug with torch.compile
-              device_type.AcceleratorDeviceType.TPU,
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-          ],
       ),
   ])
   def test_model_distributed(
