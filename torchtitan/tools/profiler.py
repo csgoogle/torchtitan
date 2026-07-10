@@ -305,14 +305,18 @@ class Profiler(Configurable):
         ), "profile_freq must be greater than or equal to warmup + active"
         device_type = get_device_type()
         activities = [torch.profiler.ProfilerActivity.CPU]
+        experimental_config = None
         if device_type == "tpu":
             activities.append(torch.profiler.ProfilerActivity.TPU)  # type: ignore
+            from torch_tpu._internal.profiler import TpuProfilerConfig  # pylint: disable=g-import-not-at-top
+            import pathlib  # pylint: disable=g-import-not-at-top
 
-            # TPU profiler C++ backend still relies on the environment variable
-            # to determine where to dump the raw .xplane.pb files.
             tpu_trace_dir = os.path.join(trace_dir, f"rank_{rank}")
-            os.makedirs(tpu_trace_dir, exist_ok=True)
-            os.environ["TPU_PROFILER_OUTPUT_DIR"] = tpu_trace_dir
+            experimental_config = TpuProfilerConfig(
+                host_tracer_level=2,
+                device_tracer_level=1,
+                run_dir=pathlib.Path(tpu_trace_dir),
+            )
         elif torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         elif torch.xpu.is_available():
@@ -325,6 +329,7 @@ class Profiler(Configurable):
             ),
             on_trace_ready=trace_handler,
             record_shapes=True,
+            experimental_config=experimental_config,
         )
         torch_profiler.__enter__()
         torch_profiler.step_num = global_step
