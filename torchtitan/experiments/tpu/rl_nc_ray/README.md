@@ -18,8 +18,10 @@ The orchestrator (`grpo.py`) runs on the Ray head node, launching remote `RayTPU
 
 ### 3. `e2e_recipe_gke.sh`
 - The main production script for running an end-to-end training job across a full multi-host GKE Ray cluster.
-- Runs 8-way Tensor Parallelism for the vLLM Generator and 2D sharding (FSDP x DP) for the Policy Trainer.
-- Contains the exact job orchestration, model hyperparameters, and token generation parameters.
+- Supports training multiple model sizes: Qwen3-0.6B (default), Qwen3-1.7B, and Qwen3-4B.
+- Configures 8-way Tensor Parallelism for the vLLM Generator and 2D sharding (FSDP x DP) for the Policy Trainer.
+- Accepts a model size argument and forwards extra arguments directly to `grpo.py`.
+
 
 ---
 
@@ -102,10 +104,17 @@ kubectl port-forward svc/ray-tpu-v6e-cluster-head-svc 8265:8265 10001:10001
 ```
 
 #### E. Submit the Decoupled Training Job
-With the port-forward connection active, launch the training job from your local workspace:
+With the port-forward connection active, launch the training job from your local workspace by specifying the model size (`0.6b`, `1.7b`, or `4b`):
 
 ```bash
-bash torchtitan/experiments/tpu/rl_nc_ray/scripts/e2e_recipe_gke.sh
+# Run Qwen3-0.6B (default)
+bash torchtitan/experiments/tpu/rl_nc_ray/scripts/e2e_recipe_gke.sh 0.6b
+
+# Run Qwen3-1.7B
+bash torchtitan/experiments/tpu/rl_nc_ray/scripts/e2e_recipe_gke.sh 1.7b
+
+# Run Qwen3-4B
+bash torchtitan/experiments/tpu/rl_nc_ray/scripts/e2e_recipe_gke.sh 4b
 ```
 
 #### F. Monitor Job Status & Training Logs
