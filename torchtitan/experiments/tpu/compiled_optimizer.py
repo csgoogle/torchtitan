@@ -6,6 +6,9 @@ backward autograd graphs, leaving `optimizer.step()` running in eager mode with
 `optimizer.step()`, functionalizes the optimizer (e.g. AdamW) via
 `minimal_fx_tracer`, and compiles it via `StaticCompiler` into a single static
 XLA graph executable to eliminate host dispatch overhead.
+
+Adapted from _build_compiled_optimizer_groups from
+https://github.com/google-pytorch/torchtitan/blob/whc/qwen/torchtitan/experiments/tpu_qwen/lib/tpu_graph_trainer.py
 """
 
 from typing import Any, Optional
