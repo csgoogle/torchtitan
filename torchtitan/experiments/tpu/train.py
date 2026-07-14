@@ -167,7 +167,8 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
 
     workarounds.apply_patches(model, train_config)
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
-      kwargs["tpu_compile_mode"] = train_config.tpu_config.compile_mode
+      if model_spec.name in ("llama3", "qwen3"):
+        kwargs["tpu_compile_mode"] = train_config.tpu_config.compile_mode
     if model_spec.name in (
         "redacted",
         "redacted_tpu",
