@@ -152,7 +152,7 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=True,
+          use_graph_split=False,
       ),
       compile=CompileConfig(
           enable=True,
@@ -243,4 +243,3 @@ def llama3_70b() -> TPUTrainerConfig:
           use_loss_kernel=True,
       ),
   )
-
