@@ -81,6 +81,9 @@ class LinearSoftmaxCrossEntropyLossTest(
             weights_tpu,
             reduction=reduction,
             implementation=implementation,
+            b_block_size=128,
+            h_block_size=128,
+            v_block_size=128,
         )
     )
 
