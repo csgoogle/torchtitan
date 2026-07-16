@@ -6,7 +6,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields, replace
-from typing import Literal
+from typing import Any, Literal
 
 from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
 from torchtitan.config import ActivationCheckpointConfig
@@ -83,6 +83,7 @@ class GraphTrainerCompileConfig(CompileConfig):
 def to_graph_trainer_config(
     base_config: Trainer.Config,
     model_registry: Callable[[str], ModelSpec],
+    target_cls: Any = None,
 ) -> "GraphTrainer.Config":
     """Convert a base Trainer.Config to a GraphTrainer.Config.
 
@@ -93,8 +94,16 @@ def to_graph_trainer_config(
     from .cudagraph import cudagraph_annotate_trace_post_processor
     from .trainer import GraphTrainer
 
+    if target_cls is None:
+        target_cls = GraphTrainer.Config
+
     d = {f.name: getattr(base_config, f.name) for f in fields(base_config)}
-    graph_spec = model_registry(base_config.model_spec.flavor)
+    flavor = (
+        base_config.model_spec.flavor
+        if hasattr(base_config, "model_spec") and base_config.model_spec is not None
+        else base_config.model.flavor
+    )
+    graph_spec = model_registry(flavor)
     # Wrap the base model config in the graph_trainer's model config class
     # (e.g. GraphTrainerQwen3Model.Config) while preserving all field values
     # (including moe_comm_backend etc.).
@@ -110,7 +119,7 @@ def to_graph_trainer_config(
         parallelize_fn=graph_spec.parallelize_fn,
         model=graph_model,
     )
-    d.pop("compile")
+    d.pop("compile", None)
 
     # graph_trainer uses graph-based SAC instead of eager AC. Override any
     # non-"none" AC mode to "selective" so callers don't need per-config fixups.
@@ -129,4 +138,4 @@ def to_graph_trainer_config(
     if profiler is not None:
         profiler.trace_post_processor = cudagraph_annotate_trace_post_processor()
 
-    return GraphTrainer.Config(**d)
+    return target_cls(**d)

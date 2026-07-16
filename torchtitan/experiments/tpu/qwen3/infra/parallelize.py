@@ -35,12 +35,12 @@ def parallelize_qwen3(
   """
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
-  if compile_mode in ("whole", "fullgraph") and compile_config.enable:
+  if compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
 
   if parallelism.use_simple_fsdp:
-      # Apply all other parallelisms but skip data parallelism
-      dtensor_parallelize.parallelize_qwen3(
+    # Apply all other parallelisms but skip data parallelism
+    dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]
           ac_config=ac_config,
           compile_config=effective_compile_config,
@@ -51,29 +51,25 @@ def parallelize_qwen3(
           training=training,
       )
 
-      if compile_mode in ("whole", "fullgraph") and compile_config.enable:
-          logger.info(f"Applying torch.compile to Whole Qwen3 Model (mode={compile_mode}).")
-          model = torch.compile(model, backend=compile_config.backend, fullgraph=True, dynamic=False)
-
-      dp_mesh_names = (
+    dp_mesh_names = (
           ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
       )
-      dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+    dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
 
-      dp_mode = "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
-      mp_policy = SimpleFSDPMixedPrecisionPolicy(
+    dp_mode = "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
+    mp_policy = SimpleFSDPMixedPrecisionPolicy(
           param_dtype=torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_param],
           reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_reduce],
       )
-      model = simple_fsdp_data_parallel(
+    model = simple_fsdp_data_parallel(
           model,
           dp_mesh,
           mode=dp_mode,
           mp_policy=mp_policy,
       )
-      logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
+    logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
   else:
-      dtensor_parallelize.parallelize_qwen3(
+    dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]
           ac_config=ac_config,
           compile_config=effective_compile_config,
@@ -83,7 +79,6 @@ def parallelize_qwen3(
           skip_dp=skip_dp,
           training=training,
       )
-      if compile_mode in ("whole", "fullgraph") and compile_config.enable:
-          logger.info(f"Applying torch.compile to Whole Qwen3 Model (mode={compile_mode}).")
-          model = torch.compile(model, backend=compile_config.backend, fullgraph=True, dynamic=False)
+  if compile_mode == "fullgraph":
+    model = torch.compile(model, fullgraph=True, backend="tpu")
   return model

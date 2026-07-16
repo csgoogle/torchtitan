@@ -52,7 +52,7 @@ def parallelize_llama(
 
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
-  if compile_mode in ("whole", "fullgraph") and compile_config.enable:
+  if compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
 
   if parallelism.use_simple_fsdp:
@@ -66,14 +66,6 @@ def parallelize_llama(
           parallelism=parallelism,
           training=training,
           skip_dp=True,
-      )
-
-    if compile_mode in ("whole", "fullgraph") and compile_config.enable:
-      logger.info(
-          f"Applying torch.compile to Whole Llama Model (mode={compile_mode})."
-      )
-      model = torch.compile(
-          model, backend=compile_config.backend, fullgraph=True, dynamic=False
       )
 
     dp_mesh_names = (
@@ -104,11 +96,6 @@ def parallelize_llama(
           training=training,
           skip_dp=skip_dp,
       )
-    if compile_mode in ("whole", "fullgraph") and compile_config.enable:
-      logger.info(
-          f"Applying torch.compile to Whole Llama Model (mode={compile_mode})."
-      )
-      model = torch.compile(
-          model, backend=compile_config.backend, fullgraph=True, dynamic=False
-      )
+  if compile_mode == "fullgraph":
+    model = torch.compile(model, fullgraph=True, backend="tpu")
   return model

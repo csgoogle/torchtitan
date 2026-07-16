@@ -148,7 +148,7 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
   _causal = 0
   for _, module in model.named_modules():
     cls_name = type(module).__name__
-    if cls_name == "ScaledDotProductAttention":
+    if "ScaledDotProductAttention" in cls_name:
       if "[redacted]" in type(module).__module__:
         module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
       else:
@@ -160,9 +160,10 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
         _causal += 1
 
   if _patched == 0:
+    all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
     raise ValueError(
         "Splash attention patch was requested but NO matching attention "
-        "modules (ScaledDotProductAttention) were found in the model."
+        f"modules (ScaledDotProductAttention) were found in the model. Found module types: {all_classes}"
     )
   else:
     logger.info(
@@ -267,7 +268,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
   _causal = 0
   for _, module in model.named_modules():
     cls_name = type(module).__name__
-    if cls_name == "ScaledDotProductAttention":
+    if "ScaledDotProductAttention" in cls_name:
       if "[redacted]" in type(module).__module__:
         module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
       else:
@@ -279,9 +280,10 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         _causal += 1
 
   if _patched == 0:
+    all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
     raise ValueError(
         "Tokamax splash attention patch was requested but NO matching "
-        "attention modules (ScaledDotProductAttention) were found in the model."
+        f"attention modules (ScaledDotProductAttention) were found in the model. Found module types: {all_classes}"
     )
   else:
     logger.info(
