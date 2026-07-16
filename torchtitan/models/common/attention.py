@@ -247,7 +247,7 @@ class FlexAttention(Module):
 
 
 class ScaledDotProductAttention(Module):
-    """Inner attention using ``F.scaled_dot_product_attention`` with CP support.
+  """Inner attention using ``F.scaled_dot_product_attention`` with CP support.
 
     Each backend handles its own layout transpose: ``forward()`` transposes from
     ``(bs, seq, heads, dim)`` to ``(bs, heads, seq, dim)`` before calling
@@ -258,42 +258,55 @@ class ScaledDotProductAttention(Module):
         compatible with _ContextParallel.
     """
 
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        pass
+  @dataclass(kw_only=True, slots=True)
+  class Config(Module.Config):
+    pass
 
-    sdpa_backends: list[SDPBackend] = []
+  sdpa_backends: list[SDPBackend] = []
 
-    def __init__(self, config: Config) -> None:
-        if config is None:
-            config = ScaledDotProductAttention.Config()
-        super().__init__()
-        if not self.sdpa_backends:
-            self.sdpa_backends = [
+  def __init__(self, config: Config) -> None:
+    if config is None:
+      config = ScaledDotProductAttention.Config()
+    super().__init__()
+    if not self.sdpa_backends:
+      self.sdpa_backends = [
                 SDPBackend.CUDNN_ATTENTION,
                 SDPBackend.FLASH_ATTENTION,
                 SDPBackend.MATH,
             ]
 
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        scale: float | None = None,
-        enable_gqa: bool = False,
-        is_causal: bool = True,
-        **kwargs,
-    ) -> torch.Tensor:
-        # Transpose to (bs, heads, seq, dim) for SDPA
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        with sdpa_kernel(self.sdpa_backends, set_priority=True):
-            out = F.scaled_dot_product_attention(
+    # Only use overrideable SDP on when TPU backend is available.
+    try:
+      tpu_mod = torch.get_device_module("tpu")
+      is_tpu = tpu_mod is not None and tpu_mod.is_available()
+    except (RuntimeError, ValueError, ImportError):
+      is_tpu = False
+
+    if is_tpu:
+      self.sdpa_backends = [
+          SDPBackend.OVERRIDEABLE,
+          SDPBackend.MATH,
+      ]
+
+  def forward(
+      self,
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      *,
+      scale: float | None = None,
+      enable_gqa: bool = False,
+      is_causal: bool = True,
+      **kwargs,
+  ) -> torch.Tensor:
+    # Transpose to (bs, heads, seq, dim) for SDPA
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    with sdpa_kernel(self.sdpa_backends, set_priority=True):
+      out = F.scaled_dot_product_attention(
                 q, k, v, scale=scale, is_causal=is_causal, enable_gqa=enable_gqa
             )
-        # Transpose back to (bs, seq, heads, dim)
-        return out.transpose(1, 2)
+    # Transpose back to (bs, seq, heads, dim)
+    return out.transpose(1, 2)
 
 
 def get_causal_mask_mod() -> _mask_mod_signature:
