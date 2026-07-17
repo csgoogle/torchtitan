@@ -250,34 +250,6 @@ def _make_splash_attention_fn(
   return splash_fn, splash_bwd_fn
 
 
-class _SplashAttentionFn(torch.autograd.Function):
-  """torch.autograd.Function bridging splash forward and direct backward."""
-
-  @staticmethod
-  def forward(ctx, q, k, v, torch_fwd_fn, torch_bwd_fn):
-    # torch_fwd_fn returns (out, logsumexp); both saved for the backward.
-    out, logsumexp = torch_fwd_fn(q, k, v)
-    ctx.save_for_backward(q, k, v, out, logsumexp)
-    ctx.torch_bwd_fn = torch_bwd_fn
-    return out
-
-  @staticmethod
-  @torch.autograd.function.once_differentiable
-  def backward(ctx, grad_output):  # pyrefly: ignore[bad-override]
-    q, k, v, out, logsumexp = ctx.saved_tensors
-    # Direct backward — no extra forward inside JAX.
-    grad_q, grad_k, grad_v = ctx.torch_bwd_fn(
-        q, k, v, out, logsumexp, grad_output
-    )
-    return (
-        grad_q,
-        grad_k,
-        grad_v,
-        None,
-        None,
-    )  # None for torch_fwd_fn, torch_bwd_fn
-
-
 _splash_op_name_cache = {}
 
 
@@ -331,6 +303,18 @@ def _get_splash_op_names(**splash_kwargs):
           torch.empty_like(v),
       )
   )
+
+  def setup_context(ctx, inputs, output):
+      q, k, v = inputs
+      out, lse = output
+      ctx.save_for_backward(q, k, v, out, lse)
+
+  def backward(ctx, grad_out, grad_lse):
+      q, k, v, out, lse = ctx.saved_tensors
+      grad_q, grad_k, grad_v = torch_bwd_fn(q, k, v, out, lse, grad_out)
+      return grad_q, grad_k, grad_v
+
+  torch_fwd_fn.register_autograd(backward, setup_context=setup_context)
 
   # Note: We return string names instead of the functions themselves.
   # Passing callables through activation checkpointing in Dynamo can trigger
@@ -445,7 +429,7 @@ def splash_sdpa(
     # head dimension to be squeezed.
     k = torch.squeeze(k, dim=1)
     v = torch.squeeze(v, dim=1)
-  result = _SplashAttentionFn.apply(q, k, v, torch_fwd_fn, torch_bwd_fn)
+  result, _ = torch_fwd_fn(q, k, v)
   result = typing.cast(torch.Tensor, result)
 
   if result.dtype != input_dtype:
