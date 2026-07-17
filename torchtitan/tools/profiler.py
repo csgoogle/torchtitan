@@ -15,7 +15,6 @@ import tyro
 from torchtitan.config import Configurable
 from torchtitan.config.function import Function
 from torchtitan.tools.logging import logger
-
 from torchtitan.tools.utils import get_device_module, get_device_type
 
 # how much memory allocation/free ops to record in memory snapshots
@@ -144,6 +143,26 @@ class Profiler(Configurable):
         This is used to configure torch.profiler.schedule.
         """
 
+        profiler_repeat: int | None = None
+        """
+        The number of times to repeat the profiling cycle
+
+        This is used to configure torch.profiler.schedule.
+        """
+
+        profiler_skip_first: int | None = None
+        """
+        The number of initial profiling cycles to skip
+
+        This is used to configure torch.profiler.schedule.
+        """
+
+        profiler_skip_first_wait: int | None = None
+        """
+        The number of initial profiling cycles to skip the wait time
+
+        This is used to configure torch.profiler.schedule.
+        """
 
         enable_memory_snapshot: bool = False
         """Whether to dump memory snapshot."""
@@ -303,10 +322,11 @@ class Profiler(Configurable):
         assert (
             wait >= 0
         ), "profile_freq must be greater than or equal to warmup + active"
-        device_type = get_device_type()
+        from torchtitan.tools.utils import get_device_type
+        
         activities = [torch.profiler.ProfilerActivity.CPU]
         experimental_config = None
-        if device_type == "tpu":
+        if get_device_type() == "tpu":
             activities.append(torch.profiler.ProfilerActivity.TPU)  # type: ignore
             from torch_tpu._internal.profiler import TpuProfilerConfig  # pylint: disable=g-import-not-at-top
             import pathlib  # pylint: disable=g-import-not-at-top

@@ -195,7 +195,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         ), "model_spec must be set before creating Trainer"
         model_spec = config.model_spec
 
-        device_module, device_type = utils.get_device_module(), utils.get_device_type()
+        device_type, device_module = utils.get_device_type(), utils.get_device_module()
         # pyrefly: ignore [read-only]
         if device_type in ["cpu", "tpu"]:
             self.device = torch.device(device_type)

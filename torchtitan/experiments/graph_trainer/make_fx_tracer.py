@@ -304,7 +304,7 @@ class TracedResult:
 
 
 def minimal_fx_tracer(fn: Callable) -> Callable[..., TracedResult]:
-  """Return a tracer for a stateless ``fn`` with explicit ``state`` input.
+    """Return a tracer for a stateless ``fn`` with explicit ``state`` input.
 
     ``fn`` must be a plain callable (not an ``nn.Module``). The returned
     callable expects ``state`` as the first positional argument, followed by
@@ -324,22 +324,22 @@ def minimal_fx_tracer(fn: Callable) -> Callable[..., TracedResult]:
     in the returned :class:`TracedResult`.
     """
 
-  def _trace_with_args(state: Any, *args: Any) -> TracedResult:
-    state_fqns = list(state.keys())
-    state_flat = list(state.values())
-    user_args = list(args)
-    user_args_flat, user_args_spec = pytree.tree_flatten(user_args)
+    def _trace_with_args(state: Any, *args: Any) -> TracedResult:
+        state_fqns = list(state.keys())
+        state_flat = list(state.values())
+        user_args = list(args)
+        user_args_flat, user_args_spec = pytree.tree_flatten(user_args)
 
-    # Validate leaves.
-    for leaf in [*state_flat, *user_args_flat]:
-      if isinstance(leaf, nn.Module):
-        raise ValueError(
+        # Validate leaves.
+        for leaf in [*state_flat, *user_args_flat]:
+            if isinstance(leaf, nn.Module):
+                raise ValueError(
                     "minimal_fx_tracer requires explicit tensor state, not nn.Module "
                     "instances. Use trace_train_step(...) for the reference "
                     "train-step wrapper."
                 )
-      if not isinstance(leaf, _ALLOWED_LEAF_TYPES):
-        raise ValueError(
+            if not isinstance(leaf, _ALLOWED_LEAF_TYPES):
+                raise ValueError(
                     "minimal_fx_tracer requires all pytree leaves in state/args to "
                     f"be tensors or primitives (int/float/bool/str), got "
                     f"{type(leaf).__name__}. Non-primitive values should either be "
@@ -347,16 +347,16 @@ def minimal_fx_tracer(fn: Callable) -> Callable[..., TracedResult]:
                     f"(pytree.register_constant), or captured in fn's closure."
                 )
 
-    # Combined flat input: [*state, *user_args] with subclasses unwrapped.
-    full_args = list(state_flat) + list(user_args_flat)
-    num_full_args = len(full_args)
-    unwrapped_args, input_layouts = _unwrap_subclasses(full_args)
+        # Combined flat input: [*state, *user_args] with subclasses unwrapped.
+        full_args = list(state_flat) + list(user_args_flat)
+        num_full_args = len(full_args)
+        unwrapped_args, input_layouts = _unwrap_subclasses(full_args)
 
-    fake_mode = FakeTensorMode(
+        fake_mode = FakeTensorMode(
             allow_non_fake_inputs=True,
             shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
         )
-    fake_args = tuple(
+        fake_args = tuple(
             (
                 fake_mode.from_tensor(a, static_shapes=True)
                 if isinstance(a, torch.Tensor)
@@ -365,76 +365,76 @@ def minimal_fx_tracer(fn: Callable) -> Callable[..., TracedResult]:
             for a in unwrapped_args
         )
 
-    output_layouts: dict[int, SubclassLayout] = {}
-    num_flat_outputs: int = 0
-    output_spec: pytree.TreeSpec | None = None
+        output_layouts: dict[int, SubclassLayout] = {}
+        num_flat_outputs: int = 0
+        output_spec: pytree.TreeSpec | None = None
 
-    def fn_with_subclass_handling(*plain_args: Any) -> list:
-      nonlocal output_layouts, output_spec, num_flat_outputs
-      output_layouts = {}
+        def fn_with_subclass_handling(*plain_args: Any) -> list:
+            nonlocal output_layouts, output_spec, num_flat_outputs
+            output_layouts = {}
 
-      wrapped = _wrap_subclasses(plain_args, num_full_args, input_layouts)
-      state_wrapped = wrapped[: len(state_flat)]
-      user_flat = wrapped[len(state_flat) :]
+            wrapped = _wrap_subclasses(plain_args, num_full_args, input_layouts)
+            state_wrapped = wrapped[: len(state_flat)]
+            user_flat = wrapped[len(state_flat) :]
 
-      state_for_fn = dict(zip(state_fqns, state_wrapped, strict=True))
-      user_list = pytree.tree_unflatten(list(user_flat), user_args_spec)
-      # b/532628568 when torch_tpu wheel updated
-      # with torch.compiler._patch_engine_backward():
-      patch_engine_ctx = getattr(
-          torch.compiler, "_patch_engine_backward", contextlib.nullcontext
-      )
-      with patch_engine_ctx():
-        result = fn(state_for_fn, *user_list)
+            state_for_fn = dict(zip(state_fqns, state_wrapped, strict=True))
+            user_list = pytree.tree_unflatten(list(user_flat), user_args_spec)
+            # b/532628568 when torch_tpu wheel updated
+            # with torch.compiler._patch_engine_backward():
+            patch_engine_ctx = getattr(
+                torch.compiler, "_patch_engine_backward", contextlib.nullcontext
+            )
+            with patch_engine_ctx():
+                result = fn(state_for_fn, *user_list)
 
-      flat_outs, output_spec = pytree.tree_flatten(result)
-      num_flat_outputs = len(flat_outs)
-      unwrapped_outs, output_layouts = _unwrap_subclasses(flat_outs)
-      return unwrapped_outs
+            flat_outs, output_spec = pytree.tree_flatten(result)
+            num_flat_outputs = len(flat_outs)
+            unwrapped_outs, output_layouts = _unwrap_subclasses(flat_outs)
+            return unwrapped_outs
 
-    ctx = TracingContext(fake_mode)
-    # preserve_node_meta propagates fx.traceback.annotate metadata to traced nodes
-    # Disable autograd multithreading so that backward tracing
-    # runs on the calling thread. Without this, the C++ autograd
-    # engine dispatches backward to a worker thread that has a
-    # fresh contextvars.Context, making the compile_on_one_rank
-    # ContextVar invisible and causing _sym_get_coordinate to
-    # bake rank 0's concrete coordinates into the backward graph.
-    # TODO: Move set_multithreading_enabled(False) to global init.
-    # Forcing backward onto the main CPU thread is a good default
-    # for both tracing and runtime, not just the tracing path.
-    # _skip_nested_compile lets the current make_fx trace inline through
-    # torch.compile'd FlexAttention kernels instead of erroring.
-    # _non_strict_tracing_context is required by _patch_autograd_grad() and
-    # marks this make_fx pass as the non-strict tracing flow, distinct from
-    # other make_fx-based entry points such as non-strict export.
-    non_strict_ctx = getattr(
-        torch.compiler, "_non_strict_tracing_context", contextlib.nullcontext
-    )
-    with (
-        fake_mode,
-        tracing(ctx),
-        preserve_node_meta(),
-        _skip_nested_compile(),
-        torch.autograd.set_multithreading_enabled(False),
-        # b/532628568 when torch_tpu wheel updated
-        # torch.compiler._non_strict_tracing_context(),
-        non_strict_ctx(),
-    ):
-      traced = make_fx(
-          fn_with_subclass_handling,
-          record_stack_traces=True,
-          record_module_stack=False,  # don't need nn_module_stack for now
-      )(*fake_args)
+        ctx = TracingContext(fake_mode)
+        # preserve_node_meta propagates fx.traceback.annotate metadata to traced nodes
+        # Disable autograd multithreading so that backward tracing
+        # runs on the calling thread. Without this, the C++ autograd
+        # engine dispatches backward to a worker thread that has a
+        # fresh contextvars.Context, making the compile_on_one_rank
+        # ContextVar invisible and causing _sym_get_coordinate to
+        # bake rank 0's concrete coordinates into the backward graph.
+        # TODO: Move set_multithreading_enabled(False) to global init.
+        # Forcing backward onto the main CPU thread is a good default
+        # for both tracing and runtime, not just the tracing path.
+        # _skip_nested_compile lets the current make_fx trace inline through
+        # torch.compile'd FlexAttention kernels instead of erroring.
+        # _non_strict_tracing_context is required by _patch_autograd_grad() and
+        # marks this make_fx pass as the non-strict tracing flow, distinct from
+        # other make_fx-based entry points such as non-strict export.
+        non_strict_ctx = getattr(
+            torch.compiler, "_non_strict_tracing_context", contextlib.nullcontext
+        )
+        with (
+            fake_mode,
+            tracing(ctx),
+            preserve_node_meta(),
+            _skip_nested_compile(),
+            torch.autograd.set_multithreading_enabled(False),
+            # b/532628568 when torch_tpu wheel updated
+            # torch.compiler._non_strict_tracing_context(),
+            non_strict_ctx(),
+        ):
+            traced = make_fx(
+                fn_with_subclass_handling,
+                record_stack_traces=True,
+                record_module_stack=False,  # don't need nn_module_stack for now
+            )(*fake_args)
 
-    # Copy forward annotations to backward nodes.
-    # Must run before DCE so that forward nodes used for matching aren't removed.
-    _copy_fwd_metadata_to_bw_nodes(traced)
+        # Copy forward annotations to backward nodes.
+        # Must run before DCE so that forward nodes used for matching aren't removed.
+        _copy_fwd_metadata_to_bw_nodes(traced)
 
-    _remove_cpu_shadow_chains(traced)
+        _remove_cpu_shadow_chains(traced)
 
-    assert output_spec is not None
-    return TracedResult(
+        assert output_spec is not None
+        return TracedResult(
             gm=traced,
             example_inputs=fake_args,
             state_fqns=state_fqns,
@@ -448,7 +448,7 @@ def minimal_fx_tracer(fn: Callable) -> Callable[..., TracedResult]:
             ],
         )
 
-  return _trace_with_args
+    return _trace_with_args
 
 
 def run_traced(

@@ -19,7 +19,7 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
     PipelineScheduleMulti,
     PipelineScheduleSingle,
-    # ScheduleDualPipeV, - not yet available in g3
+    ScheduleDualPipeV,
     ScheduleZBVZeroBubble,
 )
 

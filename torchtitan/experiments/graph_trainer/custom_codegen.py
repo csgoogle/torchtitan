@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import ast
-import os
+import os as os
 import re
 import sys
 from typing import Any

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import os
+import os as os
 import pickle
 from collections.abc import Callable
 from dataclasses import dataclass, field
