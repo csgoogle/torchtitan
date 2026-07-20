@@ -213,7 +213,7 @@ def qwen3_8b() -> TPUTrainerConfig:
           local_batch_size=6,
           seq_len=2048,
           steps=15,
-          mixed_precision_reduce="bfloat16",
+          mixed_precision_reduce="float32",
       ),
       dataloader=HuggingFaceTextDataLoader.Config(
           dataset="c4_test",
@@ -231,11 +231,10 @@ def qwen3_8b() -> TPUTrainerConfig:
           mode="selective",
       ),
       tpu_config=TPUConfig(
-          eager_mode="DEFER_AND_FUSE",
-          use_graph_split=False,
-          use_jax_profiler=False,
+          use_graph_trainer=True,
+          compile_mode="aot_fx_trace",
           compile_optimizer=True,
-          compile_mode="fullgraph",
+          optimizer_in_graph=True,
       ),
       compile=CompileConfig(
           enable=True,
