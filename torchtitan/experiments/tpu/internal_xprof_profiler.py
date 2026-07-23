@@ -18,8 +18,8 @@ class InternalXProfProfiler:
   def start(self) -> None:
     if not xprof_session:
       return
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if local_rank == 0:
+    rank = int(os.environ.get("RANK", 0))
+    if rank == 0:
       logger.info(
           "Starting Internal XProf trace at step %d",
           # pytype: disable=attribute-error
@@ -33,13 +33,13 @@ class InternalXProfProfiler:
             host_trace_level=3,
             host_cpu_profile=True,
         )
-      except RuntimeError as e:
+      except Exception as e:
         logger.warning("Failed to start Internal XProf session: %s", e)
 
   def stop(self) -> None:
     if self.session:
-      local_rank = int(os.environ.get("LOCAL_RANK", 0))
-      if local_rank == 0:
+      rank = int(os.environ.get("RANK", 0))
+      if rank == 0:
         logger.info(
             "Stopping Internal XProf profiler at step %d",
             # pytype: disable=attribute-error
@@ -60,7 +60,7 @@ class InternalXProfProfiler:
               # pytype: enable=attribute-error
               url,
           )
-        except RuntimeError as e:
+        except Exception as e:
           logger.warning("Failed to stop Internal XProf session: %s", e)
         finally:
           self.session = None
