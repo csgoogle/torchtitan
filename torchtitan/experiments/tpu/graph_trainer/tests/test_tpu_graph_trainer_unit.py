@@ -111,6 +111,53 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
     except Exception as e:
       self.fail(f"trace_train_step raised unexpected error during lowering: {e}")
 
+  def test_fwd_bwd_adamw_grad_clipping_tracing(self) -> None:
+    """Verifies that fwd_bwd_adamw traces cleanly with max_norm > 0."""
+    from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import _make_fwd_bwd_adamw_fn
+
+    device = self.accelerator_device
+    model = DummyModule(dim=32, vocab_size=128).to(device)
+    loss_fn = lambda pred, labels, tok: nn.CrossEntropyLoss()(pred.view(-1, 128), labels.view(-1)) / tok
+
+    param_fqns = []
+    for name, p in model.named_parameters():
+      if not p.requires_grad:
+        continue
+      param_fqns.append(name)
+      parent_path, _, leaf = name.rpartition(".")
+      parent = model.get_submodule(parent_path) if parent_path else model
+      parent.register_buffer(f"_optstate_{leaf}_exp_avg", torch.zeros_like(p), persistent=True)
+      parent.register_buffer(f"_optstate_{leaf}_exp_avg_sq", torch.zeros_like(p), persistent=True)
+
+    model.register_buffer("_optstate_step", torch.zeros((), dtype=torch.float32, device=device), persistent=True)
+    model.register_buffer("_optstate_lr", torch.tensor(1e-3, dtype=torch.float32, device=device), persistent=False)
+
+    fwd_bwd_adamw = _make_fwd_bwd_adamw_fn(
+        loss_fn=loss_fn,
+        param_fqns=param_fqns,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        weight_decay=0.1,
+        max_norm=1.0,
+    )
+
+    inputs = torch.randint(0, 128, (2, 16), device=device)
+    labels = torch.randint(0, 128, (2, 16), device=device)
+    valid_tokens = torch.tensor(32.0, device=device)
+
+    try:
+      traced_step = trace_train_step(fwd_bwd_adamw)(
+          model, inputs, labels, valid_tokens, {}, {}
+      )
+      self.assertIsInstance(
+          traced_step.gm,
+          torch.fx.GraphModule,
+          "traced_step.gm must be a valid FX GraphModule when max_norm > 0.",
+      )
+    except Exception as e:
+      self.fail(f"trace_train_step with grad clipping raised unexpected error: {e}")
+
 
 if __name__ == "__main__":
   absltest.main()

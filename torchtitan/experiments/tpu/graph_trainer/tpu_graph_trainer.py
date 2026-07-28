@@ -404,6 +404,8 @@ class TpuGraphTrainer(GraphTrainer):
             betas = tuple(self.optimizers.optimizers[0].param_groups[0]["betas"])
             wd = float(self.optimizers.optimizers[0].param_groups[0]["weight_decay"])
             eps = float(self.optimizers.optimizers[0].param_groups[0]["eps"])
+            max_norm_val = getattr(self.config.training, "max_norm", None)
+            max_norm = float(max_norm_val) if max_norm_val is not None else None
 
             fwd_bwd_adamw = _make_fwd_bwd_adamw_fn(
                 loss_fn=self.loss_fn,
@@ -412,6 +414,7 @@ class TpuGraphTrainer(GraphTrainer):
                 beta2=float(betas[1]),
                 eps=eps,
                 weight_decay=wd,
+                max_norm=max_norm,
             )
 
             with self.train_context():
@@ -483,6 +486,10 @@ def _get_optstate_buffer(model, param_fqn: str, kind: str) -> torch.Tensor:
     return getattr(parent, f"_optstate_{leaf}_{kind}")
 
 
+_GRAD_CLIP_EPS = 1e-6
+_GRAD_CLIP_MAX_SCALE = 1.0
+
+
 def _make_fwd_bwd_adamw_fn(
     *,
     loss_fn,
@@ -491,6 +498,7 @@ def _make_fwd_bwd_adamw_fn(
     beta2: float,
     eps: float,
     weight_decay: float,
+    max_norm: float | None = None,
 ):
     from torch.fx.traceback import annotate_fn
     from torchtitan.experiments.graph_trainer.common_utils import _MODULE_FQN
@@ -507,6 +515,15 @@ def _make_fwd_bwd_adamw_fn(
             _get_param_by_fqn(model, fqn) for fqn in param_fqns
         ]
         grads = torch.autograd.grad(loss, canonical_params)
+
+        if max_norm is not None and max_norm > 0.0:
+            total_norm = torch.linalg.vector_norm(
+                torch.stack([torch.linalg.vector_norm(g) for g in grads]),
+                2.0,
+            )
+            clip_coef = max_norm / (total_norm + _GRAD_CLIP_EPS)
+            clip_coef_clamped = torch.clamp(clip_coef, max=_GRAD_CLIP_MAX_SCALE)
+            grads = tuple(g * clip_coef_clamped for g in grads)
 
         exp_avgs = [
             _get_optstate_buffer(model, fqn, "exp_avg") for fqn in param_fqns
