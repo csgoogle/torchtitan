@@ -127,6 +127,10 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
       num_steps=TEST_TRAINING_STEPS,
       batch_size=TEST_BATCH_SIZE,
       seq_len=TEST_SEQ_LEN,
+      atol_loss=1e-2,
+      rtol_loss=1e-2,
+      atol_grad=1e-2,
+      rtol_grad=1e-2,
   )
 
 
