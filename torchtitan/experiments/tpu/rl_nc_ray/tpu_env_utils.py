@@ -172,7 +172,7 @@ def build_trainer_env_vars(rank: int, layout: dict, worker_pythonpath: str) -> t
     return env_vars, host_ip
 
 
-def build_generator_env_vars(layout: dict, worker_pythonpath: str) -> dict:
+def build_generator_env_vars(layout: dict, worker_pythonpath: str, dump_folder: str = None, **kwargs) -> dict:
     """
     Build environment variables dictionary for the generator.
     """

@@ -28,6 +28,7 @@ from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateD
 from torch.distributed.tensor import DTensor
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.types import TrainBatch
+from torchtitan.tools.profiler import Profiler
 from torchtitan.experiments.tpu import utils as tpu_utils
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools import utils
@@ -128,6 +129,7 @@ def load_initial_hf_weights_on_cpu(model, torchtitan_state_dict: dict) -> None:
 class RayTPUPolicyTrainer(PolicyTrainer):
 
     def __init__(self, *args, **kwargs):
+        profiler_config = kwargs.pop("profiler_config", None)
         # Ray actors don't have torchrun env vars by default.
         os.environ.setdefault("LOCAL_RANK", "0")
         os.environ.setdefault("RANK", "0")
@@ -156,6 +158,15 @@ class RayTPUPolicyTrainer(PolicyTrainer):
             config.optimizer.implementation = "foreach"
             
         super().__init__(*args, **kwargs)
+        
+        if profiler_config and profiler_config.enable_profiling:
+            self.profiler = profiler_config.build(
+                global_step=0,
+                base_folder=self.config.dump_folder or "./outputs",
+            )
+            self.profiler.__enter__()
+        else:
+            self.profiler = None
         print("@@@ Trainer: Finished init!")
 
     def _build_model(
@@ -326,3 +337,16 @@ class RayTPUPolicyTrainer(PolicyTrainer):
             ],
             **loss_metrics,
         }
+
+    async def optim_step(self) -> dict:
+        res = await super().optim_step()
+        if hasattr(self, "profiler") and self.profiler is not None:
+            self.profiler.step()
+        return res
+
+    def finish(self) -> bool:
+        if hasattr(self, "profiler") and self.profiler is not None:
+            self.profiler.__exit__(None, None, None)
+            self.profiler = None
+            print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Profiler cleaned up.")
+        return True
