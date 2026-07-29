@@ -26,17 +26,10 @@ from torch.distributed.checkpoint.state_dict import (
 from torchtitan.config import ParallelismConfig
 from torchtitan.config.configs import CompileConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.tools.utils import get_device_type
 from torchtitan.experiments.rl.models.attention import VLLMAttentionWrapper
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
-# vllm.compilation.codegen depends on GPU/CUDA-specific Triton compilation tools 
-# which are completely absent on TPU or CPU-only vLLM container environments.
-# Wrapping the import in a try-except block guarantees multi-architecture portability.
-try:
-    from vllm.compilation import codegen as _codegen
-except ImportError:
-    _codegen = None
+from vllm.compilation import codegen as _codegen
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -64,39 +57,31 @@ def _dtensor_safe_weak_ref_tensor(tensor):
 _torch_utils.weak_ref_tensor = _dtensor_safe_weak_ref_tensor
 
 
-# We bypass GPU-specific codegen monkeypatching in two key Ray scenarios:
-# 1. On Ray TPU Workers: They run a TPU/CPU-focused build of vLLM where Triton 
-#    and GPU codegen tools are absent, causing the _codegen import to fall back to None.
-# 2. On Ray CPU Head Node / CPU Actors: Non-accelerator VM environments do not 
-#    load GPU compilation dependencies.
-if get_device_type() == "tpu" or _codegen is None:
-    pass
-else:
-    # NOTE: Monkeypatch vLLM's _node_ref to handle DTensor placement types
-    # whose repr() uses unqualified class names not available in the generated
-    # code's exec namespace (which only has `import torch`).
-    _original_node_ref = _codegen._node_ref
-    
-    
-    # TODO: Followup with core vLLM fix
-    # https://github.com/pytorch/torchtitan/issues/3067
-    def _patched_node_ref(arg):
-        try:
-            from torch.distributed.tensor.placement_types import Partial, Placement
-    
-            if isinstance(arg, Placement):
-                cls = type(arg)
-                # Partial.__repr__ leaves reduce_op unquoted (e.g. "Partial(sum)")
-                # which would resolve to the builtin sum, not the string "sum".
-                if isinstance(arg, Partial):
-                    return f"{cls.__module__}.{cls.__name__}({arg.reduce_op!r})"
-                return f"{cls.__module__}.{repr(arg)}"
-        except ImportError:
-            pass
-        return _original_node_ref(arg)
-    
-    
-    _codegen._node_ref = _patched_node_ref
+# NOTE: Monkeypatch vLLM's _node_ref to handle DTensor placement types
+# whose repr() uses unqualified class names not available in the generated
+# code's exec namespace (which only has `import torch`).
+_original_node_ref = _codegen._node_ref
+
+
+# TODO: Followup with core vLLM fix
+# https://github.com/pytorch/torchtitan/issues/3067
+def _patched_node_ref(arg):
+    try:
+        from torch.distributed.tensor.placement_types import Partial, Placement
+
+        if isinstance(arg, Placement):
+            cls = type(arg)
+            # Partial.__repr__ leaves reduce_op unquoted (e.g. "Partial(sum)")
+            # which would resolve to the builtin sum, not the string "sum".
+            if isinstance(arg, Partial):
+                return f"{cls.__module__}.{cls.__name__}({arg.reduce_op!r})"
+            return f"{cls.__module__}.{repr(arg)}"
+    except ImportError:
+        pass
+    return _original_node_ref(arg)
+
+
+_codegen._node_ref = _patched_node_ref
 
 
 def create_torchtitan_config_from_vllm_config(
@@ -122,19 +107,7 @@ def create_torchtitan_config_from_vllm_config(
         vLLM doesn't use FSDP sharding (dp_shard=1) or expert parallelism (ep=1)
         in inference. These are set to default values.
     """
-    if get_device_type() == "tpu":
-        if vllm_config.parallel_config.tensor_parallel_size > 1:
-            world_size = dist.get_world_size()
-        else:
-            # vLLM engine is forced to run on a single device per rank for TP = 1
-            logger.info(
-                "TPU hack for vllm with tp=1"
-                "We set world_size = 1, so"
-                "vLLM engine is forced to run on a single device per rank."
-            )
-            world_size = 1
-    else:
-        world_size = dist.get_world_size()
+    world_size = dist.get_world_size()
     parallel_config = vllm_config.parallel_config
 
     parallel_dims = ParallelDims(
@@ -167,30 +140,11 @@ def create_torchtitan_config_from_vllm_config(
     return parallel_dims, parallelism
 
 
-# TPU hack for removing the decorator for TorchTitanVLLMModelWrapper class below
-def apply_if(condition, decorator):
-    """Applies a decorator only if the condition is True."""
-    def meta_decorator(target):
-        if condition:
-            return decorator(target)
-        return target
-    return meta_decorator
-
-
-# @support_torch_compile(
-#     dynamic_arg_dims={
-#         "input_ids": 0,
-#         "positions": 0,
-#     }
-# )
-@apply_if(
-    condition=get_device_type() != "tpu",  # remove decorator if on TPU
-    decorator=support_torch_compile(       # The original decorator to apply if True
-        dynamic_arg_dims={
-            "input_ids": 0,
-            "positions": 0,
-        }
-    )
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+    }
 )
 class TorchTitanVLLMModelWrapper(Module):
     """
@@ -259,22 +213,6 @@ class TorchTitanVLLMModelWrapper(Module):
         self.parallel_dims, parallelism = create_torchtitan_config_from_vllm_config(
             vllm_config
         )
-        
-        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
-            # Initialize distributed environment and mesh if not already done
-            import torch.distributed as dist
-            if not dist.is_initialized():
-                from torchtitan.experiments.tpu import utils as tpu_utils
-                import os
-                # This should have been done by vLLM TPUWorker but just in case
-                dist.init_process_group(
-                    backend="tpu_dist",
-                    rank=int(os.environ.get("RANK", 0)),
-                    world_size=int(os.environ.get("WORLD_SIZE", 1))
-                )
-            
-            # For TP>1, the mesh must be built to allow get_mesh("tp") calls
-            self.parallel_dims.build_mesh()
 
         # Fill sharding configs on the config BEFORE build so every sub-module
         # is constructed with its ShardingConfig attached (required by the
@@ -293,14 +231,8 @@ class TorchTitanVLLMModelWrapper(Module):
             )
         )
 
-        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
-            # For TPU vllm with TP, we need to init model in meta and then apply sharding
-            # otherwise it will lead to hang at Pre-built RPA kernels
-            with torch.device("meta"):
-                self.model = self.config.build()
-        else:
-            # TODO: Check if it's possible to apply meta init
-            self.model = self.config.build()
+        # TODO: Check if it's possible to apply meta init
+        self.model = self.config.build()
 
         # RoPE config from model for cache extension
         self.rope_config = self.config.rope
@@ -317,7 +249,7 @@ class TorchTitanVLLMModelWrapper(Module):
         # too low; exceeding it fails under
         # fullgraph=True so set to 10 for now
         if compile_config.enable:
-            torch._dynamo.config.recompile_limit = 100
+            torch._dynamo.config.recompile_limit = 10
 
         self.model = self.parallelize_fn(
             model=self.model,
@@ -330,16 +262,6 @@ class TorchTitanVLLMModelWrapper(Module):
             skip_dp=True,
         )
 
-        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
-            # put the model into device if it was at meta
-            device = vllm_config.device_config.device            
-            self.model = self.model.to_empty(device=device)
-            # Skip init_states to prevent thousands of eager TPU compilations!
-            # We will copy the weights from the trainer anyway.
-            # But we MUST initialize the RoPE cache, otherwise it will output garbage!
-            extended_rope = self.rope_config.build()
-            self.model.freqs_cis = extended_rope.cache.to(device=device, dtype=self.model.tok_embeddings.weight.dtype)
-
         # Pre-extend RoPE cache to cover vLLM's max model length (profiling
         # may use up to 2x max_seq_len, so use max_model_len which already
         # accounts for this). This avoids data-dependent control flow in
@@ -351,15 +273,7 @@ class TorchTitanVLLMModelWrapper(Module):
             )
 
         # Initial load model weights from HuggingFace checkpoint path
-        if get_device_type() == "tpu":
-            # On TPU with collocated GRPO, the vLLM engine is instantiated with
-            # `load_format="dummy"` and a fake model path to avoid duplicate memory
-            # allocation and disk I/O. Therefore, we must skip loading HF weights here,
-            # as the dummy path contains no weights. Instead, the real weights are synced 
-            # directly from the TorchTitan FSDP policy model via `VLLMSampler.sync_weights()`.
-            pass
-        else:
-            self._initial_load_weights(checkpoint_path=vllm_config.model_config.model)
+        self._initial_load_weights(checkpoint_path=vllm_config.model_config.model)
 
     def _extend_rope_cache(
         self, rope_cache: torch.Tensor, required_len: int
@@ -443,31 +357,17 @@ class TorchTitanVLLMModelWrapper(Module):
         # Convert vLLM interface to TorchTitan interface
         # vLLM: [total_tokens] → TorchTitan: [batch_size, seq_len]
         tokens_2d = input_ids.unsqueeze(0)
-        
-        # When TP is enabled, model expects DTensors
-        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
-            tokens_2d = DTensor.from_local(
-                tokens_2d,
-                device_mesh=self.parallel_dims.get_mesh("tp"),
-                placements=[Replicate()],
-            )
 
         # Get embeddings
         h = self.model.tok_embeddings(tokens_2d)
 
         rope_cache = self.model.freqs_cis
         positions = positions.unsqueeze(0)
-        
-        if get_device_type() == "tpu" and self.parallel_dims.tp_enabled:
-            positions = DTensor.from_local(
-                positions,
-                device_mesh=self.parallel_dims.get_mesh("tp"),
-                placements=[Replicate()],
-            )
 
         # Pass through transformer layers
         for layer in self.model.layers.values():
             h = layer(h, rope_cache, attention_masks=None, positions=positions)
+
         h = self.model.norm(h)
         # When parallelism is applied, get full tensor before return to vLLM Engine
         if isinstance(h, DTensor):

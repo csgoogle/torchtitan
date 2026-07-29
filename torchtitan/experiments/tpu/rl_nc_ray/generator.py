@@ -129,6 +129,8 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
         
         # This method is executed in the isolated Ray worker processes spawned by vLLM.
         def patched_init_worker(self, *args, **kwargs):
+            import torchtitan.experiments.tpu.rl_nc_ray  # Apply the vLLM codegen compatibility shim
+
             # [TPU HACK 6]: `torchtpu-vllm`'s worker blindly imports `init_cached_hf_modules`,
             # which was removed/moved in newer vLLM codebase versions, instantly crashing workers.
             if "vllm.utils.import_utils" not in sys.modules:
