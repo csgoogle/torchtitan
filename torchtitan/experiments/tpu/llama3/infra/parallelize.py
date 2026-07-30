@@ -13,6 +13,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
     data_parallel as simple_fsdp_data_parallel,
 )
+from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.models.llama3 import parallelize as dtensor_parallelize
 from torchtitan.tools.logging import logger
 
@@ -54,6 +55,10 @@ def parallelize_llama(
   effective_compile_config = compile_config
   if compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
+
+  if effective_compile_config.enable and hasattr(model, "layers"):
+    for layer in model.layers.values():
+      apply_spmd_safe(layer)
 
   if parallelism.use_simple_fsdp:
     # Apply all other parallelisms but skip data parallelism
@@ -97,5 +102,6 @@ def parallelize_llama(
           skip_dp=skip_dp,
       )
   if compile_mode == "fullgraph":
+    apply_spmd_safe(model)
     model = torch.compile(model, fullgraph=True, backend="tpu")
   return model
