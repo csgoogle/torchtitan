@@ -241,15 +241,28 @@ try:
                 try:
                     return original_init(self, model_spec=model_spec, vllm_config=vllm_config, **kwargs)
                 finally:
-                    # Always clean up and restore the original build and parallelize methods
-                    # so we do not contaminate other concurrent models or classes.
                     model_class.build = original_build
                     model_spec.parallelize_fn = original_parallelize
             else:
-                # If TP is disabled, initialize normally.
                 return original_init(self, model_spec=model_spec, vllm_config=vllm_config, **kwargs)
 
         vllm_wrapper.TorchTitanVLLMModelWrapper.__init__ = patched_init
+
+        # ---------------------------------------------------------------------------
+        # [TPU HACK 11]: Intercept and flatten 3D attention inputs to 2D for Pallas kernel
+        # compatibility. This completely decouples TPU-specific tensor shaping from attention.py!
+        # ---------------------------------------------------------------------------
+        from vllm.model_executor.layers.attention import Attention
+        original_attention_forward = Attention.forward
+        def patched_attention_forward(self, query, key, value, *args, **kwargs):
+            if len(query.shape) == 3:
+                query = query.reshape(query.shape[0], -1)
+            if len(key.shape) == 3:
+                key = key.reshape(key.shape[0], -1)
+            if len(value.shape) == 3:
+                value = value.reshape(value.shape[0], -1)
+            return original_attention_forward(self, query, key, value, *args, **kwargs)
+        Attention.forward = patched_attention_forward
 
     except Exception as e:
         logger.debug("Failed to apply vllm model wrapper patches: %s", e)

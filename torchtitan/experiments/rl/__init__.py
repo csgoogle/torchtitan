@@ -12,18 +12,22 @@ To register TorchTitan models with vLLM:
     register_model_to_vllm_model_registry(model_spec)
 """
 
-from torchtitan.tools.utils import get_device_type
 from torchtitan.experiments.rl.models.vllm_registry import (
     register_model_to_vllm_model_registry,
 )
-if get_device_type() == "tpu":
-    # With TPU, if we are NOT using vllm sampler, we skip vllm import
-    try:
-        from torchtitan.experiments.rl.models.vllm_wrapper import TorchTitanVLLMModelWrapper
-    except:
-        pass
-else:
-    from torchtitan.experiments.rl.models.vllm_wrapper import TorchTitanVLLMModelWrapper
+
+# To prevent importing the heavy 'vllm' library (and hitting ImportErrors on
+# hardware environments like standard TPUs where 'vllm' is not installed),
+# we lazily load 'TorchTitanVLLMModelWrapper' only when explicitly requested.
+# Importing other RL submodules (e.g., sum_digits.py) is therefore completely safe.
+def __getattr__(name: str):
+    if name == "TorchTitanVLLMModelWrapper":
+        from torchtitan.experiments.rl.models.vllm_wrapper import (
+            TorchTitanVLLMModelWrapper,
+        )
+
+        return TorchTitanVLLMModelWrapper
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 __all__ = [

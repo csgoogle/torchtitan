@@ -165,7 +165,12 @@ class RLTrainer(Configurable):
     class Config(Configurable.Config):
         """Top-level config for RL training."""
 
-        model_spec: typing.Annotated[typing.Any, tyro.conf.Suppress] = None  # Seems to be a torchtitan bug. see https://github.com/google-pytorch/torchtitan/blob/main/torchtitan/trainer.py#L61
+        # We must suppress `model_spec` from tyro's CLI parsing.
+        # At runtime, `model_spec` is pre-populated with a complex ModelSpec object.
+        # If we do not suppress it, tyro's CLI generation will recursively try to parse its
+        # nested fields and Union defaults (like parameter dicts or transformer block lists),
+        # causing strict type mismatch crashes at startup before execution begins.
+        model_spec: typing.Annotated[typing.Any, tyro.conf.Suppress] = None 
         """Model specification shared by trainer and generator.
         Set programmatically via config_registry (not from CLI)."""
 
@@ -536,6 +541,7 @@ class RLTrainer(Configurable):
             step_start = time.perf_counter()
 
             # --- Collect data and create episodes --- #
+            # TODO: remove t_gen_start, t_gen_total, t_train_start, t_train_total when OSS.
             t_gen_start = time.perf_counter()
             trajectories = self._collect_rollouts(num_groups, step=step)
             episodes = self._build_episodes(trajectories)
@@ -576,7 +582,7 @@ class RLTrainer(Configurable):
                 f"Logprob diff: mean={metrics['logprob_diff_mean']:.4e}, "
                 f"max={metrics['logprob_diff_max']:.4e} | "
                 f"Time: {time.perf_counter() - step_start:.1f}s | "
-                f"Gen Time: {t_gen_total:.1f}s | Train Time: {t_train_total:.1f}s"  # Maybe worth upstream this change.
+                f"Gen Time: {t_gen_total:.1f}s | Train Time: {t_train_total:.1f}s"  # TODO: consider remove when ustream this change to OSS.
             )
 
             if not math.isfinite(metrics["loss"]):
