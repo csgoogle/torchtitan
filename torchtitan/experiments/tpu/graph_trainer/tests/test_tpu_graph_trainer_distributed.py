@@ -30,11 +30,6 @@ class TpuGraphTrainerDistributedTest(
           args=[
               "--tpu_config.use_simple_fsdp",
           ],
-          skip_devices=[
-              # b/540048441 Re-enable once test is fixed.
-              # # TODO: TypeError: to_graph_trainer_config() got an unexpected keyword argument 'target_cls'
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
   ])
   def test_graph_trainer_distributed(
