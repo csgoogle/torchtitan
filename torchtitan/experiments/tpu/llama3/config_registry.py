@@ -68,7 +68,7 @@ def llama3_debugmodel() -> TPUTrainerConfig:
 
 def llama3_1b() -> TPUTrainerConfig:
   """Llama3 1B model configuration for TPU."""
-  model_spec = model_registry("1B")
+  model_spec = model_registry("1B", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_llama
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
@@ -107,13 +107,13 @@ def llama3_1b() -> TPUTrainerConfig:
 
 def llama3_8b() -> TPUTrainerConfig:
   """Llama3 8B model configuration for TPU."""
-  model_spec = model_registry("8B")
+  model_spec = model_registry("8B", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_llama
-  return TPUTrainerConfig(
+  config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/Llama-3.1-8B",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=3e-4),
+      optimizer=default_adamw(lr=3e-4, eps=1e-8),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -169,11 +169,13 @@ def llama3_8b() -> TPUTrainerConfig:
           use_loss_kernel=True,
       ),
   )
+  config.optimizer.implementation = "foreach"
+  return config
 
 
 def llama3_70b() -> TPUTrainerConfig:
   """Llama3 70B model configuration for TPU."""
-  model_spec = model_registry("70B")
+  model_spec = model_registry("70B", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_llama
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
@@ -239,13 +241,13 @@ def llama3_70b() -> TPUTrainerConfig:
 
 def llama3_405b() -> TPUTrainerConfig:
   """Llama3 405B model configuration for TPU."""
-  model_spec = model_registry("405B")
+  model_spec = model_registry("405B", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_llama
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=3e-4),
+      optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,

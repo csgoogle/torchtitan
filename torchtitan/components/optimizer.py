@@ -366,6 +366,10 @@ def default_adamw(lr: float = 8e-4, **kwargs: Any) -> OptimizersContainer.Config
 
         optimizer=default_adamw(lr=3e-4)
     """
+    config_kwargs = {}
+    if "implementation" in kwargs:
+        config_kwargs["implementation"] = kwargs.pop("implementation")
+
     return OptimizersContainer.Config(
         param_groups=[
             ParamGroupConfig(
@@ -379,7 +383,8 @@ def default_adamw(lr: float = 8e-4, **kwargs: Any) -> OptimizersContainer.Config
                     **kwargs,
                 },
             )
-        ]
+        ],
+        **config_kwargs
     )
 
 
