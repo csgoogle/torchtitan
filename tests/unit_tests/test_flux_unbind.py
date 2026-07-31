@@ -66,7 +66,7 @@ def double_stream_block_forward_ref(
     v = torch.cat((txt_v, img_v), dim=1)
 
     q, k = apply_rope(q, k, pe)
-    attn = module.inner_attention(q, k, v)
+    attn = module.inner_attention(q, k, v, is_causal=False)
     attn = rearrange(attn, "B L H D -> B L (H D)")
 
     txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
@@ -100,7 +100,7 @@ def single_stream_block_forward_ref(
 
     # compute attention
     q, k = apply_rope(q, k, pe)
-    attn = module.inner_attention(q, k, v)
+    attn = module.inner_attention(q, k, v, is_causal=False)
     attn = rearrange(attn, "B L H D -> B L (H D)")
 
     # compute activation in mlp stream, cat again and run second linear layer

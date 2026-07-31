@@ -347,7 +347,7 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
   train_spec = train_spec_module.get_train_spec(job_config.model.name)
 
   model_args = train_spec.model_args[job_config.model.flavor]
-  model_args.update_from_config(trainer_config=job_config)
+  model_args.update_from_config(config=job_config)
 
 
 
@@ -453,12 +453,9 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
 
   trainable_params = [p for p in model.parameters() if p.requires_grad]
 
-  optimizer = torch.optim.AdamW(
-      trainable_params,
-      lr=job_config.optimizer.lr,
-      eps=job_config.optimizer.eps,
-      foreach=True,
-  )
+  # Force foreach implementation for TPU
+  job_config.optimizer.implementation = "foreach"
+  optimizer = job_config.optimizer.build(model_parts=[model])
 
   if torch.distributed.is_initialized():
     torch.distributed.barrier()
@@ -574,7 +571,7 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
         accumulated_steps = 0
 
         extra_metrics = {
-            "lr": optimizer.param_groups[0]["lr"],
+            "lr": optimizer.optimizers[0].param_groups[0]["lr"],
             "n_tokens_seen": ntokens_seen,
             "avg_step_time": average_step_time,
             "avg_reward": avg_reward,

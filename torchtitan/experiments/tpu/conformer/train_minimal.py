@@ -343,16 +343,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
     )
     train_config.optimizer.implementation = "foreach"
 
-  foreach = train_config.optimizer.implementation == "foreach"
-  fused = train_config.optimizer.implementation == "fused"
-
-  optimizer = torch.optim.AdamW(
-      trainable_params,
-      lr=train_config.optimizer.lr,
-      eps=train_config.optimizer.eps,
-      foreach=foreach,
-      fused=fused,
-  )
+  optimizer = train_config.optimizer.build(model_parts=[model])
 
   if (
       train_config.compile.enable
@@ -493,7 +484,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         accumulated_steps = 0
 
         extra_metrics = {
-            "lr": optimizer.param_groups[0]["lr"],
+            "lr": optimizer.optimizers[0].param_groups[0]["lr"],
             "n_tokens_seen": ntokens_seen,
             "avg_step_time": avg_step_time,
         }

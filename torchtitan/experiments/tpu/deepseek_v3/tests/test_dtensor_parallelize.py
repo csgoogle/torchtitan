@@ -4,7 +4,8 @@ from absl import logging
 from absl.testing import absltest
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torchtitan.config.configs import ActivationCheckpointConfig, CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
@@ -61,7 +62,7 @@ def _verify_dtensor_deepseek_v3_non_moe_tp_forward_worker(
     # pytype: disable=wrong-arg-types
     deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
         model,
-        ac_config=ActivationCheckpointConfig(),
+        ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -104,7 +105,7 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
     # pytype: disable=wrong-arg-types
     deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
         model,
-        ac_config=ActivationCheckpointConfig(),
+        ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -123,6 +124,9 @@ def _verify_dtensor_deepseek_v3_tp_backward_worker(
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
+  # This test is already flaky at head with default tolerances of
+  # (atol_loss=1e-3, rtol_loss=1e-3, atol_grad=1e-3, rtol_grad=1e-3).
+  # TODO(jeremiahhsu): b/540005818 to audit tolerances
   runner.run_backward_parity(
       num_steps=TEST_TRAINING_STEPS,
       batch_size=TEST_BATCH_SIZE,
@@ -156,7 +160,7 @@ def _verify_dtensor_deepseek_v3_fsdp_training_loop_worker(
     # pytype: disable=wrong-arg-types
     deepseek_v3_dtensor_parallelize.parallelize_deepseekv3(
         model,
-        ac_config=ActivationCheckpointConfig(),
+        ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,

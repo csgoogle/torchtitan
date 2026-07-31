@@ -1,5 +1,5 @@
-from torchtitan.components.loss import ChunkedCELoss
-from torchtitan.components.optimizer import OptimizersContainer
+import torchtitan.components.loss as loss
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.components.validate import Validator
@@ -15,6 +15,8 @@ from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 __all__ = [
     "parallelize_qwen3",
     "qwen3_configs",
+    "qwen3_debugmodel",
+    "qwen3_debugmodel_moe",
 ]
 
 def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
@@ -37,12 +39,7 @@ def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
             out_features=vocab_size,
             param_init=qwen3_models._output_linear_init(dim),
         ),
-        rope=common_models.RoPE.Config(
-            dim=head_dim,
-            max_seq_len=128,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
+
         # pytype: disable=wrong-keyword-args
         layers=qwen3_models._build_qwen3_layers(
             n_layers=n_layers,
@@ -52,6 +49,11 @@ def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
             head_dim=head_dim,
             hidden_dim=256,
             attn_backend=attn_backend,
+            rope=common_models.CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=128,
+                theta=1000000.0,
+            ),
         ),
         # pytype: enable=wrong-keyword-args
     )
@@ -77,12 +79,7 @@ def _testmodel_moe(
             out_features=vocab_size,
             param_init=qwen3_models._output_linear_init(dim),
         ),
-        rope=common_models.RoPE.Config(
-            dim=head_dim,
-            max_seq_len=128,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
+
         # pytype: disable=wrong-keyword-args
         layers=qwen3_models._build_qwen3_moe_layers(
             n_layers=n_layers,
@@ -95,6 +92,11 @@ def _testmodel_moe(
             top_k=2,
             attn_backend=attn_backend,
             moe_comm_backend=moe_comm_backend,
+            rope=common_models.CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=128,
+                theta=1000000.0,
+            ),
         ),
         # pytype: enable=wrong-keyword-args
     )
@@ -112,6 +114,12 @@ qwen3_configs = {
     "30B-A3B": qwen3_models.qwen3_configs["30B-A3B"]("sdpa"),
 }
 
+def qwen3_debugmodel():
+    return qwen3_configs["debugmodel"]
+
+def qwen3_debugmodel_moe():
+    return qwen3_configs["debugmodel_moe"]
+
 # pytype: disable=wrong-arg-types
 register_train_spec(
     name="qwen3_tpu",
@@ -120,8 +128,8 @@ register_train_spec(
         model_args=qwen3_configs,
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=None,
-        loss_config=ChunkedCELoss.Config(),
-        optimizer_config=OptimizersContainer.Config(lr=8e-4),
+        loss_config=loss.ChunkedLossWrapper.Config(),
+        optimizer_config=default_adamw(lr=8e-4),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
         dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         validator_config=Validator.Config(enable=True),

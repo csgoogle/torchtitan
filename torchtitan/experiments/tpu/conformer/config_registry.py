@@ -1,7 +1,7 @@
 import os
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
@@ -9,6 +9,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 import torchtitan.experiments.tpu.conformer as tpu_conformer
 from torchtitan.experiments.tpu.conformer.infra.parallelize import parallelize_conformer
+from torchtitan.distributed.activation_checkpoint import FullAC
 
 
 def _conformer_model_spec(flavor: str) -> ModelSpec:
@@ -31,7 +32,7 @@ def conformer_test() -> TPUTrainerConfig:
       hf_assets_path="tests/assets/tokenizer",
       dump_folder=os.environ.get("TEST_TMPDIR", ".") + "/outputs",
       model_spec=_conformer_model_spec("test"),
-      optimizer=OptimizersContainer.Config(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
       dataloader=HuggingFaceTextDataLoader.Config(
           dataset="c4_test",
@@ -50,9 +51,7 @@ def conformer_test() -> TPUTrainerConfig:
           data_parallel_shard_degree=-1,
           data_parallel_replicate_degree=1,
       ),
-      activation_checkpoint=TPUTrainerConfig().activation_checkpoint.__class__(
-          mode="full",
-      ),
+      activation_checkpoint=FullAC.Config(),
       compile=TPUTrainerConfig().compile.__class__(
           enable=False,
           backend="tpu",

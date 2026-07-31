@@ -155,7 +155,7 @@ def _build_compiled_optimizer_groups(opt: torch.optim.Optimizer) -> list:
     traced = minimal_fx_tracer(_adamw_step)(trace_state)
     traced.gm = _tpu_backend_compile_pass(traced.gm, traced.example_inputs)
 
-    state_fqns = traced.state_fqns
+    state_fqns = list(trace_state.keys())
 
     def _run(
         live_params,

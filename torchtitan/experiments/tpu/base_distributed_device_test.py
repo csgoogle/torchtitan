@@ -2,6 +2,7 @@
 
 import enum
 import os
+import subprocess
 import tempfile
 from typing import Any, Callable, Dict, Tuple, Type
 
@@ -447,10 +448,12 @@ def _capture_distributed_state(
   }
 
   for name, param in model.named_parameters():
-    state["params"][name] = _gather_distributed_tensor(param).cpu()
+    gathered_param = _gather_distributed_tensor(param).cpu()
+    state["params"][name] = gathered_param
 
     if param.grad is not None:
-      state["grads"][name] = _gather_distributed_tensor(param.grad).cpu()
+      gathered_grad = _gather_distributed_tensor(param.grad).cpu()
+      state["grads"][name] = gathered_grad
 
   return state
 
@@ -515,6 +518,11 @@ def _run_cpu_verification(
   cpu_config.parallelism.data_parallel_replicate_degree = 1
   cpu_config.compile.enable = False
 
+  # Disable splash attention patch on CPU to avoid ValueError
+  if hasattr(cpu_config, "splash_attention_kernel"):
+    cpu_config.splash_attention_kernel.use_splash_attention_kernel = False
+    cpu_config.splash_attention_kernel.use_tokamax_splash_attention_kernel = False
+
   # Setup validator callback
   validator = numerical_validation.StateValidatorCallback(
       recorded_history=recorded_history,
@@ -539,7 +547,7 @@ def _run_cpu_verification(
     )
 
     # Load the captured distributed weights into the CPU model
-    current_cpu_dict = trainer_cpu.model.state_dict()
+    current_cpu_dict = dict(trainer_cpu.model.named_parameters())
 
     for name, param in init_state["params"].items():
       # Strip wrapper prefixes (e.g. checkpointing) to match CPU reference model
@@ -694,32 +702,39 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       )
       return
 
+    global_flags = []
     if enable_compile:
       if self.accelerator_device_type == device_type.AcceleratorDeviceType.CPU:
         self.skipTest("Skipping CPU test for torch.compile: b/327271919")
         return
-      config_args.append("--compile.enable")
+      global_flags.append("--compile.enable")
       if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
-        config_args.append("--compile.backend=tpu")
+        global_flags.append("--compile.backend=tpu")
 
     if tensor_parallel_degree is not None:
       if tensor_parallel_degree == -1:
         tensor_parallel_degree = self.num_devices
-      config_args.append(
+      global_flags.append(
           f"--parallelism.tensor_parallel_degree={tensor_parallel_degree}"
       )
     if data_parallel_shard_degree is not None:
       if data_parallel_shard_degree == -1:
         data_parallel_shard_degree = self.num_devices
-      config_args.append(
+      global_flags.append(
           f"--parallelism.data_parallel_shard_degree={data_parallel_shard_degree}"
       )
     if data_parallel_replicate_degree is not None:
       if data_parallel_replicate_degree == -1:
         data_parallel_replicate_degree = self.num_devices
-      config_args.append(
+      global_flags.append(
           f"--parallelism.data_parallel_replicate_degree={data_parallel_replicate_degree}"
       )
+
+    # Prepend flags collected in global_flags to config_args so they are
+    # not swallowed by positional subcommands introduced in the tyro upgrade.
+    # Namely, activation-checkpoint:none. This means global_flags should only
+    # contain global flags and not subcommands.
+    config_args[:] = global_flags + config_args
 
     config_manager = torchtitan.config.ConfigManager()
 
@@ -800,6 +815,8 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
                 param_rtol,
             ],
         )
+      except subprocess.CalledProcessError as e:
+        self.fail(f"Isolated subprocess failed with exit code {e.returncode}.\nstdout:\n{e.stdout}\nstderr:\n{e.stderr}")
       except Exception as e:
         self.fail(f"Isolated subprocess failed: {e}")
 

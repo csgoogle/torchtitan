@@ -6,7 +6,7 @@
 
 from torchtitan.components.loss import MSELoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
 import torchtitan.models.flux as native_flux_models
@@ -37,7 +37,7 @@ register_train_spec(
         parallelize_fn=parallelize_flux,
         pipelining_fn=None,
         loss_config=MSELoss.Config(),
-        optimizer_config=OptimizersContainer.Config(lr=1e-4),
+        optimizer_config=default_adamw(lr=1e-4),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
         dataloader_config=FluxDataLoader.Config(),
         validator_config=FluxValidator.Config(enable=True),

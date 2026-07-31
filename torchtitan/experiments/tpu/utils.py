@@ -246,6 +246,8 @@ def ptd_checkpoint_wrapper_with_early_stop(
           "early_stop is not supported by ptd_checkpoint_wrapper."
       )
 
+    checkpoint_fn_kwargs["early_stop"] = early_stop
+
     return checkpoint_wrapper.checkpoint_wrapper(
         module,
         checkpoint_impl=checkpoint_impl,

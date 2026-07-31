@@ -65,7 +65,7 @@ def parallelize_conformer(
     raise RuntimeError("Tensor Parallelism is not supported for Conformer yet")
 
   # Apply activation checkpointing if enabled
-  if train_config.activation_checkpoint.mode != "none":
+  if train_config.activation_checkpoint is not None:
     apply_ac(model)
 
   strategy = _determine_parallel_strategy(parallel_dims, train_config)

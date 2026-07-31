@@ -8,18 +8,18 @@ from functools import partial
 from typing import cast
 from torch import nn
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.validate import Validator
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
-    ActivationCheckpointConfig,
     CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.experiments.tpu.qwen3 import qwen3_configs
+import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.tpu_job_config import (
     LossKernelConfig,
@@ -36,7 +36,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 def qwen3_debugmodel() -> TPUTrainerConfig:
   """Qwen3 debug model configuration for TPU."""
 
-  model_spec = model_registry("debugmodel")
+  model_spec = model_registry("debugmodel", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_qwen3
 
   model_config = cast(Qwen3Model.Config, model_spec.model)
@@ -51,7 +51,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -74,9 +74,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
           interval=10,
           last_save_model_only=False,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="selective",
-      ),
+      activation_checkpoint=SelectiveAC.Config(),
       validator=Validator.Config(
           freq=5,
           steps=10,
@@ -87,7 +85,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
 def qwen3_moe_testmodel() -> TPUTrainerConfig:
   """Qwen3 MoE test model configuration for TPU."""
   cfg = qwen3_debugmodel()
-  config = qwen3_configs["testmodel_moe"]
+  config = tpu_qwen3.qwen3_configs["testmodel_moe"]
   cfg.model_spec = ModelSpec(
       name="qwen3_tpu",
       flavor="testmodel_moe",
@@ -108,7 +106,7 @@ def qwen3_moe_testmodel() -> TPUTrainerConfig:
 
 def qwen3_1_7b() -> TPUTrainerConfig:
   """Qwen3 1.7B model configuration for TPU."""
-  model_spec = model_registry("1.7B")
+  model_spec = model_registry("1.7B", attn_backend="sdpa")
   model_config = cast(Qwen3Model.Config, model_spec.model)
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
@@ -120,7 +118,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
           decay_ratio=0.8,
@@ -146,9 +144,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
           interval=500,
           last_save_model_only=False,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="full",
-      ),
+      activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
           use_graph_split=True,
@@ -186,7 +182,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
 
 def qwen3_8b() -> TPUTrainerConfig:
   """Qwen3 8B model configuration for TPU."""
-  model_spec = model_registry("8B")
+  model_spec = model_registry("8B", attn_backend="sdpa")
   model_config = cast(Qwen3Model.Config, model_spec.model)
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
@@ -201,7 +197,7 @@ def qwen3_8b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
           decay_ratio=0.8,
@@ -227,9 +223,7 @@ def qwen3_8b() -> TPUTrainerConfig:
           interval=500,
           last_save_model_only=False,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="selective",
-      ),
+      activation_checkpoint=SelectiveAC.Config(),
       tpu_config=TPUConfig(
           use_graph_trainer=True,
           compile_mode="aot_fx_trace",
@@ -266,7 +260,7 @@ def qwen3_8b() -> TPUTrainerConfig:
 
 def qwen3_moe_30b() -> TPUTrainerConfig:
   """Qwen3 30B MoE model configuration for TPU."""
-  model_spec = model_registry("30B-A3B")
+  model_spec = model_registry("30B-A3B", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_qwen3
 
   model_config = cast(Qwen3Model.Config, model_spec.model)
@@ -278,7 +272,7 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/Qwen3-30B-A3B",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
           decay_ratio=0.8,
@@ -301,9 +295,7 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
           interval=500,
           last_save_model_only=False,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="full",
-      ),
+      activation_checkpoint=FullAC.Config(),
       validator=Validator.Config(
           freq=5,
           steps=10,

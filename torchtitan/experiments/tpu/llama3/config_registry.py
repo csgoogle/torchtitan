@@ -5,13 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.validate import Validator
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
-    ActivationCheckpointConfig,
     CompileConfig,
     ParallelismConfig,
     TrainingConfig,
@@ -29,13 +29,13 @@ from torchtitan.models.llama3.config_registry import model_registry
 
 def llama3_debugmodel() -> TPUTrainerConfig:
   """Llama3 debug model configuration for TPU."""
-  model_spec = model_registry("debugmodel")
+  model_spec = model_registry("debugmodel", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_llama
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -58,9 +58,7 @@ def llama3_debugmodel() -> TPUTrainerConfig:
           interval=10,
           last_save_model_only=False,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="selective",
-      ),
+      activation_checkpoint=SelectiveAC.Config(),
       validator=Validator.Config(
           freq=5,
           steps=10,
@@ -76,7 +74,7 @@ def llama3_1b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -99,9 +97,7 @@ def llama3_1b() -> TPUTrainerConfig:
           interval=10,
           last_save_model_only=False,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="selective",
-      ),
+      activation_checkpoint=SelectiveAC.Config(),
       validator=Validator.Config(
           freq=5,
           steps=10,
@@ -117,7 +113,7 @@ def llama3_8b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/Llama-3.1-8B",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=3e-4),
+      optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -139,9 +135,7 @@ def llama3_8b() -> TPUTrainerConfig:
           interval=500,
           last_save_model_only=True,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="full",
-      ),
+      activation_checkpoint=FullAC.Config(),
       validator=Validator.Config(
           enable=False,
           freq=500,
@@ -185,7 +179,7 @@ def llama3_70b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=3e-4),
+      optimizer=default_adamw(lr=3e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -207,9 +201,7 @@ def llama3_70b() -> TPUTrainerConfig:
           interval=500,
           last_save_model_only=True,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="full",
-      ),
+      activation_checkpoint=FullAC.Config(),
       validator=Validator.Config(
           enable=False,
           freq=500,
@@ -275,9 +267,7 @@ def llama3_405b() -> TPUTrainerConfig:
           interval=500,
           last_save_model_only=True,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="full",
-      ),
+      activation_checkpoint=FullAC.Config(),
       validator=Validator.Config(
           enable=False,
           freq=500,

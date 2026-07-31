@@ -66,7 +66,7 @@ class ProfilerAcceleratorTest(base_device_test.BaseAcceleratorDeviceTest):
       # The CPU trace goes to `profile_traces/iteration_3/rank0_trace.json`.
       # On TPU, the TPU hardware trace (.xplane.pb) goes to `profile_traces/rank_0/plugins/profile/...`.
 
-      cpu_trace_files = list(pathlib.Path(tmpdir).rglob("*.json"))
+      cpu_trace_files = list(pathlib.Path(tmpdir).rglob("*.json*"))
       self.assertNotEmpty(
           cpu_trace_files, "Should have exported Chrome trace (.json)"
       )

@@ -1,5 +1,5 @@
-from torchtitan.components.loss import ChunkedCELoss
-from torchtitan.components.optimizer import OptimizersContainer
+import torchtitan.components.loss as loss
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.components.validate import Validator
@@ -17,7 +17,7 @@ __all__ = [
 ]
 
 
-def _testmodel(attn_backend: str = "sdpa") -> llama3_models.Llama3Model.Config:
+def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
   dim = 64
   n_heads = 8
   n_layers = 1
@@ -38,11 +38,6 @@ def _testmodel(attn_backend: str = "sdpa") -> llama3_models.Llama3Model.Config:
           out_features=128,
           param_init=llama3_models._LINEAR_INIT,
       ),
-      rope=common_models.RoPE.Config(
-          dim=dim // n_heads,
-          max_seq_len=512,
-          backend="complex",
-      ),
       layers=llama3_models._build_llama3_layers(
           n_layers=n_layers,
           dim=dim,
@@ -50,6 +45,10 @@ def _testmodel(attn_backend: str = "sdpa") -> llama3_models.Llama3Model.Config:
           n_kv_heads=n_heads,
           hidden_dim=4 * dim,
           attn_backend=attn_backend,
+          rope=common_models.ComplexRoPE.Config(
+              dim=dim // n_heads,
+              max_seq_len=512,
+          ),
       ),
   )
 
@@ -72,8 +71,8 @@ register_train_spec(
         model_args=llama3_configs,
         parallelize_fn=parallelize_llama,
         pipelining_fn=pipeline_llama,
-        loss_config=ChunkedCELoss.Config(),
-        optimizer_config=OptimizersContainer.Config(lr=8e-4),
+        loss_config=loss.ChunkedLossWrapper.Config(),
+        optimizer_config=default_adamw(lr=8e-4),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
         dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         validator_config=Validator.Config(enable=True),

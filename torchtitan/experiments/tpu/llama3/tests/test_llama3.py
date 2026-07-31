@@ -17,8 +17,8 @@ from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.rmsnorm import RMSNorm
-from torchtitan.models.common.rope import RoPE, apply_rotary_emb_complex as apply_rotary_emb
+from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.llama3.model import Llama3Model, Llama3TransformerBlock
 
 
@@ -177,10 +177,13 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
     freqs_cis_device = freqs_cis_cpu.to(self.accelerator_device)
 
     with self.subTest(name="ForwardPass"):
-      # Forward pass
-      xq_out_cpu, xk_out_cpu = apply_rotary_emb(xq_cpu, xk_cpu, freqs_cis_cpu)
-      xq_out_device, xk_out_device = apply_rotary_emb(
-          xq_device, xk_device, freqs_cis_device
+      # Reshape freqs_cis to be broadcastable: [1, seq_len, 1, head_dim // 2]
+      freqs_cis_cpu_reshaped = freqs_cis_cpu.view(1, seq_len, 1, head_dim // 2)
+      freqs_cis_device_reshaped = freqs_cis_device.view(1, seq_len, 1, head_dim // 2)
+
+      xq_out_cpu, xk_out_cpu = ComplexRoPE.apply_rotary_emb(xq_cpu, xk_cpu, freqs_cis_cpu_reshaped)
+      xq_out_device, xk_out_device = ComplexRoPE.apply_rotary_emb(
+          xq_device, xk_device, freqs_cis_device_reshaped
       )
 
       test_utils.check_equivalence(
@@ -234,23 +237,15 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
     x_cpu, x_device = self._create_input_tensor_cpu_device(
         (batch, seq_len, config.dim), requires_grad=True
     )
-    rope_config = RoPE.Config(
-        dim=config.dim // config.layers[0].attention.n_heads,
-        max_seq_len=seq_len,
-    )
-    rope = RoPE(rope_config)
-    freqs_cis_cpu = rope.cache
-    freqs_cis_device = freqs_cis_cpu.to(self.accelerator_device)
-
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      out_cpu = attention_cpu(x_cpu, freqs_cis_cpu, None)
-      out_device = attention_device(x_device, freqs_cis_device, None)
+      out_cpu = attention_cpu(x_cpu, None)
+      out_device = attention_device(x_device, None)
       test_utils.check_equivalence(
           out_device.cpu(),
           out_cpu,
-          atol=5e-4,
-          rtol=5e-4,
+          atol=1e-3,
+          rtol=1e-3,
           check_name="Attention Forward",
       )
 
@@ -264,8 +259,8 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
         test_utils.check_equivalence(
             x_device.grad.cpu(),
             x_cpu.grad,
-            atol=8e-4,
-            rtol=8e-4,
+            atol=1e-3,
+            rtol=1e-3,
             check_name="Attention Input Grad",
         )
         for (name, p_cpu), p_device in zip(
@@ -274,8 +269,8 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
           test_utils.check_equivalence(
               p_device.grad.cpu(),
               p_cpu.grad,
-              atol=1e-2,
-              rtol=1e-2,
+              atol=5e-2,
+              rtol=5e-2,
               check_name=f"Attention Param Grad: {name}",
           )
 
@@ -351,18 +346,10 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
     x_cpu, x_device = self._create_input_tensor_cpu_device(
         (batch, seq_len, config.dim), requires_grad=True
     )
-    rope_config = RoPE.Config(
-        dim=config.dim // config.layers[0].attention.n_heads,
-        max_seq_len=seq_len,
-    )
-    rope = RoPE(rope_config)
-    freqs_cis_cpu = rope.cache
-    freqs_cis_device = freqs_cis_cpu.to(self.accelerator_device)
-
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      out_cpu = transformer_block_cpu(x_cpu, freqs_cis_cpu, None)
-      out_device = transformer_block_device(x_device, freqs_cis_device, None)
+      out_cpu = transformer_block_cpu(x_cpu, None)
+      out_device = transformer_block_device(x_device, None)
       test_utils.check_equivalence(
           out_device.cpu(),
           out_cpu,

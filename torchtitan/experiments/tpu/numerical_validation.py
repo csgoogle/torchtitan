@@ -1,5 +1,6 @@
 """Shared utilities for accelerator device tests."""
 
+import os
 from typing import Any, Callable, Dict
 
 import torch

@@ -14,10 +14,11 @@ from typing import Any, List, Optional, Sequence, Tuple, cast
 
 from absl import flags
 from absl.flags import argparse_flags
-import os as os
+import os
 import torch
 import torch.distributed as dist
-from torchtitan.config import ConfigManager, Configurable
+from torchtitan.config.configurable import Configurable
+from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import gmain
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 from torchtitan.experiments.tpu import utils as tpu_utils
@@ -98,7 +99,7 @@ class TPUTrainer(torchtitan.train.Trainer):
 
     with self.train_context():
       pred = self.model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-      loss_sum = self.loss_fn(pred, labels)
+      loss_sum, _ = self.loss_fn(pred, labels)
       loss = loss_sum / global_valid_tokens
       del pred
 

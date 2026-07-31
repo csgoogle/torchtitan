@@ -314,15 +314,14 @@ class TorchaxTrainer:
         raise ValueError(f'No embedding constant for: {job_config.model_spec.name}')
 
     # Remat: default to recompute everything inside transformer block
-    if job_config.activation_checkpoint.mode == 'full':
+    from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+
+    ac_config = job_config.activation_checkpoint
+    if isinstance(ac_config, FullAC.Config):
       checkpoint_policy = jax.checkpoint_policies.nothing_saveable
-    elif job_config.activation_checkpoint.mode == 'selective':
+    elif isinstance(ac_config, SelectiveAC.Config):
       checkpoint_policy = jax.checkpoint_policies.dots_saveable
-    elif job_config.activation_checkpoint.mode == 'everything':
-      checkpoint_policy = jax.checkpoint_policies.everything_saveable
-    elif job_config.activation_checkpoint.mode == 'offload_dot':
-      checkpoint_policy = jax.checkpoint_policies.dots_with_no_batch_dims_saveable
-    elif job_config.activation_checkpoint.mode == 'nothing':
+    elif ac_config is None:
       checkpoint_policy = None
     else:
       checkpoint_policy = jax.checkpoint_policies.nothing_saveable
@@ -406,26 +405,46 @@ class TorchaxTrainer:
   def setup_optimizer(self, job_config, jittable_mod):
     """Sets up the optimizer and its state."""
 
-    if job_config.optimizer.name.lower() == 'sgd':
-      jax_optimizer = optax.sgd(job_config.optimizer.lr)
+    # Adapt to OptimizersContainer.Config
+    optim_config = job_config.optimizer
+    if hasattr(optim_config, "param_groups") and len(optim_config.param_groups) > 0:
+      # Assume first group is representative for simple Torchax setups
+      pg = optim_config.param_groups[0]
+      opt_name = pg.optimizer_name.lower()
+      kwargs = pg.optimizer_kwargs
+      lr = kwargs.get("lr", 8e-4)
+      eps = kwargs.get("eps", 1e-8)
+      wd = kwargs.get("weight_decay", 0.1)
+      betas = kwargs.get("betas", (0.9, 0.95))
+      b1, b2 = betas
+    else:
+      opt_name = optim_config.name.lower()
+      lr = optim_config.lr
+      b1 = optim_config.beta1 or 0.9
+      b2 = optim_config.beta2 or 0.95
+      eps = optim_config.eps or 1e-08
+      wd = optim_config.weight_decay or 0.1
+
+    if opt_name == 'sgd':
+      jax_optimizer = optax.sgd(lr)
       opt_state = torchax.interop.torch_view(jax_optimizer.init(torchax.interop.jax_view(jittable_mod.params)))
 
-    elif job_config.optimizer.name.lower() in ('adam', 'adamw'):
-      if job_config.optimizer.name.lower() == 'adam':
+    elif opt_name in ('adam', 'adamw'):
+      if opt_name == 'adam':
         jax_optimizer = optax.adam(
-            learning_rate=job_config.optimizer.lr,
-            b1=job_config.optimizer.beta1 or 0.9,
-            b2=job_config.optimizer.beta2 or 0.95,
-            eps=job_config.optimizer.eps or 1e-08,
+            learning_rate=lr,
+            b1=b1,
+            b2=b2,
+            eps=eps,
         )
       else:
         # AdamW usually requires weight decay
         jax_optimizer = optax.adamw(
-            learning_rate=job_config.optimizer.lr,
-            b1=job_config.optimizer.beta1 or 0.9,
-            b2=job_config.optimizer.beta2 or 0.95,
-            eps=job_config.optimizer.eps or 1e-08,
-            weight_decay=job_config.optimizer.weight_decay or 0.1,
+            learning_rate=lr,
+            b1=b1,
+            b2=b2,
+            eps=eps,
+            weight_decay=wd,
         )
 
       jax_params = torchax.interop.jax_view(jittable_mod.params)
@@ -503,7 +522,11 @@ class TorchaxTrainer:
         logger.info('Overriding Conformer loss to CTCLoss.')
         job_config.loss = conformer_loss.CTCLoss.Config()
 
-    loss_fn = job_config.loss.build(compile_config=job_config.compile)
+    loss_fn_base = job_config.loss.build(compile_config=job_config.compile)
+    def loss_fn(pred, labels, **kwargs):
+      # Wrap to discard metrics dict as torchax expects scalar loss
+      loss, _ = loss_fn_base(pred, labels, **kwargs)
+      return loss
 
     jax_optimizer, opt_state = self.setup_optimizer(
         job_config, jittable_mod
@@ -578,7 +601,7 @@ class TorchaxTrainer:
           f' {job_config.torchax_config.model_layer_override})'
           if job_config.torchax_config.model_layer_override
           else '',
-        job_config.optimizer.name,
+        job_config.optimizer.param_groups[0].optimizer_name if hasattr(job_config.optimizer, "param_groups") and len(job_config.optimizer.param_groups) > 0 else job_config.optimizer.name,
     )
 
     if job_config.profiler.enable_profiling:

@@ -234,12 +234,20 @@ func = getattr(module, function_name)
 func(*args, **kwargs)
 """
 
-  result = subprocess.run(
-      [sys.executable, "-c", script],
-      capture_output=True,
-      text=True,
-      check=True,
-  )
-  logging.info("Isolated subprocess output:\n%s", result.stdout)
-  if result.stderr:
-    logging.warning("Isolated subprocess stderr:\n%s", result.stderr)
+  try:
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    logging.info("Isolated subprocess output:\n%s", result.stdout)
+    if result.stderr:
+      logging.warning("Isolated subprocess stderr:\n%s", result.stderr)
+  # Wrap in try/except to reveal underlying Python crash traces when the
+  # isolated subprocess fails.
+  except subprocess.CalledProcessError as e:
+    logging.error("Isolated subprocess failed! stdout:\n%s", e.stdout)
+    if e.stderr:
+      logging.error("Isolated subprocess failed! stderr:\n%s", e.stderr)
+    raise

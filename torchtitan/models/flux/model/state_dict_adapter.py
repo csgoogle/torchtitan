@@ -8,7 +8,6 @@ import json
 import logging
 import os as os
 import re
-
 from collections import defaultdict
 from typing import Any
 
@@ -202,7 +201,9 @@ class FluxStateDictAdapter(StateDictAdapter):
                 # handle splitting layers
                 # split into q, k, v
                 split_vals = torch.split(
-                    value, self.model_config.hidden_size, dim=0
+                    value,
+                    self.model_config.hidden_size,  # pyrefly: ignore [missing-attribute]
+                    dim=0,
                 )
 
                 new_keys = (

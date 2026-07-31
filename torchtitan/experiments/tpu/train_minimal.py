@@ -159,7 +159,7 @@ class TrainerMinimal:
     )
 
     model_config = self.model_spec.model
-    model_config.update_from_config(trainer_config=job_config)
+    model_config.update_from_config(config=job_config)
     self.model_config = model_config
 
     if (
@@ -220,11 +220,10 @@ class TrainerMinimal:
     self.model = model.to_empty(device=self.device)
     with torch.no_grad():
       self.model.init_weights()
-
-    from torchtitan.components.loss import ChunkedCELoss
-    if isinstance(self.loss_fn, ChunkedCELoss):
+    from torchtitan.components.loss import ChunkedLossWrapper
+    if isinstance(self.loss_fn, ChunkedLossWrapper):
       lm_head = self.model.lm_head
-      assert lm_head is not None, "Model must have lm_head for ChunkedCELoss"
+      assert lm_head is not None, "Model must have lm_head for ChunkedLossWrapper"
       self.loss_fn.set_lm_head(lm_head)
       self.model._skip_lm_head = True
 
@@ -235,11 +234,14 @@ class TrainerMinimal:
         "You can disable this by setting --optimizer.implementation=foreach")
     self.optimizers = job_config.optimizer.build(model_parts=[self.model])
 
-    loss_parallel_enabled = (
-        self.parallel_dims.tp_enabled and
-        not parallelism_config.disable_loss_parallel
+    # get_spmd_context activates the configured SPMD backend (default,
+    # full_dtensor, or spmd_types) and global DeviceMesh. Components such as
+    # ChunkedLossWrapper then natively support loss parallelism automatically,
+    # eliminating need to handle loss_parallellism explicitly in the training
+    # loop.
+    self.train_context = dist_utils.get_spmd_context(
+        parallel_dims=self.parallel_dims,
     )
-    self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
     self.step_callback = step_callback
 
   def train(self):
@@ -289,7 +291,6 @@ class TrainerMinimal:
           step_start_time = time.time()
           self.optimizers.zero_grad()
           tokens, labels = get_batch()
-
           # In distributed settings, we sum locally calculated valid tokens
           # across all data-parallel ranks to get the global token count,
           # which is used to scale the loss and gradients.
@@ -310,7 +311,7 @@ class TrainerMinimal:
           # https://docs.pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.loss_parallel
           with self.train_context():  # pytype: disable=not-callable
             pred = self.model(tokens)
-            loss = self.loss_fn(pred, labels, global_valid_tokens)
+            loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
             # need to free pred before bwd to avoid peaking memory
             del pred
             loss.backward()

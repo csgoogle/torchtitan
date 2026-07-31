@@ -2,7 +2,7 @@
 
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
@@ -35,7 +35,7 @@ train_spec.register_train_spec(
         parallelize_fn=parallelize_conformer,
         pipelining_fn=None,
         loss_config=CrossEntropyLoss.Config(),
-        optimizer_config=OptimizersContainer.Config(lr=8e-4),
+        optimizer_config=default_adamw(lr=8e-4),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
         dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         tokenizer_config=HuggingFaceTokenizer.Config(),

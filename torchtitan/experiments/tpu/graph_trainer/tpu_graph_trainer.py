@@ -306,11 +306,10 @@ class TpuGraphTrainer(GraphTrainer):
     def _make_fx_forward_backward_step(
         self,
         model: nn.Module,
-        inputs: tuple[torch.Tensor, ...],
+        inputs: torch.Tensor,
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor,
+        global_valid_tokens: float,
         params: list[torch.Tensor],
-        extra_inputs: dict[str, torch.Tensor],
         extra_kwargs: dict[str, Any],
     ) -> torch.Tensor:
         """Override of GraphTrainer._make_fx_forward_backward_step applying TPU pipeline graph passes."""
@@ -318,8 +317,8 @@ class TpuGraphTrainer(GraphTrainer):
             maybe_register_blockmask_pytree_node,
         )
         from torchtitan.experiments.graph_trainer.make_fx_tracer import (
-            run_traced_train_step,
-            trace_train_step,
+            run_traced,
+            minimal_fx_tracer,
         )
         from torchtitan.experiments.graph_trainer.trainer import make_fwd_bwd_step
         from torchtitan.experiments.graph_trainer.passes import apply_graph_passes
@@ -331,15 +330,18 @@ class TpuGraphTrainer(GraphTrainer):
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
             else:
-                fwd_bwd_fn = make_fwd_bwd_step(self.loss_fn)
+                fwd_bwd_fn = make_fwd_bwd_step(model, self.loss_fn)
                 maybe_register_blockmask_pytree_node()
                 with self.train_context():
-                    self._traced_step = trace_train_step(fwd_bwd_fn)(
-                        model,
+                    self._traced_step = minimal_fx_tracer(
+                        fwd_bwd_fn,
+                        module=model,
+                        prepare_inputs=self._prepare_trace_inputs,
+                        prepare_call_inputs=self._prepare_trace_call_inputs,
+                    )(
                         inputs,
                         labels,
                         global_valid_tokens,
-                        extra_inputs,
                         extra_kwargs,
                     )
 
@@ -353,13 +355,10 @@ class TpuGraphTrainer(GraphTrainer):
                     compile_config=self.config.compile,
                 )
         with self.train_context():
-            outputs = run_traced_train_step(
-                self._traced_step,
-                model,
+            outputs = run_traced(self._traced_step, module=model)(
                 inputs,
                 labels,
                 global_valid_tokens,
-                extra_inputs,
                 extra_kwargs,
             )
         loss = outputs[0]
@@ -376,15 +375,15 @@ class TpuGraphTrainer(GraphTrainer):
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor,
+        global_valid_tokens: float,
     ) -> torch.Tensor:
         """TPU/PJRT addition: lowers and runs joint forward, backward, and AdamW optimizer FX graph step."""
         from torchtitan.experiments.graph_trainer.common_utils import (
             maybe_register_blockmask_pytree_node,
         )
         from torchtitan.experiments.graph_trainer.make_fx_tracer import (
-            run_traced_train_step,
-            trace_train_step,
+            run_traced,
+            minimal_fx_tracer,
         )
         from torchtitan.experiments.graph_trainer.passes import apply_graph_passes
         from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
@@ -394,7 +393,7 @@ class TpuGraphTrainer(GraphTrainer):
         assert len(self.model_parts) == 1
         model = self.model_parts[0]
 
-        inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
+        inputs, labels, extra_kwargs = self.post_dataloading_process(
             input_dict, labels
         )
 
@@ -408,6 +407,7 @@ class TpuGraphTrainer(GraphTrainer):
             max_norm = float(max_norm_val) if max_norm_val is not None else None
 
             fwd_bwd_adamw = _make_fwd_bwd_adamw_fn(
+                model,
                 loss_fn=self.loss_fn,
                 param_fqns=param_fqns,
                 beta1=float(betas[0]),
@@ -418,12 +418,13 @@ class TpuGraphTrainer(GraphTrainer):
             )
 
             with self.train_context():
-                self._traced_step = trace_train_step(fwd_bwd_adamw)(
-                    model,
+                self._traced_step = minimal_fx_tracer(
+                    fwd_bwd_adamw,
+                    module=model,
+                )(
                     inputs,
                     labels,
                     global_valid_tokens,
-                    extra_inputs,
                     extra_kwargs,
                 )
             pipeline_fn = PASS_PIPELINE_REGISTRY["tpu"]
@@ -436,13 +437,10 @@ class TpuGraphTrainer(GraphTrainer):
             )
 
         with self.train_context():
-            outputs = run_traced_train_step(
-                self._traced_step,
-                model,
+            outputs = run_traced(self._traced_step, module=model)(
                 inputs,
                 labels,
                 global_valid_tokens,
-                extra_inputs,
                 extra_kwargs,
             )
 
@@ -491,6 +489,7 @@ _GRAD_CLIP_MAX_SCALE = 1.0
 
 
 def _make_fwd_bwd_adamw_fn(
+    model: nn.Module,
     *,
     loss_fn,
     param_fqns: list[str],
@@ -500,15 +499,17 @@ def _make_fwd_bwd_adamw_fn(
     weight_decay: float,
     max_norm: float | None = None,
 ):
-    from torch.fx.traceback import annotate_fn
-    from torchtitan.experiments.graph_trainer.common_utils import _MODULE_FQN
+    from torchtitan.experiments.graph_trainer.common_utils import compute_annotated_loss
 
     def fwd_bwd_adamw(
-        model, inputs, labels, global_valid_tokens, extra_inputs, extra_kwargs
+        inputs, labels, global_valid_tokens, extra_kwargs
     ):
-        pred = model(inputs, **extra_inputs, **extra_kwargs)
-        loss = annotate_fn({_MODULE_FQN: "loss"})(loss_fn)(
-            pred, labels, global_valid_tokens
+        pred = model(inputs, **extra_kwargs)
+        loss = compute_annotated_loss(
+            loss_fn,
+            pred,
+            labels,
+            {"global_valid_tokens": global_valid_tokens},
         )
 
         canonical_params: list[torch.Tensor] = [

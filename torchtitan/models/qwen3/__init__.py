@@ -10,10 +10,15 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.components.quantization import QuantizationConverter
-
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.models.common import Embedding, Linear, RoPE, TransformerBlock
+from torchtitan.models.common import (
+    CosSinRoPE,
+    Embedding,
+    Linear,
+    RoPE,
+    TransformerBlock,
+)
 from torchtitan.models.common.config_utils import (
     get_attention_config,
     make_experts_config,
@@ -22,8 +27,11 @@ from torchtitan.models.common.config_utils import (
     make_moe_config,
     make_router_config,
 )
+from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
-from torchtitan.models.common.rmsnorm import RMSNorm
+from torchtitan.models.utils import validate_converter_order
+
+from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import Qwen3Model, Qwen3TransformerBlock
@@ -65,9 +73,9 @@ def _depth_init(layer_id: int) -> dict[str, Callable]:
 
 def _depth_experts_init(layer_id: int) -> dict[str, Callable]:
     return {
-        "w1": partial(nn.init.trunc_normal_, std=0.02),
-        "w2": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
-        "w3": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        "w1_EFD": partial(nn.init.trunc_normal_, std=0.02),
+        "w2_EDF": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        "w3_EFD": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
     }
 
 
@@ -83,11 +91,12 @@ def _build_qwen3_layers(
     n_kv_heads: int,
     head_dim: int,
     hidden_dim: int,
-    fuse_qkv: bool = False,
+    fuse_qkv: bool = True,
     attn_backend: str,
+    rope: RoPE.Config,
 ) -> list[TransformerBlock.Config]:
     """Build per-layer configs for dense Qwen3 models with depth-scaled inits."""
-    inner_attention, mask_type = get_attention_config(attn_backend)
+    inner_attention = get_attention_config(attn_backend)
     layers = []
     for layer_id in range(n_layers):
         layers.append(
@@ -103,8 +112,7 @@ def _build_qwen3_layers(
                     wo_param_init=_depth_init(layer_id),
                     inner_attention=inner_attention,
                     fuse_qkv=fuse_qkv,
-                    mask_type=mask_type,
-                    rope_backend="cos_sin",
+                    rope=rope,
                     qk_norm=_qwen3_norm(head_dim),
                 ),
                 feed_forward=make_ffn_config(
@@ -128,12 +136,14 @@ def _build_qwen3_moe_layers(
     moe_hidden_dim: int,
     num_experts: int,
     top_k: int,
+    fuse_qkv: bool = True,
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    rope: RoPE.Config,
 ) -> list[TransformerBlock.Config]:
     """Build per-layer configs for MoE Qwen3 models with depth-scaled inits."""
-    inner_attention, mask_type = get_attention_config(attn_backend)
+    inner_attention = get_attention_config(attn_backend)
     layers = []
     for layer_id in range(n_layers):
         layers.append(
@@ -148,8 +158,8 @@ def _build_qwen3_moe_layers(
                     wqkv_param_init=_LINEAR_INIT,
                     wo_param_init=_depth_init(layer_id),
                     inner_attention=inner_attention,
-                    mask_type=mask_type,
-                    rope_backend="cos_sin",
+                    fuse_qkv=fuse_qkv,
+                    rope=rope,
                     qk_norm=_qwen3_norm(head_dim),
                 ),
                 moe=make_moe_config(
@@ -168,7 +178,6 @@ def _build_qwen3_moe_layers(
                         num_experts=num_experts,
                         top_k=top_k,
                         param_init=_depth_experts_init(layer_id),
-                        score_before_experts=False,
                         comm_backend=moe_comm_backend,
                         non_blocking_capacity_factor=non_blocking_capacity_factor,
                     ),
@@ -198,61 +207,40 @@ def _debugmodel(attn_backend: str) -> Qwen3Model.Config:
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_layers(
-            n_layers=n_layers,
-            dim=dim,
-            n_heads=16,
-            n_kv_heads=8,
-            head_dim=head_dim,
-            hidden_dim=3072,
-            attn_backend=attn_backend,
-        ),
-    )
-
-
-def _debugmodel_fused_qkv(attn_backend: str) -> Qwen3Model.Config:
-    dim = 256
-    head_dim = 128
-    n_layers = 8
-    vocab_size = 2048
-    return Qwen3Model.Config(
-        vocab_size=vocab_size,
-        dim=dim,
-        norm=_qwen3_norm(dim),
-        enable_weight_tying=True,
-        tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size,
-            embedding_dim=dim,
-            param_init=_EMBEDDING_SKIP_INIT,
-        ),
-        lm_head=Linear.Config(
-            in_features=dim,
-            out_features=vocab_size,
-            param_init=_output_linear_init(dim),
-        ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
-        layers=_build_qwen3_layers(
-            n_layers=n_layers,
-            dim=dim,
-            n_heads=16,
-            n_kv_heads=8,
-            head_dim=head_dim,
-            hidden_dim=3072,
             fuse_qkv=True,
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=16,
+            n_kv_heads=8,
+            head_dim=head_dim,
+            hidden_dim=3072,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=4096,
+                theta=1000000.0,
+            ),
         ),
     )
+
+
+def _debugmodel_non_fused_qkv(attn_backend: str) -> Qwen3Model.Config:
+    # Reverse of the default fused QKV: keeps coverage for the separate
+    # wq/wk/wv path now that fuse_qkv defaults to True.
+    config = _debugmodel(attn_backend)
+    config.layers = _build_qwen3_layers(
+        fuse_qkv=False,
+        n_layers=8,
+        dim=256,
+        n_heads=16,
+        n_kv_heads=8,
+        head_dim=128,
+        hidden_dim=3072,
+        attn_backend=attn_backend,
+        rope=CosSinRoPE.Config(dim=128, max_seq_len=4096, theta=1000000.0),
+    )
+    return config
 
 
 def _0_6b(attn_backend: str) -> Qwen3Model.Config:
@@ -275,13 +263,8 @@ def _0_6b(attn_backend: str) -> Qwen3Model.Config:
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_layers(
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=16,
@@ -289,6 +272,11 @@ def _0_6b(attn_backend: str) -> Qwen3Model.Config:
             head_dim=head_dim,
             hidden_dim=3072,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=40960,
+                theta=1000000.0,
+            ),
         ),
     )
 
@@ -313,13 +301,8 @@ def _1_7b(attn_backend: str) -> Qwen3Model.Config:
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_layers(
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=16,
@@ -327,6 +310,11 @@ def _1_7b(attn_backend: str) -> Qwen3Model.Config:
             head_dim=head_dim,
             hidden_dim=6144,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=40960,
+                theta=1000000.0,
+            ),
         ),
     )
 
@@ -351,13 +339,8 @@ def _4b(attn_backend: str) -> Qwen3Model.Config:
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_layers(
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=32,
@@ -365,6 +348,11 @@ def _4b(attn_backend: str) -> Qwen3Model.Config:
             head_dim=head_dim,
             hidden_dim=9728,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=40960,
+                theta=1000000.0,
+            ),
         ),
     )
 
@@ -386,13 +374,8 @@ def _8b(attn_backend: str) -> Qwen3Model.Config:
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_layers(
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=32,
@@ -400,6 +383,11 @@ def _8b(attn_backend: str) -> Qwen3Model.Config:
             head_dim=head_dim,
             hidden_dim=12288,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=40960,
+                theta=1000000.0,
+            ),
         ),
     )
 
@@ -421,13 +409,8 @@ def _14b(attn_backend: str) -> Qwen3Model.Config:
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_layers(
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=40,
@@ -435,6 +418,11 @@ def _14b(attn_backend: str) -> Qwen3Model.Config:
             head_dim=head_dim,
             hidden_dim=17408,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=40960,
+                theta=1000000.0,
+            ),
         ),
     )
 
@@ -456,13 +444,8 @@ def _32b(attn_backend: str) -> Qwen3Model.Config:
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_layers(
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=64,
@@ -470,6 +453,11 @@ def _32b(attn_backend: str) -> Qwen3Model.Config:
             head_dim=head_dim,
             hidden_dim=25600,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=40960,
+                theta=1000000.0,
+            ),
         ),
     )
 
@@ -497,13 +485,8 @@ def _debugmodel_moe(
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_moe_layers(
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=16,
@@ -513,6 +496,11 @@ def _debugmodel_moe(
             num_experts=64,
             top_k=8,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=4096,
+                theta=1000000.0,
+            ),
             moe_comm_backend=moe_comm_backend,
         ),
     )
@@ -538,13 +526,8 @@ def _30b_a3b(
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=262144,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_moe_layers(
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=32,
@@ -554,6 +537,11 @@ def _30b_a3b(
             num_experts=128,
             top_k=8,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=40960,
+                theta=1000000.0,
+            ),
             moe_comm_backend=moe_comm_backend,
         ),
     )
@@ -579,13 +567,8 @@ def _235b_a22b(
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
         ),
-        rope=RoPE.Config(
-            dim=head_dim,
-            max_seq_len=4096,
-            theta=5000000.0,
-            backend="cos_sin",
-        ),
         layers=_build_qwen3_moe_layers(
+            fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
             n_heads=64,
@@ -595,6 +578,11 @@ def _235b_a22b(
             num_experts=128,
             top_k=8,
             attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=40960,
+                theta=5000000.0,
+            ),
             moe_comm_backend=moe_comm_backend,
         ),
     )
@@ -602,7 +590,7 @@ def _235b_a22b(
 
 qwen3_configs = {
     "debugmodel": _debugmodel,
-    "debugmodel_fused_qkv": _debugmodel_fused_qkv,
+    "debugmodel_non_fused_qkv": _debugmodel_non_fused_qkv,
     "0.6B": _0_6b,
     "1.7B": _1_7b,
     "4B": _4b,
@@ -617,23 +605,24 @@ qwen3_configs = {
 
 def model_registry(
     flavor: str,
-    attn_backend: str = "sdpa",
+    attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
-    quantization: list[QuantizationConverter.Config] | None = None,
+    converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
     kwargs = dict(attn_backend=attn_backend)
     if moe_comm_backend is not None:
         kwargs["moe_comm_backend"] = moe_comm_backend
     config = qwen3_configs[flavor](**kwargs)
-    if quantization is not None:
-        for q in quantization:
-            q.build().convert(config)
+    if converters is not None:
+        validate_converter_order(converters)
+        for c in converters:
+            config = c.build().convert(config)
     return ModelSpec(
         name="qwen3",
         flavor=flavor,
         model=config,
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=pipeline_llm,
-        post_optimizer_build_fn=None,
+        post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=Qwen3StateDictAdapter,
     )

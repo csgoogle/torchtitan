@@ -194,23 +194,15 @@ class JaxTrainer:
                 model_args.num_kv_reuse_layers = scaled  # pyrefly: ignore[missing-attribute]
 
         # Choose activation checkpoint policy.
-        ac_mode = job_config.activation_checkpoint.mode
-        if ac_mode == 'full':
+        from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+
+        ac_config = job_config.activation_checkpoint
+        if isinstance(ac_config, FullAC.Config):
             checkpoint_policy = jax.checkpoint_policies.nothing_saveable
-        elif ac_mode == 'selective':
+        elif isinstance(ac_config, SelectiveAC.Config):
             checkpoint_policy = jax.checkpoint_policies.dots_saveable
-        elif ac_mode == 'nothing':
+        elif ac_config is None:
             checkpoint_policy = None
-        elif ac_mode == 'offload_dot':
-            # MaxText-style: offload named tensors (decoder_layer_input) to pinned
-            # host memory during fwd, reload in bwd. Trades PCIe bandwidth for HBM.
-            # Model must wrap the target tensors with jax.ad_checkpoint.checkpoint_name.
-            checkpoint_policy = jax.checkpoint_policies.save_and_offload_only_these_names(
-                names_which_can_be_saved=[],
-                names_which_can_be_offloaded=["decoder_layer_input"],
-                offload_src="device",
-                offload_dst="pinned_host",
-            )
         else:
             checkpoint_policy = jax.checkpoint_policies.nothing_saveable
 
@@ -301,12 +293,25 @@ class JaxTrainer:
     # ------------------------------------------------------------------
 
     def setup_optimizer(self, job_config, model):
-        opt_name = job_config.optimizer.name.lower()
-        lr = job_config.optimizer.lr
-        b1 = job_config.optimizer.beta1 or 0.9
-        b2 = job_config.optimizer.beta2 or 0.95
-        eps = job_config.optimizer.eps or 1e-8
-        wd = job_config.optimizer.weight_decay or 0.1
+        # Adapt to OptimizersContainer.Config
+        optim_config = job_config.optimizer
+        if hasattr(optim_config, "param_groups") and len(optim_config.param_groups) > 0:
+            # Assume first group is representative for simple JAX setups
+            pg = optim_config.param_groups[0]
+            opt_name = pg.optimizer_name.lower()
+            kwargs = pg.optimizer_kwargs
+            lr = kwargs.get("lr", 8e-4)
+            eps = kwargs.get("eps", 1e-8)
+            wd = kwargs.get("weight_decay", 0.1)
+            betas = kwargs.get("betas", (0.9, 0.95))
+            b1, b2 = betas
+        else:
+            opt_name = optim_config.name.lower()
+            lr = optim_config.lr
+            b1 = optim_config.beta1 or 0.9
+            b2 = optim_config.beta2 or 0.95
+            eps = optim_config.eps or 1e-8
+            wd = optim_config.weight_decay or 0.1
 
         if opt_name == 'sgd':
             tx = optax.sgd(lr)

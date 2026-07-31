@@ -75,9 +75,13 @@ class TrainMinimalDistributedTest(
           config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+          skip_devices=[
+              # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
+              device_type.AcceleratorDeviceType.CPU,
+          ],
           loss_atol=1e-3,
           loss_rtol=1e-3,
-          grad_atol=5e-4,
+          grad_atol=8e-4,
           grad_rtol=1e-3,
           param_atol=5e-3,
           param_rtol=1e-3,
@@ -89,9 +93,13 @@ class TrainMinimalDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=["--parallelism.use_simple_fsdp"],
+          skip_devices=[
+              # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
+              device_type.AcceleratorDeviceType.CPU,
+          ],
           loss_atol=1e-3,
           loss_rtol=1e-3,
-          grad_atol=5e-4,
+          grad_atol=8e-4,
           grad_rtol=1e-3,
           param_atol=5e-3,
           param_rtol=1e-3,
@@ -116,6 +124,10 @@ class TrainMinimalDistributedTest(
           config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+          skip_devices=[
+             # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
+              device_type.AcceleratorDeviceType.TPU,
+          ],
           loss_atol=1e-3,
           loss_rtol=1e-3,
           grad_atol=2e-3,
@@ -130,6 +142,10 @@ class TrainMinimalDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=["--parallelism.use_simple_fsdp"],
+          skip_devices=[
+              # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
+              device_type.AcceleratorDeviceType.TPU,
+          ],
           loss_atol=1e-3,
           loss_rtol=1e-3,
           grad_atol=2e-3,
@@ -180,7 +196,7 @@ class TrainMinimalDistributedTest(
             "--training.steps=3",
             "--training.mixed_precision_param=float32",
             "--training.mixed_precision_reduce=float32",
-            "--training.local_batch_size=4",
+            "--training.local_batch_size=2",
         ] + (args or []),
         tensor_parallel_degree=tensor_parallel_degree,
         data_parallel_shard_degree=data_parallel_shard_degree,

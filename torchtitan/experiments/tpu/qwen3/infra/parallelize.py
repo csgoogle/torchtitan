@@ -21,7 +21,7 @@ def parallelize_qwen3(
     training: torchtitan.config.TrainingConfig,
     parallelism: torchtitan.config.ParallelismConfig,
     compile_config: torchtitan.config.CompileConfig,
-    ac_config: torchtitan.config.ActivationCheckpointConfig,
+    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config",
     dump_folder: str,
     skip_dp: bool = False,
     tpu_compile_mode: str = "layer",
