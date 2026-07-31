@@ -66,13 +66,17 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 
 ```
 
-### Install TorchTPU
+### Build TorchTPU wheel from source
 
-You can either build TorchTPU from source or install a prebuilt wheel.
+TorchTPU offers a pre-built wheel via
 
-Build instructions are available in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source) (note that this is a gated repository).
+```
+pip install --pre --no-deps --index-url "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch_tpu
+```
 
-First, create and activate a Python 3.12 virtual environment:
+**Important Note:** However, it currently only supports torch `2.11` and is not forward compatible with later torch versions. TorchTitan requires at least torch `>=2.12`, so we must build from torch_tpu from source.
+
+1. First, create and activate a Python 3.12 virtual environment:
 
 ```bash
 sudo apt install python3.12  # Install Python 3.12 if it is not already installed.
@@ -81,38 +85,68 @@ python3.12 -m venv venv; source venv/bin/activate
 
 ```
 
-#### Install a prebuilt wheel
+2. Clone [torch_tpu](https://github.com/google-pytorch/torch_tpu)
 
-Install dependencies. Some dependencies have to be installed before
-TorchTPU.
+    ```
+    git clone git@github.com:google-pytorch/torch_tpu.git
+    ```
+
+3. Change the pin in `torch_tpu/pyproject.toml` to torch `2.12`
+
+    ```
+    dependencies = [
+        "torch>=2.12.0", # Uprev from 2.11.0
+        ...
+    ]
+    ```
+
+4. Regenerate requirements lockfiles. From the `torch_tpu` root run:
+
+    ```
+    bash requirements/lock_environments.sh
+    ```
+
+5. Follow build instructions in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source). Instructions are repeated here:
+
+    Wheels can be built via:
+
+    ```bash
+    bazel build -c opt //ci/wheel:torch_tpu_wheel
+    ```
+
+    (Alternative) For building without Remote Execution (RBE) caching, use bazel
+    command below:
+
+    ```bash
+    bazel build -c opt //ci/wheel:torch_tpu_wheel --config=no_rbe
+    ```
+
+    Note that this command will install the CUDA version of `torch`; to get the
+    CPU-only build, use the `--index-url` parameter from the section on installing
+    nightlies, or install the CPU build separately.
+
+### Install TorchTitan + TorchTPU and its dependencies
+
+Cone the torchtitan repository:
 
 ```bash
-# Package installation sequence matters here due to: https://github.com/openxla/tokamax/issues/240
-pip install "jax[tpu]==0.9.1" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-pip install git+https://github.com/openxla/tokamax.git@8cba6a6a1e52e9efbb7ff8facb66f18f0bfcbe4c
-pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-pip install libtpu==0.0.41 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-```
-
-In order to install prebuilt TorchTPU wheel, you need to authenticate first.
-
-```bash
-pip install keyrings.google-artifactregistry-auth
-gcloud auth login
-gcloud auth application-default login
-
-pip install --pre --no-deps --index-url "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch_tpu
-```
-
-### Install TorchTitan and its dependencies
-
-```bash
-git clone https://github.com/google-pytorch/torchtitan   # This repository will be available at a later date.
+git clone https://github.com/google-pytorch/torchtitan
 cd torchtitan
+```
+
+Some dependencies have to be installed before TorchTPU.
+
+```bash
 pip install -r requirements.txt
 pip install -r .ci/docker/requirements-flux.txt
 pip install portpicker absl-py numpy gcsfs frozendict triton fairscale
+```
 
+
+Install TorchTPU wheel via:
+
+```
+pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl --index-url "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 ```
 
 ### Optional: Download the Hugging Face model tokenizer
@@ -278,34 +312,13 @@ xpk cluster create --cluster=${CLUSTER_NAME} \
 
 ### Build the TorchTitan TPU-enabled Docker image
 
-Clone the repository from GitHub (note that this repository will be available at a later date).
+Clone the repository from GitHub
 
 ```bash
 git clone https://github.com/google-pytorch/torchtitan
 cd torchtitan
 
 ```
-
-#### Download the TorchTPU wheel file
-
-Before the public release of TorchTPU, you must either copy a prebuilt wheel file or build one from source.
-
-Build instructions are available in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source) (note that this is a gated repository).
-
-To download a prebuilt wheel, run the following:
-
-```bash
-pip install keyrings.google-artifactregistry-auth
-gcloud auth login
-gcloud auth application-default login
-
-pip download --pre --no-deps \
-    --index-url "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
-    torch_tpu
-
-```
-
-The downloaded file will have a name similar to `torch_tpu-0.1.0.dev2242026-cp312-cp312-manylinux_2_31_x86_64.whl`. Rename it to `torch_tpu-0.1.0.dev0-cp312-cp312-manylinux_2_31_x86_64.whl` to match the hardcoded name in the Dockerfile.
 
 #### Optional: Download the Hugging Face model tokenizer
 
@@ -328,10 +341,14 @@ gcloud storage cp --recursive ./tests gs://${BUCKET_NAME}/tests
 
 #### Build the Docker image
 
-Run from the root of the torchtitan repository for the following operations.
+First, copy the `torch_tpu` wheel built in [Build and install TorchTPU wheel from source](#build-and-install-torchtpu-wheel-from-source) to the root TorchTitan directory so it is accessible from docker build context:
+```bash
+cp ../torch_tpu/bazel-bin/ci/wheel/torch_tpu-*.whl ./
+```
+
+Run from the root of the torchtitan repository
 ```bash
 docker build -t torchtitan-container:latest -f torchtitan/experiments/tpu/Dockerfile .
-
 ```
 
 #### Upload the Docker image to Artifact Registry
