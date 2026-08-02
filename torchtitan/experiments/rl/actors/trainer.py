@@ -40,6 +40,7 @@ from torchtitan.experiments.rl.actors.utils import (
 from torchtitan.experiments.rl.types import TrainBatch
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
+from torchtitan.tools.profiler import Profiler
 from torchtitan.tools.logging import init_logger
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,8 @@ class PolicyTrainer(Actor, Configurable):
         )
         dump_folder: str = ""
         """Folder for AC debug dumps when using memory_budget mode."""
+        profiler: Profiler.Config = field(default_factory=Profiler.Config)
+        """Profiler configuration."""
 
     def __init__(
         self,

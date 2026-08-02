@@ -22,6 +22,7 @@ from torchtitan.experiments.rl.models.vllm_registry import (
 from torchtitan.experiments.rl.types import Completion
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.utils import has_cuda_capability
+from torchtitan.tools.profiler import Profiler
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig
 from vllm.sampling_params import RequestOutputKind
@@ -135,6 +136,9 @@ class VLLMGenerator(Actor, Configurable):
 
         debug: DebugConfig = field(default_factory=DebugConfig)
         """Debug and determinism settings."""
+
+        profiler: Profiler.Config = field(default_factory=Profiler.Config)
+        """Profiler configuration."""
 
         def __post_init__(self):
             # Generator only supports TP. vLLM handles its own parallelism

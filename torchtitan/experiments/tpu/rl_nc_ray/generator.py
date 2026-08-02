@@ -179,7 +179,7 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
 
 @ray.remote
 class RayVLLMGenerator:
-    def __init__(self, config, *, model_spec, model_path, compile_config, max_num_seqs):
+    def __init__(self, config, *, model_spec, model_path, compile_config, max_num_seqs, dump_folder=None, **kwargs):
         os.environ.setdefault("LOCAL_RANK", "0")
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
@@ -236,3 +236,11 @@ class RayVLLMGenerator:
         print(
             f"@@@ Generator: Loaded model state dicts for policy v{version}"
         )
+
+    def start_profile(self, profile_prefix: str | None = None) -> None:
+        if hasattr(self.generator, "_engine"):
+            self.generator._engine.start_profile(profile_prefix)
+
+    def stop_profile(self) -> None:
+        if hasattr(self.generator, "_engine"):
+            self.generator._engine.stop_profile()
