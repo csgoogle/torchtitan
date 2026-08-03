@@ -65,7 +65,7 @@ def parallelize_flux(
         workarounds.use_splash_attention_patch(model)
 
     if ac_config is not None:
-        apply_ac(model)
+        apply_ac(model, ac_config)
 
     if parallelism.spmd_backend == "spmd_types":
         model.parallelize(parallel_dims)
@@ -202,7 +202,7 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
     )
 
 
-def apply_ac(model: nn.Module):
+def apply_ac(model: nn.Module, ac_config: ActivationCheckpointingConfig):
     """Apply full activation checkpointing to the Flux double/single blocks."""
 
     # pyrefly: ignore [missing-attribute]

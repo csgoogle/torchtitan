@@ -58,7 +58,8 @@ xpk workload create \
     --splash-attention-kernel.use-splash-attention-kernel \
     --compile.enable \
     --compile.backend=tpu \
-    --activation-checkpoint.no-preserve_rng_state"
+    activation-checkpoint:full \
+    --activation-checkpoint.no-preserve-rng-state"
 ```
 
 **6/11/26: With this configuration you should observe the following metrics**
@@ -108,7 +109,8 @@ xpk workload create \
     --splash-attention-kernel.use-splash-attention-kernel \
     --compile.enable \
     --compile.backend=tpu \
-    --activation-checkpoint.no-preserve_rng_state"
+    activation-checkpoint:full \
+    --activation-checkpoint.no-preserve-rng-state"
 ```
 
 **6/11/26: With this configuration you should observe the following metrics**
