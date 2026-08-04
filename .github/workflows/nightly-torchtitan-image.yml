@@ -1,0 +1,173 @@
+name: nightly-torchtitan-image
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *" # 01:00 PST / 09:00 UTC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheel:
+    name: Build torch_tpu wheel from source against PyTorch Nightly
+    runs-on: linux-x86-n4-16
+    outputs:
+      torch_tpu_sha: ${{ steps.torch_tpu_sha.outputs.sha }}
+    container:
+      image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build@sha256:480f397c57207671315a27173ccec790ea9c66ef030af96cbe6ac9b4a6613996"
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout torchtitan repository
+        uses: actions/checkout@v4
+
+      - name: Checkout torch_tpu repository
+        uses: actions/checkout@v4
+        with:
+          repository: google-pytorch/torch_tpu
+          path: torch_tpu
+          token: ${{ secrets.TORCH_TPU_PAT }}
+
+      - name: Get torch_tpu commit SHA
+        id: torch_tpu_sha
+        run: |
+          SHA=$(git -C torch_tpu rev-parse --short=7 HEAD)
+          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download PyTorch Nightly CPU Wheel
+        run: |
+          mkdir -p torch_tpu/dist
+          pip install --upgrade pip
+          pip download --no-deps --pre torch \
+            --index-url https://download.pytorch.org/whl/nightly/cpu \
+            --only-binary=:all: \
+            --python-version 3.12 \
+            --implementation cp \
+            -d torch_tpu/dist
+          TORCH_WHEEL=$(ls $(pwd)/torch_tpu/dist/torch-*.whl | head -n 1)
+          echo "TORCH_SOURCE=$TORCH_WHEEL" >> $GITHUB_ENV
+          echo "Using TORCH_SOURCE=$TORCH_WHEEL"
+
+      - name: Build TorchTPU wheel via Bazel
+        run: |
+          cd torch_tpu
+          bazel build -c opt //ci/wheel:torch_tpu_wheel \
+            --config=wheel_common \
+            --config=local_torch \
+            --repo_env=TORCH_SOURCE=$TORCH_SOURCE
+
+      - name: Upload compiled torch_tpu wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: torch-tpu-wheel-from-torch-nightly
+          path: torch_tpu/bazel-bin/ci/wheel/torch_tpu-*.whl
+          retention-days: 1
+
+  build-and-push-image:
+    name: Build and push nightly TorchTitan TPU image
+    needs: [build-wheel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      IMAGE_REPO: us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container
+
+    steps:
+      - name: Checkout torchtitan repository
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets and auth config
+        env:
+          GAR_JSON_KEY: ${{ secrets.GAR_JSON_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GAR_JSON_KEY}" ]]; then
+            echo "Missing required secret: GAR_JSON_KEY"
+            exit 1
+          fi
+          if [[ -z "${HF_TOKEN}" ]]; then
+            echo "Missing required secret: HF_TOKEN"
+            exit 1
+          fi
+
+      - name: Download torch_tpu wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: torch-tpu-wheel-from-torch-nightly
+          path: .
+
+      - name: Authenticate to Google Cloud via service account key
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GAR_JSON_KEY }}
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker auth for GAR
+        run: gcloud auth configure-docker us-west1-docker.pkg.dev --quiet
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags and labels
+        id: meta
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          NIGHTLY_DATE=$(date -u +%Y%m%d)
+          TORCH_TPU_SHA="${{ needs.build-wheel.outputs.torch_tpu_sha }}"
+
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE_REPO}:nightly"
+            echo "${IMAGE_REPO}:nightly-${NIGHTLY_DATE}"
+            echo "${IMAGE_REPO}:torchtitan-commit-${SHORT_SHA}"
+            echo "${IMAGE_REPO}:torch-tpu-commit-${TORCH_TPU_SHA}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "labels<<EOF"
+            echo "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.revision=${GITHUB_SHA}"
+            echo "org.opencontainers.image.title=torchtitan-tpu-nightly"
+            echo "org.opencontainers.image.description=Nightly TorchTitan TPU image built from source against PyTorch Nightly"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push nightly image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: torchtitan/experiments/tpu/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print published tags
+        run: |
+          echo "Published tags:"
+          echo "${{ steps.meta.outputs.tags }}"
