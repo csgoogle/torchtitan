@@ -6,6 +6,7 @@ import typing
 from typing import Callable, List, Sequence, Tuple
 
 from absl import flags
+from absl import logging
 from absl.flags import argparse_flags
 import torch.multiprocessing as mp
 import torchtitan.config
