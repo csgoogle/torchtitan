@@ -17,10 +17,9 @@ RUN pip install -r requirements.txt
 COPY .ci/docker/requirements-flux.txt .
 RUN pip install -r requirements-flux.txt
 
-COPY torchtitan /torchtitan
+COPY torchtitan /torchtitan/torchtitan
 # only need to copy assets and tests when using local tokenizers and datasets
 COPY assets /torchtitan/assets
-COPY tests /tests
+COPY tests /torchtitan/tests
 
 WORKDIR /torchtitan
-ENV PYTHONPATH=/
