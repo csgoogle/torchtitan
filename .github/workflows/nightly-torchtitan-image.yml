@@ -133,13 +133,13 @@ jobs:
           set -euo pipefail
 
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
-          NIGHTLY_DATE=$(date -u +%Y%m%d)
+          NIGHTLY_DATE=$(date -u +%Y-%m-%d)
           TORCH_TPU_SHA="${{ needs.build-wheel.outputs.torch_tpu_sha }}"
 
           {
             echo "tags<<EOF"
-            echo "${IMAGE_REPO}:nightly"
-            echo "${IMAGE_REPO}:nightly-${NIGHTLY_DATE}"
+            echo "${IMAGE_REPO}:latest"
+            echo "${IMAGE_REPO}:${NIGHTLY_DATE}"
             echo "${IMAGE_REPO}:torchtitan-commit-${SHORT_SHA}"
             echo "${IMAGE_REPO}:torch-tpu-commit-${TORCH_TPU_SHA}"
             echo "EOF"
