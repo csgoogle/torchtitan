@@ -62,7 +62,7 @@ class TPUTrainer(torchtitan.train.Trainer):
       if not tpu_config.enable_amp:
         logger.info("AMP is disabled, using uniform precision training.")
       if tpu_config.compile_optimizer:
-        from torchtitan.experiments.tpu.compiled_optimizer import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
+        from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
         apply_compiled_optimizer(self)
 
 

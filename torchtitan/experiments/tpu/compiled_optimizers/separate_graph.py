@@ -1,19 +1,18 @@
-"""Compiled optimizer implementation for PyTorch-on-TPU.
+"""Compiled optimizer as a separate static XLA graph for PyTorch-on-TPU.
 
-Standard PyTorch `torch.compile` only traces the `nn.Module` forward and
-backward autograd graphs, leaving `optimizer.step()` running in eager mode with
-300+ host dispatches per step. `apply_compiled_optimizer` intercepts
-`optimizer.step()`, functionalizes the optimizer (e.g. AdamW) via
-`minimal_fx_tracer`, and compiles it via `StaticCompiler` into a single static
-XLA graph executable to eliminate host dispatch overhead.
+This module compiles `optimizer.step()` into its own standalone static XLA graph
+executable via `StaticCompiler`, eliminating 300+ host dispatch roundtrips per
+step without merging the optimizer into the forward/backward graph.
 
-Adapted from _build_compiled_optimizer_groups from
-https://github.com/google-pytorch/torchtitan/blob/whc/qwen/torchtitan/experiments/tpu_qwen/lib/tpu_graph_trainer.py
+Used by:
+1. Regular Trainer (`use_graph_trainer=False`) when `--tpu-config.compile-optimizer`
+   is enabled.
+2. Graph Trainer (`use_graph_trainer=True`) when `optimizer_in_graph=False`
+   and `--tpu-config.compile-optimizer` is enabled.
 """
 
 from typing import Any, Optional
 import torch
-import torch.optim.adamw as _adamw_mod
 from torch_tpu._internal.compile.compiler import StaticCompiler  # pytype: disable=import-error
 
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
@@ -21,6 +20,7 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     _wrap_subclasses,
     minimal_fx_tracer,
 )
+from torchtitan.experiments.tpu.compiled_optimizers.functional import functional_adamw_step
 from torchtitan.tools.logging import logger
 
 
@@ -98,6 +98,11 @@ def _build_compiled_optimizer_groups(opt: torch.optim.Optimizer) -> list:
     n_params = len(params)
     is_capturable = params[0].device.type != "cpu"
 
+    # StaticCompiler/minimal_fx_tracer traces a single callable taking a flat
+    # dictionary state. `_adamw_step` acts as the unpacking adapter: it unpacks
+    # the dictionary keys into ordered lists, delegates the numerical update to
+    # `functional_adamw_step`, and closes over group hyperparameters so they are
+    # baked as static constants into the compiled XLA graph.
     def _adamw_step(
         state,
         _n=n_params,
@@ -108,36 +113,30 @@ def _build_compiled_optimizer_groups(opt: torch.optim.Optimizer) -> list:
         _maximize=maximize,
         _capturable=is_capturable,
     ):
-      # Clone tensors so AdamW operates functionally without mutating tracer input slots
-      params_c = [state[f"p_{i}"].clone() for i in range(_n)]
+      """Tracing adapter: unpacks dict state and calls functional_adamw_step."""
+      params_c = [state[f"p_{i}"] for i in range(_n)]
       grads_c = [state[f"g_{i}"] for i in range(_n)]
       exp_avgs_c = [state[f"ea_{i}"] for i in range(_n)]
       exp_avg_sqs_c = [state[f"eas_{i}"] for i in range(_n)]
       steps_c = [state[f"st_{i}"] for i in range(_n)]
       lr_t = state["lr"]
-      _adamw_mod.adamw(
+      # Delegate numerical AdamW step math to functional_adamw_step kernel.
+      new_params, new_eas, new_eass, new_steps = functional_adamw_step(
           params_c,
           grads_c,
           exp_avgs_c,
           exp_avg_sqs_c,
-          [],
           steps_c,
-          foreach=True,
-          capturable=True,
-          differentiable=False,
-          fused=False,
-          grad_scale=None,
-          found_inf=None,
-          has_complex=False,
-          amsgrad=False,
+          lr_t,
           beta1=_b1,
           beta2=_b2,
-          lr=lr_t,
-          weight_decay=_wd,
           eps=_eps,
+          weight_decay=_wd,
           maximize=_maximize,
+          foreach=True,
+          capturable=True,
       )
-      return (*params_c, *exp_avgs_c, *exp_avg_sqs_c, *steps_c)
+      return (*new_params, *new_eas, *new_eass, *new_steps)
 
     trace_state: dict = {}
     for i, p in enumerate(params):
@@ -249,6 +248,4 @@ def apply_compiled_optimizer(trainer: Any) -> None:
 
 __all__ = [
     "apply_compiled_optimizer",
-    "_build_compiled_optimizer_groups",
-    "_tpu_backend_compile_pass",
 ]

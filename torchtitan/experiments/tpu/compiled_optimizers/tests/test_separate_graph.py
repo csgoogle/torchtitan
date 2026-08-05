@@ -1,10 +1,10 @@
-"""Unit tests for compiled AdamW optimizer on TPU / CPU."""
+"""Unit tests for separate-graph compiled AdamW optimizer on TPU / CPU."""
 
 from absl.testing import absltest
 import torch
 from torch import nn
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
-from torchtitan.experiments.tpu.compiled_optimizer import apply_compiled_optimizer
+from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer
 
 
 class DummyOptimizersContainer:
@@ -23,7 +23,7 @@ class DummyTrainer:
     self.optimizers = DummyOptimizersContainer(optimizer)
 
 
-class CompiledOptimizerTest(BaseAcceleratorDeviceTest):
+class SeparateGraphOptimizerTest(BaseAcceleratorDeviceTest):
 
   def test_compiled_optimizer_step(self):
     device = self.accelerator_device
@@ -140,7 +140,6 @@ class CompiledOptimizerTest(BaseAcceleratorDeviceTest):
             atol=1e-4,
             check_device=False,
         )
-      
 
 
 if __name__ == "__main__":

@@ -4,7 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""TpuGraphTrainer subclass for TPU with optional optimizer-in-graph."""
+"""TpuGraphTrainer subclass for TPU with optional optimizer compilation.
+
+Note there are 2 ways of compiling the optimizer graph on TPU:
+1. Together with fwd+bwd+loss (when TpuGraphTrainer is used and
+   optimizer_in_graph=True): TpuGraphTrainer directly traces the fused step,
+   accessing the functional AdamW math and state buffer helpers from
+   `torchtitan.experiments.tpu.compiled_optimizers.functional`.
+2. As a separate graph (when TpuGraphTrainer with optimizer_in_graph=False,
+   or Regular Trainer with compiled optimizer): `apply_compiled_optimizer` from
+   `torchtitan.experiments.tpu.compiled_optimizers.separate_graph` handles
+   DTensor subclass wrapping/unwrapping and compiles `optimizer.step()` as a
+   standalone graph, reusing the same functional AdamW math.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +30,13 @@ import torch
 
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu import workarounds
-from torchtitan.experiments.tpu.compiled_optimizer import _build_compiled_optimizer_groups
+from torchtitan.experiments.tpu.compiled_optimizers.functional import (
+    functional_adamw_step,
+    update_model_and_optstate_buffers,
+)
+from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
+    apply_compiled_optimizer,
+)
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import register as register_tpu_pipeline
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.tools.logging import logger
@@ -116,22 +134,7 @@ class TpuGraphTrainer(GraphTrainer):
             _optimizer_compile_enabled(config, tpu_extra) and not self._optimizer_in_graph
         )
         if self._optimizer_compile:
-            self._compiled_optimizers: list[Optional[Any]] = [
-                None for _ in self.optimizers.optimizers
-            ]
-            _container = self.optimizers
-            _trainer = self
-
-            def _patched_step(closure: Any = None) -> None:
-                assert closure is None, "compiled optimizer step does not support closures"
-                _trainer._compiled_optimizer_step()
-
-            _container.step = _patched_step  # type: ignore[assignment]
-            print(
-                f"[compiled_opt] Separate optimizer-graph compile enabled — patched OptimizersContainer.step "
-                f"({len(self.optimizers.optimizers)} inner optimizer(s)).",
-                flush=True,
-            )
+            apply_compiled_optimizer(self)
 
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -140,35 +143,6 @@ class TpuGraphTrainer(GraphTrainer):
         if not self._optimizer_in_graph:
             return super().train_step(data_iterator)
         return self._train_step_optimizer_in_graph(data_iterator)
-
-    def _compiled_optimizer_step(self) -> None:
-        """TPU/PJRT addition: executes compiled optimizer groups across meshes."""
-        for i, opt in enumerate(self.optimizers.optimizers):
-            if self._compiled_optimizers[i] is None:
-                self._compiled_optimizers[i] = _build_compiled_optimizer_groups(opt)
-            for fn, params, state_refs, lr_ref in self._compiled_optimizers[i]:
-                grads = [p.grad for p in params]
-                if any(g is None for g in grads):
-                    opt.step()
-                    continue
-                exp_avgs = [s["exp_avg"] for s in state_refs]
-                exp_avg_sqs = [s["exp_avg_sq"] for s in state_refs]
-                steps = [s["step"] for s in state_refs]
-                lr_ref.fill_(float(opt.param_groups[lr_ref._group_idx]["lr"]))  # type: ignore[attr-defined]
-                outs = fn(params, grads, exp_avgs, exp_avg_sqs, steps, lr_ref)
-                n = len(params)
-                new_params = outs[:n]
-                new_exp_avgs = outs[n : 2 * n]
-                new_exp_avg_sqs = outs[2 * n : 3 * n]
-                new_steps = outs[3 * n : 4 * n]
-                for p, np_ in zip(params, new_params, strict=True):
-                    p.data.copy_(np_)
-                for ea, nea in zip(exp_avgs, new_exp_avgs, strict=True):
-                    ea.copy_(nea)
-                for eas, neas in zip(exp_avg_sqs, new_exp_avg_sqs, strict=True):
-                    eas.copy_(neas)
-                for s, ns in zip(steps, new_steps, strict=True):
-                    s.copy_(ns)
 
     def _register_optimizer_buffers(self) -> None:
         """TPU/PJRT addition: registers persistent optstate buffers when optimizer_in_graph is enabled."""
@@ -451,37 +425,20 @@ class TpuGraphTrainer(GraphTrainer):
         new_exp_avg_sqs = outputs[1 + 2 * n : 1 + 3 * n]
         new_step = outputs[1 + 3 * n]
 
-        for fqn, new_p in zip(self._optstate_param_fqns, new_params, strict=True):
-            live = _get_param_by_fqn(model, fqn)
-            live.data.copy_(new_p.detach() if isinstance(new_p, torch.Tensor) else new_p)
-        for fqn, new_ea in zip(self._optstate_param_fqns, new_exp_avgs, strict=True):
-            buf = _get_optstate_buffer(model, fqn, "exp_avg")
-            buf.copy_(new_ea.detach() if isinstance(new_ea, torch.Tensor) else new_ea)
-        for fqn, new_eas in zip(
-            self._optstate_param_fqns, new_exp_avg_sqs, strict=True
-        ):
-            buf = _get_optstate_buffer(model, fqn, "exp_avg_sq")
-            buf.copy_(new_eas.detach() if isinstance(new_eas, torch.Tensor) else new_eas)
+        from torchtitan.experiments.tpu.compiled_optimizers.functional import update_model_and_optstate_buffers
+
+        update_model_and_optstate_buffers(
+            model,
+            self._optstate_param_fqns,
+            new_params,
+            new_exp_avgs,
+            new_exp_avg_sqs,
+        )
         model._optstate_step.copy_(
             new_step.detach() if isinstance(new_step, torch.Tensor) else new_step
         )
 
         return loss
-
-
-def _get_param_by_fqn(model, fqn: str) -> torch.Tensor:
-    parent_path, _, leaf = fqn.rpartition(".")
-    parent = model.get_submodule(parent_path) if parent_path else model
-    params = getattr(parent, "_parameters", None)
-    if params is not None and leaf in params:
-        return params[leaf]
-    return getattr(parent, leaf)
-
-
-def _get_optstate_buffer(model, param_fqn: str, kind: str) -> torch.Tensor:
-    parent_path, _, leaf = param_fqn.rpartition(".")
-    parent = model.get_submodule(parent_path) if parent_path else model
-    return getattr(parent, f"_optstate_{leaf}_{kind}")
 
 
 _GRAD_CLIP_EPS = 1e-6
@@ -500,6 +457,11 @@ def _make_fwd_bwd_adamw_fn(
     max_norm: float | None = None,
 ):
     from torchtitan.experiments.graph_trainer.common_utils import compute_annotated_loss
+    from torchtitan.experiments.tpu.compiled_optimizers.functional import (
+        _get_param_by_fqn,
+        _get_optstate_buffer,
+        functional_adamw_step,
+    )
 
     def fwd_bwd_adamw(
         inputs, labels, global_valid_tokens, extra_kwargs
@@ -535,37 +497,24 @@ def _make_fwd_bwd_adamw_fn(
         step_t = model._optstate_step
         lr_t = model._optstate_lr
 
-        import torch.optim.adamw as _adamw_mod
-
         n = len(canonical_params)
-        new_params = [p.clone() for p in canonical_params]
-        new_eas = [ea.clone() for ea in exp_avgs]
-        new_eass = [eas.clone() for eas in exp_avg_sqs]
-        steps_c = [step_t.clone() for _ in range(n)]
-        grads_cast = [g.to(p.dtype) for g, p in zip(grads, canonical_params)]
-        _adamw_mod.adamw(
-            new_params,
-            grads_cast,
-            new_eas,
-            new_eass,
-            [],
-            steps_c,
-            foreach=False,
-            capturable=True,
-            differentiable=False,
-            fused=False,
-            grad_scale=None,
-            found_inf=None,
-            has_complex=False,
-            amsgrad=False,
+        steps = [step_t for _ in range(n)]
+        new_params, new_eas, new_eass, new_steps = functional_adamw_step(
+            canonical_params,
+            grads,
+            exp_avgs,
+            exp_avg_sqs,
+            steps,
+            lr_t,
             beta1=beta1,
             beta2=beta2,
-            lr=lr_t,
-            weight_decay=weight_decay,
             eps=eps,
+            weight_decay=weight_decay,
             maximize=False,
+            foreach=False,
+            capturable=True,
         )
-        return [loss, *new_params, *new_eas, *new_eass, steps_c[0]]
+        return [loss, *new_params, *new_eas, *new_eass, new_steps[0]]
 
     return fwd_bwd_adamw
 
@@ -608,53 +557,51 @@ def _split_optimizers_by_mesh(optimizers_container) -> bool:
 
 
 def _dump_weight_stats(model_parts) -> None:
-    rank = int(os.environ.get("RANK", "0"))
-    if rank != 0:
-        return
-    try:
-        from torch.distributed.tensor import DTensor
-    except Exception:
-        DTensor = None
-    logger.debug("[debug_weights] === post-init weight stats (rank 0) ===")
-    for model in model_parts:
-        for name, p in model.named_parameters():
-            t = p
-            if DTensor is not None and isinstance(p, DTensor):
-                t = p._local_tensor
-            try:
-                t_cpu = t.detach().to("cpu").float()
-                has_nan = bool(torch.isnan(t_cpu).any().item())
-                has_inf = bool(torch.isinf(t_cpu).any().item())
-                lo = float(t_cpu.min().item())
-                hi = float(t_cpu.max().item())
-                me = float(t_cpu.mean().item())
-                st = float(t_cpu.std().item())
-                logger.debug(
+  rank = int(os.environ.get("RANK", "0"))
+  if rank != 0:
+    return
+  try:
+    from torch.distributed.tensor import DTensor
+  except Exception:
+    DTensor = None
+  logger.debug("[debug_weights] === post-init weight stats (rank 0) ===")
+  for model in model_parts:
+    for name, p in model.named_parameters():
+      t = p
+      if DTensor is not None and isinstance(p, DTensor):
+        t = p._local_tensor
+      try:
+        t_cpu = t.detach().to("cpu").float()
+        has_nan = bool(torch.isnan(t_cpu).any().item())
+        has_inf = bool(torch.isinf(t_cpu).any().item())
+        lo = float(t_cpu.min().item())
+        hi = float(t_cpu.max().item())
+        me = float(t_cpu.mean().item())
+        st = float(t_cpu.std().item())
+        logger.debug(
                     f"[debug_weights]   {name}: shape={tuple(t.shape)} "
                     f"min={lo:+.4f} max={hi:+.4f} mean={me:+.5f} std={st:.5f} "
                     f"nan={has_nan} inf={has_inf}"
                 )
-            except Exception as e:
-                logger.debug(f"[debug_weights]   {name}: <error {type(e).__name__}: {e}>")
-    for model in model_parts:
-        for name, buf in model.named_buffers():
-            t = buf
-            if DTensor is not None and isinstance(buf, DTensor):
-                t = buf._local_tensor
-            try:
-                t_cpu = t.detach().to("cpu").float()
-                has_nan = bool(torch.isnan(t_cpu).any().item())
-                lo = float(t_cpu.min().item())
-                hi = float(t_cpu.max().item())
-                logger.debug(
+      except Exception as e:
+        logger.debug(f"[debug_weights]   {name}: <error {type(e).__name__}: {e}>")
+  for model in model_parts:
+    for name, buf in model.named_buffers():
+      t = buf
+      if DTensor is not None and isinstance(buf, DTensor):
+        t = buf._local_tensor
+      try:
+        t_cpu = t.detach().to("cpu").float()
+        has_nan = bool(torch.isnan(t_cpu).any().item())
+        lo = float(t_cpu.min().item())
+        hi = float(t_cpu.max().item())
+        logger.debug(
                     f"[debug_weights]   buf {name}: shape={tuple(t.shape)} "
                     f"min={lo:+.4f} max={hi:+.4f} nan={has_nan}"
                 )
-            except Exception as e:
-                logger.debug(f"[debug_weights]   buf {name}: <error {type(e).__name__}: {e}>")
-    logger.debug("[debug_weights] === end ===")
-
-
+      except Exception as e:
+        logger.debug(f"[debug_weights]   buf {name}: <error {type(e).__name__}: {e}>")
+  logger.debug("[debug_weights] === end ===")
 
 
 def _apply_tpu_moe_post_init(model_parts, tpu_extra: TpuGraphTrainerConfig) -> None:
