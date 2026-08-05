@@ -7,8 +7,19 @@ pulling in Monarch's networking or RDMA dependencies, which conflict with Ray an
 """
 
 import sys
+import copyreg
+import torch.utils._config_module
 from unittest.mock import MagicMock
 import logging
+
+import importlib
+
+# Register custom reducer on PyTorch ConfigModule base class so that cloudpickle / Ray 
+# can serialize RayTPUPolicyTrainer without failing on dynamically modified PyTorch config modules.
+torch.utils._config_module.ConfigModule.__reduce__ = lambda self: (
+    importlib.import_module,
+    (self.__module__,),
+)
 
 logger = logging.getLogger(__name__)
 
