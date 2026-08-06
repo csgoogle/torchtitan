@@ -28,7 +28,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.models.qwen3.config_registry import model_registry
+from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
