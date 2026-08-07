@@ -252,6 +252,25 @@ def qwen3_30b_a3b() -> Trainer.Config:
     )
 
 
+def qwen3_30b_a3b_global_aux() -> Trainer.Config:
+    config = qwen3_30b_a3b()
+    config.model_spec = model_registry("30B-A3B-global-aux")
+    config.metrics = MetricsProcessor.Config(log_freq=1)
+    config.optimizer = default_adamw(lr=3e-4)
+    config.lr_scheduler = LRSchedulersContainer.Config(
+        warmup_steps=200,
+        total_steps=40000,
+        decay_type="linear",
+        min_lr_factor=0.0,
+    )
+    config.training.local_batch_size = 12
+    config.training.global_batch_size = 768
+    config.training.seq_len = 2048
+    config.training.steps = 250
+    config.activation_checkpoint = None
+    return config
+
+
 def qwen3_32b() -> Trainer.Config:
     model_spec = model_registry("32B")
     return Trainer.Config(
