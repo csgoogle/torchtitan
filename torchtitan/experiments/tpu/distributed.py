@@ -8,7 +8,6 @@ import os
 from typing import Any, Callable, Tuple
 
 from absl import logging
-import tensorflow as tf
 import torch
 import torch.distributed as dist
 from torchtitan.experiments.tpu import gdist
