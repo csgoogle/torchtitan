@@ -18,7 +18,6 @@ from torchtitan.experiments.tpu.qwen3.infra import parallelize as qwen3_dtensor_
 
 
 
-
 # Constants for test parameters
 # To use OVERRIDEABLE SDP on TPU, need to ensure local batch size is
 # >= 4, i.e. TEST_BATCH_SIZE / world_size >= 4.

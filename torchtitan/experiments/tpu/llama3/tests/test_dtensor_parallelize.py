@@ -23,7 +23,6 @@ from torchtitan.models.llama3.model import Llama3Model
 
 
 
-
 # Constants for test parameters
 # To use OVERRIDEABLE SDP on TPU, need to ensure local batch size is
 # >= 4, i.e. TEST_BATCH_SIZE / world_size >= 4.

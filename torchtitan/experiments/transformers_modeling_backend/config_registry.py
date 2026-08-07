@@ -28,7 +28,7 @@ def transformers_modeling_backend_debugmodel() -> TransformersBackendConfig:
     model_spec = model_registry("debugmodel")
     return TransformersBackendConfig(
         loss=CrossEntropyLoss.Config(),
-        hf_assets_path="./tests/assets/tokenizer",
+        hf_assets_path="tests/assets/tokenizer",
         hf_model="Qwen/Qwen3-4B-Instruct-2507",
         debug=DebugConfig(print_config=True),
         model_spec=model_spec,
@@ -98,7 +98,7 @@ def transformers_modeling_backend_sft_full() -> TransformersBackendConfig:
 
     return TransformersBackendConfig(
         loss=CrossEntropyLoss.Config(),
-        hf_assets_path="./tests/assets/qwen3_0.6b",
+        hf_assets_path="tests/assets/qwen3_0.6b",
         hf_model="Qwen/Qwen3-0.6B",
         model_spec=model_registry("sft_full"),
         tokenizer=HFBackendTokenizer.Config(),
@@ -145,7 +145,7 @@ def transformers_modeling_backend_sft_debugmodel() -> TransformersBackendConfig:
 
     return TransformersBackendConfig(
         loss=CrossEntropyLoss.Config(),
-        hf_assets_path="./tests/assets/tokenizer",
+        hf_assets_path="tests/assets/tokenizer",
         hf_model="Qwen/Qwen3-4B-Instruct-2507",
         model_spec=model_registry("sft_debugmodel"),
         tokenizer=HFBackendTokenizer.Config(),

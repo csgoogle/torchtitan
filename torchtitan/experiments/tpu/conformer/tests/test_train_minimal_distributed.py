@@ -8,7 +8,6 @@ from torchtitan.experiments.tpu.conformer import train_minimal as conformer_trai
 
 
 
-
 class TrainMinimalDistributedTest(
     base_distributed_device_test.BaseDistributedDeviceTest
 ):

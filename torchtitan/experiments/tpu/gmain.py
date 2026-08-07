@@ -16,7 +16,6 @@ import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 
 from absl import app
 
-
 global_start_trainer_func = None
 
 
@@ -70,6 +69,7 @@ def main(parsed_args: Tuple[argparse.Namespace, List[str]]):
   )
 
   _start_trainer(config)
+
 
 
 def handle_main(

@@ -15,7 +15,6 @@ from torchtitan.experiments.tpu.train import TPUTrainer, start_trainer
 
 
 
-
 class StartTrainerWithLossCapture:
 
   def __init__(self, output_path: str):

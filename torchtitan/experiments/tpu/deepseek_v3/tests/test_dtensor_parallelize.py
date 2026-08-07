@@ -17,7 +17,6 @@ from torchtitan.models.deepseek_v3.model import DeepSeekV3Model
 import torchtitan.models.deepseek_v3.parallelize as deepseek_v3_dtensor_parallelize
 
 
-
 # Constants for test parameters
 # To use OVERRIDEABLE SDP on TPU, need to ensure local batch size is
 # >= 4, i.e. TEST_BATCH_SIZE / world_size >= 4.

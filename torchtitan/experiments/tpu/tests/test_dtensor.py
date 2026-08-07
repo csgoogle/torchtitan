@@ -22,7 +22,6 @@ import torch.compiler
 
 
 
-
 BATCH_SIZE = 2
 SEQ_LEN = 128
 HIDDEN_SIZE = 256

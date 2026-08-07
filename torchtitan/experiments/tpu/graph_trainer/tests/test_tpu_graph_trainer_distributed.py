@@ -13,7 +13,6 @@ import torchtitan.experiments.tpu.train
 
 
 
-
 class TpuGraphTrainerDistributedTest(
     base_distributed_device_test.BaseDistributedDeviceTest
 ):
