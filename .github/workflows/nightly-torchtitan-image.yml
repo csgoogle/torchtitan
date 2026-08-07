@@ -2,11 +2,21 @@ name: nightly-torchtitan-image
 
 on:
   workflow_dispatch:
+    inputs:
+      torch_tpu_ref:
+        description: 'Branch, tag, or commit SHA of torch_tpu to checkout'
+        required: false
+        default: 'main'
+      push_image:
+        description: 'Push the image to GAR'
+        required: false
+        type: boolean
+        default: true
   schedule:
     - cron: "0 9 * * *" # 01:00 PST / 09:00 UTC
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.torch_tpu_ref || 'main' }}
   cancel-in-progress: true
 
 permissions:
@@ -35,6 +45,7 @@ jobs:
           repository: google-pytorch/torch_tpu
           path: torch_tpu
           token: ${{ secrets.TORCH_TPU_PAT }}
+          ref: ${{ github.event.inputs.torch_tpu_ref || 'main' }}
 
       - name: Get torch_tpu commit SHA
         id: torch_tpu_sha
@@ -135,16 +146,35 @@ jobs:
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           NIGHTLY_DATE=$(date -u +%Y-%m-%d)
           TORCH_TPU_SHA="${{ needs.build-wheel.outputs.torch_tpu_sha }}"
+          TORCH_TPU_REF="${{ github.event.inputs.torch_tpu_ref || 'main' }}"
+          TORCHITAN_REF="${{ github.ref_name }}"
 
-          {
-            echo "tags<<EOF"
-            echo "${IMAGE_REPO}:latest"
-            echo "${IMAGE_REPO}:${NIGHTLY_DATE}"
-            echo "${IMAGE_REPO}:torchtitan-commit-${SHORT_SHA}"
-            echo "${IMAGE_REPO}:torch-tpu-commit-${TORCH_TPU_SHA}"
-            echo "EOF"
-            echo "NIGHTLY_DATE=${NIGHTLY_DATE}"
-          } >> "${GITHUB_OUTPUT}"
+          # Sanitize ref names
+          SAFE_TORCH_TPU_REF=$(echo "${TORCH_TPU_REF}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          SAFE_TORCHITAN_REF=$(echo "${TORCHITAN_REF}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+
+          IS_CUSTOM=false
+          if [[ "${TORCH_TPU_REF}" != "main" ]] || [[ "${TORCHITAN_REF}" != "main" ]]; then
+            IS_CUSTOM=true
+          fi
+
+          if [ "$IS_CUSTOM" = "true" ]; then
+            {
+              echo "tags<<EOF"
+              echo "${IMAGE_REPO}:torch-tpu-${SAFE_TORCH_TPU_REF}-torchtitan-${SAFE_TORCHITAN_REF}"
+              echo "EOF"
+            } >> "${GITHUB_OUTPUT}"
+          else
+            {
+              echo "tags<<EOF"
+              echo "${IMAGE_REPO}:latest"
+              echo "${IMAGE_REPO}:${NIGHTLY_DATE}"
+              echo "${IMAGE_REPO}:torchtitan-commit-${SHORT_SHA}"
+              echo "${IMAGE_REPO}:torch-tpu-commit-${TORCH_TPU_SHA}"
+              echo "EOF"
+              echo "NIGHTLY_DATE=${NIGHTLY_DATE}"
+            } >> "${GITHUB_OUTPUT}"
+          fi
 
           {
             echo "labels<<EOF"
@@ -152,6 +182,8 @@ jobs:
             echo "org.opencontainers.image.revision=${GITHUB_SHA}"
             echo "org.opencontainers.image.title=torchtitan-tpu-nightly"
             echo "org.opencontainers.image.description=Nightly TorchTitan TPU image built from source against PyTorch Nightly"
+            echo "torchtitan.branch=${TORCHITAN_REF}"
+            echo "torch_tpu.branch=${TORCH_TPU_REF}"
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
@@ -164,11 +196,12 @@ jobs:
           python3 scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.2-1B --assets tokenizer --hf_token="${HF_TOKEN}"
 
       - name: Build and push nightly image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: torchtitan/experiments/tpu/Dockerfile
-          push: true
+          push: ${{ github.event.inputs.push_image != 'false' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -180,3 +213,8 @@ jobs:
         run: |
           echo "Published tags:"
           echo "${{ steps.meta.outputs.tags }}"
+
+      - name: Print image Digest
+        run: |
+          echo "Image Digest:"
+          echo "${{ steps.build.outputs.digest }}"
