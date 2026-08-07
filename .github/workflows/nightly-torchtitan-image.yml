@@ -143,6 +143,7 @@ jobs:
             echo "${IMAGE_REPO}:torchtitan-commit-${SHORT_SHA}"
             echo "${IMAGE_REPO}:torch-tpu-commit-${TORCH_TPU_SHA}"
             echo "EOF"
+            echo "NIGHTLY_DATE=${NIGHTLY_DATE}"
           } >> "${GITHUB_OUTPUT}"
 
           {
@@ -170,6 +171,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CACHE_BUSTER=${{ steps.meta.outputs.NIGHTLY_DATE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
