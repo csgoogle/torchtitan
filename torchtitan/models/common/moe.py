@@ -301,6 +301,72 @@ def configure_moe_aux_loss_reduction(model: nn.Module, parallel_dims) -> None:
 # END PR3000 cherry-pick.
 
 
+def _record_moe_aux_loss_telemetry(
+    aux_loss: MoELoadBalanceAuxLoss,
+    scores_BLE: torch.Tensor,
+    topk_expert_ids_BLK: torch.Tensor,
+    *,
+    router_logits_BLE: torch.Tensor | None,
+    expert_bias_E: torch.Tensor | None,
+) -> None:
+    if aux_loss.type != "batch_wise":
+        return
+
+    _, _, num_experts = scores_BLE.shape
+    with torch.no_grad():
+        # Keep forward telemetry local; the metrics path batches one all-reduce
+        # across layers at log time.
+        local_tokens_per_expert_E = torch.histc(
+            topk_expert_ids_BLK.reshape(-1).float(),
+            bins=num_experts,
+            min=0,
+            max=num_experts,
+        ).to(dtype=scores_BLE.dtype)
+        probs_BLE = scores_BLE / (scores_BLE.sum(dim=-1, keepdim=True) + 1e-20)
+        local_prob_sums_E = probs_BLE.sum(dim=(0, 1)).detach()
+
+        aux_loss.last_local_tokens_per_expert_E = (
+            local_tokens_per_expert_E.detach().float()
+        )
+        aux_loss.last_local_prob_sums_E = local_prob_sums_E.detach().float()
+        if router_logits_BLE is not None:
+            logits = router_logits_BLE.detach().float()
+            aux_loss.last_router_logits_abs_mean = logits.abs().mean()
+            aux_loss.last_router_logits_abs_max = logits.abs().amax()
+            aux_loss.last_router_logits_std = logits.std(correction=0)
+        else:
+            aux_loss.last_router_logits_abs_mean = torch.zeros(
+                (), dtype=torch.float32, device=scores_BLE.device
+            )
+            aux_loss.last_router_logits_abs_max = torch.zeros(
+                (), dtype=torch.float32, device=scores_BLE.device
+            )
+            aux_loss.last_router_logits_std = torch.zeros(
+                (), dtype=torch.float32, device=scores_BLE.device
+            )
+
+        if expert_bias_E is not None:
+            bias = expert_bias_E.detach().float()
+            aux_loss.last_expert_bias_abs_mean = bias.abs().mean()
+            aux_loss.last_expert_bias_abs_max = bias.abs().amax()
+            aux_loss.last_expert_bias_enabled = torch.ones(
+                (), dtype=torch.float32, device=scores_BLE.device
+            )
+        else:
+            aux_loss.last_expert_bias_abs_mean = torch.zeros(
+                (), dtype=torch.float32, device=scores_BLE.device
+            )
+            aux_loss.last_expert_bias_abs_max = torch.zeros(
+                (), dtype=torch.float32, device=scores_BLE.device
+            )
+            aux_loss.last_expert_bias_enabled = torch.zeros(
+                (), dtype=torch.float32, device=scores_BLE.device
+            )
+        aux_loss.last_dropped_routes = torch.zeros(
+            (), dtype=torch.float32, device=scores_BLE.device
+        )
+
+
 class GroupedExperts(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -533,7 +599,7 @@ class TokenChoiceTopKRouter(Module):
 
     def forward(
         self, x_BLD: torch.Tensor, expert_bias_E: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x_BLD: Input ``(B, L, D)``.
@@ -543,17 +609,18 @@ class TokenChoiceTopKRouter(Module):
             topk_scores_BLK: Routing scores ``(B, L, K)``.
             topk_expert_ids_BLK: Expert indices ``(B, L, K)``.
             scores_BLE: Full routing scores ``(B, L, E)``.
+            router_logits_BLE: Router logits before score normalization ``(B, L, E)``.
         """
         # Compute gate in float32 to help stability of expert load balancing.
         with torch.autocast(device_type=x_BLD.device.type, dtype=torch.float32):
-            scores_BLE = self.gate(x_BLD)
+            router_logits_BLE = self.gate(x_BLD)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
-        # scores_BLE is already float32 from the autocast above.
+        # router_logits_BLE is already float32 from the autocast above.
         if self.score_func == "sigmoid":
-            scores_BLE = torch.sigmoid(scores_BLE)
+            scores_BLE = torch.sigmoid(router_logits_BLE)
         elif self.score_func == "softmax":
-            scores_BLE = F.softmax(scores_BLE, dim=-1)
+            scores_BLE = F.softmax(router_logits_BLE, dim=-1)
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
@@ -589,6 +656,7 @@ class TokenChoiceTopKRouter(Module):
             topk_scores_BLK,
             topk_expert_ids_BLK,
             scores_BLE,
+            router_logits_BLE,
         )
 
 
@@ -716,6 +784,7 @@ class MoE(Module):
             topk_scores_BLK,
             topk_expert_ids_BLK,
             scores_BLE,
+            router_logits_BLE,
         ) = self.router(x_BLD, self.expert_bias_E)
 
         if self.training and self.aux_loss is not None:
@@ -723,6 +792,15 @@ class MoE(Module):
                 topk_scores_BLK,
                 scores_BLE,
                 topk_expert_ids_BLK,
+            )
+            # Telemetry is intentionally non-load-bearing; the aux-loss gradient
+            # path is the self.aux_loss call above.
+            _record_moe_aux_loss_telemetry(
+                self.aux_loss,
+                scores_BLE,
+                topk_expert_ids_BLK,
+                router_logits_BLE=router_logits_BLE,
+                expert_bias_E=self.expert_bias_E,
             )
 
         # Build a one-hot routing map (B, L, E) marking the experts each token

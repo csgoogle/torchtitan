@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
@@ -31,6 +32,7 @@ __all__ = [
     "OptimizersContainer",
     "ParamGroupConfig",
     "default_adamw",
+    "get_moe_load_balancing_metrics",
     "register_moe_load_balancing_hook",
 ]
 
@@ -71,6 +73,7 @@ T = TypeVar("T", bound=Optimizer)
 
 class _MoELike(Protocol):
     load_balance_coeff: float | None
+    aux_loss: Any | None
     tokens_per_expert_E: torch.Tensor  # noqa: N815
     expert_bias_E: torch.Tensor  # noqa: N815
 
@@ -531,3 +534,158 @@ def register_moe_load_balancing_hook(
                 model_parts, parallel_dims=parallel_dims
             )
         )
+
+
+def get_moe_load_balancing_metrics(
+    model_parts: list[nn.Module],
+) -> dict[str, Any]:
+    local_tokens_per_expert_E_list = []
+    local_prob_sums_E_list = []
+    dropped_routes_0D_list = []
+    router_logits_abs_mean_0D_list = []
+    router_logits_abs_max_0D_list = []
+    router_logits_std_0D_list = []
+    expert_bias_abs_mean_0D_list = []
+    expert_bias_abs_max_0D_list = []
+    expert_bias_enabled_0D_list = []
+    aux_loss_modules = []
+    coefficients = []
+    top_ks = []
+
+    for model_part in model_parts:
+        layers = model_part.get_submodule("layers")
+        assert isinstance(layers, nn.ModuleDict)
+        for transformer_block in layers.values():
+            if not getattr(transformer_block, "moe_enabled", False):
+                continue
+            moe = cast(_MoELike, transformer_block.moe)
+            if moe.aux_loss is None:
+                continue
+            aux_loss = moe.aux_loss
+            if not hasattr(aux_loss, "last_local_tokens_per_expert_E"):
+                continue
+            local_tokens_per_expert_E_list.append(
+                aux_loss.last_local_tokens_per_expert_E
+            )
+            local_prob_sums_E_list.append(aux_loss.last_local_prob_sums_E)
+            dropped_routes_0D_list.append(aux_loss.last_dropped_routes)
+            router_logits_abs_mean_0D_list.append(aux_loss.last_router_logits_abs_mean)
+            router_logits_abs_max_0D_list.append(aux_loss.last_router_logits_abs_max)
+            router_logits_std_0D_list.append(aux_loss.last_router_logits_std)
+            expert_bias_abs_mean_0D_list.append(aux_loss.last_expert_bias_abs_mean)
+            expert_bias_abs_max_0D_list.append(aux_loss.last_expert_bias_abs_max)
+            expert_bias_enabled_0D_list.append(aux_loss.last_expert_bias_enabled)
+            aux_loss_modules.append(aux_loss)
+            coefficients.append(aux_loss.coeff)
+            top_ks.append(aux_loss.top_k)
+
+    if not local_tokens_per_expert_E_list:
+        return {}
+
+    coeff = coefficients[0]
+    if any(value != coeff for value in coefficients):
+        raise ValueError("MoE auxiliary loss coefficient must match across layers")
+    top_k = top_ks[0]
+    if any(value != top_k for value in top_ks):
+        raise ValueError("MoE auxiliary loss top_k must match across layers")
+
+    local_tokens_per_expert_LE = torch.stack(local_tokens_per_expert_E_list).float()
+    local_prob_sums_LE = torch.stack(local_prob_sums_E_list).float()
+    num_layers = local_tokens_per_expert_LE.size(0)
+    num_experts = local_tokens_per_expert_LE.size(1)
+    local_sums_2LE = torch.cat(
+        [local_tokens_per_expert_LE, local_prob_sums_LE], dim=0
+    )
+    # The loss all-reduces only hard counts; DP gradient reduction combines its
+    # rank-local probability contributions. Metrics need both values globally
+    # materialized. Counts are repeated here because the verbatim PR3000 loss
+    # does not expose them; batching both statistics adds no other collective.
+    global_sums_2LE = _all_reduce_moe_metric_sums(
+        local_sums_2LE,
+        aux_loss_modules[0],
+    )
+    global_tokens_per_expert_LE, global_prob_sums_LE = global_sums_2LE.split(
+        num_layers, dim=0
+    )
+
+    global_tokens_L = global_tokens_per_expert_LE.sum(dim=1) / top_k
+    probability_fraction_LE = global_prob_sums_LE / global_tokens_L.unsqueeze(1)
+    token_fraction_LE = global_tokens_per_expert_LE * (
+        num_experts / (top_k * global_tokens_L.unsqueeze(1))
+    )
+    normalized_aux_loss_L = (token_fraction_LE * probability_fraction_LE).sum(dim=1)
+    mean_counts_L = global_tokens_per_expert_LE.mean(dim=1)
+    max_mean_L = global_tokens_per_expert_LE.amax(dim=1) / mean_counts_L
+    route_cv_L = global_tokens_per_expert_LE.std(dim=1, correction=0) / mean_counts_L
+    assignment_totals_L = global_tokens_per_expert_LE.sum(dim=1)
+
+    metrics = {
+        "moe/global_aux_loss": normalized_aux_loss_L.mean() * coeff,
+        "moe/global_aux_loss_normalized": normalized_aux_loss_L.mean(),
+        "moe/route_max_mean_max": max_mean_L.amax(),
+        "moe/route_max_mean_mean": max_mean_L.mean(),
+        "moe/route_max_mean_median": max_mean_L.median(),
+        "moe/route_cv_max": route_cv_L.amax(),
+        "moe/route_cv_mean": route_cv_L.mean(),
+        "moe/route_cv_median": route_cv_L.median(),
+        "moe/route_assignments_min": assignment_totals_L.amin(),
+        "moe/route_assignments_max": assignment_totals_L.amax(),
+        "moe/dropped_routes_total": torch.stack(dropped_routes_0D_list)
+        .float()
+        .sum(),
+        "moe/router_logits_abs_mean": torch.stack(router_logits_abs_mean_0D_list)
+        .float()
+        .mean(),
+        "moe/router_logits_abs_max": torch.stack(router_logits_abs_max_0D_list)
+        .float()
+        .amax(),
+        "moe/router_logits_std_mean": torch.stack(router_logits_std_0D_list)
+        .float()
+        .mean(),
+        "moe/expert_bias_enabled": torch.stack(expert_bias_enabled_0D_list)
+        .float()
+        .amax(),
+        "moe/expert_bias_abs_mean": torch.stack(expert_bias_abs_mean_0D_list)
+        .float()
+        .mean(),
+        "moe/expert_bias_abs_max": torch.stack(expert_bias_abs_max_0D_list)
+        .float()
+        .amax(),
+    }
+
+    for layer_idx, (layer_loss, layer_counts, layer_max_mean, layer_cv) in enumerate(
+        zip(
+            normalized_aux_loss_L,
+            global_tokens_per_expert_LE,
+            max_mean_L,
+            route_cv_L,
+            strict=True,
+        )
+    ):
+        metrics[f"moe/global_aux_loss_normalized/layer_{layer_idx:03d}"] = layer_loss
+        metrics[f"moe/route_max_mean/layer_{layer_idx:03d}"] = layer_max_mean
+        metrics[f"moe/route_cv/layer_{layer_idx:03d}"] = layer_cv
+        metrics[f"moe/route_assignments/layer_{layer_idx:03d}"] = layer_counts.sum()
+
+    # Preserve exact per-expert counts in one event; thousands of individual
+    # scalar writes can make the metrics rank miss the process-group timeout.
+    metrics["moe/route_counts_json"] = json.dumps(
+        global_tokens_per_expert_LE.to(dtype=torch.int64, device="cpu").tolist(),
+        separators=(",", ":"),
+    )
+
+    return metrics
+
+
+def _all_reduce_moe_metric_sums(
+    values: torch.Tensor,
+    aux_loss: Any,
+) -> torch.Tensor:
+    with torch.no_grad():
+        for reduce_mesh in (aux_loss.tp_mesh, aux_loss.dp_mesh, aux_loss.cp_mesh):
+            if reduce_mesh is None:
+                continue
+            torch.distributed.all_reduce(
+                values, group=reduce_mesh.get_group(), op=torch.distributed.ReduceOp.SUM
+            )
+    return values

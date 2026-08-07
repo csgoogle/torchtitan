@@ -13,6 +13,8 @@ from typing import Any
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.summary import scalar as scalar_summary
+from torch.utils.tensorboard.summary import text as text_summary
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
@@ -122,9 +124,22 @@ class TensorBoardLogger(BaseLogger):
         logger.info(f"TensorBoard logging enabled. Logs will be saved at {log_dir}")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
+        summary = None
         for k, v in metrics.items():
             tag = k if self.tag is None else f"{self.tag}/{k}"
-            self.writer.add_scalar(tag, v, step)
+            if isinstance(v, str):
+                value_summary = text_summary(tag, v)
+            else:
+                value_summary = scalar_summary(tag, v)
+            if summary is None:
+                summary = value_summary
+            else:
+                summary.value.extend(value_summary.value)
+
+        if summary is not None:
+            # SummaryWriter's file writer is asynchronous, but one writer call
+            # per metric can saturate its bounded event queue on remote storage.
+            self.writer._get_file_writer().add_summary(summary, step)
 
     def close(self) -> None:
         self.writer.close()
