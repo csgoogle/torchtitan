@@ -12,11 +12,62 @@ from enum import Enum
 from typing import Any, Literal
 
 import spmd_types as spmd
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import init_device_mesh as torch_init_device_mesh
 
 from torchtitan.config.configs import ParallelismConfig
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import get_device_type
+
+
+def init_device_mesh(
+    device_type: str,
+    mesh_shape: tuple[int, ...],
+    mesh_dim_names: tuple[str, ...] | None = None,
+    enable_tpu_topo_mesh: bool = False,
+) -> DeviceMesh:
+    if (
+        enable_tpu_topo_mesh
+        and device_type == "tpu"
+        and hasattr(torch, "tpu")
+        and hasattr(torch.tpu, "topology_aware_mesh")
+    ):
+        rank_mesh = torch.tpu.topology_aware_mesh(mesh_shape)
+        # DeviceMesh reuses the default process group for 1D world-size meshes,
+        # which silently discards our ordering. To avoid this, explicitly create
+        # a process group for the mesh if the layout is 1D and disable rank
+        # sorting.
+        if (
+            rank_mesh.ndim == 1
+            and rank_mesh.numel() == dist.get_world_size()
+            and not torch.equal(
+                rank_mesh,
+                torch.arange(dist.get_world_size(), dtype=torch.int64),
+            )
+        ):
+            logger.info(
+                "[topo_mesh] creating a dedicated process group for 1D mesh "
+                "with sort_ranks=False to preserve topology-aware rank ordering"
+            )
+            pg = dist.new_group(ranks=rank_mesh.tolist(), sort_ranks=False)
+            return DeviceMesh.from_group(
+                group=pg,
+                device_type=device_type,
+                mesh=rank_mesh,
+                mesh_dim_names=mesh_dim_names,
+            )
+
+        return DeviceMesh(
+            device_type,
+            rank_mesh,
+            mesh_dim_names=mesh_dim_names,
+        )
+
+    return torch_init_device_mesh(
+        device_type, mesh_shape, mesh_dim_names=mesh_dim_names
+    )
 
 
 __all__ = ["MeshAxisName", "ParallelDims", "SpmdLayout", "unfold_dp_axes"]
@@ -137,6 +188,7 @@ class ParallelDims:
     ep: int
     world_size: int
     spmd_backend: Literal["default", "full_dtensor", "spmd_types"] = "default"
+    enable_tpu_topo_mesh: bool = False
     # Cache by axis name(s); DeviceMesh equality is by identity, so reuse
     # is required for ``mesh in spmd_meshes()`` checks.
     _single_axis_meshes: dict[str, DeviceMesh] = field(default_factory=dict)
@@ -157,6 +209,7 @@ class ParallelDims:
             ep=parallelism_config.expert_parallel_degree,
             world_size=world_size,
             spmd_backend=parallelism_config.spmd_backend,
+            enable_tpu_topo_mesh=parallelism_config.enable_tpu_topo_mesh,
         )
 
     def __post_init__(self):
@@ -274,7 +327,10 @@ class ParallelDims:
         efsdp = fsdp * self.tp // self.ep
 
         self._world_mesh = init_device_mesh(
-            get_device_type(), (self.world_size,), mesh_dim_names=("world",)
+            get_device_type(),
+            (self.world_size,),
+            mesh_dim_names=("world",),
+            enable_tpu_topo_mesh=self.enable_tpu_topo_mesh,
         )
         dataloading_mesh = unflatten_mesh(
             self._world_mesh,
@@ -376,10 +432,8 @@ class ParallelDims:
             if m is not None
         ]
 
-        logger.info(
-            f"Successfully created meshes with active dimensions: "
-            f"{list(self.get_all_one_dimensional_meshes().keys())}"
-        )
+        if self.enable_tpu_topo_mesh:
+            self._override_tpu_world_process_groups()
 
         return self._world_mesh
 
@@ -408,6 +462,73 @@ class ParallelDims:
             assert actual_size == expected_size, (
                 f"Mesh '{mesh_name}' has unexpected size: "
                 f"expected {expected_size}, got {actual_size}"
+            )
+
+    def _override_tpu_world_process_groups(self) -> None:
+        """Override world-sized dimensions in all meshes to use custom TPU group.
+        NOTE: This is a temporary workaround for the reason described below."""
+
+        if get_device_type() != "tpu" or not self.enable_tpu_topo_mesh:
+            return
+
+        try:
+            # Why this is needed:
+            # During `DeviceMesh.unflatten` or slicing, PyTorch initializes new
+            # process groups for each logical axis under the hood. However,
+            # PyTorch's internal group-creation helper does not pass
+            # `sort_ranks=False`. This leads to `dist.new_group` sorting the
+            # ranks sequentially and discarding our custom topology-aware rank
+            # layout.
+            #
+            # How upstream PyTorch would fix this instead (either/or):
+            # 1. Allow custom pre-created process groups to be passed as a
+            #    backend override / mapping configuration when calling
+            #    `.unflatten()` or slicing.
+            # 2. Let users configure `sort_ranks=False` or specify ranking
+            #    preferences during DeviceMesh backend group initialization.
+            world_pg = self._world_mesh.get_group()
+
+            # Combine global and single-axis meshes to ensure consistent
+            # topology-aware process group override.
+            all_meshes = {
+                **self._global_meshes,
+                **self._single_axis_meshes,
+            }
+
+            for name, mesh in all_meshes.items():
+                root_mesh = mesh._get_root_mesh()
+                if root_mesh is not None and hasattr(
+                    root_mesh, "_pg_registry"
+                ):
+                    if hasattr(mesh, "_dim_group_names"):
+                        new_dim_group_names = list(mesh._dim_group_names)
+                        overridden = False
+                        for i in range(mesh.ndim):
+                            if mesh.size(i) == self.world_size:
+                                old_group_name = new_dim_group_names[i]
+                                if old_group_name != world_pg.group_name:
+                                    root_mesh._pg_registry[
+                                        old_group_name
+                                    ] = world_pg
+                                    root_mesh._pg_registry[
+                                        world_pg.group_name
+                                    ] = world_pg
+                                    new_dim_group_names[i] = (
+                                        world_pg.group_name
+                                    )
+                                    overridden = True
+                        if overridden:
+                            mesh._dim_group_names = new_dim_group_names
+                            logger.info(
+                                f"Successfully overrode process group for "
+                                f"world-sized mesh '{name}' with custom "
+                                f"topology-aware process group "
+                                f"'{world_pg.group_name}'"
+                            )
+        except Exception as e:
+            logger.warning(
+                "Failed to override world-sized submesh process groups: "
+                f"{e}"
             )
 
     def get_optional_mesh(
