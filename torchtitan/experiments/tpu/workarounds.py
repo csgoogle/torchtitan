@@ -414,6 +414,91 @@ def use_cpu_safe_histc_patch() -> None:
   logger.info("Monkey-patched torch.histc to support int dtypes on CPU")
 
 
+def use_rope_tpu_optimization_patch() -> None:
+  """Monkey patches torchtitan.models.common.rope._reshape_for_broadcast with a TPU-optimized path.
+
+  Why upstream torch.gather is slow on TPU:
+  1. Index Tensor Bloat: Upstream expands the 2D `positions` tensor into a
+     massive 4D index tensor, multiplying its memory size by `cache_width`
+     (e.g., 33.5 MB vs 262 KB).
+  2. Forced Scalar Memory Lookups: The mathematical API of `torch.gather`
+     requires an independent scalar index for every single element in the
+     output tensor. Because XLA cannot assume the indices are identical at
+     runtime, it must generate machine code that computes a dynamic memory
+     address and fetches exactly 1 scalar number at a time (millions of
+     scattered scalar fetches), destroying memory bandwidth.
+
+  Why direct 2D advanced indexing is fast on TPU:
+  1. 128x Smaller Index: Uses the 2D `positions` tensor directly without
+     expanding it.
+  2. Fast Contiguous Vector Loads: By writing `rope_cache[positions]`, we
+     semantically request entire rows of the matrix. Because XLA knows the
+     elements of a row are stored contiguously in physical memory
+     (Row-Major order), it compiles a single Vector Load instruction
+     (HLO Gather with slice_sizes=[1, cache_width]). The TPU calculates just
+     one dynamic address per row and scoops up the entire vector block in a
+     single fast hardware cycle.
+  3. O(1) Metadata Unsqueeze: We reshape the 3D result to 4D via
+     `.unsqueeze(2)`, which only modifies shape metadata and does zero
+     memory work.
+
+  Equivalence: Both methods mathematically compute
+  `rope_cache[positions[b, s], k]`, providing exact bitwise parity while
+  eliminating the TPU scalar lookup bottleneck.
+  """
+  try:
+    import torchtitan.models.common.rope as rope
+    import spmd_types as spmd
+    from torch.fx.experimental.symbolic_shapes import guard_or_false  # pylint: disable=g-import-not-at-top,g-importing-member
+  except ImportError:
+    return
+
+  @spmd.local_map(out_types={"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R})
+  def _reshape_for_broadcast_patched(
+      rope_cache: torch.Tensor,
+      query_shape: torch.Size | tuple[int, ...],
+      positions: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    ndim = len(query_shape)
+    assert ndim > 1
+    bsz, seqlen = query_shape[:2]
+    cache_width = rope_cache.shape[-1]
+
+    # Case 1: No positions (sequential). Unchanged from original.
+    if positions is None:
+      rope_cache = rope_cache[0:seqlen]
+      shape = [
+          d if i == 1 else cache_width if i == ndim - 1 else 1
+          for i, d in enumerate(query_shape)
+      ]
+      return rope_cache.view(*shape)
+
+    # Case 2: Singleton positions (bsz=1). Unchanged from original.
+    if guard_or_false(positions.size(0) == 1):
+      rope_cache = rope_cache[positions.squeeze(0)]
+      shape = [
+          d if i == 1 else cache_width if i == ndim - 1 else 1
+          for i, d in enumerate(query_shape)
+      ]
+      return rope_cache.view(*shape)
+    # Case 3: Per-batch positions (bsz > 1).
+    # Replaces slow 4D torch.gather (33.5 MB index, scalar HLO lookups)
+    # with fast 2D indexing rope_cache[positions].unsqueeze(2) (262 KB index,
+    # native TPU 2D embedding lookup copying contiguous vector rows).
+    else:
+      # Index 2D cache [max_seqlen, cache_width] with 2D positions [bsz, seqlen]:
+      # yields [bsz, seqlen, cache_width]. unsqueeze(2) inserts head
+      # dimension, returning shape [bsz, seqlen, 1, cache_width].
+      return rope_cache[positions].unsqueeze(2)
+
+  rope._reshape_for_broadcast = _reshape_for_broadcast_patched
+  logger.info(
+      "Monkey-patched "
+      "torchtitan.models.common.rope._reshape_for_broadcast "
+      "with TPU optimized path"
+  )
+
+
 def apply_patches(model: nn.Module, job_config: Any) -> None:
   """Applies all TPU-specific patches and workarounds to the model."""
   # Enable CPU safe histc workaround.
@@ -440,5 +525,5 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   if hasattr(job_config, "qwen3") and job_config.qwen3.use_fill_indices_kernel:
     use_fill_indices_patch(model)
 
-
-
+  # Apply RoPE TPU Optimization Patch
+  use_rope_tpu_optimization_patch()
