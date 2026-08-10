@@ -271,6 +271,12 @@ def qwen3_30b_a3b_global_aux() -> Trainer.Config:
     return config
 
 
+def qwen3_30b_a3b_global_aux_megatron_init() -> Trainer.Config:
+    config = qwen3_30b_a3b_global_aux()
+    config.model_spec = model_registry("30B-A3B-global-aux-megatron-init")
+    return config
+
+
 def qwen3_32b() -> Trainer.Config:
     model_spec = model_registry("32B")
     return Trainer.Config(
