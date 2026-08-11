@@ -9,7 +9,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 
-import spmd_types as spmd
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
@@ -17,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.experimental import local_map
+import spmd_types as spmd
 
 from torchtitan.config import CompileConfig, Configurable
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
