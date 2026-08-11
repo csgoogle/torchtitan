@@ -19,6 +19,9 @@ from torchtitan.trainer import Trainer
 
 EpOverlapChunkDim = Literal["batch", "seq"]
 EpOverlapChunkStrategy = Literal["eager", "graph"]
+GraphTrainerMemoryPolicy = Literal[
+    "default", "full", "eager", "sac_and_offload"
+]
 
 TRANSFORMER_BLOCK_FQN = "layers.*"
 MOE_BLOCK_FQN = "layers.*.moe"
@@ -94,7 +97,7 @@ class GraphTrainerCompileConfig(CompileConfig):
     debug_graph_passes: bool = False
     """Log timing, op-count diffs, and before/after graphs for each pass to tlparse."""
 
-    memory_policy: Literal["default", "full", "eager", "sac_and_offload"] = "default"
+    memory_policy: GraphTrainerMemoryPolicy = "default"
     """
     Memory optimization policy for activation management (SAC, offload).
         default: SAC — save all compute-intensive ops and FSDP all_gathers.

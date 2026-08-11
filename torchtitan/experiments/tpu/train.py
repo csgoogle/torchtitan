@@ -26,6 +26,9 @@ import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    to_tpu_graph_trainer_config,
+)
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
@@ -162,7 +165,6 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
           f" (current mode: {train_config.tpu_config.compile_mode}). This may"
           " lead to severe HBM fragmentation and stack reservation OOMs."
       )
-    from torchtitan.experiments.graph_trainer.configs import to_graph_trainer_config
     from torchtitan.experiments.tpu.graph_trainer import TpuGraphTrainer, TpuGraphTrainerConfig
 
     if model_name == "qwen3":
@@ -176,7 +178,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
           f"Model {model_name} is not currently supported with GraphTrainer."
       )
 
-    gt_cfg = to_graph_trainer_config(
+    gt_cfg = to_tpu_graph_trainer_config(
         train_config, gt_registry, target_cls=TpuGraphTrainer.Config
     )
 
