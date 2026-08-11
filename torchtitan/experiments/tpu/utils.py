@@ -181,8 +181,35 @@ def _get_tpu_module() -> torch.device:
     return {}
   setattr(_device_module, "memory_stats", memory_stats)
 
+  def is_triton_capable(*args, **kwargs):
+    return False
+  setattr(_device_module, "is_triton_capable", is_triton_capable)
+  try:
+    setattr(type(_device_module), "is_triton_capable", is_triton_capable)
+  except TypeError:
+    pass
+
   tpu_device_module = _device_module
   return _device_module
+
+def _patch_tpu_device_module():
+  def is_triton_capable(*args, **kwargs):
+    return False
+
+  try:
+    from torch_tpu._internal.device._device_module import TpuDeviceModule
+    setattr(TpuDeviceModule, "is_triton_capable", is_triton_capable)
+  except Exception:
+    pass
+
+  try:
+    from torch._dynamo.device_interface import get_interface_for_device
+    tpu_interface = get_interface_for_device("tpu")
+    setattr(tpu_interface, "is_triton_capable", is_triton_capable)
+  except Exception:
+    pass
+
+_patch_tpu_device_module()
 
 
 def get_device_module() -> torch.device:

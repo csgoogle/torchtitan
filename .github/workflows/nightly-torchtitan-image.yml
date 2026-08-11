@@ -37,15 +37,18 @@ jobs:
 
     steps:
       - name: Checkout torchtitan repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
 
       - name: Checkout torch_tpu repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: google-pytorch/torch_tpu
           path: torch_tpu
           token: ${{ secrets.TORCH_TPU_PAT }}
           ref: ${{ github.event.inputs.torch_tpu_ref || 'main' }}
+          persist-credentials: false
 
       - name: Get torch_tpu commit SHA
         id: torch_tpu_sha
@@ -54,7 +57,7 @@ jobs:
           echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
 
       - name: Setup Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'
 
@@ -81,7 +84,7 @@ jobs:
             --repo_env=TORCH_SOURCE=$TORCH_SOURCE
 
       - name: Upload compiled torch_tpu wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: torch-tpu-wheel-from-torch-nightly
           path: torch_tpu/bazel-bin/ci/wheel/torch_tpu-*.whl
@@ -100,7 +103,9 @@ jobs:
 
     steps:
       - name: Checkout torchtitan repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
 
       - name: Validate required secrets and auth config
         env:
@@ -119,24 +124,24 @@ jobs:
           fi
 
       - name: Download torch_tpu wheel artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: torch-tpu-wheel-from-torch-nightly
           path: .
 
       - name: Authenticate to Google Cloud via service account key
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
         with:
           credentials_json: ${{ secrets.GAR_JSON_KEY }}
 
       - name: Setup gcloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
 
       - name: Configure Docker auth for GAR
         run: gcloud auth configure-docker us-west1-docker.pkg.dev --quiet
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
       - name: Compute image tags and labels
         id: meta
@@ -145,9 +150,9 @@ jobs:
 
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           NIGHTLY_DATE=$(date -u +%Y-%m-%d)
-          TORCH_TPU_SHA="${{ needs.build-wheel.outputs.torch_tpu_sha }}"
-          TORCH_TPU_REF="${{ github.event.inputs.torch_tpu_ref || 'main' }}"
-          TORCHITAN_REF="${{ github.ref_name }}"
+          TORCH_TPU_SHA="${NEEDS_BUILD_WHEEL_OUTPUTS_TORCH_TPU_SHA}"
+          TORCH_TPU_REF="${INPUT_TORCH_TPU_REF}"
+          TORCHITAN_REF="${GITHUB_REF_NAME}"
 
           # Sanitize ref names
           SAFE_TORCH_TPU_REF=$(echo "${TORCH_TPU_REF}" | sed 's/[^a-zA-Z0-9._-]/-/g')
@@ -186,6 +191,9 @@ jobs:
             echo "torch_tpu.branch=${TORCH_TPU_REF}"
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
+        env:
+          NEEDS_BUILD_WHEEL_OUTPUTS_TORCH_TPU_SHA: ${{ needs.build-wheel.outputs.torch_tpu_sha }}
+          INPUT_TORCH_TPU_REF: ${{ github.event.inputs.torch_tpu_ref || 'main' }}
 
       - name: Download HuggingFace Tokenizers
         env:
@@ -197,7 +205,7 @@ jobs:
 
       - name: Build and push nightly image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
         with:
           context: .
           file: torchtitan/experiments/tpu/Dockerfile
@@ -212,9 +220,13 @@ jobs:
       - name: Print published tags
         run: |
           echo "Published tags:"
-          echo "${{ steps.meta.outputs.tags }}"
+          echo "${STEPS_META_OUTPUTS_TAGS}"
+        env:
+          STEPS_META_OUTPUTS_TAGS: ${{ steps.meta.outputs.tags }}
 
       - name: Print image Digest
         run: |
           echo "Image Digest:"
-          echo "${{ steps.build.outputs.digest }}"
+          echo "${STEPS_BUILD_OUTPUTS_DIGEST}"
+        env:
+          STEPS_BUILD_OUTPUTS_DIGEST: ${{ steps.build.outputs.digest }}
