@@ -49,6 +49,10 @@ _LINEAR_INIT = {
     "weight": partial(nn.init.trunc_normal_, std=0.02),
     "bias": nn.init.zeros_,
 }
+_ROUTER_INIT = {
+    "weight": partial(nn.init.normal_, std=0.02),
+    "bias": nn.init.zeros_,
+}
 _NORM_INIT = {"weight": nn.init.ones_}
 _EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=1.0)}
 _EMBEDDING_SKIP_INIT = {"weight": skip_param_init}
@@ -141,6 +145,9 @@ def _build_qwen3_moe_layers(
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
     rope: RoPE.Config,
+    load_balance_coeff: float | None = 1e-3,
+    aux_loss_coeff: float | None = None,
+    depth_scale_router_init: bool = True,
 ) -> list[TransformerBlock.Config]:
     """Build per-layer configs for MoE Qwen3 models with depth-scaled inits."""
     inner_attention = get_attention_config(attn_backend)
@@ -164,10 +171,17 @@ def _build_qwen3_moe_layers(
                 ),
                 moe=make_moe_config(
                     num_experts=num_experts,
+                    load_balance_coeff=load_balance_coeff,
+                    aux_loss_type="batch_wise" if aux_loss_coeff is not None else None,
+                    aux_loss_coeff=aux_loss_coeff,
                     router=make_router_config(
                         dim=dim,
                         num_experts=num_experts,
-                        gate_param_init=_depth_init(layer_id),
+                        gate_param_init=(
+                            _depth_init(layer_id)
+                            if depth_scale_router_init
+                            else _ROUTER_INIT
+                        ),
                         top_k=top_k,
                         score_func="softmax",
                         route_norm=True,
@@ -509,6 +523,10 @@ def _debugmodel_moe(
 def _30b_a3b(
     attn_backend: str,
     moe_comm_backend: str = "standard",
+    *,
+    load_balance_coeff: float | None = 1e-3,
+    aux_loss_coeff: float | None = None,
+    depth_scale_router_init: bool = True,
 ) -> Qwen3Model.Config:
     dim = 2048
     head_dim = 128
@@ -543,7 +561,23 @@ def _30b_a3b(
                 theta=1000000.0,
             ),
             moe_comm_backend=moe_comm_backend,
+            load_balance_coeff=load_balance_coeff,
+            aux_loss_coeff=aux_loss_coeff,
+            depth_scale_router_init=depth_scale_router_init,
         ),
+    )
+
+
+def _30b_a3b_global_aux(
+    attn_backend: str,
+    moe_comm_backend: str = "standard",
+) -> Qwen3Model.Config:
+    return _30b_a3b(
+        attn_backend,
+        moe_comm_backend,
+        load_balance_coeff=None,
+        aux_loss_coeff=1e-3,
+        depth_scale_router_init=False,
     )
 
 
@@ -599,6 +633,7 @@ qwen3_configs = {
     "32B": _32b,
     "debugmodel_moe": _debugmodel_moe,
     "30B-A3B": _30b_a3b,
+    "30B-A3B-global-aux": _30b_a3b_global_aux,
     "235B-A22B": _235b_a22b,
 }
 

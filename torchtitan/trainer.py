@@ -268,6 +268,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         else:
             batch_degree, batch_rank = 1, 0
 
+        # verify batch sizes
+        global_batch_size = config.training.global_batch_size
+        local_global_batch_size = config.training.local_batch_size * batch_degree
+        if global_batch_size < 0:
+            # This global batch size results in 1 gradient accumulation
+            # step.
+            global_batch_size = local_global_batch_size
+        assert global_batch_size > 0
+        assert global_batch_size % local_global_batch_size == 0, (
+            f"global batch size must be multiple of local batch size times "
+            f"data-parallel degree ({global_batch_size} "
+            f"% ({config.training.local_batch_size} * {batch_degree}) != 0)"
+        )
+
+        # calculate gradient accumulation steps
+        self.gradient_accumulation_steps = global_batch_size // local_global_batch_size
+        assert self.gradient_accumulation_steps > 0
+
         # take control of garbage collection to avoid stragglers
         self.gc_handler = utils.GarbageCollection(
             gc_freq=config.training.gc_freq, debug=config.training.gc_debug
@@ -287,6 +305,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # set the model args from training job configs
         model_config.update_from_config(
             config=config,
+            global_batch_size=global_batch_size,
+            local_global_batch_size=local_global_batch_size,
         )
         self.model_config = model_config
 
@@ -350,27 +370,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.loss_fn = config.loss.build(
             compile_config=config.compile,
         )
-
-        # verify batch sizes
-        global_batch_size = config.training.global_batch_size
-        if global_batch_size < 0:
-            # This global batch size results in 1 gradient accumulation
-            # step.
-            global_batch_size = config.training.local_batch_size * batch_degree
-        assert global_batch_size > 0
-        assert (
-            global_batch_size % (config.training.local_batch_size * batch_degree) == 0
-        ), (
-            f"global batch size must be multiple of local batch size times "
-            f"data-parallel degree ({global_batch_size} "
-            f"% ({config.training.local_batch_size} * {batch_degree}) != 0)"
-        )
-
-        # calculate gradient accumulation steps
-        self.gradient_accumulation_steps = global_batch_size // (
-            config.training.local_batch_size * batch_degree
-        )
-        assert self.gradient_accumulation_steps > 0
 
         # apply parallelisms and initialization
         with sl.log_trace_span("model_parallelism_init"):

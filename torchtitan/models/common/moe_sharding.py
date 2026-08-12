@@ -119,13 +119,13 @@ def _router_gate_config(*, enable_ep: bool, enable_sp: bool) -> ShardingConfig:
         "weight": dense_param_placement(tp=spmd.R),
         "bias": dense_param_placement(tp=spmd.R),
     }
+    output_layout = _router_output_layout(enable_ep=enable_ep)
     if enable_ep:
         input_layout = (
             dense_sequence_parallel_placement()
             if enable_sp
             else dense_activation_placement(tp=spmd.I)
         )
-        output_layout = dense_sequence_parallel_placement()
         return ShardingConfig(
             state_shardings=state,
             in_src_shardings={"input": input_layout},
@@ -134,14 +134,48 @@ def _router_gate_config(*, enable_ep: bool, enable_sp: bool) -> ShardingConfig:
             out_dst_shardings=output_layout,
         )
     else:
-        input_layout = dense_activation_placement(tp=spmd.R)
         return ShardingConfig(
             state_shardings=state,
-            in_src_shardings={"input": input_layout},
-            in_dst_shardings={"input": input_layout},
-            out_src_shardings=input_layout,
-            out_dst_shardings=input_layout,
+            in_src_shardings={"input": output_layout},
+            in_dst_shardings={"input": output_layout},
+            out_src_shardings=output_layout,
+            out_dst_shardings=output_layout,
         )
+
+
+def _router_output_layout(*, enable_ep: bool) -> SpmdLayout:
+    return (
+        dense_sequence_parallel_placement()
+        if enable_ep
+        else dense_activation_placement(tp=spmd.R)
+    )
+
+
+def _aux_loss_config(*, enable_ep: bool) -> ShardingConfig:
+    # Adapted from PR3000's DTensor-placement version to this fork's
+    # spmd_types sharding DSL; keep the aux-loss math itself verbatim in moe.py.
+    router_output_layout = _router_output_layout(enable_ep=enable_ep)
+    return ShardingConfig(
+        in_src_shardings={
+            "topk_scores_BLK": router_output_layout,
+            "scores_BLE": router_output_layout,
+            "topk_expert_ids_BLK": router_output_layout,
+        },
+        in_dst_shardings={
+            "topk_scores_BLK": router_output_layout,
+            "scores_BLE": router_output_layout,
+            "topk_expert_ids_BLK": router_output_layout,
+        },
+        out_src_shardings=router_output_layout,
+        out_dst_shardings=router_output_layout,
+        local_map=LocalMapConfig(
+            in_grad_placements=(
+                router_output_layout,
+                router_output_layout,
+                router_output_layout,
+            ),
+        ),
+    )
 
 
 def _tokens_per_expert_placement(*, enable_ep: bool) -> SpmdLayout:
@@ -240,6 +274,8 @@ def set_moe_sharding_config(
     moe_cfg.router.gate.sharding_config = _router_gate_config(
         enable_ep=enable_ep, enable_sp=enable_sp
     )
+    if getattr(moe_cfg, "aux_loss", None) is not None:
+        moe_cfg.aux_loss.sharding_config = _aux_loss_config(enable_ep=enable_ep)
 
     # Shared experts: SwiGLU FFN run in parallel with the routed experts.
     # Gather x to Replicate ONCE at the module boundary so w1/w3 share it (their

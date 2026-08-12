@@ -24,6 +24,7 @@ from torchtitan.distributed.full_dtensor import (
     validate_config,
 )
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
+from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
 from torchtitan.models.qwen3.model import Qwen3Model
 
 
@@ -56,6 +57,8 @@ def parallelize_qwen3(
             )
         if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
             model.parallelize(parallel_dims)
+
+    configure_moe_aux_loss_reduction(model, parallel_dims)
 
     if parallel_dims.tp_enabled:
         maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
