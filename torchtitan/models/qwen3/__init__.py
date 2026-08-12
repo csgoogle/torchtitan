@@ -28,7 +28,7 @@ from torchtitan.models.common.config_utils import (
     make_router_config,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
+from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.utils import validate_converter_order
 
 from torchtitan.protocols.model import ModelConfigConverter
@@ -45,41 +45,42 @@ __all__ = [
 ]
 
 
-_LINEAR_INIT = {
-    "weight": partial(nn.init.trunc_normal_, std=0.02),
-    "bias": nn.init.zeros_,
-}
-_ROUTER_INIT = {
+# Qwen3 uses normal initialization with std=0.02. For residual output
+# projections, align with Megatron's scaled initializer. Megatron applies it
+# to the attention output and MoE expert down projections:
+# https://github.com/NVIDIA/Megatron-LM/blob/d12f6c8c9aff51e166d872fd70151687a8e3f375/megatron/core/transformer/transformer_config.py#L2289-L2303
+_LINEAR_INIT: dict[str, Callable] = {
     "weight": partial(nn.init.normal_, std=0.02),
     "bias": nn.init.zeros_,
 }
 _NORM_INIT = {"weight": nn.init.ones_}
-_EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=1.0)}
+_EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.02)}
 _EMBEDDING_SKIP_INIT = {"weight": skip_param_init}
+_EXPERTS_INIT: dict[str, Callable] = {
+    "w1_EFD": _LINEAR_INIT["weight"],
+    "w2_EDF": _LINEAR_INIT["weight"],
+    "w3_EFD": _LINEAR_INIT["weight"],
+}
 
 _EPS = 1e-6
 
 
-def _output_linear_init(dim: int) -> dict[str, Callable]:
-    s = dim**-0.5
+def _residual_output_weight_init(n_layers: int) -> Callable:
+    std = 0.02 / (2 * n_layers) ** 0.5
+    return partial(nn.init.normal_, std=std)
+
+
+def _residual_output_init(n_layers: int) -> dict[str, Callable]:
     return {
-        "weight": partial(nn.init.trunc_normal_, std=s, a=-3 * s, b=3 * s),
+        "weight": _residual_output_weight_init(n_layers),
         "bias": nn.init.zeros_,
     }
 
 
-def _depth_init(layer_id: int) -> dict[str, Callable]:
+def _moe_experts_init(n_layers: int) -> dict[str, Callable]:
     return {
-        "weight": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
-        "bias": nn.init.zeros_,
-    }
-
-
-def _depth_experts_init(layer_id: int) -> dict[str, Callable]:
-    return {
-        "w1_EFD": partial(nn.init.trunc_normal_, std=0.02),
-        "w2_EDF": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
-        "w3_EFD": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        **_EXPERTS_INIT,
+        "w2_EDF": _residual_output_weight_init(n_layers),
     }
 
 
@@ -99,10 +100,10 @@ def _build_qwen3_layers(
     attn_backend: str,
     rope: RoPE.Config,
 ) -> list[TransformerBlock.Config]:
-    """Build per-layer configs for dense Qwen3 models with depth-scaled inits."""
+    """Build per-layer configs for dense Qwen3 models."""
     inner_attention = get_attention_config(attn_backend)
     layers = []
-    for layer_id in range(n_layers):
+    for _ in range(n_layers):
         layers.append(
             Qwen3TransformerBlock.Config(
                 attention_norm=_qwen3_norm(dim),
@@ -113,7 +114,7 @@ def _build_qwen3_layers(
                     n_kv_heads=n_kv_heads,
                     head_dim=head_dim,
                     wqkv_param_init=_LINEAR_INIT,
-                    wo_param_init=_depth_init(layer_id),
+                    wo_param_init=_LINEAR_INIT,
                     inner_attention=inner_attention,
                     fuse_qkv=fuse_qkv,
                     rope=rope,
@@ -123,7 +124,7 @@ def _build_qwen3_layers(
                     dim=dim,
                     hidden_dim=hidden_dim,
                     w1_param_init=_LINEAR_INIT,
-                    w2w3_param_init=_depth_init(layer_id),
+                    w2w3_param_init=_LINEAR_INIT,
                 ),
             )
         )
@@ -147,12 +148,13 @@ def _build_qwen3_moe_layers(
     rope: RoPE.Config,
     load_balance_coeff: float | None = 1e-3,
     aux_loss_coeff: float | None = None,
-    depth_scale_router_init: bool = True,
 ) -> list[TransformerBlock.Config]:
-    """Build per-layer configs for MoE Qwen3 models with depth-scaled inits."""
+    """Build per-layer configs for MoE Qwen3 models."""
     inner_attention = get_attention_config(attn_backend)
+    output_init = _residual_output_init(n_layers)
+    experts_init = _moe_experts_init(n_layers)
     layers = []
-    for layer_id in range(n_layers):
+    for _ in range(n_layers):
         layers.append(
             Qwen3TransformerBlock.Config(
                 attention_norm=_qwen3_norm(dim),
@@ -163,7 +165,7 @@ def _build_qwen3_moe_layers(
                     n_kv_heads=n_kv_heads,
                     head_dim=head_dim,
                     wqkv_param_init=_LINEAR_INIT,
-                    wo_param_init=_depth_init(layer_id),
+                    wo_param_init=output_init,
                     inner_attention=inner_attention,
                     fuse_qkv=fuse_qkv,
                     rope=rope,
@@ -177,11 +179,7 @@ def _build_qwen3_moe_layers(
                     router=make_router_config(
                         dim=dim,
                         num_experts=num_experts,
-                        gate_param_init=(
-                            _depth_init(layer_id)
-                            if depth_scale_router_init
-                            else _ROUTER_INIT
-                        ),
+                        gate_param_init=_LINEAR_INIT,
                         top_k=top_k,
                         score_func="softmax",
                         route_norm=True,
@@ -191,7 +189,7 @@ def _build_qwen3_moe_layers(
                         hidden_dim=moe_hidden_dim,
                         num_experts=num_experts,
                         top_k=top_k,
-                        param_init=_depth_experts_init(layer_id),
+                        param_init=experts_init,
                         comm_backend=moe_comm_backend,
                         non_blocking_capacity_factor=non_blocking_capacity_factor,
                     ),
@@ -219,7 +217,7 @@ def _debugmodel(attn_backend: str) -> Qwen3Model.Config:
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
             fuse_qkv=True,
@@ -275,7 +273,7 @@ def _0_6b(attn_backend: str) -> Qwen3Model.Config:
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
             fuse_qkv=True,
@@ -313,7 +311,7 @@ def _1_7b(attn_backend: str) -> Qwen3Model.Config:
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
             fuse_qkv=True,
@@ -351,7 +349,7 @@ def _4b(attn_backend: str) -> Qwen3Model.Config:
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
             fuse_qkv=True,
@@ -386,7 +384,7 @@ def _8b(attn_backend: str) -> Qwen3Model.Config:
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
             fuse_qkv=True,
@@ -421,7 +419,7 @@ def _14b(attn_backend: str) -> Qwen3Model.Config:
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
             fuse_qkv=True,
@@ -456,7 +454,7 @@ def _32b(attn_backend: str) -> Qwen3Model.Config:
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_layers(
             fuse_qkv=True,
@@ -497,7 +495,7 @@ def _debugmodel_moe(
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_moe_layers(
             fuse_qkv=True,
@@ -526,7 +524,6 @@ def _30b_a3b(
     *,
     load_balance_coeff: float | None = 1e-3,
     aux_loss_coeff: float | None = None,
-    depth_scale_router_init: bool = True,
 ) -> Qwen3Model.Config:
     dim = 2048
     head_dim = 128
@@ -542,7 +539,7 @@ def _30b_a3b(
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_moe_layers(
             fuse_qkv=True,
@@ -563,7 +560,6 @@ def _30b_a3b(
             moe_comm_backend=moe_comm_backend,
             load_balance_coeff=load_balance_coeff,
             aux_loss_coeff=aux_loss_coeff,
-            depth_scale_router_init=depth_scale_router_init,
         ),
     )
 
@@ -577,7 +573,6 @@ def _30b_a3b_global_aux(
         moe_comm_backend,
         load_balance_coeff=None,
         aux_loss_coeff=1e-3,
-        depth_scale_router_init=False,
     )
 
 
@@ -599,7 +594,7 @@ def _235b_a22b(
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=_output_linear_init(dim),
+            param_init=_LINEAR_INIT,
         ),
         layers=_build_qwen3_moe_layers(
             fuse_qkv=True,
