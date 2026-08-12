@@ -223,12 +223,15 @@ def qwen3_8b() -> TPUTrainerConfig:
           interval=500,
           last_save_model_only=False,
       ),
+      # GraphTrainer does not apply this eager AC config; its graph
+      # rematerialization policy is selected in TPUConfig below.
       activation_checkpoint=SelectiveAC.Config(),
       tpu_config=TPUConfig(
           use_graph_trainer=True,
           compile_mode="aot_fx_trace",
           compile_optimizer=True,
           optimizer_in_graph=True,
+          graph_trainer_memory_policy="default",
       ),
       compile=CompileConfig(
           enable=True,

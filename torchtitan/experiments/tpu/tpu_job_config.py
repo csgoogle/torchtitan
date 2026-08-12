@@ -4,6 +4,7 @@ import dataclasses
 from typing import Literal
 
 import torchtitan.config
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerMemoryPolicy
 import torchtitan.trainer
 
 
@@ -23,6 +24,9 @@ class TPUConfig:
   use_graph_trainer: bool = False
   # Whether to compile the optimizer step into the joint fwd+loss+bwd graph.
   optimizer_in_graph: bool = False
+  # GraphTrainer rematerializes its joint forward/backward FX graph instead of
+  # tracing eager activation-checkpoint wrappers.
+  graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
   # Disable Automatic Mixed Precision (AMP), so all training is done in uniform
   # precision.
   enable_amp: bool = True
