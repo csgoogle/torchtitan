@@ -178,7 +178,10 @@ def _get_tpu_module() -> torch.device:
   setattr(_device_module, "empty_cache", empty_cache)
 
   def memory_stats(device=None):
-    return {}
+    # torch_tpu exposes memory stats through the modern torch.accelerator namespace,
+    # but torchtitan expects it on the legacy device module namespace (torch.tpu).
+    # We mock it here by routing it to the native PyTorch accelerator API.
+    return torch.accelerator.memory_stats()
   setattr(_device_module, "memory_stats", memory_stats)
 
   def is_triton_capable(*args, **kwargs):
