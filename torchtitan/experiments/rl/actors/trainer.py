@@ -123,8 +123,8 @@ class PolicyTrainer(Actor, Configurable):
         self._transfer_dtype = gen_dtype if gen_dtype != training_dtype else None
 
         # Device setup
-        device_module, device_type = utils.device_module, utils.device_type
-        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+        device_module, device_type = utils.get_device_module(), utils.get_device_type()
+        self.device = utils.get_local_device()
         device_module.set_device(self.device)
 
         # Enable batch-invariant mode BEFORE init_distributed
