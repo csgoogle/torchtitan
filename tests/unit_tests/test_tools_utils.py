@@ -46,6 +46,21 @@ def test_get_local_device_uses_zero_when_one_device_visible(
     assert get_local_device() == torch.device("cuda:0")
 
 
+@pytest.mark.parametrize("device_type", ["cuda", "cpu", "tpu"])
+def test_get_local_device_ignores_local_rank_for_a_single_device(
+    monkeypatch: pytest.MonkeyPatch, device_type: str
+) -> None:
+    # When a process owns one device, LOCAL_RANK is not a device index on any
+    # lane. Assert that invariant rather than an exact device object, so the
+    # test holds whether the lane reports index 0 or no index at all.
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    _patch_device(monkeypatch, device_type, 1)
+
+    device = get_local_device()
+    assert device.type == device_type
+    assert device.index in (None, 0)
+
+
 def test_get_local_device_rejects_out_of_range_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
