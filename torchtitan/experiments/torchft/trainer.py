@@ -48,9 +48,9 @@ class FaultTolerantTrainer(Trainer):
         ), "model_spec must be set before creating Trainer"
         model_spec = config.model_spec
 
-        device_module, device_type = utils.device_module, utils.device_type
+        device_module, device_type = utils.get_device_module(), utils.get_device_type()
         # pyrefly: ignore [read-only]
-        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+        self.device = utils.get_local_device()
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
 
