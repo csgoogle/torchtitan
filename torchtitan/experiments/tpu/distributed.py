@@ -87,6 +87,12 @@ def _run_in_gdist_worker(
       )
     func(device, global_rank, world_size, *worker_args)
   elif accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
+    # Bootstrap TORCH_TPU_SLICEBUILDER_ADDRESSES / TORCH_TPU_TOPOLOGY here, in
+    # the worker: _maybe_init_distributed_on_tpu_vm() reads WORLD_SIZE from the
+    # environment, which torchrun sets per worker and which is absent in the
+    # spawning parent -- so the pre-spawn call cannot do it for us. Must precede
+    # the first TPU device use, or the PJRT client is never created.
+    distributed_utils.maybe_init_distributed()
     if not dist.is_initialized() and run_init_process_group:
       device = torch.device("tpu")
 
