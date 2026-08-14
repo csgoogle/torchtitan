@@ -116,10 +116,6 @@ def _get_cpu_module() -> ModuleType:
 
 def _get_tpu_module() -> ModuleType:
     """Returns torch.tpu with the device-module functions it is missing.
-
-    torch_tpu natively provides get_device_name, get_device_properties,
-    set_device, current_device, device_count, synchronize and
-    is_triton_capable, so only the memory-management trio is shimmed here.
     """
     global _tpu_device_module
     if _tpu_device_module is not None:
@@ -144,8 +140,19 @@ def _get_tpu_module() -> ModuleType:
         return torch.accelerator.memory_stats()
 
     setattr(device_module, "memory_stats", memory_stats)
+
+    def is_triton_capable(*args, **kwargs):
+        return False
+
+    setattr(device_module, "is_triton_capable", is_triton_capable)
     _tpu_device_module = device_module
     return device_module
+
+
+# Build it now on TPU hosts. The shims above must exist before any library
+# that probes the device module at import time. This is a temporary solution.
+if _get_available_device_type() == "tpu":
+    _get_tpu_module()
 
 
 def get_device_module() -> ModuleType:
