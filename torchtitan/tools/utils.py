@@ -51,7 +51,6 @@ def get_device_info() -> tuple[str, ModuleType]:
 from torchtitan.experiments.tpu import utils as tpu_utils
 get_device_type = tpu_utils.get_device_type
 get_device_module = tpu_utils.get_device_module
-set_device_type = tpu_utils.set_device_type
 
 
 def get_local_device() -> torch.device:

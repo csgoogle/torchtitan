@@ -22,8 +22,6 @@ global_start_trainer_func = None
 def _start_trainer(config: tpu_job_config_module.TPUTrainerConfig):
   """Starts the trainer with the specified eager mode if enabled."""
   global global_start_trainer_func  # pylint: disable=global-variable-not-assigned
-  if os.environ.get("TORCHTITAN_DEVICE_TYPE", ""):
-    tpu_utils.set_device_type(os.environ["TORCHTITAN_DEVICE_TYPE"])
   is_tpu = tpu_utils.get_device_type() == "tpu"
   if is_tpu:
     # Populates TORCH_TPU_SLICEBUILDER_ADDRESSES / TORCH_TPU_TOPOLOGY before any
@@ -55,10 +53,16 @@ def _parse_flags(argv: Sequence[str]) -> Tuple[argparse.Namespace, List[str]]:
   )
   parser.add_argument(
       "--device",
-      help="device to run the training on",
+      help=(
+          "Device the training is expected to run on. Optional, and checked"
+          " rather than applied: the run fails if the detected device differs."
+          " Select the device in the environment before launching --"
+          " TORCH_DEVICE_BACKEND_AUTOLOAD=0 unregisters the TPU backend and"
+          " CUDA_VISIBLE_DEVICES= hides GPUs, both yielding CPU."
+      ),
       choices=["cpu", "cuda", "tpu"],
-      default="",
-      required=True,
+      default=None,
+      required=False,
   )
   parser.add_argument(
       "--nproc_per_node",
@@ -70,8 +74,39 @@ def _parse_flags(argv: Sequence[str]) -> Tuple[argparse.Namespace, List[str]]:
   return args, remaining_args
 
 
+def _verify_requested_device(requested: str | None) -> None:
+  """Checks --device against the device that was actually detected.
+
+  The flag reports; it does not select. Device selection is fixed before this
+  process starts, when torch is imported and registers whichever accelerator
+  the environment exposes -- by which time main() is far too late to change it.
+  Checking here turns a stale or copy-pasted --device into an immediate error
+  instead of a run that silently uses the wrong hardware.
+
+  Args:
+    requested: The value of --device, or None when it was not passed.
+
+  Raises:
+    ValueError: If the requested device is not the detected one.
+  """
+  if not requested:
+    return
+  detected = tpu_utils.get_device_type()
+  if requested == detected:
+    return
+  raise ValueError(
+      f"--device={requested} was requested but {detected} was detected."
+      " --device reports the device; it cannot select one, because the"
+      " accelerator is fixed when torch is imported. Select the device in the"
+      " environment before launching: TORCH_DEVICE_BACKEND_AUTOLOAD=0"
+      " unregisters the TPU backend and CUDA_VISIBLE_DEVICES= hides GPUs, both"
+      " of which yield CPU. Omit --device to accept whatever is detected."
+  )
+
+
 def main(parsed_args: Tuple[argparse.Namespace, List[str]]):
   args, remaining_args = parsed_args
+  _verify_requested_device(args.device)
   config_manager = torchtitan.config.ConfigManager()
   config = typing.cast(
       tpu_job_config_module.TPUTrainerConfig,

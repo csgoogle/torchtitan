@@ -17,6 +17,7 @@ from torchtitan.experiments.tpu import gdist
 import torchtitan.config
 import torchtitan.trainer
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
+from torchtitan.experiments.tpu import device_env
 from torchtitan.experiments.tpu import distributed_utils
 from torchtitan.experiments.tpu import numerical_validation
 from torchtitan.experiments.tpu import test_utils
@@ -490,8 +491,8 @@ def _run_cpu_verification(
   """Runs the CPU verification in a separate process."""
   logging.info("[Child Process] Starting CPU Training (Verifying)...")
 
-  # Force device type to CPU in this process
-  tpu_utils.set_device_type("cpu")
+  # The device is CPU because run_in_subprocess launched this process with a
+  # CPU-only environment (see device_env), so detection reports CPU here.
 
   # Load recorded data from the file
   if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
@@ -678,7 +679,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
     super().setUp()
     torch.compiler.reset()
     self.num_devices = test_utils._NUM_DEVICES.value
-    self.accelerator_device_type = test_utils._DEVICE.value
+    self.accelerator_device_type = test_utils.resolve_device_type()
 
     if not test_utils.flags.FLAGS["num_devices"].present:
       if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
@@ -764,7 +765,10 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
     config = config_manager.parse_args(config_args)
     config.dump_folder = tempfile.gettempdir()
 
-    utils.set_device_type(self.accelerator_device_type.value)
+    if self.accelerator_device_type == device_type.AcceleratorDeviceType.CPU:
+      # Workers are spawned and re-detect their device, so hide the accelerator
+      # in the environment they inherit rather than setting a global here.
+      os.environ.update(device_env.cpu_only_env())
     if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
       # Construct the environment before spawning workers.
       distributed_utils.maybe_init_distributed(self.num_devices)
@@ -828,6 +832,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
         test_utils.run_in_subprocess(
             module_name="torchtitan.experiments.tpu.base_distributed_device_test",
             function_name="_run_cpu_verification",
+            env=device_env.cpu_only_env(),
             args=[
                 temp_path,
                 config_args,

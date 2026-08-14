@@ -25,7 +25,7 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     torch.compiler.reset()
-    self.accelerator_device_type = test_utils._DEVICE.value
+    self.accelerator_device_type = test_utils.resolve_device_type()
     if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
       self.accelerator_device = torch.device("tpu")
       logging.info("Using TPU device: %s", self.accelerator_device)

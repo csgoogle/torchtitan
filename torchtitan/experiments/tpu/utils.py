@@ -45,15 +45,6 @@ def get_device_type() -> str:
   return device_type
 
 
-def set_device_type(device_type_str: str):
-  """Sets the device for the current process."""
-  if device_type_str not in ["cpu", "cuda", "tpu"]:
-    raise ValueError(f"Invalid device type: {device_type_str}")
-
-  global device_type
-  device_type = device_type_str
-
-
 def _get_cpu_module() -> torch.device:
   """Returns the torch.cpu module with additional functions."""
   global device_module
