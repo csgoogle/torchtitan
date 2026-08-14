@@ -478,7 +478,7 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
 
   metrics_processor.num_flops_per_token = num_flops_per_token
 
-  device_name = tpu_utils.get_device_module().get_device_name()
+  device_name = utils.get_device_module().get_device_name()
   peak_flops = utils.get_peak_flops(device_name)
 
   total_tokens = 0

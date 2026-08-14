@@ -21,7 +21,6 @@ from torchtitan.config.configurable import Configurable
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import gmain
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
-from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
@@ -124,7 +123,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     init_logger()
 
   if (
-      tpu_utils.get_device_type() == "tpu"
+      utils.get_device_type() == "tpu"
       and train_config.optimizer.implementation == "fused"
   ):
     # TODO: b/45811390 - Remove this once fused optimizer is supported on TPU.

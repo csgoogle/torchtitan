@@ -11,9 +11,11 @@ import subprocess
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
+import psutil
 import torch
+import torch.distributed as dist
 from torch._utils import _get_available_device_type, _get_device_module
 
 from torchtitan.observability import structured_logger as sl
@@ -48,9 +50,112 @@ def get_device_info() -> tuple[str, ModuleType]:
 
 
 # device_type, device_module = get_device_info()
-from torchtitan.experiments.tpu import utils as tpu_utils
-get_device_type = tpu_utils.get_device_type
-get_device_module = tpu_utils.get_device_module
+_device_type: str | None = None
+_cpu_device_module: ModuleType | None = None
+_tpu_device_module: ModuleType | None = None
+
+
+def get_device_type() -> str:
+    """Returns the device type this process runs on, detected once and cached.
+
+    Detection is side-effect free: torch._utils resolves TPU through
+    torch.tpu.is_available(), a PCI scan that does not initialize the PJRT
+    runtime. Which accelerator is visible is fixed by the environment before
+    torch is imported (see experiments/tpu/device_env.py), so the answer cannot
+    change during the process and is safe to cache.
+    """
+    global _device_type
+    if _device_type is None:
+        _device_type = _get_available_device_type() or "cpu"
+    return _device_type
+
+
+def _get_cpu_module() -> ModuleType:
+    """Returns torch.cpu with the device-module functions it is missing."""
+    global _cpu_device_module
+    if _cpu_device_module is not None:
+        return _cpu_device_module
+
+    device_module = _get_device_module("cpu")
+
+    # torch.cpu doesn't have get_device_name
+    def get_device_name(device=None):
+        return "cpu"
+
+    setattr(device_module, "get_device_name", get_device_name)
+
+    def current_device():
+        # torch.cpu.current_device() returns the string "cpu"; callers here
+        # need an index, e.g. torch.device(device_type, current_device()).
+        return dist.get_rank()
+
+    setattr(device_module, "current_device", current_device)
+
+    def get_device_properties(device=None):
+        return SimpleNamespace(total_memory=psutil.virtual_memory().total)
+
+    setattr(device_module, "get_device_properties", get_device_properties)
+
+    def reset_peak_memory_stats(device=None):
+        pass
+
+    setattr(device_module, "reset_peak_memory_stats", reset_peak_memory_stats)
+
+    def empty_cache():
+        pass
+
+    setattr(device_module, "empty_cache", empty_cache)
+
+    def memory_stats(device=None):
+        return {}
+
+    setattr(device_module, "memory_stats", memory_stats)
+    _cpu_device_module = device_module
+    return device_module
+
+
+def _get_tpu_module() -> ModuleType:
+    """Returns torch.tpu with the device-module functions it is missing.
+
+    torch_tpu natively provides get_device_name, get_device_properties,
+    set_device, current_device, device_count, synchronize and
+    is_triton_capable, so only the memory-management trio is shimmed here.
+    """
+    global _tpu_device_module
+    if _tpu_device_module is not None:
+        return _tpu_device_module
+
+    device_module = _get_device_module("tpu")
+
+    def reset_peak_memory_stats(device=None):
+        pass
+
+    setattr(device_module, "reset_peak_memory_stats", reset_peak_memory_stats)
+
+    def empty_cache():
+        pass
+
+    setattr(device_module, "empty_cache", empty_cache)
+
+    def memory_stats(device=None):
+        # torch_tpu exposes memory stats through the modern torch.accelerator
+        # namespace, but torchtitan expects them on the legacy device-module
+        # namespace (torch.tpu). Route them across.
+        return torch.accelerator.memory_stats()
+
+    setattr(device_module, "memory_stats", memory_stats)
+    _tpu_device_module = device_module
+    return device_module
+
+
+def get_device_module() -> ModuleType:
+    """Returns the device module for the detected device type."""
+    device_type = get_device_type()
+    if device_type == "tpu":
+        return _get_tpu_module()
+    if device_type == "cpu":
+        return _get_cpu_module()
+    return _get_device_module(device_type)  # e.g. torch.cuda
 
 
 def get_local_device() -> torch.device:
@@ -219,25 +324,31 @@ def get_peak_flops(device_name: str) -> float:
     elif "l40s" in device_name:
         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
         return 362e12
-    elif device_name.startswith("tpu-"):
-        if "v4" in device_name:
+    elif "tpu" in device_name.lower():
+        # torch_tpu reports "TPU v6e"; older torchtitan builds reported
+        # "tpu-v6e" (and "tpu-7x" for v7). Match both, case-insensitively.
+        tpu_name = device_name.lower().replace("-", " ")
+        if "v4" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/v4
             return 275e12
-        elif "v5e" in device_name:
+        elif "v5e" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/v5e
             return 197e12
-        elif "v5p" in device_name:
+        elif "v5p" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/v5p
             # The quoted number is per chip. We use this number as we assume
             # megacore is enabled for v5p.
             return 459e12
-        elif "v6e" in device_name:
+        elif "v6e" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/v6e
             return 918e12
-        elif "7x" in device_name:
+        elif "v7" in tpu_name or "7x" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/tpu7x
             # The quoted number is per chip. We halve it for per-core FLOPS.
             return 2307e12 / 2
+        logger.warning(
+            f"Unrecognized TPU device name: {device_name}, fallback to A100"
+        )
     elif "neuron" in device_name:
         # AWS Trainium/Inferentia: query chip type via torch.neuron
         # TensorEngine BF16 TFLOPS per NeuronCore × default Logical NeuronCore (LNC) count per device

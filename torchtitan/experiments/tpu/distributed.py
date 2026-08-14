@@ -14,7 +14,7 @@ from torchtitan.experiments.tpu import gdist
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import device_env
 from torchtitan.experiments.tpu import distributed_utils
-from torchtitan.experiments.tpu import utils as tpu_utils
+from torchtitan.tools import utils
 
 
 def _ensure_device_type_set(
@@ -22,7 +22,7 @@ def _ensure_device_type_set(
   """Sets the device type for the current process."""
   if accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
     # We have to force TPU device to be registered here
-    available_device_type = tpu_utils.get_device_type()
+    available_device_type = utils.get_device_type()
     if available_device_type != "tpu":
       raise RuntimeError(
           "TPU requested but TPU device is not available."

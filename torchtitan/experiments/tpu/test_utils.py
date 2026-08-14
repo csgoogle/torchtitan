@@ -49,9 +49,9 @@ def resolve_device_type() -> device_type.AcceleratorDeviceType:
   """
   # Imported here: tpu_utils pulls in torch device modules, which tests that
   # only need the flags should not pay for at import time.
-  from torchtitan.experiments.tpu import utils as tpu_utils  # pylint: disable=g-import-not-at-top
+  from torchtitan.tools import utils  # pylint: disable=g-import-not-at-top
 
-  detected = device_type.AcceleratorDeviceType(tpu_utils.get_device_type())
+  detected = device_type.AcceleratorDeviceType(utils.get_device_type())
   requested = _DEVICE.value
   if requested is None or requested == detected:
     return detected

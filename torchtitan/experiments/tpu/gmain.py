@@ -11,7 +11,7 @@ from absl.flags import argparse_flags
 import torch.multiprocessing as mp
 import torchtitan.config
 from torchtitan.experiments.tpu import distributed_utils as tpu_distributed_utils
-from torchtitan.experiments.tpu import utils as tpu_utils
+from torchtitan.tools import utils
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 
 from absl import app
@@ -22,7 +22,7 @@ global_start_trainer_func = None
 def _start_trainer(config: tpu_job_config_module.TPUTrainerConfig):
   """Starts the trainer with the specified eager mode if enabled."""
   global global_start_trainer_func  # pylint: disable=global-variable-not-assigned
-  is_tpu = tpu_utils.get_device_type() == "tpu"
+  is_tpu = utils.get_device_type() == "tpu"
   if is_tpu:
     # Populates TORCH_TPU_SLICEBUILDER_ADDRESSES / TORCH_TPU_TOPOLOGY before any
     # TPU device is created. gmain does not spawn, so this is the per-worker
@@ -91,7 +91,7 @@ def _verify_requested_device(requested: str | None) -> None:
   """
   if not requested:
     return
-  detected = tpu_utils.get_device_type()
+  detected = utils.get_device_type()
   if requested == detected:
     return
   raise ValueError(
