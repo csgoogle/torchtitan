@@ -123,15 +123,6 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   if rank == 0:
     init_logger()
 
-  if tpu_utils.get_device_type() == "tpu":
-    # Runs in each worker: gdist.torchrun() invokes start_trainer directly, and
-    # the TPU-VM bootstrap reads WORLD_SIZE from the environment, which only the
-    # worker has. Must precede Trainer.__init__, which selects and sets the
-    # device. Idempotent when a launcher already populated the env.
-    from torchtitan.experiments.tpu import distributed_utils  # pylint: disable=g-import-not-at-top
-
-    distributed_utils.maybe_init_distributed()
-
   if (
       tpu_utils.get_device_type() == "tpu"
       and train_config.optimizer.implementation == "fused"
