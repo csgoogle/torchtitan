@@ -39,7 +39,7 @@ def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
         lm_head=common_models.Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=qwen3_models._output_linear_init(dim),
+            param_init=qwen3_models._LINEAR_INIT,
         ),
 
         # pytype: disable=wrong-keyword-args
@@ -79,7 +79,7 @@ def _testmodel_moe(
         lm_head=common_models.Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=qwen3_models._output_linear_init(dim),
+            param_init=qwen3_models._LINEAR_INIT,
         ),
 
         # pytype: disable=wrong-keyword-args
@@ -126,7 +126,7 @@ def _8b_tpu(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
         lm_head=common_models.Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=qwen3_models._output_linear_init(dim),
+            param_init=qwen3_models._LINEAR_INIT,
         ),
         # pytype: disable=wrong-keyword-args
         layers=qwen3_models._build_qwen3_layers(
