@@ -24,9 +24,13 @@ tpu_device_module = None
 def get_device_type() -> str:
   """Determines and returns the available device type.
 
-  This function checks for available devices in the order: CUDA, TPU, and then
-  falls back to CPU. The result is cached in the global `device_type` variable
-  to avoid repeated discovery.
+  Detection is side-effect free: torch._utils resolves TPU through
+  torch.tpu.is_available(), which only scans PCI devices -- it does not
+  initialize the PJRT runtime. Bootstrapping the TPU distributed environment
+  is the caller's job (tpu_distributed_utils.maybe_init_distributed(), called
+  from the TPU entry points before any device is used).
+
+  The result is cached in the global `device_type` variable.
 
   Returns:
       The device type as a string ("cuda", "tpu", or "cpu").
@@ -35,37 +39,9 @@ def get_device_type() -> str:
   if device_type is not None:
     return device_type
 
-  if torch.cuda.is_available():
-    device_type = "cuda"
-    return device_type
-
-  try:
-    logger.info("Trying to discover TPU device")
-    import torch_tpu  # pylint: disable=g-import-not-at-top, unused-import
-    # This supposed to trigger libtpu.so registration on Cloud, but it doesn't.
-    try:
-      # pylint: disable=g-import-not-at-top
-      # pytype: disable=import-error
-      import libtpu  # pylint: disable=g-import-not-at-top, import-error
-      libtpu.configure_library_path()
-      # pylint: enable=g-import-not-at-top
-      # pytype: enable=import-error
-    except ImportError:
-      logger.warning("libtpu not found.")
-    import torchtitan.experiments.tpu.distributed_utils as tpu_dist_utils  # pylint: disable=g-import-not-at-top
-    tpu_dist_utils.maybe_init_distributed()
-    _ = torch.device("tpu")
-    device_type = "tpu"
-    return device_type
-  except Exception as e:  # pylint: disable=broad-except
-    logger.warning("TPU device discovery failed: %s", e)
-
+  # _get_available_device_type() ends at the privateuse1 backend, which
+  # torch_tpu registers as "tpu" via PyTorch's backend autoload.
   device_type = _get_available_device_type() or "cpu"
-  # Seems the code above registers a tpu device, regardless of availability.
-  # If we reach this point, we should fall back to CPU.
-  if device_type == "tpu":
-    device_type = "cpu"
-
   return device_type
 
 
