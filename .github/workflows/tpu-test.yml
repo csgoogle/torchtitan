@@ -34,7 +34,7 @@ jobs:
 
     # 1. ADD NATIVE CONTAINER DEFINITION HERE WITH AUTHENTICATION
     container:
-      image: us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container@sha256:707a5f592a81d3d64f3700d4c423ecc8aa9ae33fab4516008d3a5ae8d9c9c117
+      image: us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest
       credentials:
         username: _json_key
         password: ${{ secrets.GAR_JSON_KEY }}
