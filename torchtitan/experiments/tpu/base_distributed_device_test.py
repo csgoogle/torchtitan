@@ -22,7 +22,6 @@ from torchtitan.experiments.tpu import distributed_utils
 from torchtitan.experiments.tpu import numerical_validation
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import train_minimal
-from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools import utils
 
@@ -630,7 +629,7 @@ class DistributedTrainWithRecorder:
   def __call__(self, config):
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    device = tpu_utils.get_device()
+    device = utils.get_local_device()
 
     dist_type = config_to_input_distribution(config)
 

@@ -12,7 +12,6 @@ import torchtitan.config
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
-from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
@@ -36,7 +35,7 @@ def _run_model_distributed(
     train_config: torchtitan.experiments.tpu.tpu_job_config.TPUTrainerConfig,
 ):
   use_cpu_safe_histc_patch()
-  device = tpu_utils.get_device()
+  device = utils.get_local_device()
   world_size = int(os.environ.get("WORLD_SIZE", 1))
   if world_size > 1:
     dist_utils.init_distributed(
