@@ -52,13 +52,19 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
             sys.modules["vllm.utils.import_utils"] = types.ModuleType("import_utils")
         sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
         
-        from tpu_inference.executors import ray_distributed_executor
+        try:
+            from vllm_torchtpu.executors import ray_distributed_executor
+            from vllm_torchtpu.platforms import tpu_platform
+            TPU_MAP = getattr(tpu_platform, "TPU_MULTIHOST_TOPOLOGY_MAP", getattr(ray_distributed_executor, "TPU_TOPOLOGY_MAP", {}))
+        except ImportError:
+            from tpu_inference.executors import ray_distributed_executor
+            TPU_MAP = getattr(ray_distributed_executor, "TPU_TOPOLOGY_MAP", {})
 
         # [TPU HACK 2]: Add missing 4-chip and 8-chip topologies to torchtpu-vllm.
         # The library hardcodes 16-chip multi-host topologies. We must inject our
         # smaller slice topologies for it to correctly dispatch PJRT clients.
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "2,2,1"
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,4,1"
+        TPU_MAP[4] = "2,2,1"
+        TPU_MAP[8] = "2,4,1"
 
         # [TPU HACK 3]: Prevent torchtpu-vllm from claiming the entire Ray cluster.
         # torchtpu-vllm assumes it is the only application running on the Ray cluster.
