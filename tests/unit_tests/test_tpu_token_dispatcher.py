@@ -1,0 +1,215 @@
+from unittest import mock
+
+import torch
+
+from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
+    TpuTokenDispatcherConverter,
+    stable_grouped_reduce,
+)
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+
+
+def test_local_reorder_matches_reference_forward_and_backward():
+    generator = torch.Generator().manual_seed(1234)
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=3, top_k=8
+    ).build()
+    x = torch.randn(5, 4, dtype=torch.bfloat16, generator=generator)
+    x.requires_grad_()
+    scores = torch.randn(5, 8, generator=generator, requires_grad=True)
+    expert_ids = torch.randint(0, 3, (5, 8), generator=generator)
+    grad_routed = torch.randn(40, 4, dtype=torch.bfloat16, generator=generator)
+    grad_scores = torch.randn(40, generator=generator)
+
+    actual_routed, actual_indices, actual_scores = dispatcher._local_reorder(
+        x, scores, expert_ids
+    )
+    actual_grads = torch.autograd.grad(
+        (actual_routed, actual_scores),
+        (x, scores),
+        (grad_routed, grad_scores),
+    )
+
+    reference_x = x.detach().requires_grad_()
+    reference_scores = scores.detach().requires_grad_()
+    permutation = torch.argsort(expert_ids.reshape(-1), stable=True)
+    reference_indices = permutation // 8
+    reference_routed = reference_x[reference_indices]
+    reference_sorted_scores = reference_scores.reshape(-1)[permutation]
+    reference_grads = torch.autograd.grad(
+        (reference_routed, reference_sorted_scores),
+        (reference_x, reference_scores),
+        (grad_routed, grad_scores),
+    )
+
+    torch.testing.assert_close(actual_routed, reference_routed)
+    torch.testing.assert_close(actual_indices, reference_indices)
+    torch.testing.assert_close(actual_scores, reference_sorted_scores)
+    torch.testing.assert_close(
+        actual_grads[0], reference_grads[0], rtol=0.05, atol=0.125
+    )
+    torch.testing.assert_close(actual_grads[1], reference_grads[1])
+
+
+def test_local_reorder_preserves_unused_gradients():
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=2, top_k=2
+    ).build()
+    expert_ids = torch.tensor([[1, 0], [0, 1]])
+    grad_routed = torch.tensor([[1.0], [0.0], [3.0], [0.0]])
+    grad_scores = torch.tensor([1.0, 0.0, 3.0, 0.0])
+
+    x = torch.tensor([[2.0], [4.0]], requires_grad=True)
+    scores = torch.arange(4, dtype=torch.float32).reshape(2, 2).requires_grad_()
+    routed, _, sorted_scores = dispatcher._local_reorder(x, scores, expert_ids)
+    grad_x, grad_score_input = torch.autograd.grad(
+        (routed, sorted_scores),
+        (x, scores),
+        (grad_routed, grad_scores),
+    )
+    permutation = torch.argsort(expert_ids.reshape(-1), stable=True)
+    expected_x = torch.zeros_like(x).index_add(0, permutation // 2, grad_routed)
+    expected_scores = torch.zeros_like(scores).reshape(-1)
+    expected_scores[permutation] = grad_scores
+    torch.testing.assert_close(grad_x, expected_x)
+    torch.testing.assert_close(grad_score_input, expected_scores.reshape_as(scores))
+
+    x = x.detach().requires_grad_()
+    scores = scores.detach().requires_grad_()
+    routed, _, _ = dispatcher._local_reorder(x, scores, expert_ids)
+    routed_only = torch.autograd.grad(
+        routed, (x, scores), grad_routed, allow_unused=True
+    )
+    assert routed_only[1] is None
+
+    x = x.detach().requires_grad_()
+    scores = scores.detach().requires_grad_()
+    _, _, sorted_scores = dispatcher._local_reorder(x, scores, expert_ids)
+    scores_only = torch.autograd.grad(
+        sorted_scores, (x, scores), grad_scores, allow_unused=True
+    )
+    assert scores_only[0] is None
+
+
+def test_local_combine_matches_standard_dispatcher():
+    generator = torch.Generator().manual_seed(5678)
+    actual_dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=3, top_k=2
+    ).build()
+    reference_dispatcher = AllToAllTokenDispatcher.Config(
+        num_experts=3, top_k=2
+    ).build()
+    x = torch.randn(5, 4, dtype=torch.bfloat16, generator=generator)
+    expert_ids = torch.randint(0, 3, (5, 2), generator=generator)
+    counts = torch.bincount(expert_ids.reshape(-1), minlength=3)
+
+    actual_scores = torch.randn(5, 2, generator=generator, requires_grad=True)
+    reference_scores = actual_scores.detach().requires_grad_()
+    _, _, actual_metadata = actual_dispatcher.dispatch(
+        x, actual_scores, expert_ids, counts
+    )
+    _, _, reference_metadata = reference_dispatcher.dispatch(
+        x, reference_scores, expert_ids, counts
+    )
+
+    actual_routed = torch.randn(
+        10, 4, dtype=torch.bfloat16, generator=generator, requires_grad=True
+    )
+    reference_routed = actual_routed.detach().requires_grad_()
+    actual = actual_dispatcher.combine(
+        actual_routed,
+        actual_metadata,
+        x,
+        num_local_tokens_after_padding=5,
+        local_seq_len_after_padding=5,
+    )
+    reference = reference_dispatcher.combine(
+        reference_routed,
+        reference_metadata,
+        x,
+        num_local_tokens_after_padding=5,
+        local_seq_len_after_padding=5,
+    )
+    grad_output = torch.randn(5, 4, dtype=torch.bfloat16, generator=generator)
+    actual_grads = torch.autograd.grad(
+        actual, (actual_routed, actual_scores), grad_output
+    )
+    reference_grads = torch.autograd.grad(
+        reference, (reference_routed, reference_scores), grad_output
+    )
+
+    torch.testing.assert_close(actual, reference, rtol=0.05, atol=0.125)
+    torch.testing.assert_close(
+        actual_grads[0], reference_grads[0], rtol=0.05, atol=0.125
+    )
+    torch.testing.assert_close(actual_grads[1], reference_grads[1])
+
+
+def test_ep_combine_delegates_to_standard_dispatcher():
+    dispatcher = TpuAllToAllTokenDispatcher.Config(
+        num_experts=2, top_k=2
+    ).build()
+    dispatcher.ep_mesh = object()
+    expected = torch.tensor([1.0])
+
+    with mock.patch.object(
+        AllToAllTokenDispatcher, "combine", return_value=expected
+    ) as combine:
+        actual = dispatcher.combine(
+            torch.empty(0),
+            mock.sentinel.metadata,
+            torch.empty(0),
+            num_local_tokens_after_padding=0,
+            local_seq_len_after_padding=0,
+        )
+
+    assert actual is expected
+    combine.assert_called_once()
+
+
+def test_grouped_reduce_saves_only_row_index():
+    index = torch.tensor([2, 0, 2, 1, 0, 1])
+    src = torch.arange(24, dtype=torch.float32).reshape(6, 4).requires_grad_()
+    grad_output = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    saved_shapes = []
+
+    def pack(tensor):
+        saved_shapes.append(tensor.shape)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        actual = stable_grouped_reduce(src, index, top_k=2)
+        (grad_src,) = torch.autograd.grad(actual, (src,), grad_output)
+
+    reference = torch.zeros(3, 4).scatter_add(
+        0, index.reshape(-1, 1).expand_as(src), src.detach()
+    )
+    torch.testing.assert_close(actual, reference)
+    torch.testing.assert_close(grad_src, torch.index_select(grad_output, 0, index))
+    assert saved_shapes == [index.shape]
+
+
+def test_converter_preserves_fields_and_is_idempotent():
+    class RootConfig:
+        def __init__(self):
+            self.dispatcher = AllToAllTokenDispatcher.Config(
+                num_experts=8, top_k=2
+            )
+
+        def traverse(self, config_type):
+            if isinstance(self.dispatcher, config_type):
+                yield "dispatcher", self.dispatcher, self, "dispatcher"
+
+    root = RootConfig()
+    converter = TpuTokenDispatcherConverter.Config().build()
+    converted = converter.convert(root)
+
+    assert converted is root
+    assert isinstance(root.dispatcher, TpuAllToAllTokenDispatcher.Config)
+    assert root.dispatcher.num_experts == 8
+    assert root.dispatcher.top_k == 2
+
+    dispatcher = root.dispatcher
+    converter.convert(root)
+    assert root.dispatcher is dispatcher

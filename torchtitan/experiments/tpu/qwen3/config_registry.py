@@ -26,6 +26,9 @@ from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
+from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuTokenDispatcherConverter,
+)
 from torchtitan.experiments.tpu.tpu_job_config import (
     LossKernelConfig,
     SplashAttentionKernelConfig,
@@ -276,6 +279,7 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
       "30B-A3B-global-aux",
       attn_backend="sdpa",
       converters=[
+          TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
       ],
   )
