@@ -52,10 +52,11 @@ def _build_grouped_matmul_kernels(tile_m: int, use_full_tgmm_tiling: bool):
       # per-expert weight matrices transposed.
       grad_lhs = gmm_ops.gmm(
           dout,
-          jnp.swapaxes(rhs, 1, 2),
+          rhs,
           group_sizes=group_sizes,
           preferred_element_type=jnp.bfloat16,
           tiling=(tile_m, rhs.shape[2], rhs.shape[1]),
+          transpose_rhs=True,
       )
       # dWeight reduces each expert's variable-size token group into one
       # matrix, which is the contraction implemented by MegaBlox TGMM.

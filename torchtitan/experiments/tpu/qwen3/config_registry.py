@@ -328,6 +328,7 @@ def qwen3_moe_30b_fsdp_only_full_ac_profile() -> TPUTrainerConfig:
     experts.use_pallas_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
     experts.pallas_grouped_mm_use_full_tgmm_tiling = True
+    experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 6
   cfg.training.global_batch_size = 768
   cfg.training.seq_len = 2048
