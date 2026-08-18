@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from functools import partial
 from typing import cast
 from torch import nn
@@ -20,6 +21,10 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
+from torchtitan.experiments.tpu.grouped_experts import (
+    TpuGroupedExperts,
+    TpuGroupedExpertsConverter,
+)
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.tpu_job_config import (
     LossKernelConfig,
@@ -29,9 +34,12 @@ from torchtitan.experiments.tpu.tpu_job_config import (
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.experiments.tpu.qwen3 import model_registry
+from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.tools.profiler import Profiler
+
 
 def qwen3_debugmodel() -> TPUTrainerConfig:
   """Qwen3 debug model configuration for TPU."""
@@ -262,48 +270,112 @@ def qwen3_8b() -> TPUTrainerConfig:
 
 
 def qwen3_moe_30b() -> TPUTrainerConfig:
-  """Qwen3 30B MoE model configuration for TPU."""
-  model_spec = model_registry("30B-A3B", attn_backend="sdpa")
-  model_spec.parallelize_fn = tpu_parallelize_qwen3
-
-  model_config = cast(Qwen3Model.Config, model_spec.model)
-  model_config.enable_weight_tying = False
-  model_config.tok_embeddings.param_init = {
-      "weight": partial(nn.init.normal_, std=1.0)
-  }
-  return TPUTrainerConfig(
-      loss=CrossEntropyLoss.Config(),
-      hf_assets_path="./assets/hf/Qwen3-30B-A3B",
-      model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=600,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
-      ),
-      training=TrainingConfig(
-          local_batch_size=2,
-          seq_len=4096,
-          steps=3000,
-      ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4",
-      ),
-      metrics=MetricsProcessor.Config(log_freq=10),
-      parallelism=ParallelismConfig(
-          pipeline_parallel_schedule="Interleaved1F1B"
-      ),
-      checkpoint=CheckpointManager.Config(
-          interval=500,
-          last_save_model_only=False,
-      ),
-      activation_checkpoint=FullAC.Config(),
-      validator=Validator.Config(
-          freq=5,
-          steps=10,
-      ),
+  """TPU specialization of the global-aux Qwen3 30B recipe."""
+  cfg = TPUTrainerConfig.derive_from(qwen3_30b_a3b_global_aux())
+  cfg.model_spec = model_registry(
+      "30B-A3B-global-aux",
+      attn_backend="sdpa",
+      converters=[
+          TpuGroupedExpertsConverter.Config(),
+      ],
   )
+  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
+  cfg.training.local_batch_size = 6
+  cfg.training.global_batch_size = 768
+  cfg.parallelism = ParallelismConfig(
+      use_simple_fsdp=True,
+      data_parallel_shard_degree=-1,
+      expert_parallel_degree=128,
+  )
+  cfg.tpu_config = TPUConfig(
+      use_graph_trainer=True,
+      compile_mode="aot_fx_trace",
+      graph_trainer_memory_policy="full",
+  )
+  cfg.compile = CompileConfig(
+      enable=True,
+      backend="tpu",
+      components=["model"],
+  )
+  cfg.splash_attention_kernel = SplashAttentionKernelConfig(
+      use_splash_attention_kernel=True,
+      sa_block_q=1024,
+      sa_block_kv=1024,
+      sa_block_dkv=1024,
+      sa_block_kv_compute=1024,
+      sa_block_q_dkv=1024,
+      sa_block_kv_dkv=1024,
+      sa_block_kv_dkv_compute=1024,
+      sa_block_q_dq=1024,
+      sa_block_kv_dq=1024,
+  )
+  cfg.loss_kernel = LossKernelConfig(use_loss_kernel=False)
+  cfg.validator = Validator.Config(enable=False)
+  return cfg
+
+
+def qwen3_moe_30b_fsdp_only_full_ac_profile() -> TPUTrainerConfig:
+  """Batch-6 FSDP128 profile with local dropless expert dispatch."""
+  cfg = qwen3_moe_30b()
+  cfg.parallelism = ParallelismConfig(
+      use_simple_fsdp=True,
+      enable_tpu_topo_mesh=True,
+      data_parallel_shard_degree=-1,
+      expert_parallel_degree=1,
+  )
+  assert cfg.model_spec is not None
+  for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
+    experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+  cfg.training.local_batch_size = 6
+  cfg.training.global_batch_size = 768
+  cfg.training.seq_len = 2048
+  cfg.training.steps = 8
+  cfg.tpu_config = TPUConfig(
+      use_graph_trainer=True,
+      compile_mode="aot_fx_trace",
+      graph_trainer_memory_policy="full",
+      enable_graph_trainer_remat_schedule=True,
+      compile_optimizer=False,
+      optimizer_in_graph=False,
+  )
+  cfg.compile = CompileConfig(
+      enable=True,
+      backend="tpu",
+      components=["model"],
+  )
+  cfg.splash_attention_kernel = SplashAttentionKernelConfig(
+      use_splash_attention_kernel=True,
+      sa_block_q=1024,
+      sa_block_kv=1024,
+      sa_block_dkv=1024,
+      sa_block_kv_compute=1024,
+      sa_block_q_dkv=1024,
+      sa_block_kv_dkv=1024,
+      sa_block_kv_dkv_compute=1024,
+      sa_block_q_dq=1024,
+      sa_block_kv_dq=1024,
+  )
+  cfg.loss_kernel = LossKernelConfig(use_loss_kernel=False)
+  cfg.metrics.log_freq = 1
+  cfg.checkpoint = CheckpointManager.Config(enable=False)
+  cfg.profiler = Profiler.Config(
+      enable_profiling=int(os.environ.get("RANK", "0")) == 0,
+      profile_freq=5,
+      profiler_warmup=2,
+      profiler_active=1,
+  )
+  cfg.validator = Validator.Config(enable=False)
+  return cfg
+
+
+def qwen3_moe_30b_fsdp_only_full_ac_benchmark() -> TPUTrainerConfig:
+  """Profiler-free bracket for the batch-6 FSDP128 comparison."""
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_profile()
+  cfg.training.steps = 30
+  cfg.metrics.log_freq = 5
+  cfg.profiler = Profiler.Config(enable_profiling=False)
+  return cfg
 
 
 def qwen3_moe_30b_proxy() -> TPUTrainerConfig:

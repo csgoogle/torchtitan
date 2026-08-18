@@ -24,6 +24,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 import logging
 import os
+import time
 from typing import Any, Optional
 
 import torch
@@ -44,6 +45,9 @@ from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import register as register_tpu_pipeline
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.tools.logging import logger
+
+
+_TPU7X_BF16_PEAK_FLOPS = 1154e12
 
 
 @dataclass
@@ -72,6 +76,94 @@ def _optimizer_compile_enabled(config, tpu_extra) -> bool:
     if tpu_extra is not None and getattr(tpu_extra, "optimizer_compile", False):
         return True
     return bool(getattr(config.compile, "optimizer_compile", False))
+
+
+def _set_canonical_qwen_mfu(metrics_processor, model_config, seq_len: int) -> None:
+    """Use activated weights and the project-standard attention FLOP count."""
+    attention_layers = [
+        layer.attention
+        for layer in model_config.layers
+        if getattr(layer, "attention", None) is not None
+    ]
+    upstream_attention_flops = sum(
+        12 * attention.n_heads * attention.head_dim * seq_len
+        for attention in attention_layers
+    )
+    canonical_attention_flops = (
+        12 * len(attention_layers) * model_config.dim * seq_len
+    )
+    metrics_processor.num_flops_per_token += (
+        canonical_attention_flops - upstream_attention_flops
+    )
+    metrics_processor.gpu_peak_flops = _TPU7X_BF16_PEAK_FLOPS
+
+
+def _install_mfu_benchmark_bracket(metrics_processor, *, final_step: int) -> None:
+    """Measure one synchronized steady-state interval across metric logs."""
+    warmup_step = int(os.environ.get("TITANTPU_BENCHMARK_WARMUP", "5"))
+    rank = int(os.environ.get("RANK", "0"))
+    original_log = metrics_processor.log
+    peak_flops = metrics_processor.gpu_peak_flops
+    flops_per_token = metrics_processor.num_flops_per_token
+    non_data_parallel_size = metrics_processor.parallel_dims.non_data_parallel_size
+    state: dict[str, Any] = {
+        "start": None,
+        "tokens": 0,
+        "start_step": None,
+        "last_step": None,
+        "finished": False,
+    }
+
+    def benchmark_log(step, *args, **kwargs):
+        # Trainer materializes loss and grad norm before log(), so these
+        # timestamps are device-drained boundaries that include the optimizer.
+        now = time.perf_counter()
+        tokens = metrics_processor.ntokens_since_last_log
+        if state["start"] is None:
+            if step >= warmup_step:
+                state["start"] = now
+                state["start_step"] = step
+        else:
+            state["tokens"] += tokens
+            state["last_step"] = step
+
+        result = original_log(step, *args, **kwargs)
+        if (
+            state["start"] is not None
+            and not state["finished"]
+            and step >= final_step
+        ):
+            elapsed = now - state["start"]
+            start_step = state["start_step"]
+            last_step = state["last_step"] or step
+            measured_steps = max(last_step - start_step, 1)
+            tokens_per_rank = state["tokens"]
+            tps = tokens_per_rank / (
+                elapsed * non_data_parallel_size
+            )
+            tflops = flops_per_token * tps / 1e12
+            mfu = 100 * tflops * 1e12 / peak_flops
+            state["finished"] = True
+            if rank == 0:
+                print(
+                    f"[mfu_benchmark] warmup_end_step={start_step} "
+                    f"final_step={last_step} measured_steps={measured_steps} "
+                    f"wall={elapsed:.6f}s mean_step_time={elapsed / measured_steps:.6f}s "
+                    f"tokens_per_rank={tokens_per_rank} tflops={tflops:.6f} "
+                    f"mfu={mfu:.6f}%",
+                    flush=True,
+                )
+        return result
+
+    metrics_processor.log = benchmark_log
+    if rank == 0:
+        print(
+            f"[mfu_benchmark] installed: warmup_step={warmup_step} "
+            f"final_step={final_step} non_data_parallel_size={non_data_parallel_size} "
+            f"peak_per_device={peak_flops / 1e12:.0f}TFLOPS "
+            f"flops_per_token={flops_per_token / 1e9:.6f}GFLOPs",
+            flush=True,
+        )
 
 
 class TpuGraphTrainer(GraphTrainer):
@@ -128,6 +220,13 @@ class TpuGraphTrainer(GraphTrainer):
         self._tpu_extra = tpu_extra
         if tpu_extra is not None and tpu_extra.device == "tpu":
             _apply_tpu_moe_post_init(self.model_parts, tpu_extra)
+            self.metrics_processor.gpu_peak_flops = _TPU7X_BF16_PEAK_FLOPS
+            if config.model_spec is not None and config.model_spec.name == "qwen3":
+                _set_canonical_qwen_mfu(
+                    self.metrics_processor,
+                    self.model_config,
+                    config.training.seq_len,
+                )
 
         # Only dump weight/buffer statistics when debug logging is explicitly enabled per review comment.
         if logger.isEnabledFor(logging.DEBUG):
@@ -142,6 +241,12 @@ class TpuGraphTrainer(GraphTrainer):
         )
         if self._optimizer_compile:
             apply_compiled_optimizer(self)
+
+        if os.environ.get("TITANTPU_BENCHMARK"):
+            _install_mfu_benchmark_bracket(
+                self.metrics_processor,
+                final_step=int(config.training.steps),
+            )
 
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -476,6 +581,7 @@ def _make_fwd_bwd_adamw_fn(
     weight_decay: float,
     max_norm: float | None = None,
     collect_moe_routing_metrics: bool = False,
+    capturable: bool = True,
 ):
     from torchtitan.experiments.graph_trainer.common_utils import compute_annotated_loss
     from torchtitan.experiments.tpu.compiled_optimizers.functional import (
@@ -538,7 +644,7 @@ def _make_fwd_bwd_adamw_fn(
             weight_decay=weight_decay,
             maximize=False,
             foreach=False,
-            capturable=True,
+            capturable=capturable,
         )
         return [
             loss,

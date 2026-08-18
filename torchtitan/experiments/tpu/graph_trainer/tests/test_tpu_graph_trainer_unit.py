@@ -1,7 +1,12 @@
 """Unit tests for TpuGraphTrainer (tracing, loss override, and config wiring)."""
 
+import contextlib
+import io
+import os
+from types import SimpleNamespace
 import typing
 import unittest
+from unittest import mock
 
 from absl.testing import absltest
 import torch
@@ -42,6 +47,57 @@ def _make_dummy_fwd_bwd_step(loss_fn: nn.Module, model: nn.Module):
     return [loss] + list(grads)
 
   return fwd_bwd_fn
+
+
+class MfuBenchmarkTest(absltest.TestCase):
+
+  def test_canonical_qwen_attention_flops(self) -> None:
+    metrics = SimpleNamespace(num_flops_per_token=1000, gpu_peak_flops=0)
+    model_config = SimpleNamespace(
+        dim=16,
+        layers=[
+            SimpleNamespace(attention=SimpleNamespace(n_heads=4, head_dim=8))
+        ],
+    )
+
+    tpu_graph_trainer._set_canonical_qwen_mfu(metrics, model_config, seq_len=2)
+
+    self.assertEqual(metrics.num_flops_per_token, 616)
+    self.assertEqual(
+        metrics.gpu_peak_flops, tpu_graph_trainer._TPU7X_BF16_PEAK_FLOPS
+    )
+
+  def test_mfu_benchmark_bracket(self) -> None:
+    metrics = SimpleNamespace(
+        ntokens_since_last_log=100,
+        parallel_dims=SimpleNamespace(non_data_parallel_size=1),
+        num_flops_per_token=2e9,
+        gpu_peak_flops=100e12,
+        log=lambda *args, **kwargs: None,
+    )
+    output = io.StringIO()
+    with (
+        mock.patch.dict(
+            os.environ,
+            {"RANK": "0", "TITANTPU_BENCHMARK_WARMUP": "5"},
+        ),
+        mock.patch.object(
+            tpu_graph_trainer.time,
+            "perf_counter",
+            side_effect=(10.0, 12.0, 17.0),
+        ),
+        contextlib.redirect_stdout(output),
+    ):
+      tpu_graph_trainer._install_mfu_benchmark_bracket(metrics, final_step=7)
+      metrics.log(5, 0.0, 0.0, 0.0)
+      metrics.log(6, 0.0, 0.0, 0.0)
+      metrics.log(7, 0.0, 0.0, 0.0)
+
+    line = output.getvalue()
+    self.assertIn("flops_per_token=2.000000GFLOPs", line)
+    self.assertIn("measured_steps=2", line)
+    self.assertIn("wall=7.000000s", line)
+    self.assertIn("tokens_per_rank=200", line)
 
 
 class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
@@ -186,6 +242,7 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
         eps=1e-8,
         weight_decay=0.1,
         max_norm=1.0,
+        capturable=False,
     )
 
     inputs = torch.randint(0, 128, (2, 16), device=device)
@@ -212,4 +269,3 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
 
 if __name__ == "__main__":
   absltest.main()
-
