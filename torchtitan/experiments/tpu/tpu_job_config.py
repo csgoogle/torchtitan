@@ -29,6 +29,10 @@ class TPUConfig:
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
   # Keep rematerialized layer workspaces local in the XLA schedule.
   enable_graph_trainer_remat_schedule: bool = False
+  # Emit one aggregate MFU measurement after the configured start log step
+  # through the end of training. Both boundaries must be metric log steps.
+  enable_mfu_benchmark: bool = False
+  mfu_benchmark_start_step: int = 5
   # Disable Automatic Mixed Precision (AMP), so all training is done in uniform
   # precision.
   enable_amp: bool = True

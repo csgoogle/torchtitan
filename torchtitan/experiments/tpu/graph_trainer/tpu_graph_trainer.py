@@ -41,6 +41,7 @@ from torchtitan.experiments.tpu.compiled_optimizers.functional import (
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
+from torchtitan.experiments.tpu.graph_trainer.mfu_benchmark import MfuBenchmark
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import register as register_tpu_pipeline
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.tools.logging import logger
@@ -59,6 +60,9 @@ class TpuGraphTrainerConfig:
     optimizer_in_graph: bool = False
     optimizer_compile: bool = False
     compile_mode: str = "none"
+    enable_mfu_benchmark: bool = False
+    mfu_benchmark_start_step: int = 5
+    mfu_benchmark_final_step: int = 0
     job_config: Optional[TPUTrainerConfig] = None
 
 
@@ -143,13 +147,24 @@ class TpuGraphTrainer(GraphTrainer):
         if self._optimizer_compile:
             apply_compiled_optimizer(self)
 
+        self._mfu_benchmark = None
+        if tpu_extra is not None and tpu_extra.enable_mfu_benchmark:
+            self._mfu_benchmark = MfuBenchmark(
+                self.metrics_processor,
+                start_step=tpu_extra.mfu_benchmark_start_step,
+                final_step=tpu_extra.mfu_benchmark_final_step,
+            )
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> None:
         """Override of GraphTrainer.train_step to branch into optimizer_in_graph loop when enabled."""
         if not self._optimizer_in_graph:
-            return super().train_step(data_iterator)
-        return self._train_step_optimizer_in_graph(data_iterator)
+            super().train_step(data_iterator)
+        else:
+            self._train_step_optimizer_in_graph(data_iterator)
+        if self._mfu_benchmark is not None:
+            self._mfu_benchmark.record(self.step, self.ntokens_seen)
 
     def _register_optimizer_buffers(self) -> None:
         """TPU/PJRT addition: registers persistent optstate buffers when optimizer_in_graph is enabled."""
@@ -484,6 +499,7 @@ def _make_fwd_bwd_adamw_fn(
     weight_decay: float,
     max_norm: float | None = None,
     collect_moe_routing_metrics: bool = False,
+    capturable: bool = True,
 ):
     from torchtitan.experiments.graph_trainer.common_utils import (
         compute_annotated_loss,
@@ -551,7 +567,7 @@ def _make_fwd_bwd_adamw_fn(
             weight_decay=weight_decay,
             maximize=False,
             foreach=False,
-            capturable=True,
+            capturable=capturable,
         )
         return [
             loss,
