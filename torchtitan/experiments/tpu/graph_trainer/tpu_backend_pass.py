@@ -16,6 +16,10 @@ import time
 from typing import Any, Callable
 
 import torch
+
+from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+    apply_tpu_remat_schedule,
+)
 from torchtitan.tools.logging import logger
 
 
@@ -126,6 +130,20 @@ def construct_tpu_pass_pipeline(
             functools.partial(tag_with_memory_policy_pass, config=config)
         )
         passes.append(selective_activation_remat_pass)
+        if config.tpu_config.enable_graph_trainer_remat_schedule:
+            if config.tpu_config.optimizer_in_graph or getattr(
+                config.compile, "optimizer_in_graph", False
+            ):
+                raise ValueError(
+                    "TPU remat scheduling requires parameter gradients as graph "
+                    "outputs and does not support optimizer_in_graph"
+                )
+            passes.append(
+                functools.partial(
+                    apply_tpu_remat_schedule,
+                    num_static_inputs=traced_result.num_static_inputs,
+                )
+            )
         logger.info(
             f"[tpu_backend_pass] activation checkpointing enabled "
             f"(memory_policy={memory_policy!r}); prepended "

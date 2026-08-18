@@ -234,3 +234,46 @@ def find_fsdp_reduce_grad_input(param_grad_output: Any) -> fx.Node | None:
         if is_reduce_grad_collective(previous_node):
             reduce_grad_input = node
     return reduce_grad_input
+
+
+def find_fsdp_local_grad_before_reduce_dtype_cast(
+    reduce_grad_input: Any,
+) -> fx.Node | None:
+    """Return the local BF16 gradient before its FP32 FSDP reduce cast.
+
+    ``find_fsdp_reduce_grad_input`` returns the exact value consumed by the
+    first synchronization collective. That value must remain unchanged for
+    FSDP numerics. Scheduling-only dependencies can instead use the source of
+    its BF16-to-FP32 cast, which proves that local dWeight computation is done
+    without ordering the cast or collective itself.
+    """
+    if not isinstance(reduce_grad_input, fx.Node):
+        return None
+
+    node = reduce_grad_input
+    while hasattr(node.target, "is_view") and node.target.is_view:
+        if len(node.all_input_nodes) != 1:
+            return None
+        node = node.all_input_nodes[0]
+
+    if (
+        node.target is not torch.ops.aten._to_copy.default
+        or len(node.all_input_nodes) != 1
+    ):
+        return None
+
+    source = node.all_input_nodes[0]
+    source_val = source.meta.get("val")
+    cast_val = node.meta.get("val")
+    if not isinstance(source_val, torch.Tensor) or not isinstance(
+        cast_val, torch.Tensor
+    ):
+        return None
+    if (
+        source_val.dtype != torch.bfloat16
+        or cast_val.dtype != torch.float32
+        or source_val.shape != cast_val.shape
+        or source_val.device != cast_val.device
+    ):
+        return None
+    return source

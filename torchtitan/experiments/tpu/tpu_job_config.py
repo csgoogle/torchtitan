@@ -27,6 +27,8 @@ class TPUConfig:
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  # Keep rematerialized layer workspaces local in the XLA schedule.
+  enable_graph_trainer_remat_schedule: bool = False
   # Disable Automatic Mixed Precision (AMP), so all training is done in uniform
   # precision.
   enable_amp: bool = True

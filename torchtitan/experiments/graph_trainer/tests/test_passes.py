@@ -106,6 +106,12 @@ from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_identity_slice_pass,
     remove_identity_view_pass,
 )
+from torchtitan.experiments.graph_trainer.selective_activation_remat import (
+    REMAT_REGION_ID_META,
+    REMAT_REGION_ROLE_META,
+    REMAT_ROLE_BACKWARD,
+    REMAT_ROLE_RECOMPUTE,
+)
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 from torchtitan.experiments.graph_trainer.tests.test_cpu_offload import (  # noqa: F401
     TestCpuOffloadPass,
@@ -1581,7 +1587,9 @@ class TestApplySACPass(TestCase):
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
         fwd.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        fwd.meta["custom"] = {_MODULE_FQN: "layers.3.attention"}
         bwd.meta["autograd_backward"] = True
+        bwd.meta["custom"] = {_MODULE_FQN: "layers.3.attention"}
 
         gm = selective_activation_remat_pass(gm)
 
@@ -1590,6 +1598,13 @@ class TestApplySACPass(TestCase):
         ]
         self.assertEqual(len(recomputed_nodes), 1)
         self.assertTrue(recomputed_nodes[0].meta["autograd_backward"])
+        self.assertEqual(recomputed_nodes[0].meta[REMAT_REGION_ID_META], 3)
+        self.assertEqual(
+            recomputed_nodes[0].meta[REMAT_REGION_ROLE_META],
+            REMAT_ROLE_RECOMPUTE,
+        )
+        self.assertEqual(bwd.meta[REMAT_REGION_ID_META], 3)
+        self.assertEqual(bwd.meta[REMAT_REGION_ROLE_META], REMAT_ROLE_BACKWARD)
 
     def test_remat_dup_gets_independent_custom_meta(self):
         # fx.Graph.node_copy shallow-copies node.meta, so without intervention a
@@ -1736,6 +1751,19 @@ class TestFullMemoryPolicy(TestCase):
                 CheckpointPolicy.MUST_RECOMPUTE,
                 f"node {node.name} in single layer should be MUST_RECOMPUTE",
             )
+
+    def test_final_layer_output_forced_to_must_save(self):
+        gm = self._build_gm(
+            [
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.relu.default,
+            ],
+            layer_fqns=["layers.47", "norm"],
+        )
+        tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
+        nodes = self._get_call_function_nodes(gm)
+        self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(nodes[1].meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
 
 
 class TestBucketingPrefetchOrder(FSDPTest):
