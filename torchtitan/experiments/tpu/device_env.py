@@ -7,7 +7,7 @@ which is why this module imports no torch -- it only computes and applies
 environment variables, so a parent can configure a child it is about to spawn.
 
 Preferring this over mutating a device-type global means the child's detection
-is correct from the start, and every later reader of get_device_type() agrees
+is correct from the start, and every later reader of device_type agrees
 by construction rather than by remembering to call a setter.
 """
 

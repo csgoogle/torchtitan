@@ -292,7 +292,7 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
     torchtitan.tools.logging.init_logger()
     job_config.maybe_log()
 
-  if utils.get_device_type() == "tpu":
+  if utils.device_type == "tpu":
     # Bootstrap explicitly: gmain does this before calling start_trainer,
     # but this module has no other entry point and no test coverage, so
     # do not rely on the caller. Idempotent when already initialized.
@@ -335,7 +335,7 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
 
 
   seed = job_config.debug.seed or 42
-  if utils.get_device_type() == "tpu":
+  if utils.device_type == "tpu":
     torch.manual_seed(seed)
     logger.info("Set manual seed to %d", seed)
   else:
@@ -483,7 +483,7 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
 
   metrics_processor.num_flops_per_token = num_flops_per_token
 
-  device_name = utils.get_device_module().get_device_name()
+  device_name = utils.device_module.get_device_name()
   peak_flops = utils.get_peak_flops(device_name)
 
   total_tokens = 0

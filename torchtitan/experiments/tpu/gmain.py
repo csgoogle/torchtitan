@@ -22,7 +22,7 @@ global_start_trainer_func = None
 def _start_trainer(config: tpu_job_config_module.TPUTrainerConfig):
   """Starts the trainer with the specified eager mode if enabled."""
   global global_start_trainer_func  # pylint: disable=global-variable-not-assigned
-  is_tpu = utils.get_device_type() == "tpu"
+  is_tpu = utils.device_type == "tpu"
   if is_tpu:
     # Populates TORCH_TPU_SLICEBUILDER_ADDRESSES / TORCH_TPU_TOPOLOGY before any
     # TPU device is created. gmain does not spawn, so this is the per-worker
@@ -91,7 +91,7 @@ def _verify_requested_device(requested: str | None) -> None:
   """
   if not requested:
     return
-  detected = utils.get_device_type()
+  detected = utils.device_type
   if requested == detected:
     return
   raise ValueError(

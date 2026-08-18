@@ -203,7 +203,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       batch_degree, batch_rank = 1, 0
 
   seed = train_config.debug.seed or 42
-  if utils.get_device_type() == "tpu":
+  if utils.device_type == "tpu":
     torch.manual_seed(seed)
     logger.info("Set manual seed to %d", seed)
   else:
@@ -370,7 +370,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
   ) = model_args.get_nparams_and_flops(model, train_config.training.seq_len)
   metrics_processor.num_flops_per_token = num_flops_per_token
 
-  device_name = utils.get_device_module().get_device_name()
+  device_name = utils.device_module.get_device_name()
   peak_flops = utils.get_peak_flops(device_name)
   logger.info(
       "Peak FLOPS for %s used for computing MFU: %d",

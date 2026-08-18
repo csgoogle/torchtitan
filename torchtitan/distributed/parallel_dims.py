@@ -19,7 +19,7 @@ from torch.distributed.device_mesh import init_device_mesh as torch_init_device_
 
 from torchtitan.config.configs import ParallelismConfig
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import get_device_type
+from torchtitan.tools.utils import device_type
 
 
 def init_device_mesh(
@@ -327,7 +327,7 @@ class ParallelDims:
         efsdp = fsdp * self.tp // self.ep
 
         self._world_mesh = init_device_mesh(
-            get_device_type(),
+            device_type,
             (self.world_size,),
             mesh_dim_names=("world",),
             enable_tpu_topo_mesh=self.enable_tpu_topo_mesh,
@@ -468,7 +468,7 @@ class ParallelDims:
         """Override world-sized dimensions in all meshes to use custom TPU group.
         NOTE: This is a temporary workaround for the reason described below."""
 
-        if get_device_type() != "tpu" or not self.enable_tpu_topo_mesh:
+        if device_type != "tpu" or not self.enable_tpu_topo_mesh:
             return
 
         try:

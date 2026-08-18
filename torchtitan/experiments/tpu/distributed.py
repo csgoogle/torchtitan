@@ -22,7 +22,7 @@ def _ensure_device_type_set(
   """Sets the device type for the current process."""
   if accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
     # We have to force TPU device to be registered here
-    available_device_type = utils.get_device_type()
+    available_device_type = utils.device_type
     if available_device_type != "tpu":
       raise RuntimeError(
           "TPU requested but TPU device is not available."

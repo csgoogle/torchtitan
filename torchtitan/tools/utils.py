@@ -43,95 +43,52 @@ def has_rocm_capability(major: int, minor: int) -> bool:
     )
 
 
-def get_device_info() -> tuple[str, ModuleType]:
-    device_type = _get_available_device_type() or "cuda"
-    device_module = _get_device_module(device_type)  # default device_module:torch.cuda
-    return device_type, device_module
+def _patch_cpu_device_module(device_module: ModuleType) -> None:
+    """Adds the device-module functions torch.cpu does not provide."""
 
-
-# device_type, device_module = get_device_info()
-_device_type: str | None = None
-_cpu_device_module: ModuleType | None = None
-_tpu_device_module: ModuleType | None = None
-
-
-def get_device_type() -> str:
-    """Returns the device type this process runs on, detected once and cached.
-
-    Detection is side-effect free: torch._utils resolves TPU through
-    torch.tpu.is_available(), a PCI scan that does not initialize the PJRT
-    runtime. Which accelerator is visible is fixed by the environment before
-    torch is imported (see experiments/tpu/device_env.py), so the answer cannot
-    change during the process and is safe to cache.
-    """
-    global _device_type
-    if _device_type is None:
-        _device_type = _get_available_device_type() or "cpu"
-    return _device_type
-
-
-def _get_cpu_module() -> ModuleType:
-    """Returns torch.cpu with the device-module functions it is missing."""
-    global _cpu_device_module
-    if _cpu_device_module is not None:
-        return _cpu_device_module
-
-    device_module = _get_device_module("cpu")
-
-    # torch.cpu doesn't have get_device_name
     def get_device_name(device=None):
         return "cpu"
 
-    setattr(device_module, "get_device_name", get_device_name)
-
     def current_device():
-        # torch.cpu.current_device() returns the string "cpu"; callers here
-        # need an index, e.g. torch.device(device_type, current_device()).
-        return dist.get_rank()
-
-    setattr(device_module, "current_device", current_device)
+        # torch.cpu.current_device() returns the string "cpu"; callers need an
+        # index, e.g. torch.device(device_type, current_device()). A process
+        # has exactly one CPU device, so it is always index 0.
+        return 0
 
     def get_device_properties(device=None):
         return SimpleNamespace(total_memory=psutil.virtual_memory().total)
 
-    setattr(device_module, "get_device_properties", get_device_properties)
-
     def reset_peak_memory_stats(device=None):
         pass
 
-    setattr(device_module, "reset_peak_memory_stats", reset_peak_memory_stats)
-
     def empty_cache():
         pass
-
-    setattr(device_module, "empty_cache", empty_cache)
 
     def memory_stats(device=None):
         return {}
 
+    setattr(device_module, "get_device_name", get_device_name)
+    setattr(device_module, "current_device", current_device)
+    setattr(device_module, "get_device_properties", get_device_properties)
+    setattr(device_module, "reset_peak_memory_stats", reset_peak_memory_stats)
+    setattr(device_module, "empty_cache", empty_cache)
     setattr(device_module, "memory_stats", memory_stats)
-    _cpu_device_module = device_module
-    return device_module
 
 
-def _get_tpu_module() -> ModuleType:
-    """Returns torch.tpu with the device-module functions it is missing.
+def _patch_tpu_device_module(device_module: ModuleType) -> None:
+    """Adds the device-module functions torch_tpu does not provide.
+
+    torch_tpu natively provides get_device_name, get_device_properties,
+    set_device, current_device, device_count and synchronize; it gained
+    is_triton_capable on 2026-08-11, so that one is only back-filled for older
+    builds. Drop these once torch_tpu exposes the memory-management trio.
     """
-    global _tpu_device_module
-    if _tpu_device_module is not None:
-        return _tpu_device_module
-
-    device_module = _get_device_module("tpu")
 
     def reset_peak_memory_stats(device=None):
         pass
 
-    setattr(device_module, "reset_peak_memory_stats", reset_peak_memory_stats)
-
     def empty_cache():
         pass
-
-    setattr(device_module, "empty_cache", empty_cache)
 
     def memory_stats(device=None):
         # torch_tpu exposes memory stats through the modern torch.accelerator
@@ -139,30 +96,30 @@ def _get_tpu_module() -> ModuleType:
         # namespace (torch.tpu). Route them across.
         return torch.accelerator.memory_stats()
 
-    setattr(device_module, "memory_stats", memory_stats)
-
     def is_triton_capable(*args, **kwargs):
         return False
 
-    setattr(device_module, "is_triton_capable", is_triton_capable)
-    _tpu_device_module = device_module
-    return device_module
+    setattr(device_module, "reset_peak_memory_stats", reset_peak_memory_stats)
+    setattr(device_module, "empty_cache", empty_cache)
+    setattr(device_module, "memory_stats", memory_stats)
+    if not hasattr(device_module, "is_triton_capable"):
+        setattr(device_module, "is_triton_capable", is_triton_capable)
 
 
-# Build it now on TPU hosts. The shims above must exist before any library
-# that probes the device module at import time. This is a temporary solution.
-if _get_available_device_type() == "tpu":
-    _get_tpu_module()
-
-
-def get_device_module() -> ModuleType:
-    """Returns the device module for the detected device type."""
-    device_type = get_device_type()
-    if device_type == "tpu":
-        return _get_tpu_module()
+def get_device_info() -> tuple[str, ModuleType]:
+    # Upstream falls back to "cuda"; this fork falls back to "cpu" so that a
+    # machine with no accelerator -- or one where the accelerator was hidden on
+    # purpose, see experiments/tpu/device_env.py -- reports what it will run on.
+    device_type = _get_available_device_type() or "cpu"
+    device_module = _get_device_module(device_type)
     if device_type == "cpu":
-        return _get_cpu_module()
-    return _get_device_module(device_type)  # e.g. torch.cuda
+        _patch_cpu_device_module(device_module)
+    elif device_type == "tpu":
+        _patch_tpu_device_module(device_module)
+    return device_type, device_module
+
+
+device_type, device_module = get_device_info()
 
 
 def get_local_device() -> torch.device:
@@ -182,7 +139,6 @@ def get_local_device() -> torch.device:
     -- until the PJRT runtime is initialized, which happens after callers of
     this function have already selected a device.
     """
-    device_type = get_device_type()
     if device_type in ["cpu", "tpu"]:
         return torch.device(device_type)
 
@@ -199,7 +155,6 @@ def get_local_device() -> torch.device:
     if local_rank < 0:
         raise ValueError(f"LOCAL_RANK must be non-negative, got: {local_rank}")
 
-    device_module = get_device_module()
     num_devices = None
     if hasattr(device_module, "device_count"):
         num_devices = device_module.device_count()

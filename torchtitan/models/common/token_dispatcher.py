@@ -22,7 +22,7 @@ from torchtitan.distributed.minimal_async_ep import (
 from torchtitan.distributed.spmd_types import current_spmd_mesh, maybe_set_sparse_mesh
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.ops.scatter_add import deterministic_scatter_add
-from torchtitan.tools.utils import get_device_module, get_device_type
+from torchtitan.tools.utils import device_module, device_type
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1056,7 +1056,7 @@ class MinimalAsyncEPTokenDispatcher(LocalTokenDispatcher):
         self.tokens_per_rank = config.tokens_per_rank
         self.dtype = config.dtype
         if config.device is None:
-            buffer_device = torch.device(get_device_type(), get_device_module().current_device())
+            buffer_device = torch.device(device_type, device_module.current_device())
         else:
             buffer_device = config.device
         # pyrefly: ignore [read-only]
