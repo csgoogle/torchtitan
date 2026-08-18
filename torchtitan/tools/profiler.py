@@ -18,7 +18,7 @@ from torchtitan.config import Configurable
 from torchtitan.config.function import Function
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import get_device_module, get_device_type
+from torchtitan.tools.utils import device_module, device_type
 
 # Paths expects by meta internal tooling
 PROFILE_DIR = "profiling/traces"  # Profiler.Config.save_traces_folder default
@@ -52,7 +52,7 @@ class MemoryProfiler:
         rank: int,
         max_entries: int,
     ) -> None:
-        get_device_module().memory._record_memory_history(
+        device_module.memory._record_memory_history(
             # stacks="python" records only Python frames (not C++), which is much
             # cheaper to capture and serialize, keeping the snapshot dump from
             # taking minutes -- the default stacks="all" symbolizes C++ frames,
@@ -90,7 +90,7 @@ class MemoryProfiler:
         )
         with open(output_file, "wb") as output:
             # Protocol 4 for compatibility with pytorch.org/memory_viz JS parser
-            pickle.dump(get_device_module().memory._snapshot(), output, protocol=4)
+            pickle.dump(device_module.memory._snapshot(), output, protocol=4)
         logger.info(
             f"Finished dumping memory snapshot in {time.monotonic() - begin:.2f} seconds"
         )
@@ -322,11 +322,11 @@ class Profiler(Configurable):
         assert (
             wait >= 0
         ), "profile_freq must be greater than or equal to warmup + active"
-        from torchtitan.tools.utils import get_device_type
+        from torchtitan.tools.utils import device_type
         
         activities = [torch.profiler.ProfilerActivity.CPU]
         experimental_config = None
-        if get_device_type() == "tpu":
+        if device_type == "tpu":
             activities.append(torch.profiler.ProfilerActivity.TPU)  # type: ignore
             from torch_tpu._internal.profiler import TpuProfilerConfig  # pylint: disable=g-import-not-at-top
             import pathlib  # pylint: disable=g-import-not-at-top

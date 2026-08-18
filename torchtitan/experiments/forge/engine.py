@@ -111,7 +111,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         self.config = config
 
-        device_type, device_module = utils.get_device_type(), utils.get_device_module()
+        device_type, device_module = utils.device_type, utils.device_module
         self.device = utils.get_local_device()
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)

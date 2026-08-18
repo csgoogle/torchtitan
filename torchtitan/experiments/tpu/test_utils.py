@@ -51,7 +51,7 @@ def resolve_device_type() -> device_type.AcceleratorDeviceType:
   # only need the flags should not pay for at import time.
   from torchtitan.tools import utils  # pylint: disable=g-import-not-at-top
 
-  detected = device_type.AcceleratorDeviceType(utils.get_device_type())
+  detected = device_type.AcceleratorDeviceType(utils.device_type)
   requested = _DEVICE.value
   if requested is None or requested == detected:
     return detected

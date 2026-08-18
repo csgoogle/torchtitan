@@ -27,7 +27,7 @@ from torch.distributed.tensor.placement_types import Placement, Shard
 
 from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import get_device_module, get_device_type, get_local_device
+from torchtitan.tools.utils import device_module, device_type, get_local_device
 
 if TYPE_CHECKING:
     from torchtitan.distributed.parallel_dims import ParallelDims
@@ -485,14 +485,14 @@ def init_distributed(
 
     def _get_distributed_backend(enable_cpu_backend):
         backend = "nccl"
-        if get_device_type() == "tpu":
+        if device_type == "tpu":
             backend = "tpu_dist"
-        if get_device_type() in torch.distributed.Backend.default_device_backend_map:
+        if device_type in torch.distributed.Backend.default_device_backend_map:
             backend = torch.distributed.Backend.default_device_backend_map.get(
-                get_device_type()
+                device_type
             )
         if enable_cpu_backend:
-            backend = f"{get_device_type()}:{backend},cpu:gloo"
+            backend = f"{device_type}:{backend},cpu:gloo"
         return backend
 
     TRACE_BUFFER_SIZE = "TORCH_FR_BUFFER_SIZE"
@@ -564,11 +564,11 @@ def set_pg_timeouts(
     # otherwise, some ranks may issue collectives with the new/shorter timeout and
     # those may time out, before other ranks have finished with initialization done
     # under the old/slow timeout.
-    if get_device_type() == 'cpu' or get_device_type() == 'tpu':
+    if device_type == 'cpu' or device_type == 'tpu':
         torch.distributed.barrier()
     else:
-        torch.distributed.barrier(device_ids=[get_device_module().current_device()])
-    get_device_module().synchronize()
+        torch.distributed.barrier(device_ids=[device_module.current_device()])
+    device_module.synchronize()
 
     # None represents the 'default' PG, not part of the mesh
     groups: list[torch.distributed.ProcessGroup | None] = [

@@ -123,7 +123,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     init_logger()
 
   if (
-      utils.get_device_type() == "tpu"
+      utils.device_type == "tpu"
       and train_config.optimizer.implementation == "fused"
   ):
     # TODO: b/45811390 - Remove this once fused optimizer is supported on TPU.

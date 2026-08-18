@@ -230,7 +230,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         ), "model_spec must be set before creating Trainer"
         model_spec = config.model_spec
 
-        device_type, device_module = utils.get_device_type(), utils.get_device_module()
+        device_type, device_module = utils.device_type, utils.device_module
         # pyrefly: ignore [read-only]
         self.device = utils.get_local_device()
         # Device has to be set before creating TorchFT manager.
