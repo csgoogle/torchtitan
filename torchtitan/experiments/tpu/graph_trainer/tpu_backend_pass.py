@@ -17,6 +17,9 @@ from typing import Any, Callable
 
 import torch
 
+from torchtitan.experiments.tpu.graph_trainer.passes.elide_paired_dweight_casts import (
+    apply_elide_paired_dweight_casts_pass,
+)
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_remat_schedule,
 )
@@ -120,6 +123,9 @@ def construct_tpu_pass_pipeline(
     passes: list[Callable] = []
 
     memory_policy = getattr(config.compile, "memory_policy", "none")
+    elide_paired_dweight_casts = (
+        config.tpu_config.elide_bf16_rounded_paired_dweight_casts
+    )
     if memory_policy and memory_policy != "none":
         from torchtitan.experiments.graph_trainer.passes import (
             selective_activation_remat_pass,
@@ -130,6 +136,8 @@ def construct_tpu_pass_pipeline(
             functools.partial(tag_with_memory_policy_pass, config=config)
         )
         passes.append(selective_activation_remat_pass)
+        if elide_paired_dweight_casts:
+            passes.append(apply_elide_paired_dweight_casts_pass)
         if config.tpu_config.enable_graph_trainer_remat_schedule:
             if config.tpu_config.optimizer_in_graph or getattr(
                 config.compile, "optimizer_in_graph", False
@@ -149,6 +157,8 @@ def construct_tpu_pass_pipeline(
             f"(memory_policy={memory_policy!r}); prepended "
             f"tag_with_memory_policy + selective_activation_remat"
         )
+    elif elide_paired_dweight_casts:
+        passes.append(apply_elide_paired_dweight_casts_pass)
 
     from torchtitan.experiments.tpu.graph_trainer.passes.insert_combine_barriers import (
         apply_combine_barrier_pass,

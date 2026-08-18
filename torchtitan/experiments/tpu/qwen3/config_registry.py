@@ -330,6 +330,8 @@ def qwen3_moe_30b_fsdp_only_full_ac_profile() -> TPUTrainerConfig:
   assert cfg.model_spec is not None
   for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
+    experts.use_pallas_paired_grouped_mm = True
+    experts.emit_bf16_rounded_fp32_paired_dweight = True
     experts.pallas_grouped_mm_tile_m = 256
     experts.pallas_grouped_mm_use_full_tgmm_tiling = True
     experts.use_kernel_native_weight_layout = True
@@ -342,6 +344,7 @@ def qwen3_moe_30b_fsdp_only_full_ac_profile() -> TPUTrainerConfig:
       compile_mode="aot_fx_trace",
       graph_trainer_memory_policy="full",
       enable_graph_trainer_remat_schedule=True,
+      elide_bf16_rounded_paired_dweight_casts=True,
       libtpu_init_args=(
           "--xla_tpu_enable_sparse_core_collective_aggregator=true "
           "--xla_tpu_enable_latency_hiding_layer_scheduler=true"

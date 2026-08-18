@@ -29,6 +29,9 @@ class TPUConfig:
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
   # Keep rematerialized layer workspaces local in the XLA schedule.
   enable_graph_trainer_remat_schedule: bool = False
+  # Feed BF16-rounded FP32 paired-expert dWeights directly to SimpleFSDP's
+  # FP32 reduce-scatter instead of casting them BF16 -> FP32 in the graph.
+  elide_bf16_rounded_paired_dweight_casts: bool = False
   # Disable Automatic Mixed Precision (AMP), so all training is done in uniform
   # precision.
   enable_amp: bool = True

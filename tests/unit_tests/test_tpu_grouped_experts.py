@@ -24,6 +24,8 @@ def _build_experts(
     num_experts=1,
     *,
     use_pallas_grouped_mm=False,
+    use_pallas_paired_grouped_mm=False,
+    emit_bf16_rounded_fp32_paired_dweight=False,
     use_kernel_native_weight_layout=False,
     param_init=None,
 ):
@@ -32,6 +34,10 @@ def _build_experts(
         hidden_dim=24,
         num_experts=num_experts,
         use_pallas_grouped_mm=use_pallas_grouped_mm,
+        use_pallas_paired_grouped_mm=use_pallas_paired_grouped_mm,
+        emit_bf16_rounded_fp32_paired_dweight=(
+            emit_bf16_rounded_fp32_paired_dweight
+        ),
         use_kernel_native_weight_layout=use_kernel_native_weight_layout,
         param_init=param_init,
         token_dispatcher=LocalTokenDispatcher.Config(
@@ -99,7 +105,31 @@ def test_kernel_native_layout_requires_pallas():
         _build_experts(use_kernel_native_weight_layout=True)
 
 
-def test_kernel_native_layout_preserves_initialization_and_state_dict():
+def test_paired_grouped_mm_requires_pallas():
+    with pytest.raises(ValueError, match="Paired grouped matmul requires Pallas"):
+        _build_experts(use_pallas_paired_grouped_mm=True)
+
+
+def test_paired_grouped_mm_requires_native_weights():
+    with pytest.raises(
+        ValueError, match="Paired grouped matmul requires kernel-native weights"
+    ):
+        _build_experts(
+            use_pallas_grouped_mm=True,
+            use_pallas_paired_grouped_mm=True,
+        )
+
+
+def test_bf16_rounded_fp32_dweight_requires_paired_grouped_mm():
+    with pytest.raises(
+        ValueError,
+        match="BF16-rounded FP32 dWeight requires paired grouped matmul",
+    ):
+        _build_experts(emit_bf16_rounded_fp32_paired_dweight=True)
+
+
+@pytest.mark.parametrize("use_pair", [False, True])
+def test_kernel_native_layout_preserves_initialization_and_state_dict(use_pair):
     param_init = {
         "w1_EFD": lambda x: torch.nn.init.normal_(x, std=0.02),
         "w2_EDF": lambda x: torch.nn.init.normal_(x, std=0.01),
@@ -112,17 +142,21 @@ def test_kernel_native_layout_preserves_initialization_and_state_dict():
     native = _build_experts(
         num_experts=3,
         use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=use_pair,
         use_kernel_native_weight_layout=True,
         param_init=param_init,
     )
     native.init_states()
 
-    assert native.w1_EDF.is_contiguous()
+    if use_pair:
+        assert native.w13_E2DF.is_contiguous()
+    else:
+        assert native.w1_EDF.is_contiguous()
+        assert native.w3_EDF.is_contiguous()
     assert native.w2_EFD.is_contiguous()
-    assert native.w3_EDF.is_contiguous()
     stock_state = stock.state_dict()
     native_state = native.state_dict()
-    assert set(native_state) == set(stock_state)
+    assert list(native_state) == list(stock_state)
     for name in stock_state:
         torch.testing.assert_close(
             native_state[name], stock_state[name], rtol=0, atol=0
@@ -131,6 +165,7 @@ def test_kernel_native_layout_preserves_initialization_and_state_dict():
     restored = _build_experts(
         num_experts=3,
         use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=use_pair,
         use_kernel_native_weight_layout=True,
     )
     restored.load_state_dict(stock_state)
@@ -138,10 +173,12 @@ def test_kernel_native_layout_preserves_initialization_and_state_dict():
         torch.testing.assert_close(value, stock_state[name], rtol=0, atol=0)
 
 
-def test_kernel_native_layout_checkpoint_hook_order():
+@pytest.mark.parametrize("use_pair", [False, True])
+def test_kernel_native_layout_checkpoint_hook_order(use_pair):
     native = _build_experts(
         num_experts=2,
         use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=use_pair,
         use_kernel_native_weight_layout=True,
     )
     save_keys = set()
@@ -161,11 +198,17 @@ def test_kernel_native_layout_checkpoint_hook_order():
 
     native.register_load_state_dict_pre_hook(observe_load)
     native.load_state_dict(state)
-    assert {"w1_EDF", "w2_EFD", "w3_EDF"} <= load_keys
+    expected_native_keys = (
+        {"w13_E2DF", "w2_EFD"}
+        if use_pair
+        else {"w1_EDF", "w2_EFD", "w3_EDF"}
+    )
+    assert expected_native_keys <= load_keys
     assert not {"w1_EFD", "w2_EDF", "w3_EFD"} & load_keys
 
 
-def test_kernel_native_layout_pallas_forward_and_backward():
+@pytest.mark.parametrize("use_pair", [False, True])
+def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
     param_init = {
         name: lambda x: torch.nn.init.normal_(x, std=0.02)
         for name in ("w1_EFD", "w2_EDF", "w3_EFD")
@@ -176,6 +219,7 @@ def test_kernel_native_layout_pallas_forward_and_backward():
     native = _build_experts(
         num_experts=2,
         use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=use_pair,
         use_kernel_native_weight_layout=True,
         param_init=param_init,
     )
@@ -191,10 +235,27 @@ def test_kernel_native_layout_pallas_forward_and_backward():
         offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
         return torch._grouped_mm(x, weight, offs=offsets)
 
+    def paired_grouped_mm(
+        x,
+        w13,
+        counts,
+        *,
+        tile_m,
+        emit_bf16_rounded_fp32_dweight=False,
+    ):
+        assert not emit_bf16_rounded_fp32_dweight
+        return (
+            grouped_mm(x, w13[:, 0].contiguous(), counts, tile_m=tile_m),
+            grouped_mm(x, w13[:, 1].contiguous(), counts, tile_m=tile_m),
+        )
+
     expected = stock._experts_forward(x, counts)
     with patch(
         "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
         side_effect=grouped_mm,
+    ), patch(
+        "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
+        side_effect=paired_grouped_mm,
     ):
         actual = native._experts_forward(x_native, counts)
     torch.testing.assert_close(actual, expected)
@@ -202,11 +263,19 @@ def test_kernel_native_layout_pallas_forward_and_backward():
     actual.float().square().sum().backward()
     expected.float().square().sum().backward()
     torch.testing.assert_close(x_native.grad, x.grad, rtol=0.01, atol=1e-6)
-    for name, grad in (
-        ("w1_EFD", native.w1_EDF.grad.transpose(-2, -1)),
-        ("w2_EDF", native.w2_EFD.grad.transpose(-2, -1)),
-        ("w3_EFD", native.w3_EDF.grad.transpose(-2, -1)),
-    ):
+    if use_pair:
+        native_grads = (
+            ("w1_EFD", native.w13_E2DF.grad[:, 0].transpose(-2, -1)),
+            ("w2_EDF", native.w2_EFD.grad.transpose(-2, -1)),
+            ("w3_EFD", native.w13_E2DF.grad[:, 1].transpose(-2, -1)),
+        )
+    else:
+        native_grads = (
+            ("w1_EFD", native.w1_EDF.grad.transpose(-2, -1)),
+            ("w2_EDF", native.w2_EFD.grad.transpose(-2, -1)),
+            ("w3_EFD", native.w3_EDF.grad.transpose(-2, -1)),
+        )
+    for name, grad in native_grads:
         expected_param = getattr(stock, name)
         torch.testing.assert_close(grad, expected_param.grad, rtol=0.01, atol=1e-6)
 
@@ -224,6 +293,13 @@ def test_kernel_native_layout_transposes_tp_sharding_axes():
     assert native.state_shardings["w1_EDF"].axis_types[MeshAxisName.TP] == spmd.S(2)
     assert native.state_shardings["w2_EFD"].axis_types[MeshAxisName.TP] == spmd.S(1)
     assert native.state_shardings["w3_EDF"].axis_types[MeshAxisName.TP] == spmd.S(2)
+
+    packed = _native_weight_sharding(config, pack_gate_up=True)
+    assert set(packed.state_shardings) == {"w13_E2DF", "w2_EFD"}
+    assert packed.state_shardings["w13_E2DF"].axis_types[MeshAxisName.TP] == spmd.S(
+        3
+    )
+    assert packed.state_shardings["w2_EFD"].axis_types[MeshAxisName.TP] == spmd.S(1)
 
 
 def test_kernel_native_layout_transposes_rank_aware_partition_spec():
