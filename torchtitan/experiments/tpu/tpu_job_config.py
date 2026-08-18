@@ -33,6 +33,10 @@ class TPUConfig:
   # precision.
   enable_amp: bool = True
   log_freq: int = 10
+  # Empty leaves launcher-owned LIBTPU_INIT_ARGS untouched. Non-empty values
+  # are applied before distributed/PJRT initialization; existing launch-time
+  # flags are preserved and conflicting values fail instead of silently winning.
+  libtpu_init_args: str = ""
   eager_mode: Literal[
       "",
       "DEFER_AND_FUSE",

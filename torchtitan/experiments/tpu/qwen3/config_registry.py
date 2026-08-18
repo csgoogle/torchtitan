@@ -338,6 +338,10 @@ def qwen3_moe_30b_fsdp_only_full_ac_profile() -> TPUTrainerConfig:
       compile_mode="aot_fx_trace",
       graph_trainer_memory_policy="full",
       enable_graph_trainer_remat_schedule=True,
+      libtpu_init_args=(
+          "--xla_tpu_enable_sparse_core_collective_aggregator=true "
+          "--xla_tpu_enable_latency_hiding_layer_scheduler=true"
+      ),
       compile_optimizer=False,
       optimizer_in_graph=False,
   )

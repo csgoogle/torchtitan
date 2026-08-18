@@ -9,6 +9,7 @@
 import argparse
 import functools
 import json
+import shlex
 import tempfile
 from typing import Any, List, Optional, Sequence, Tuple, cast
 
@@ -36,6 +37,41 @@ from torchtitan.tools.logging import init_logger, logger
 import torchtitan.train
 
 from absl import app
+
+
+def _configure_libtpu_init_args(configured: str) -> None:
+  if not configured:
+    return
+
+  existing_tokens = shlex.split(os.environ.get("LIBTPU_INIT_ARGS", ""))
+  configured_tokens = shlex.split(configured)
+
+  def flag_key(token: str) -> str:
+    if not token.startswith("--"):
+      raise ValueError(f"Invalid LIBTPU_INIT_ARGS token: {token!r}")
+    return token.split("=", 1)[0]
+
+  merged_tokens = []
+  by_key = {}
+  source_by_key = {}
+
+  def merge(tokens: list[str], source: str) -> None:
+    for token in tokens:
+      key = flag_key(token)
+      previous = by_key.get(key)
+      if previous is not None and previous != token:
+        raise ValueError(
+            f"Conflicting LIBTPU_INIT_ARGS values for {key}: "
+            f"{source_by_key[key]} set {previous!r}, {source} requested {token!r}"
+        )
+      if previous is None:
+        merged_tokens.append(token)
+        by_key[key] = token
+        source_by_key[key] = source
+
+  merge(existing_tokens, "launcher")
+  merge(configured_tokens, "config")
+  os.environ["LIBTPU_INIT_ARGS"] = shlex.join(merged_tokens)
 
 
 class TPUTrainer(torchtitan.train.Trainer):
@@ -118,6 +154,7 @@ class TPUTrainer(torchtitan.train.Trainer):
 
 def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   """Starts the training process."""
+  _configure_libtpu_init_args(train_config.tpu_config.libtpu_init_args)
   rank = int(os.getenv("RANK", "0"))
   if rank == 0:
     init_logger()
