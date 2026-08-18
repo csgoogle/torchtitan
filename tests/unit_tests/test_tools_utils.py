@@ -21,10 +21,9 @@ class _FakeDeviceModule:
 def _patch_device(
     monkeypatch: pytest.MonkeyPatch, device_type: str, num_devices: int
 ) -> None:
-    monkeypatch.setattr("torchtitan.tools.utils.get_device_type", lambda: device_type)
+    monkeypatch.setattr("torchtitan.tools.utils.device_type", device_type)
     monkeypatch.setattr(
-        "torchtitan.tools.utils.get_device_module",
-        lambda: _FakeDeviceModule(num_devices),
+        "torchtitan.tools.utils.device_module", _FakeDeviceModule(num_devices)
     )
 
 
