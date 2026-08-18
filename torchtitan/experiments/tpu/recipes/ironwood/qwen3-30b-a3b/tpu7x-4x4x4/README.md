@@ -1,0 +1,49 @@
+# Qwen3-30B-A3B on TPU7x 4x4x4
+
+This recipe runs the FSDP-only Qwen3-30B-A3B benchmark on 128 TPU cores.
+See the TPU [README](../../../../README.md) for XPK installation and cluster
+setup.
+
+The two `LIBTPU_INIT_ARGS` below must be set before PJRT initialization. The
+SparseCore collective aggregator is required by the latency-hiding layer
+scheduler for this workload, so keep the flags enabled or disabled together.
+
+```bash
+export PROJECT_ID=YOUR_PROJECT_ID
+export ZONE=YOUR_ZONE
+export CLUSTER_NAME=YOUR_CLUSTER_NAME
+export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
+export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
+
+export LIBTPU_INIT_ARGS='--xla_tpu_enable_sparse_core_collective_aggregator=true \
+    --xla_tpu_enable_latency_hiding_layer_scheduler=true'
+
+xpk workload create \
+--workload="$WORKLOAD_NAME" \
+--cluster="$CLUSTER_NAME" \
+--zone="$ZONE" \
+--project="$PROJECT_ID" \
+--tpu-type=tpu7x-4x4x4 \
+--num-slices=1 \
+--docker-image="$WORKLOAD_IMAGE" \
+--env LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS" \
+--env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
+--command "\
+    torchrun \
+    --nnodes=16 \
+    --nproc_per_node=8 \
+    --rdzv_backend=static \
+    --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
+    --node_rank=\$TPU_WORKER_ID \
+    -m torchtitan.experiments.tpu.train \
+    --module=torchtitan.experiments.tpu.qwen3 \
+    --config=qwen3_moe_30b_fsdp_only_full_ac_benchmark"
+```
+
+The scheduler is opt-in: omit these two flags to run the same TorchTitan
+configuration without it. The flags are launcher-owned because libtpu reads
+them before the TorchTitan configuration is constructed.
+
+In matched 30-step TPU7x runs, enabling the pair improved throughput by about
+5% at both GBS768/2K and GBS1024/2K. The runs retained FP32 FSDP reductions and
+completed with finite loss and gradient norms on all 16 hosts.
