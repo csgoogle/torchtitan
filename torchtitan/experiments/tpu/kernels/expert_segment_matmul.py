@@ -2,9 +2,9 @@
 
 For expert ``e``, forward computes ``Y_e = X_e @ W_e``. Backward computes
 ``dX_e = dY_e @ W_e.T`` with another GMM and ``dW_e = X_e.T @ dY_e`` with
-TGMM. dInput uses an explicit weight transpose because MegaBlox's
-``transpose_rhs=True`` mode increased whole-program HBM by about 5 GiB at the
-Qwen3-30B production shape. dWeight accumulates in FP32 across token tiles.
+TGMM. dInput uses MegaBlox's logical rhs transpose so kernel-native weights do
+not require a physical layout conversion. dWeight accumulates in FP32 across
+token tiles.
 
 The module-level custom operators are stable Dynamo/AOTAutograd boundaries.
 Tiling arguments are compile-time constants, while ``group_sizes`` remains a
@@ -57,8 +57,6 @@ def _grouped_mm_fwd(
         preferred_element_type=lhs.dtype,
         tiling=_tiling(tile_m, tile_k, tile_n, k_dim, n_dim),
     )
-
-
 @pallas.jax_op("tt_experts::grouped_mm_bwd")
 def _grouped_mm_bwd(
     dout: jax.Array,
@@ -75,7 +73,7 @@ def _grouped_mm_bwd(
     _, k_dim, n_dim = rhs.shape
     grad_lhs = megablox_gmm(
         dout,
-        jnp.swapaxes(rhs, 1, 2),
+        rhs,
         group_sizes=group_sizes,
         preferred_element_type=dout.dtype,
         tiling=_tiling(
@@ -85,6 +83,7 @@ def _grouped_mm_bwd(
             n_dim,
             k_dim,
         ),
+        transpose_rhs=True,
     )
     grad_rhs = megablox_tgmm(
         jnp.swapaxes(lhs, 0, 1),
