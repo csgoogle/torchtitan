@@ -124,5 +124,4 @@ def handle_main(
 ):
   global global_start_trainer_func
   global_start_trainer_func = start_trainer_func
-  app.run(main, flags_parser=(
-      lambda args: (None, flags.FLAGS(args, known_only=True)[1:])))
+  app.run(main, flags_parser=_parse_flags)
