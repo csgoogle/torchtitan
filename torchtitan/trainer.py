@@ -25,7 +25,11 @@ from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhausted
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper, IGNORE_INDEX
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import (
+    configure_moe_routing_metrics,
+    get_moe_load_balancing_metrics,
+    OptimizersContainer,
+)
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
@@ -434,6 +438,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 model.train()
 
                 self.model_parts = [model]
+
+        self._collect_moe_routing_metrics = configure_moe_routing_metrics(
+            self.model_parts, config.metrics.enable_moe_routing
+        )
 
         # Set lm_head reference for ChunkedLossWrapper after model construction.
         # Non-PP: single model part always has lm_head.
@@ -866,6 +874,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
         }
+        extra_metrics.update(get_moe_load_balancing_metrics(self.model_parts))
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

@@ -11,6 +11,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from torchtitan.components.optimizer import (
+    collect_moe_routing_metric_tensors,
+    set_moe_routing_metric_tensors,
+)
 from torchtitan.experiments.graph_trainer.common_utils import (
     accumulate_param_grads_,
     compute_annotated_loss,
@@ -67,7 +71,7 @@ def _maybe_apply_numa_binding(device_index: int, device_type: str) -> None:
     logger.info("NUMA binding applied for GPU %d", device_index)
 
 
-def make_fwd_bwd_step(model, loss_fn):
+def make_fwd_bwd_step(model, loss_fn, collect_moe_routing_metrics: bool = False):
     """Return a plain function that traces the entire fwd+loss+bwd step.
 
     ``model`` and ``loss_fn`` are captured in the closure so neither shows up
@@ -77,6 +81,11 @@ def make_fwd_bwd_step(model, loss_fn):
 
     def fwd_bwd_step(inputs, labels, global_valid_tokens, extra_kwargs):
         pred = model(inputs, **extra_kwargs)
+        routing_metrics = (
+            collect_moe_routing_metric_tensors([model])
+            if collect_moe_routing_metrics
+            else []
+        )
         # The loss function is not a submodule of the model, so
         # annotate_module_fqns won't tag it. Annotate it here so that
         # downstream passes (bucketing, SAC, kernel annotations) can
@@ -93,7 +102,7 @@ def make_fwd_bwd_step(model, loss_fn):
             if p.requires_grad
         ]
         grads = torch.autograd.grad(loss, params)
-        return [loss] + list(grads)
+        return [loss, *grads, *routing_metrics]
 
     return fwd_bwd_step
 
@@ -234,7 +243,11 @@ class GraphTrainer(Trainer):
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
             else:
-                fwd_bwd_fn = make_fwd_bwd_step(model, self.loss_fn)
+                fwd_bwd_fn = make_fwd_bwd_step(
+                    model,
+                    self.loss_fn,
+                    collect_moe_routing_metrics=self._collect_moe_routing_metrics,
+                )
                 with self.train_context(), log_timer("minimal_fx_tracer"):
                     self._traced_step = minimal_fx_tracer(
                         fwd_bwd_fn,
@@ -273,7 +286,11 @@ class GraphTrainer(Trainer):
                 extra_kwargs,
             )
         loss = outputs[0]
-        grads = outputs[1:]
+        grads = outputs[1 : 1 + len(params)]
+        if self._collect_moe_routing_metrics:
+            set_moe_routing_metric_tensors(
+                [model], list(outputs[1 + len(params) :])
+            )
 
         accumulate_param_grads_(params, grads)
         return loss

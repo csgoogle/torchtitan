@@ -124,7 +124,10 @@ class TensorBoardLogger(BaseLogger):
     def log(self, metrics: dict[str, Any], step: int) -> None:
         for k, v in metrics.items():
             tag = k if self.tag is None else f"{self.tag}/{k}"
-            self.writer.add_scalar(tag, v, step)
+            if isinstance(v, str):
+                self.writer.add_text(tag, v, step)
+            else:
+                self.writer.add_scalar(tag, v, step)
 
     def close(self) -> None:
         self.writer.close()
@@ -280,6 +283,9 @@ class MetricsProcessor(Configurable):
     class Config(Configurable.Config):
         log_freq: int = 10
         """How often to log metrics to TensorBoard, in iterations"""
+
+        enable_moe_routing: bool = False
+        """Whether to collect MoE routing counts and normalized auxiliary loss"""
 
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""

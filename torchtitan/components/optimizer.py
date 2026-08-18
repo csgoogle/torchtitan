@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
@@ -30,8 +31,12 @@ from torchtitan.tools.logging import logger
 __all__ = [
     "OptimizersContainer",
     "ParamGroupConfig",
+    "collect_moe_routing_metric_tensors",
+    "configure_moe_routing_metrics",
     "default_adamw",
+    "get_moe_load_balancing_metrics",
     "register_moe_load_balancing_hook",
+    "set_moe_routing_metric_tensors",
 ]
 
 
@@ -71,8 +76,21 @@ T = TypeVar("T", bound=Optimizer)
 
 class _MoELike(Protocol):
     load_balance_coeff: float | None
+    aux_loss: Any | None
     tokens_per_expert_E: torch.Tensor  # noqa: N815
     expert_bias_E: torch.Tensor  # noqa: N815
+
+
+def _iter_moe_layers(
+    model_parts: list[nn.Module],
+) -> Iterator[tuple[nn.Module, _MoELike]]:
+    for model_part in model_parts:
+        layers = getattr(model_part, "layers", None)
+        if not isinstance(layers, nn.ModuleDict):
+            continue
+        for transformer_block in layers.values():
+            if getattr(transformer_block, "moe_enabled", False):
+                yield transformer_block, cast(_MoELike, transformer_block.moe)
 
 
 class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
@@ -404,16 +422,6 @@ def register_moe_load_balancing_hook(
         parallel_dims: Parallel dimensions for distributed communication.
     """
 
-    def _iter_moe_layers(
-        model_parts: list[nn.Module],
-    ) -> Iterator[tuple[nn.Module, _MoELike]]:
-        for model_part in model_parts:
-            layers = model_part.get_submodule("layers")
-            assert isinstance(layers, nn.ModuleDict)
-            for transformer_block in layers.values():
-                if getattr(transformer_block, "moe_enabled", False):
-                    yield transformer_block, cast(_MoELike, transformer_block.moe)
-
     def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
         moe_layers = list(_iter_moe_layers(model_parts))
         if not moe_layers:
@@ -499,31 +507,23 @@ def register_moe_load_balancing_hook(
 
         moe_layer_idx = 0
         with torch.no_grad():
-            for model_part in model_parts:
-                layers = model_part.get_submodule("layers")
-                assert isinstance(layers, nn.ModuleDict)
-                for transformer_block in layers.values():
-                    if not transformer_block.moe_enabled:
-                        continue
-                    moe = cast(_MoELike, transformer_block.moe)
-                    load_balance_coeff = moe.load_balance_coeff
-                    assert load_balance_coeff is not None
+            for _transformer_block, moe in _iter_moe_layers(model_parts):
+                load_balance_coeff = moe.load_balance_coeff
+                assert load_balance_coeff is not None
 
-                    tokens_per_expert_E = tokens_per_expert_E_by_layer[
-                        moe_layer_idx
-                    ].float()
-                    moe_layer_idx += 1
+                tokens_per_expert_E = tokens_per_expert_E_by_layer[
+                    moe_layer_idx
+                ].float()
+                moe_layer_idx += 1
 
-                    # update the expert bias
-                    # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
-                    expert_bias_delta_E = load_balance_coeff * torch.sign(
-                        tokens_per_expert_E.mean() - tokens_per_expert_E
-                    )
-                    expert_bias_delta_E = (
-                        expert_bias_delta_E - expert_bias_delta_E.mean()
-                    )
-                    moe.expert_bias_E.add_(expert_bias_delta_E)
-                    moe.tokens_per_expert_E.zero_()
+                # update the expert bias
+                # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
+                expert_bias_delta_E = load_balance_coeff * torch.sign(
+                    tokens_per_expert_E.mean() - tokens_per_expert_E
+                )
+                expert_bias_delta_E = expert_bias_delta_E - expert_bias_delta_E.mean()
+                moe.expert_bias_E.add_(expert_bias_delta_E)
+                moe.tokens_per_expert_E.zero_()
 
     if _should_register_moe_balancing_hook(model_parts):
         optimizers.register_step_pre_hook(
@@ -531,3 +531,174 @@ def register_moe_load_balancing_hook(
                 model_parts, parallel_dims=parallel_dims
             )
         )
+
+
+def configure_moe_routing_metrics(
+    model_parts: list[nn.Module], enabled: bool
+) -> bool:
+    """Enable graph-safe routing metric capture on supported MoE layers."""
+    found_supported_layer = False
+    for _transformer_block, moe in _iter_moe_layers(model_parts):
+        if moe.aux_loss is None:
+            continue
+        if enabled and moe.aux_loss.type != "batch_wise":
+            raise ValueError(
+                "MoE routing metrics currently require batch_wise auxiliary loss"
+            )
+        moe.aux_loss.collect_routing_metrics = enabled
+        found_supported_layer = True
+    return enabled and found_supported_layer
+
+
+def _local_metric_tensor(value: torch.Tensor) -> torch.Tensor:
+    if isinstance(value, torch.distributed.tensor.DTensor):
+        return value.to_local()
+    return value
+
+
+def collect_moe_routing_metric_tensors(
+    model_parts: list[nn.Module],
+) -> list[torch.Tensor]:
+    """Collect the fixed-shape local tensors produced by the latest forward."""
+    local_counts = []
+    local_normalized_aux_losses = []
+    for _transformer_block, moe in _iter_moe_layers(model_parts):
+        aux_loss = moe.aux_loss
+        if aux_loss is None or not aux_loss.collect_routing_metrics:
+            continue
+        if not hasattr(aux_loss, "_last_local_tokens_per_expert_E") or not hasattr(
+            aux_loss, "_last_local_normalized_aux_loss"
+        ):
+            raise RuntimeError(
+                "MoE routing metrics were enabled but the forward did not produce them"
+            )
+        local_counts.append(
+            _local_metric_tensor(aux_loss._last_local_tokens_per_expert_E)
+        )
+        local_normalized_aux_losses.append(
+            _local_metric_tensor(aux_loss._last_local_normalized_aux_loss)
+        )
+
+    if not local_counts:
+        return []
+    return [
+        torch.stack(local_counts).float(),
+        torch.stack(local_normalized_aux_losses).float(),
+    ]
+
+
+def set_moe_routing_metric_tensors(
+    model_parts: list[nn.Module], metric_tensors: list[torch.Tensor]
+) -> None:
+    """Restore graph outputs as runtime sidecars consumed by metric logging."""
+    if not metric_tensors:
+        return
+    if len(metric_tensors) != 2:
+        raise ValueError(
+            f"Expected two MoE routing metric tensors, got {len(metric_tensors)}"
+        )
+    local_counts_LE, local_normalized_aux_losses_L = metric_tensors
+    aux_loss_modules = [
+        moe.aux_loss
+        for _transformer_block, moe in _iter_moe_layers(model_parts)
+        if moe.aux_loss is not None and moe.aux_loss.collect_routing_metrics
+    ]
+    if (
+        local_counts_LE.size(0) != len(aux_loss_modules)
+        or local_normalized_aux_losses_L.size(0) != len(aux_loss_modules)
+    ):
+        raise ValueError("MoE routing metric output shapes do not match the model")
+    for layer_idx, aux_loss in enumerate(aux_loss_modules):
+        aux_loss._last_local_tokens_per_expert_E = local_counts_LE[layer_idx]
+        aux_loss._last_local_normalized_aux_loss = local_normalized_aux_losses_L[
+            layer_idx
+        ]
+
+
+def get_moe_load_balancing_metrics(
+    model_parts: list[nn.Module],
+) -> dict[str, Any]:
+    metric_tensors = collect_moe_routing_metric_tensors(model_parts)
+    if not metric_tensors:
+        return {}
+
+    local_tokens_per_expert_LE, local_normalized_aux_loss_L = metric_tensors
+    aux_loss_modules = [
+        moe.aux_loss
+        for _transformer_block, moe in _iter_moe_layers(model_parts)
+        if moe.aux_loss is not None and moe.aux_loss.collect_routing_metrics
+    ]
+    local_sums = torch.cat(
+        [local_tokens_per_expert_LE, local_normalized_aux_loss_L.unsqueeze(1)], dim=1
+    )
+    global_sums = _all_reduce_moe_metric_sums(local_sums, aux_loss_modules[0])
+    global_tokens_per_expert_LE = global_sums[:, :-1]
+    dp_degree = (
+        aux_loss_modules[0].dp_mesh.size()
+        if aux_loss_modules[0].dp_mesh is not None
+        else 1
+    )
+    normalized_aux_loss_L = global_sums[:, -1] / dp_degree
+
+    mean_counts_L = global_tokens_per_expert_LE.mean(dim=1)
+    max_mean_L = global_tokens_per_expert_LE.amax(dim=1) / mean_counts_L
+    route_cv_L = (
+        (global_tokens_per_expert_LE - mean_counts_L.unsqueeze(1))
+        .square()
+        .mean(dim=1)
+        .sqrt()
+        / mean_counts_L
+    )
+    assignment_totals_L = global_tokens_per_expert_LE.sum(dim=1)
+    # TPU workaround: torch_tpu lacks aten::median; sorting preserves
+    # PyTorch's lower-median semantics.
+    median_idx = (max_mean_L.numel() - 1) // 2
+
+    metrics = {
+        "moe/global_aux_loss_normalized": normalized_aux_loss_L.mean(),
+        "moe/route_max_mean_max": max_mean_L.amax(),
+        "moe/route_max_mean_mean": max_mean_L.mean(),
+        "moe/route_max_mean_median": max_mean_L.sort().values[median_idx],
+        "moe/route_cv_max": route_cv_L.amax(),
+        "moe/route_cv_mean": route_cv_L.mean(),
+        "moe/route_cv_median": route_cv_L.sort().values[median_idx],
+        "moe/route_assignments_min": assignment_totals_L.amin(),
+        "moe/route_assignments_max": assignment_totals_L.amax(),
+    }
+
+    for layer_idx, (layer_loss, layer_counts, layer_max_mean, layer_cv) in enumerate(
+        zip(
+            normalized_aux_loss_L,
+            global_tokens_per_expert_LE,
+            max_mean_L,
+            route_cv_L,
+            strict=True,
+        )
+    ):
+        metrics[f"moe/global_aux_loss_normalized/layer_{layer_idx:03d}"] = layer_loss
+        metrics[f"moe/route_max_mean/layer_{layer_idx:03d}"] = layer_max_mean
+        metrics[f"moe/route_cv/layer_{layer_idx:03d}"] = layer_cv
+        metrics[f"moe/route_assignments/layer_{layer_idx:03d}"] = layer_counts.sum()
+
+    # Preserve exact per-expert counts in one event; thousands of individual
+    # scalar writes can make the metrics rank miss the process-group timeout.
+    metrics["moe/route_counts_json"] = json.dumps(
+        global_tokens_per_expert_LE.to(dtype=torch.int64, device="cpu").tolist(),
+        separators=(",", ":"),
+    )
+
+    return metrics
+
+
+def _all_reduce_moe_metric_sums(
+    values: torch.Tensor,
+    aux_loss: Any,
+) -> torch.Tensor:
+    with torch.no_grad():
+        for reduce_mesh in (aux_loss.tp_mesh, aux_loss.dp_mesh, aux_loss.cp_mesh):
+            if reduce_mesh is None:
+                continue
+            torch.distributed.all_reduce(
+                values, group=reduce_mesh.get_group(), op=torch.distributed.ReduceOp.SUM
+            )
+    return values

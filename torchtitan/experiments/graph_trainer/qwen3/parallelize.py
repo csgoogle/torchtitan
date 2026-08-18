@@ -20,6 +20,7 @@ from torchtitan.experiments.graph_trainer.ep_eager_chunk import (
     maybe_apply_ep_overlap_eager_chunking,
 )
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
+from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
 
 
 def annotate_qwen3(model: GraphTrainerQwen3Model) -> None:
@@ -69,6 +70,8 @@ def parallelize_qwen3(
 
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         model.parallelize(parallel_dims)
+
+    configure_moe_aux_loss_reduction(model, parallel_dims)
 
     if parallel_dims.tp_enabled:
         maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
