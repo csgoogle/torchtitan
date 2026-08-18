@@ -57,8 +57,8 @@ import torchtitan.distributed
 from torchtitan.distributed import utils as dist_utils
 
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
+from torchtitan.experiments.tpu import distributed_utils
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.tools.profiler as torchtitan_profiler
 
 import torchtitan.experiments.tpu.llama3  # trigger llama3_tpu model registration
@@ -292,7 +292,12 @@ def start_trainer(job_config: grpo_job_config.GRPOJobConfig) -> None:
     torchtitan.tools.logging.init_logger()
     job_config.maybe_log()
 
-  device = tpu_utils.get_device()
+  if utils.get_device_type() == "tpu":
+    # Bootstrap explicitly: gmain does this before calling start_trainer,
+    # but this module has no other entry point and no test coverage, so
+    # do not rely on the caller. Idempotent when already initialized.
+    distributed_utils.maybe_init_distributed()
+  device = utils.get_local_device()
 
   if world_size > 1:
     dist_utils.init_distributed(

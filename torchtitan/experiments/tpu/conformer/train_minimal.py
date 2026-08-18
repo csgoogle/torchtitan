@@ -146,7 +146,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
     torchtitan.tools.logging.init_logger()
     train_config.maybe_log()
 
-  device = tpu_utils.get_device()
+  device = utils.get_local_device()
 
   if world_size == 1 and device.type == "tpu":
     from torch_tpu._internal.device._device_module import TpuDeviceModule

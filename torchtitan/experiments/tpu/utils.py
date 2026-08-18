@@ -4,27 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
-
 import torch
 from torch.distributed.algorithms._checkpoint import checkpoint_wrapper
 
-from torchtitan.tools.utils import get_device_type
 
-__all__ = ["get_device", "ptd_checkpoint_wrapper_with_early_stop"]
-
-
-def get_device() -> torch.device:
-  """Determines and returns the device based on the available device type."""
-  _device_type = get_device_type()
-  if _device_type == "cuda" and torch.cuda.is_available():
-    return torch.device(f"{_device_type}:{int(os.getenv('LOCAL_RANK', 0))}")
-  elif _device_type == "tpu":
-    import torchtitan.experiments.tpu.distributed_utils as tpu_dist_utils  # pylint: disable=g-import-not-at-top
-    tpu_dist_utils.maybe_init_distributed()
-    return torch.device("tpu")
-  else:
-    return torch.device(_device_type)
+__all__ = ["ptd_checkpoint_wrapper_with_early_stop"]
 
 
 def ptd_checkpoint_wrapper_with_early_stop(

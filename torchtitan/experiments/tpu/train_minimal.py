@@ -20,7 +20,6 @@ import torchtitan.distributed
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
@@ -376,7 +375,7 @@ def start_trainer(config: JobConfig):
   if rank == 0:
     torchtitan.tools.logging.init_logger()
 
-  device = tpu_utils.get_device()
+  device = utils.get_local_device()
 
   if config.optimizer.implementation == "fused" and device.type == "tpu":
     # TODO b/45811390 - Remove this once fused optimizer is supported on TPU.
