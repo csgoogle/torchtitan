@@ -15,8 +15,15 @@ export CLUSTER_NAME=YOUR_CLUSTER_NAME
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 
+# Let eligible reduce-scatter operations use both SparseCores. This is optimal
+# for the current Zero-2 schedule, where backward has no parameter all-gathers
+# competing with reduce-scatter. It is also optimal for the dependency-ordered
+# Zero-3 interleave in PR #328, which cannot overlap its all-gathers and
+# reduce-scatters. Re-evaluate this choice for Zero-3 prefetch or future
+# schedules that can make those collectives concurrent.
 export LIBTPU_INIT_ARGS='--xla_tpu_enable_sparse_core_collective_aggregator=true \
-    --xla_tpu_enable_latency_hiding_layer_scheduler=true'
+    --xla_tpu_enable_latency_hiding_layer_scheduler=true \
+    --xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false'
 
 xpk workload create \
 --workload="$WORKLOAD_NAME" \
@@ -40,9 +47,11 @@ xpk workload create \
     --config=qwen3_moe_30b_fsdp_only_full_ac_benchmark"
 ```
 
-The scheduler is opt-in: omit these two flags to run the same TorchTitan
-configuration without it. The flags are launcher-owned because libtpu reads
-them before the TorchTitan configuration is constructed.
+The scheduler is opt-in: omit the aggregator and scheduler flags to run the
+same TorchTitan configuration without it. The dual-SparseCore reduce-scatter
+flag is an independent recipe choice and may need to be disabled for schedules
+that overlap all-gather and reduce-scatter. These flags are launcher-owned
+because libtpu reads them before the TorchTitan configuration is constructed.
 
 In matched 30-step TPU7x runs, enabling the pair improved throughput by about
 5% at both GBS768/2K and GBS1024/2K. The runs retained FP32 FSDP reductions and
