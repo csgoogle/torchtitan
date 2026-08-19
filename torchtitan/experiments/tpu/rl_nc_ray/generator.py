@@ -52,30 +52,19 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
             sys.modules["vllm.utils.import_utils"] = types.ModuleType("import_utils")
         sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
         
-        from tpu_inference.executors import ray_distributed_executor
-        
-        # [TPU HACK 1]: Force MATH attention backend on driver.
-        # TPU v6e (v6e) has limited VMEM. If the Pallas attention kernel requests 
-        # exactly 128MB, XLA compilation crashes. Forcing the MATH backend avoids this.
         try:
-            import tpu_inference.platforms.tpu_platform as tpu_platform
-            from vllm.config import AttentionConfig
-            from vllm.v1.attention.backends.registry import AttentionBackendEnum
-            
-            orig_wrap = tpu_platform.TpuPlatform.wrap_engine_kwargs
-            def patched_wrap(self, engine_kwargs):
-                orig_wrap(self, engine_kwargs)
-                if "attention_config" in engine_kwargs:
-                    engine_kwargs["attention_config"].backend = AttentionBackendEnum.MATH
-            tpu_platform.TpuPlatform.wrap_engine_kwargs = patched_wrap
-        except Exception as e:
-            logger.warning(f"Failed to patch TPUPlatform.wrap_engine_kwargs: {e}")
+            from vllm_torchtpu.executors import ray_distributed_executor
+            from vllm_torchtpu.platforms import tpu_platform
+            TPU_MAP = getattr(tpu_platform, "TPU_MULTIHOST_TOPOLOGY_MAP", getattr(ray_distributed_executor, "TPU_TOPOLOGY_MAP", {}))
+        except ImportError:
+            from tpu_inference.executors import ray_distributed_executor
+            TPU_MAP = getattr(ray_distributed_executor, "TPU_TOPOLOGY_MAP", {})
 
         # [TPU HACK 2]: Add missing 4-chip and 8-chip topologies to torchtpu-vllm.
         # The library hardcodes 16-chip multi-host topologies. We must inject our
         # smaller slice topologies for it to correctly dispatch PJRT clients.
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "2,2,1"
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,4,1"
+        TPU_MAP[4] = "2,2,1"
+        TPU_MAP[8] = "2,4,1"
 
         # [TPU HACK 3]: Prevent torchtpu-vllm from claiming the entire Ray cluster.
         # torchtpu-vllm assumes it is the only application running on the Ray cluster.

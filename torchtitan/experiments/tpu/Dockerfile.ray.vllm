@@ -30,21 +30,17 @@ RUN pip install -r requirements.txt
 RUN pip install 'typeguard==2.13.3'
 RUN pip install portpicker absl-py numpy gcsfs frozendict triton fairscale
 
-# --- Install vllm and torchtpu-vllm ---
+# --- Install vllm and vllm-torchtpu ---
 ARG GITHUB_USER
 ARG GITHUB_TOKEN
 RUN git clone --depth 1 --branch v0.19.0 https://github.com/vllm-project/vllm.git
-RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/google-pytorch/torchtpu-vllm.git
+RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/vllm-project/vllm-torchtpu.git /vllm-torchtpu
 
-WORKDIR /torchtpu-vllm
-RUN git checkout 98536189411258e7307f261759edfb6fc8df8a60
-WORKDIR /
-
-# Patch vLLM's TPU requirements to accept our local workspace in torchtpu-vllm instead of overriding it
-RUN sed -i '/tpu-inference/d' vllm/requirements/tpu.txt
+# Patch vLLM's TPU requirements to accept our local workspace in vllm-torchtpu instead of overriding it
+RUN sed -i '/tpu-inference/d' vllm/requirements/tpu.txt && sed -i '/vllm-torchtpu/d' vllm/requirements/tpu.txt
 
 # Install vLLM in editable mode (forcing the 0.19.0 base version to prevent .dev prerelease mismatch during dependency resolution)
-WORKDIR /torchtpu-vllm
+WORKDIR /vllm-torchtpu
 
 # Hack pyproject.toml to pin versions
 RUN sed -i 's/torch-tpu==[0-9a-zA-Z.]*/torch-tpu==0.1.1.dev20260527102151/' pyproject.toml
