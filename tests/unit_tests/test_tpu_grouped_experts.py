@@ -36,6 +36,7 @@ def test_model_converter_preserves_config_fields():
     assert root.experts.hidden_dim == original.hidden_dim
     assert root.experts.num_experts == original.num_experts
     assert root.experts.token_dispatcher == original.token_dispatcher
+    assert not root.experts.pallas_grouped_mm_use_full_tgmm_tiling
 
 
 def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
@@ -49,3 +50,7 @@ def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
     assert len(experts) == 48
     assert all(expert.use_pallas_grouped_mm for _, expert, _, _ in experts)
     assert all(expert.pallas_grouped_mm_tile_m == 256 for _, expert, _, _ in experts)
+    assert all(
+        expert.pallas_grouped_mm_use_full_tgmm_tiling
+        for _, expert, _, _ in experts
+    )

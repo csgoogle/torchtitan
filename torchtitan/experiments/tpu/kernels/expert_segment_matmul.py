@@ -20,11 +20,14 @@ from torch_tpu._internal import pallas
 
 
 @lru_cache(maxsize=None)
-def _build_grouped_matmul_kernels(tile_m: int):
+def _build_grouped_matmul_kernels(tile_m: int, use_full_tgmm_tiling: bool):
   """Build GMM forward/dInput and TGMM dWeight with runtime group sizes."""
   with jax.default_device(jax.local_devices()[0]):
+    tgmm_suffix = "full" if use_full_tgmm_tiling else "128"
 
-    @pallas.jax_op(f"tt_experts::grouped_mm_fwd_tm{tile_m}")
+    @pallas.jax_op(
+        f"tt_experts::grouped_mm_fwd_tm{tile_m}_tgmm_{tgmm_suffix}"
+    )
     def fwd_op(
         lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array
     ) -> jax.Array:
@@ -36,7 +39,9 @@ def _build_grouped_matmul_kernels(tile_m: int):
           tiling=(tile_m, rhs.shape[1], rhs.shape[2]),
       )
 
-    @pallas.jax_op(f"tt_experts::grouped_mm_bwd_tm{tile_m}")
+    @pallas.jax_op(
+        f"tt_experts::grouped_mm_bwd_tm{tile_m}_tgmm_{tgmm_suffix}"
+    )
     def bwd_op(
         dout: jax.Array,
         lhs: jax.Array,
@@ -54,12 +59,17 @@ def _build_grouped_matmul_kernels(tile_m: int):
       )
       # dWeight reduces each expert's variable-size token group into one
       # matrix, which is the contraction implemented by MegaBlox TGMM.
+      tgmm_tiling = (
+          (tile_m, lhs.shape[1], dout.shape[1])
+          if use_full_tgmm_tiling
+          else (128, 128, 128)
+      )
       grad_rhs = gmm_ops.backend.tgmm(
           jnp.swapaxes(lhs, 0, 1),
           dout,
           group_sizes=group_sizes,
           preferred_element_type=jnp.float32,
-          tiling=(128, 128, 128),
+          tiling=tgmm_tiling,
           interpret=False,
       )
       return grad_lhs, grad_rhs
@@ -69,21 +79,24 @@ def _build_grouped_matmul_kernels(tile_m: int):
 
 class _GroupedMatmulAutograd(torch.autograd.Function):
   @staticmethod
-  def forward(ctx, lhs, rhs, group_sizes, tile_m):
+  def forward(ctx, lhs, rhs, group_sizes, tile_m, use_full_tgmm_tiling):
     ctx.save_for_backward(lhs, rhs, group_sizes)
     ctx.tile_m = tile_m
-    fwd_op, _ = _build_grouped_matmul_kernels(tile_m)
+    ctx.use_full_tgmm_tiling = use_full_tgmm_tiling
+    fwd_op, _ = _build_grouped_matmul_kernels(tile_m, use_full_tgmm_tiling)
     return cast(torch.Tensor, fwd_op(lhs, rhs, group_sizes))
 
   @staticmethod
   def backward(ctx, grad_output):  # pyrefly: ignore[bad-override]
     lhs, rhs, group_sizes = ctx.saved_tensors
-    _, bwd_op = _build_grouped_matmul_kernels(ctx.tile_m)
+    _, bwd_op = _build_grouped_matmul_kernels(
+        ctx.tile_m, ctx.use_full_tgmm_tiling
+    )
     grad_lhs, grad_rhs = cast(
         Tuple[torch.Tensor, torch.Tensor],
         bwd_op(grad_output, lhs, rhs, group_sizes),
     )
-    return grad_lhs, grad_rhs, None, None
+    return grad_lhs, grad_rhs, None, None, None
 
 
 def segment_matmul_pallas_2d(
@@ -92,8 +105,11 @@ def segment_matmul_pallas_2d(
     group_sizes: torch.Tensor,
     *,
     tile_m: int = 1024,
+    use_full_tgmm_tiling: bool = False,
 ) -> torch.Tensor:
   """Compute per-expert matmuls without moving group sizes to the host."""
   if group_sizes.dtype != torch.int32:
     group_sizes = group_sizes.to(torch.int32)
-  return _GroupedMatmulAutograd.apply(lhs, rhs, group_sizes, tile_m)
+  return _GroupedMatmulAutograd.apply(
+      lhs, rhs, group_sizes, tile_m, use_full_tgmm_tiling
+  )

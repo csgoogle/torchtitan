@@ -19,11 +19,17 @@ class TpuGroupedExperts(GroupedExperts):
   class Config(GroupedExperts.Config):
     use_pallas_grouped_mm: bool = False
     pallas_grouped_mm_tile_m: int = 1024
+    # Full K-by-N TGMM tiles use proportionally larger FP32 VMEM scratch, so
+    # recipes opt in only after validating their expert dimensions.
+    pallas_grouped_mm_use_full_tgmm_tiling: bool = False
 
   def __init__(self, config: Config):
     super().__init__(config)
     self.use_pallas_grouped_mm = config.use_pallas_grouped_mm
     self.pallas_grouped_mm_tile_m = config.pallas_grouped_mm_tile_m
+    self.pallas_grouped_mm_use_full_tgmm_tiling = (
+        config.pallas_grouped_mm_use_full_tgmm_tiling
+    )
 
   def _experts_forward(
       self,
@@ -49,12 +55,14 @@ class TpuGroupedExperts(GroupedExperts):
 
     x_bf16 = x_RD.bfloat16()
     tile_m = self.pallas_grouped_mm_tile_m
+    use_full_tgmm_tiling = self.pallas_grouped_mm_use_full_tgmm_tiling
     hidden_RF = F.silu(
         segment_matmul_pallas_2d(
             x_bf16,
             w1_EFD.bfloat16().transpose(-2, -1),
             num_tokens_per_expert_E,
             tile_m=tile_m,
+            use_full_tgmm_tiling=use_full_tgmm_tiling,
         )
     )
     hidden_RF = hidden_RF * segment_matmul_pallas_2d(
@@ -62,12 +70,14 @@ class TpuGroupedExperts(GroupedExperts):
         w3_EFD.bfloat16().transpose(-2, -1),
         num_tokens_per_expert_E,
         tile_m=tile_m,
+        use_full_tgmm_tiling=use_full_tgmm_tiling,
     )
     return segment_matmul_pallas_2d(
         hidden_RF,
         w2_EDF.bfloat16().transpose(-2, -1),
         num_tokens_per_expert_E,
         tile_m=tile_m,
+        use_full_tgmm_tiling=use_full_tgmm_tiling,
     ).type_as(x_RD)
 
 
