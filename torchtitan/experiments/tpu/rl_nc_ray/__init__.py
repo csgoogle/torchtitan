@@ -88,30 +88,23 @@ try:
     import types
     import vllm
 
-    # Create a dummy module object to mock the missing vLLM compilation codegen layer.
-    # Since we are inside the TPU experiments directory, we are sure that we want
-    # to mock codegen whenever vllm is installed on TPU/CPU.
-    vllm_codegen = types.ModuleType("vllm.compilation.codegen")
-    # Define a dummy _node_ref attribute so that unconditional monkeypatching
-    # in vllm_wrapper.py executes successfully without raising AttributeErrors.
-    vllm_codegen._node_ref = lambda arg: arg
-    
-    # Try importing the real vllm.compilation package if it exists so we do not
-    # break real package sub-imports (e.g. vllm.compilation.passes).
+    # Try importing the real vllm.compilation.codegen first.
+    # Only fallback to a mock shim if vllm codegen fails to import.
     try:
-        import vllm.compilation
-    except ImportError as e:
-        logger.debug("Failed to import vllm.compilation, fallback mocking: %s", e)
-        # If compilation is missing entirely (e.g. on older or specialized vLLM versions),
-        # construct and register a placeholder package.
-        vllm_compilation = types.ModuleType("vllm.compilation")
-        vllm_compilation.__path__ = []  # Mark as a package directory
-        sys.modules["vllm.compilation"] = vllm_compilation
-        setattr(vllm, "compilation", vllm_compilation)
-        
-    # Register our dummy codegen module inside vllm.compilation and sys.modules.
-    vllm.compilation.codegen = vllm_codegen
-    sys.modules["vllm.compilation.codegen"] = vllm_codegen
+        import vllm.compilation.codegen
+    except (ImportError, AttributeError):
+        vllm_codegen = types.ModuleType("vllm.compilation.codegen")
+        vllm_codegen._node_ref = lambda arg: arg
+        try:
+            import vllm.compilation
+        except (ImportError, AttributeError) as e:
+            logger.debug("Failed to import vllm.compilation, fallback mocking: %s", e)
+            vllm_compilation = types.ModuleType("vllm.compilation")
+            vllm_compilation.__path__ = []
+            sys.modules["vllm.compilation"] = vllm_compilation
+            setattr(vllm, "compilation", vllm_compilation)
+        vllm.compilation.codegen = vllm_codegen
+        sys.modules["vllm.compilation.codegen"] = vllm_codegen
 
     # ---------------------------------------------------------------------------
     # vLLM support_torch_compile Decorator Override for TPU

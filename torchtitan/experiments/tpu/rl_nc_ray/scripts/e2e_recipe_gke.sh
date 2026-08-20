@@ -28,7 +28,7 @@ esac
 ray job submit \
   --address="http://127.0.0.1:8265" \
   --working-dir . \
-  --runtime-env-json '{"env_vars": {"PYTHONPATH": "torchtitan/experiments/tpu/rl_nc_ray/dummy_modules:.", "PYTHONUNBUFFERED": "1"}}' \
+  --runtime-env-json '{"env_vars": {"PYTHONPATH": "torchtitan/experiments/tpu/rl_nc_ray/dummy_modules:.", "PYTHONUNBUFFERED": "1", "VLLM_USE_V1": "0"}}' \
   -- \
   python3 -m torchtitan.experiments.tpu.rl_nc_ray.grpo \
     --module rl \

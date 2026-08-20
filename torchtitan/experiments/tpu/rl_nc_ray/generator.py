@@ -94,36 +94,29 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
                 return res
             ray.cluster_resources = patched_cluster_resources
 
-        OriginalRayWorkerWrapper = ray_distributed_executor.RayWorkerWrapper
-        original_init_worker = OriginalRayWorkerWrapper.init_worker
-        
-        
-        # This method is executed in the isolated Ray worker processes spawned by vLLM.
-        def patched_init_worker(self, *args, **kwargs):
-            import torchtitan.experiments.tpu.rl_nc_ray  # Apply the vLLM codegen compatibility shim
+        def setup_worker_context(self):
+            import torchtitan.experiments.tpu.rl_nc_ray  # Apply compatibility shims
 
-            # [TPU HACK 7]: When loading dummy formats to save memory, vLLM attempts to randomize 
-            # weights in Python logic to prevent NaN loss. On TPU, running eager seq randomization 
-            # over millions of parameters triggers thousands of un-fused XLA compilations.
-            # This causes a 20+ minute hang! We mock out the dummy initializer here.
-            import vllm.model_executor.model_loader.weight_utils
-            vllm.model_executor.model_loader.weight_utils.initialize_dummy_weights = lambda *args, **kwargs: None
-            import vllm.model_executor.model_loader.dummy_loader
-            vllm.model_executor.model_loader.dummy_loader.initialize_dummy_weights = lambda *args, **kwargs: None
-            
+            # [TPU HACK 7]: Mock dummy initializers to prevent 20+ min XLA compilation hangs
+            try:
+                import vllm.model_executor.model_loader.weight_utils
+                vllm.model_executor.model_loader.weight_utils.initialize_dummy_weights = lambda *args, **kwargs: None
+                import vllm.model_executor.model_loader.dummy_loader
+                vllm.model_executor.model_loader.dummy_loader.initialize_dummy_weights = lambda *args, **kwargs: None
+            except Exception:
+                pass
+
             # [TPU HACK 8]: Implement multi-host remote weight injection.
-            # The orchestrator cannot use `driver_worker.get_model()` to sync weights because 
-            # the driver worker does not exist when using `TPU_MULTIHOST_BACKEND="ray"`.
-            # We inject this method directly into the Ray workers.
             def load_weights_from_state_dict_on_worker(self, state_dict):
-                vllm_model = self.worker.model_runner.model
+                worker_obj = getattr(self, "worker", self)
+                vllm_model = getattr(worker_obj, "model_runner", worker_obj).model
                 from torchtitan.experiments.tpu.rl_nc_ray.weight_transfer_utils import load_weights_on_worker
-                # Delegate to the highly optimized, memory-safe, CPU-sliced worker loader
-                rank = int(os.environ.get("RANK", "0"))
+                rank = int(os.environ.get("RANK", getattr(self, "rank", 0)))
                 return load_weights_on_worker(vllm_model, state_dict, rank)
-                
+
             self.__class__.load_weights_from_state_dict_on_worker = load_weights_from_state_dict_on_worker
-            
+            self.__class__.execute_method = lambda self, method_name, *args, **kwargs: getattr(self, method_name)(*args, **kwargs)
+
             if os.path.exists(vllm_args_path):
                 try:
                     with open(vllm_args_path, "rb") as f:
@@ -131,20 +124,65 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
                     register_model_to_vllm_model_registry(ms_spec, c_config)
                 except Exception as e:
                     logger.error(f"Failed to load TorchTitan args: {e}")
-            
+
             # Prevent Dynamo recompilations due to grad_mode toggling 
             torch.set_grad_enabled(False)
-            
-            return original_init_worker(self, *args, **kwargs)
-            
-        OriginalRayWorkerWrapper.init_worker = patched_init_worker
+
+        # Patch V0 RayWorkerWrapper
+        if hasattr(ray_distributed_executor, "RayWorkerWrapper"):
+            orig_init_v0 = ray_distributed_executor.RayWorkerWrapper.init_worker
+            def patched_init_v0(self, *args, **kwargs):
+                setup_worker_context(self)
+                return orig_init_v0(self, *args, **kwargs)
+            ray_distributed_executor.RayWorkerWrapper.init_worker = patched_init_v0
+
+        # Patch V1 RayWorkerProc
+        try:
+            from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+            orig_init_v1 = RayWorkerProc.initialize_worker
+            def patched_init_v1(self, *args, **kwargs):
+                setup_worker_context(self)
+                return orig_init_v1(self, *args, **kwargs)
+            RayWorkerProc.initialize_worker = patched_init_v1
+        except Exception:
+            pass
     except ImportError:
         pass
 
 
+def _load_weights_rpc_worker(worker, state_dict_ref):
+    import os
+    import ray
+    import torch.distributed as dist
+    
+    if hasattr(worker, "vllm_config") and hasattr(worker.vllm_config, "parallel_config"):
+        rank = worker.vllm_config.parallel_config.rank
+    elif hasattr(worker, "rank"):
+        rank = worker.rank
+    elif dist.is_initialized():
+        rank = dist.get_rank()
+    else:
+        rank = int(os.environ.get("RANK", "0"))
+        
+    if isinstance(state_dict_ref, ray.ObjectRef):
+        state_dict_data = ray.get(state_dict_ref)
+    else:
+        state_dict_data = state_dict_ref
+        
+    if hasattr(worker, "get_model"):
+        vllm_model = worker.get_model()
+    elif hasattr(worker, "model_runner") and hasattr(worker.model_runner, "model"):
+        vllm_model = worker.model_runner.model
+    else:
+        vllm_model = getattr(worker, "model", worker)
+        
+    from torchtitan.experiments.tpu.rl_nc_ray.weight_transfer_utils import load_weights_on_worker
+    return load_weights_on_worker(vllm_model, state_dict_data, rank)
+
 @ray.remote
 class RayVLLMGenerator:
     def __init__(self, config, *, model_spec, model_path, compile_config, max_num_seqs, dump_folder=None, **kwargs):
+        os.environ["VLLM_USE_V1"] = "0"
         os.environ.setdefault("LOCAL_RANK", "0")
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
@@ -182,14 +220,19 @@ class RayVLLMGenerator:
         state_dict_ref = state_dict_ref_list[0]
         
         executor = self.generator._engine.model_executor
-        if hasattr(executor, "workers"):
-            refs = []
-            for worker in executor.workers:
-                refs.append(worker.execute_method.remote("load_weights_from_state_dict_on_worker", state_dict_ref))
+        if hasattr(executor, "collective_rpc"):
+            # vLLM V1: Broadcast weight injection to workers via native message queue collective RPC
+            executor.collective_rpc(_load_weights_rpc_worker, args=(state_dict_ref,))
+        elif hasattr(executor, "workers") and executor.workers:
+            # vLLM V0: Ray actors execute_method
+            refs = [
+                worker.execute_method.remote("load_weights_from_state_dict_on_worker", state_dict_ref)
+                for worker in executor.workers
+            ]
             ray.get(refs)
         else:
             # Fallback for single-process local runs where workers don't exist
-            state_dict_data = ray.get(state_dict_ref)
+            state_dict_data = ray.get(state_dict_ref) if isinstance(state_dict_ref, ray.ObjectRef) else state_dict_ref
             vllm_model = executor.driver_worker.get_model()
             load_weights_on_driver(vllm_model, state_dict_data)
                         

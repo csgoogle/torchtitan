@@ -2,3 +2,5 @@ __pycache__/
 assets/
 logs/
 *.log
+.env
+build_and_push_docker.sh
