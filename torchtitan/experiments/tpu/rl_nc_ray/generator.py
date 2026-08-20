@@ -46,11 +46,6 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
     import vllm
     
     try:
-        # [TPU HACK 10]: `torchtpu-vllm`'s worker blindly imports `init_cached_hf_modules`,
-        # which was removed/moved in newer vLLM codebase versions, instantly crashing workers.
-        if "vllm.utils.import_utils" not in sys.modules:
-            sys.modules["vllm.utils.import_utils"] = types.ModuleType("import_utils")
-        sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
         
         try:
             from vllm_torchtpu.executors import ray_distributed_executor
@@ -102,29 +97,10 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
         OriginalRayWorkerWrapper = ray_distributed_executor.RayWorkerWrapper
         original_init_worker = OriginalRayWorkerWrapper.init_worker
         
-        # [TPU HACK 5]: Prevent vLLM from attempting to set CUDA devices on TPU workers.
-        # vLLM's `RayWorkerWrapper.setup_device_if_necessary` explicitly accesses 
-        # `self.worker.device`, which throws an AttributeError on `TPUWorker` and crashes the job.
-        def patched_setup_device_if_necessary(self):
-            if not getattr(self, "compiled_dag_cuda_device_set", False):
-                try:
-                    from vllm.platforms import current_platform
-                    if current_platform.is_cuda() and hasattr(self.worker, "device") and self.worker.device is not None:
-                        current_platform.set_device(self.worker.device)
-                except Exception:
-                    pass
-                self.compiled_dag_cuda_device_set = True
-        OriginalRayWorkerWrapper.setup_device_if_necessary = patched_setup_device_if_necessary
         
         # This method is executed in the isolated Ray worker processes spawned by vLLM.
         def patched_init_worker(self, *args, **kwargs):
             import torchtitan.experiments.tpu.rl_nc_ray  # Apply the vLLM codegen compatibility shim
-
-            # [TPU HACK 6]: `torchtpu-vllm`'s worker blindly imports `init_cached_hf_modules`,
-            # which was removed/moved in newer vLLM codebase versions, instantly crashing workers.
-            if "vllm.utils.import_utils" not in sys.modules:
-                sys.modules["vllm.utils.import_utils"] = types.ModuleType("import_utils")
-            sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
 
             # [TPU HACK 7]: When loading dummy formats to save memory, vLLM attempts to randomize 
             # weights in Python logic to prevent NaN loss. On TPU, running eager seq randomization 
