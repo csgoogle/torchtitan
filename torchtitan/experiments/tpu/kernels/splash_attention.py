@@ -4,6 +4,7 @@ Wraps JAX's splash_attention_kernel for use with PyTorch tensors on TPU.
 Uses torch_tpu._internal.pallas.custom_jax_kernel() to bridge JAX -> PyTorch.
 """
 
+import hashlib
 import math
 import os
 import typing
@@ -256,7 +257,7 @@ _splash_op_name_cache = {}
 @torch._dynamo.assume_constant_result
 def _get_splash_op_names(**splash_kwargs):
   """Create and cache PyTorch forward/backward functions for splash attention."""
-  cache_key = tuple(splash_kwargs.items())
+  cache_key = tuple(sorted(splash_kwargs.items()))
   if cache_key in _splash_op_name_cache:
     return _splash_op_name_cache[cache_key]
 
@@ -264,7 +265,8 @@ def _get_splash_op_names(**splash_kwargs):
   torch_fwd_fn = custom_jax_kernel(splash_fn, name="splash_attention")
   torch_bwd_fn = custom_jax_kernel(splash_bwd_fn, name="splash_attention_bwd")
 
-  identifier = abs(hash(cache_key))  # TODO: use a better identifier
+  # Truncate SHA-256 to 16 hex characters (64 bits) for op name readability.
+  identifier = hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()[:16]
   op_fwd_name = f"splash_attn_fwd_{identifier}"
   op_bwd_name = f"splash_attn_bwd_{identifier}"
   torch_fwd_fn = torch.library.custom_op(
