@@ -120,7 +120,7 @@ class _FusedQKVInit:
             [
                 q.view(n_kv_heads, heads_per_kv, head_dim, *tail),
                 k.view(n_kv_heads, 1, head_dim, *tail),
-                k.view(n_kv_heads, 1, head_dim, *tail),
+                v.view(n_kv_heads, 1, head_dim, *tail),
             ],
             dim=1,
         ).view(-1, *tail)
