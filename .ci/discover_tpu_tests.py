@@ -26,6 +26,8 @@ DISABLED_TESTS = {
     "torchtitan.experiments.tpu.rl.tests.test_grpo_token",
     # TODO: ModuleNotFoundError: No module named 'internal'
     "torchtitan.experiments.tpu.tests.test_profiler",
+    # TODO: add copybara handling for this test
+    "torchtitan.experiments.tpu.kernels.tests.test_kernel_name_determinism",
     # TODO: SyntaxError: invalid syntax (from jaxtyping)
     "torchtitan.experiments.tpu.redacted.tests.test_train_minimal_distributed",
     # TODO: Unknown command line flag 'device'

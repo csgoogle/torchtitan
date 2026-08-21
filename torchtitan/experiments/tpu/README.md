@@ -137,9 +137,10 @@ cd torchtitan
 Some dependencies have to be installed before TorchTPU.
 
 ```bash
+pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+pip install -r torchtitan/experiments/tpu/requirements.txt -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 pip install -r requirements.txt
 pip install -r .ci/docker/requirements-flux.txt
-pip install portpicker absl-py numpy gcsfs frozendict triton fairscale
 ```
 
 
