@@ -57,6 +57,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
+    qwen3_moe_30b_fsdp_only_splash_sac_profile,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
@@ -150,7 +151,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           tpu_config=TPUConfig(use_scan_layers=True, use_graph_trainer=False)
       )
 
-  @parameterized.parameters("default", "full", "eager")
+  @parameterized.parameters("default", "full", "eager", "tpu_splash")
   def test_cli_memory_policy_is_propagated(self, policy: str) -> None:
     config = typing.cast(
         TPUTrainerConfig,
@@ -342,6 +343,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         config.tpu_config.fsdp_allreduce_slice_max_input_bytes,
         40 * 1024**2,
     )
+
     graph_config = to_tpu_graph_trainer_config(
         config,
         qwen3_gt.model_registry,
@@ -356,6 +358,29 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         for step in pipeline
     ]
     self.assertIn("apply_selected_reduce_scatter_allreduce_pass", pipeline_names)
+
+  def test_qwen3_moe_fsdp_splash_sac_profile_recipe(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_splash_sac_profile()
+
+    self.assertEqual(
+        config.tpu_config.graph_trainer_memory_policy,
+        "tpu_splash",
+    )
+    self.assertEqual(
+        config.tpu_config.graph_trainer_memory_policy_save_budget_gb,
+        5.00,
+    )
+
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    self.assertEqual(graph_config.compile.memory_policy, "tpu_splash")
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_memory_policy_save_budget_gb,
+        5.00,
+    )
 
   @parameterized.named_parameters(
       ("requires_simple_fsdp", "use_simple_fsdp", False, "SimpleFSDP"),

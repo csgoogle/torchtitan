@@ -30,6 +30,9 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_remat_fsdp_all_gather_schedule,
     apply_tpu_remat_schedule,
 )
+# Imported for the side effect: it registers TPU-only policies in the shared
+# GraphTrainer registry without making shared GraphTrainer import TPU code.
+import torchtitan.experiments.tpu.graph_trainer.memory_policy  # noqa: F401
 from torchtitan.tools.logging import logger
 
 

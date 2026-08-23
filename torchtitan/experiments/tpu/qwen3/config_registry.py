@@ -544,6 +544,26 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_30b_fsdp_only_splash_sac_profile() -> TPUTrainerConfig:
+  """FSDP128 profile that retains later-layer Splash outputs within budget."""
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_profile()
+  cfg.tpu_config.graph_trainer_memory_policy = "tpu_splash"
+  # Current main leaves enough HBM to retain all 48 Splash tuples. The budget
+  # remains explicit so this experimental recipe fails safely if the shape or
+  # activation footprint changes.
+  cfg.tpu_config.graph_trainer_memory_policy_save_budget_gb = 5.00
+  return cfg
+
+
+def qwen3_moe_30b_fsdp_only_splash_sac_benchmark() -> TPUTrainerConfig:
+  """Profiler-free bracket for the Splash-output SAC A/B."""
+  cfg = qwen3_moe_30b_fsdp_only_splash_sac_profile()
+  cfg.training.steps = 30
+  cfg.metrics.log_freq = 5
+  cfg.profiler = Profiler.Config(enable_profiling=False)
+  return cfg
+
+
 def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
   """Proxy model for Qwen3 30B MoE (4 layers instead of 48) for testing/iterations."""
   cfg = qwen3_moe_30b()

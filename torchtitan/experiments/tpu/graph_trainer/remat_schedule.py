@@ -156,13 +156,14 @@ def apply_tpu_remat_schedule(
     start, while the later FSDP cast and reduce-scatter may still overlap with
     layer 0.
 
-    Every saved primal is barriered. The earliest external backward value
-    entering the region anchors it at backward entry; later cotangents retain
-    their natural dependencies because they may be produced after local
-    backward has begun. Each tagged parameter gradient must belong to exactly
-    one region. Parameters shared across regions are not supported. Trace-time
-    gradient identity makes this work whether gradients are graph outputs or
-    are consumed by an optimizer inside the graph.
+    Every saved primal is barriered at its first schedulable recompute use. The
+    incoming cotangent also anchors that barrier. Selectively saved operations
+    can have backward users that must run before the next layer's remaining
+    gradients exist; those earlier users retain their natural dependencies.
+    Each tagged parameter gradient must belong to exactly one region.
+    Parameters shared across regions are not supported. Trace-time gradient
+    identity makes this work whether gradients are graph outputs or are
+    consumed by an optimizer inside the graph.
 
     The barrier uses the next layer's local parameter gradients before FSDP
     synchronization. The currently validated expert path anchors before the
@@ -315,34 +316,40 @@ def apply_tpu_remat_schedule(
 
         # The next layer's local gradients are dependency-only barrier inputs;
         # only the saved primals and cotangent have users redirected through
-        # their corresponding tuple outputs.
+        # their corresponding tuple outputs. Selective saves can expose an
+        # early backward user that the ordering gradients themselves depend on
+        # (for example, a saved Splash-attention backward). Leave such users
+        # before the barrier and constrain the remaining recompute/backward
+        # suffix, avoiding a dependency cycle.
         boundaries = list(
             dict.fromkeys(primal_boundaries + [cotangent] + ordering_gradients)
         )
+        last_boundary_order = max(order[boundary] for boundary in boundaries)
         redirect_users: dict[torch.fx.Node, set[torch.fx.Node]] = {
-            boundary: {user for user in boundary.users if user in recompute_nodes}
+            boundary: {
+                user
+                for user in boundary.users
+                if user in recompute_nodes and order[user] > last_boundary_order
+            }
             for boundary in primal_boundaries
         }
         redirect_users[cotangent] = {
-            user for user in cotangent.users if _is_backward_node(user)
+            user
+            for user in cotangent.users
+            if user in backward_nodes and order[user] > last_boundary_order
         }
         redirect_users = {
             boundary: users for boundary, users in redirect_users.items() if users
         }
+        if not redirect_users:
+            raise RuntimeError(
+                f"remat region {region_id} has no schedulable entry after its "
+                "ordering gradients"
+            )
         first_user = min(
             (user for users in redirect_users.values() for user in users),
             key=order.__getitem__,
         )
-        late_boundaries = [
-            boundary.name
-            for boundary in boundaries
-            if order[boundary] >= order[first_user]
-        ]
-        if late_boundaries:
-            raise RuntimeError(
-                f"remat region {region_id} has boundary values unavailable before "
-                f"{first_user.name}: {late_boundaries}"
-            )
 
         with gm.graph.inserting_before(first_user):
             barrier = gm.graph.call_function(

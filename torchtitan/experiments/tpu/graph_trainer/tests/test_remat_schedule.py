@@ -162,6 +162,86 @@ def _trace_simple_fsdp_remat_graph(n_layers: int = 3):
 
 
 class TestTpuFsdpRematSchedule(unittest.TestCase):
+    def test_saved_backward_before_next_layer_gradient_stays_before_barrier(
+        self,
+    ) -> None:
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.empty(2, 4, dtype=torch.bfloat16, device="meta")
+
+        saved0 = graph.call_function(torch.ops.aten.clone.default, args=(x,))
+        saved0.meta = {"val": x.meta["val"]}
+        saved1 = graph.call_function(torch.ops.aten.clone.default, args=(x,))
+        saved1.meta = {"val": x.meta["val"]}
+        cotangent0 = graph.call_function(
+            torch.ops.aten.clone.default, args=(x,)
+        )
+        cotangent0.meta = {"val": x.meta["val"], "autograd_backward": True}
+
+        early_backward0 = graph.call_function(
+            torch.ops.aten.alias.default, args=(cotangent0,)
+        )
+        early_backward0.meta = {
+            "val": x.meta["val"],
+            "autograd_backward": True,
+            "custom": {"module_fqn": "layers.0.attention"},
+        }
+        gradient1 = graph.call_function(
+            torch.ops.aten.alias.default, args=(early_backward0,)
+        )
+        gradient1.meta = {
+            "val": x.meta["val"],
+            "autograd_backward": True,
+            "custom": {
+                "module_fqn": "layers.1.attention",
+                PARAMETER_GRADIENT_FQNS_META: ("layers.1.attention.weight",),
+            },
+        }
+
+        recompute1 = graph.call_function(
+            torch.ops.aten.clone.default, args=(saved1,)
+        )
+        recompute1.name = "layer1_recomputed"
+        recompute1.meta = {
+            "val": x.meta["val"],
+            "custom": {"module_fqn": "layers.1.attention"},
+        }
+        recompute0 = graph.call_function(
+            torch.ops.aten.clone.default, args=(saved0,)
+        )
+        recompute0.name = "layer0_recomputed"
+        recompute0.meta = {
+            "val": x.meta["val"],
+            "custom": {"module_fqn": "layers.0.attention"},
+        }
+        backward0 = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(recompute0, early_backward0)
+        )
+        backward0.meta = {
+            "val": x.meta["val"],
+            "autograd_backward": True,
+            "custom": {"module_fqn": "layers.0.attention"},
+        }
+        graph.output((backward0, gradient1, recompute1))
+        gm = torch.fx.GraphModule(nn.Module(), graph)
+
+        apply_tpu_remat_schedule(gm, (x,), num_static_inputs=0)
+
+        barrier0 = next(
+            node
+            for node in gm.graph.nodes
+            if node.target is _optimization_barrier
+            and gradient1 in node.all_input_nodes
+        )
+        self.assertEqual(
+            (
+                early_backward0.args[0],
+                recompute0.args[0].target,
+                recompute0.args[0].args[0],
+            ),
+            (cotangent0, operator.getitem, barrier0),
+        )
+
     def test_all_gather_barrier_uses_configured_layer_distance(self) -> None:
         for distance, expected_anchor_ids in (
             (1, (1, 2, None)),

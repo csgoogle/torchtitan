@@ -10,6 +10,7 @@ import torchtitan.trainer
 
 
 GraphTrainerFSDPSchedule = Literal["none", "prefetch", "interleave"]
+TpuGraphTrainerMemoryPolicy = Literal[GraphTrainerMemoryPolicy, "tpu_splash"]
 BackwardPartitionMode = Literal[
     "none",
     "by_layer",
@@ -79,7 +80,10 @@ class TPUConfig:
   optimizer_in_graph: bool = False
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
-  graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  # TPU-only policies are registered by experiments/tpu/graph_trainer rather
+  # than added to the shared GraphTrainer policy type.
+  graph_trainer_memory_policy: TpuGraphTrainerMemoryPolicy = "default"
+  graph_trainer_memory_policy_save_budget_gb: float = 0.0
   # Run the decoder layers as a single scan instead of a Python loop, so the
   # compiler sees one loop body rather than n_layers copies of it. Each layer's
   # weights become a row of one stacked tensor, which is what gives the scan
