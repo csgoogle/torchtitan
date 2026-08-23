@@ -66,6 +66,13 @@ class TPUConfig:
   compile_optimizer: bool = False
   # Compile the DTensor-aware global gradient norm as a separate static graph.
   compile_grad_norm: bool = False
+  # Lower explicitly selected FSDP gradient reduce-scatters as all-reduce plus
+  # a rank-local slice. The patterns match parameter FQNs recorded by
+  # GraphTrainer; an empty tuple is a no-op. This is a TPU latency workaround,
+  # not a generally cheaper collective, so recipes must also provide the
+  # largest validated full-gradient payload.
+  fsdp_allreduce_slice_parameter_patterns: tuple[str, ...] = ()
+  fsdp_allreduce_slice_max_input_bytes: int = 0
   # Run via TpuGraphTrainer (joint fwd+loss+bwd aot_fx_trace and FX-graph SAC passes).
   use_graph_trainer: bool = False
   # Whether to compile the optimizer step into the joint fwd+loss+bwd graph.

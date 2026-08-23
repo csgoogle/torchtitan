@@ -328,6 +328,101 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         )
     )
 
+  def test_fsdp_only_recipe_selects_attention_gradients_for_allreduce(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+
+    self.assertSequenceEqual(
+        config.tpu_config.fsdp_allreduce_slice_parameter_patterns,
+        (
+            "layers.*.attention.qkv_linear.wqkv_packed.weight",
+            "layers.*.attention.wo.weight",
+        ),
+    )
+    self.assertEqual(
+        config.tpu_config.fsdp_allreduce_slice_max_input_bytes,
+        40 * 1024**2,
+    )
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    pipeline = construct_tpu_pass_pipeline(
+        typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
+        graph_config,
+    )
+    pipeline_names = [
+        getattr(getattr(step, "func", step), "__name__", "")
+        for step in pipeline
+    ]
+    self.assertIn("apply_selected_reduce_scatter_allreduce_pass", pipeline_names)
+
+  @parameterized.named_parameters(
+      ("requires_simple_fsdp", "use_simple_fsdp", False, "SimpleFSDP"),
+      (
+          "rejects_dp_replication",
+          "data_parallel_replicate_degree",
+          2,
+          "full-world FSDP",
+      ),
+      (
+          "rejects_fixed_fsdp_degree",
+          "data_parallel_shard_degree",
+          64,
+          "full-world FSDP",
+      ),
+      (
+          "rejects_tensor_parallel",
+          "tensor_parallel_degree",
+          2,
+          "full-world FSDP",
+      ),
+      (
+          "rejects_context_parallel",
+          "context_parallel_degree",
+          2,
+          "full-world FSDP",
+      ),
+      (
+          "rejects_pipeline_parallel",
+          "pipeline_parallel_degree",
+          2,
+          "full-world FSDP",
+      ),
+      (
+          "rejects_expert_parallel",
+          "expert_parallel_degree",
+          2,
+          "full-world FSDP",
+      ),
+  )
+  def test_fsdp_allreduce_slice_rejects_unsupported_parallelism(
+      self,
+      field: str,
+      value: bool | int,
+      message: str,
+  ) -> None:
+    config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+    setattr(config.parallelism, field, value)
+
+    with self.assertRaisesRegex(ValueError, message):
+      to_tpu_graph_trainer_config(
+          config,
+          qwen3_gt.model_registry,
+          target_cls=TpuGraphTrainer.Config,
+      )
+
+  def test_fsdp_allreduce_slice_requires_fp32_reductions(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+    config.training.mixed_precision_reduce = "bfloat16"
+
+    with self.assertRaisesRegex(ValueError, "FP32 FSDP reductions"):
+      to_tpu_graph_trainer_config(
+          config,
+          qwen3_gt.model_registry,
+          target_cls=TpuGraphTrainer.Config,
+      )
+
   def test_attention_parity_recipe_adds_bf16_rope(self) -> None:
     config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
     self.assertIn(

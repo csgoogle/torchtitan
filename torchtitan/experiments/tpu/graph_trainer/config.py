@@ -25,12 +25,46 @@ from torchtitan.protocols.model_spec import ModelSpec
 ConfigT = TypeVar("ConfigT")
 
 
+def _validate_fsdp_allreduce_slice(
+    train_config: TPUTrainerConfig,
+) -> None:
+  patterns = train_config.tpu_config.fsdp_allreduce_slice_parameter_patterns
+  if not patterns:
+    return
+
+  if train_config.tpu_config.fsdp_allreduce_slice_max_input_bytes <= 0:
+    raise ValueError(
+        "fsdp all-reduce-plus-slice requires a positive maximum input size"
+    )
+
+  parallelism = train_config.parallelism
+  if not parallelism.use_simple_fsdp:
+    raise ValueError("fsdp all-reduce-plus-slice requires SimpleFSDP")
+  if (
+      parallelism.data_parallel_replicate_degree != 1
+      or parallelism.data_parallel_shard_degree != -1
+      or parallelism.tensor_parallel_degree != 1
+      or parallelism.context_parallel_degree != 1
+      or parallelism.pipeline_parallel_degree != 1
+      or parallelism.expert_parallel_degree != 1
+    ):
+    raise ValueError(
+        "fsdp all-reduce-plus-slice currently requires full-world FSDP "
+        "with DP-replicate/TP/CP/PP/EP degrees all equal to 1"
+    )
+  if train_config.training.mixed_precision_reduce != "float32":
+    raise ValueError(
+        "fsdp all-reduce-plus-slice currently requires FP32 FSDP reductions"
+    )
+
+
 def to_tpu_graph_trainer_config(
     train_config: TPUTrainerConfig,
     model_registry: Callable[[str], ModelSpec],
     target_cls: type[ConfigT],
 ) -> ConfigT:
   """Convert a TPU recipe and propagate its TPU-only GraphTrainer settings."""
+  _validate_fsdp_allreduce_slice(train_config)
   memory_policy = train_config.tpu_config.graph_trainer_memory_policy
   if memory_policy == "sac_and_offload":
     raise ValueError(

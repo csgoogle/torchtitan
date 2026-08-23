@@ -447,6 +447,14 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
       graph_trainer_memory_policy="full",
       enable_graph_trainer_remat_schedule=True,
       compile_grad_norm=True,
+      fsdp_allreduce_slice_parameter_patterns=(
+          "layers.*.attention.qkv_linear.wqkv_packed.weight",
+          "layers.*.attention.wo.weight",
+      ),
+      # The validated QKV and output-projection gradients are 40 and 32 MiB.
+      # Larger reductions can lose to native reduce-scatter because all-reduce
+      # sends roughly twice the ring traffic and materializes the full result.
+      fsdp_allreduce_slice_max_input_bytes=40 * 1024**2,
       compile_optimizer=False,
       optimizer_in_graph=False,
   )
