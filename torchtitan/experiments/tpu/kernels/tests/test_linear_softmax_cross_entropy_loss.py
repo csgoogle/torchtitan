@@ -166,6 +166,9 @@ class LinearSoftmaxCrossEntropyLossTest(
 
     # Compare
 
+    self.assertEqual(actual_grad_x.dtype, x_tpu.dtype)
+    self.assertEqual(actual_grad_weights.dtype, weights_tpu.dtype)
+
     torch.testing.assert_close(
         actual_out.cpu(), expected_out.cpu(), rtol=loss_rtol, atol=loss_atol
     )

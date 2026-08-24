@@ -92,7 +92,9 @@ def _my_bwd(
     grad_x, grad_w = reference.linear_softmax_cross_entropy_loss_bwd_reference(
         dout, lse, x, labels, weights, reduction=reduction
     )
-    return grad_x, grad_w
+    # Match the custom-op schema and ordinary linear autograd: Tokamax may
+    # accumulate in FP32, but gradients cross this boundary in the input dtype.
+    return grad_x.astype(x.dtype), grad_w.astype(weights.dtype)
 
   from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel  # pylint: disable=g-import-not-at-top
 
@@ -109,7 +111,10 @@ def _my_bwd(
           reduction=reduction,
       )
   )
-  return grad_x, grad_w
+  # Keep the Pallas and reference implementations on the same autograd dtype
+  # contract. The pinned Tokamax revision separately fixes where dout is
+  # applied so this cast occurs after the BF16 gradient GEMMs.
+  return grad_x.astype(x.dtype), grad_w.astype(weights.dtype)
 
 
 _loss_op_name_cache = {}

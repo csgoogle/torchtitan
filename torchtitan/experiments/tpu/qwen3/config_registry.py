@@ -25,6 +25,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuTokenDispatcherConverter,
@@ -42,6 +43,16 @@ from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.profiler import Profiler
+
+
+_FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
+
+
+def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
+  """Select the fused loss and its pre-construction LM-head override together."""
+  config.loss = PallasCrossEntropyLoss.Config()
+  if _FUSED_LOSS_OVERRIDE not in config.override.imports:
+    config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
 def qwen3_debugmodel() -> TPUTrainerConfig:
@@ -280,8 +291,7 @@ def qwen3_8b() -> TPUTrainerConfig:
   # Optionally override any model config settings here
   # model_config = cast(Qwen3Model.Config, model_spec.model)
 
-  return TPUTrainerConfig(
-      loss=CrossEntropyLoss.Config(),
+  config = TPUTrainerConfig(
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
       # Keep the established dense optimizer path until native fused AdamW has
@@ -342,20 +352,20 @@ def qwen3_8b() -> TPUTrainerConfig:
           sa_block_q_dq=1024,
           sa_block_kv_dq=1024,
       ),
-      loss_kernel=LossKernelConfig(
-          use_loss_kernel=True,
-      ),
       validator=Validator.Config(
           enable=False,
           freq=5,
           steps=10,
       ),
   )
+  _enable_pallas_cross_entropy(config)
+  return config
 
 
 def qwen3_moe_30b() -> TPUTrainerConfig:
   """TPU specialization of the global-aux Qwen3 30B recipe."""
   cfg = TPUTrainerConfig.derive_from(qwen3_30b_a3b_global_aux())
+  cfg.loss = CrossEntropyLoss.Config()
   cfg.model_spec = model_registry(
       "30B-A3B-global-aux",
       attn_backend="sdpa",
@@ -402,6 +412,7 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
 def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   """Batch-6 FSDP128 baseline with local dropless expert dispatch."""
   cfg = qwen3_moe_30b()
+  _enable_pallas_cross_entropy(cfg)
   cfg.parallelism = ParallelismConfig(
       use_simple_fsdp=True,
       enable_tpu_topo_mesh=True,

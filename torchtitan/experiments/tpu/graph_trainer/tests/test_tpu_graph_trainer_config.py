@@ -12,6 +12,9 @@ from types import SimpleNamespace
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
+from torch import nn
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.config import apply_overrides
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.graph_trainer import qwen3 as qwen3_gt
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
@@ -27,6 +30,11 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as tpu_qwen3_graph_registry,
 )
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.overrides.fused_loss import (
+    FusedLossLinearWrapper,
+    fused_loss_lm_head,
+)
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
     qwen3_moe_30b,
@@ -34,6 +42,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_profile,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.models.common import Linear
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
@@ -65,7 +74,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             f"--tpu_config.graph_trainer_memory_policy={policy}",
         ]),
     )
-
     graph_config = to_tpu_graph_trainer_config(
         config,
         qwen3_gt.model_registry,
@@ -119,6 +127,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_qwen3_8b_explicitly_uses_default_graph_policy(self) -> None:
     config = qwen3_8b()
 
+    self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
     self.assertEqual(
         config.tpu_config.graph_trainer_memory_policy,
         "default",
@@ -130,6 +139,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         qwen3_gt.model_registry,
         target_cls=TpuGraphTrainer.Config,
     )
+    self.assertIsInstance(graph_config.loss, PallasCrossEntropyLoss.Config)
     self.assertEqual(graph_config.compile.memory_policy, "default")
 
   def test_fsdp_only_recipe_uses_fused_adamw(self) -> None:
@@ -154,6 +164,98 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "never")
+
+  def test_qwen3_moe_fsdp_uses_pallas_cross_entropy(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_full_ac_profile()
+
+    self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
+
+  @parameterized.parameters(qwen3_8b, qwen3_moe_30b_fsdp_only_full_ac_profile)
+  def test_pallas_loss_recipe_overrides_lm_head(self, recipe) -> None:
+    config = recipe()
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    self.assertIn(
+        "torchtitan.experiments.tpu.overrides.fused_loss",
+        graph_config.override.imports,
+    )
+    apply_overrides(graph_config.override, graph_config)
+    assert graph_config.model_spec is not None
+    lm_head_config = graph_config.model_spec.model.lm_head
+    self.assertIsInstance(lm_head_config, FusedLossLinearWrapper.Config)
+
+    with torch.device("meta"):
+      model = graph_config.model_spec.model.build()
+    self.assertIsInstance(model.lm_head, FusedLossLinearWrapper)
+    self.assertEqual(
+        [name for name in model.state_dict() if name.endswith("lm_head.weight")],
+        ["lm_head.weight"],
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer_params = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    self.assertTrue(
+        any(parameter is model.lm_head.weight for parameter in optimizer_params)
+    )
+
+  def test_fused_loss_linear_wrapper_contract(self) -> None:
+    param_init = {"weight": lambda weight: nn.init.constant_(weight, 0.25)}
+    sharding_config = object()
+    linear_config = Linear.Config(
+        in_features=4,
+        out_features=8,
+        param_init=param_init,
+        sharding_config=sharding_config,
+    )
+    config = fused_loss_lm_head(linear_config)
+
+    self.assertIs(config.param_init, linear_config.param_init)
+    self.assertIs(config.sharding_config, linear_config.sharding_config)
+    lm_head = config.build()
+    lm_head.init_states()
+    hidden = torch.randn(2, 4)
+    output, output_weight = lm_head(hidden)
+
+    self.assertIs(output, hidden)
+    self.assertEqual(list(lm_head.state_dict()), ["weight"])
+    torch.testing.assert_close(
+        lm_head.weight,
+        torch.full_like(lm_head.weight, 0.25),
+    )
+    torch.testing.assert_close(output_weight, lm_head.weight.t())
+
+  def test_qwen3_moe_ep_keeps_plain_cross_entropy(self) -> None:
+    config = qwen3_moe_30b()
+
+    self.assertIsInstance(config.loss, CrossEntropyLoss.Config)
+
+  def test_chunked_loss_is_rejected(self) -> None:
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_debugmodel",
+        ]),
+    )
+    config.loss = ChunkedLossWrapper.Config()
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    with self.assertRaisesRegex(
+        ValueError, "TPU GraphTrainer does not support ChunkedLossWrapper"
+    ):
+      TpuGraphTrainer(graph_config)
 
   def test_remat_schedule_supports_optimizer_in_graph(self) -> None:
     config = qwen3_8b()
