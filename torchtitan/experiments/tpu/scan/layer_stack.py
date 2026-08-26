@@ -443,6 +443,7 @@ def install_scan_over_layers(
 
   Returns the `ScannedLayerStack` now installed at `model.layers`.
   """
+  from torchtitan.experiments.tpu.scan import reverse as scan_reverse  # pylint: disable=g-import-not-at-top
   from torchtitan.experiments.tpu.scan.torch_tpu_fix import (  # pylint: disable=g-import-not-at-top
       use_torch_tpu_scan_fix,
   )
@@ -461,5 +462,11 @@ def install_scan_over_layers(
   use_torch_tpu_scan_fix()
 
   apply_scan_over_layers(model, peel_first_layer=peel_first_layer)
+
+  # `scan`'s backward is a reverse scan that upstream emulates by flipping the
+  # saved residual stack, materialising a byte-for-byte duplicate of the largest
+  # buffer in the arena. torch_tpu can lower the reverse directly.
+  if scan_reverse.enabled():
+    scan_reverse.install_scan_reverse_backward()
 
   return model.layers
