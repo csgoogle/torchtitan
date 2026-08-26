@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Checkpoint interop tests for FusedQKVLinear.
+"""Tests for FusedQKVLinear initialization, checkpointing, and forward layout.
 
 FusedQKVLinear stores a single fused ``wqkv`` parameter but checkpoints in the
 stock ``QKVLinear`` layout (``wq.weight`` / ``wk.weight`` / ``wv.weight``) via
@@ -17,6 +17,7 @@ import unittest
 
 import torch
 from torchtitan.models.common.attention import FusedQKVLinear, QKVLinear
+from torchtitan.models.common.config_utils import _fused_qkv_param_init
 from torchtitan.models.common.linear import Linear
 
 _DIM = 16
@@ -54,6 +55,41 @@ def _build_stock(with_bias: bool = False) -> QKVLinear:
         for p in stock.parameters():
             p.copy_(torch.randn_like(p))
     return stock
+
+
+class TestFusedQKVInitialization(unittest.TestCase):
+    def test_matches_separate_qkv_initialization(self):
+        def init(t: torch.Tensor) -> torch.Tensor:
+            return torch.nn.init.normal_(t, std=0.02)
+
+        torch.manual_seed(1234)
+        q = torch.empty(_WQ_OUT, _DIM)
+        k = torch.empty(_WK_OUT, _DIM)
+        v = torch.empty(_WK_OUT, _DIM)
+        init(q)
+        init(k)
+        init(v)
+        expected = torch.cat(
+            [
+                q.view(_N_KV_HEADS, _HPK, _HEAD_DIM, _DIM),
+                k.view(_N_KV_HEADS, 1, _HEAD_DIM, _DIM),
+                v.view(_N_KV_HEADS, 1, _HEAD_DIM, _DIM),
+            ],
+            dim=1,
+        ).reshape(_WQKV_OUT, _DIM)
+
+        torch.manual_seed(1234)
+        actual = torch.empty_like(expected)
+        fused_init = _fused_qkv_param_init(
+            {"weight": init},
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+        )["weight"]
+        fused_init(actual)
+
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertFalse(torch.equal(k, v))
 
 
 class TestFusedQKVCheckpointInterop(unittest.TestCase):
