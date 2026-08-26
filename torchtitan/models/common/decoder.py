@@ -257,7 +257,21 @@ class Decoder(BaseModel):
             # ``skip_param_init``, so re-point it at the initialized lm_head
             # weight.
             assert self.tok_embeddings is not None and self.lm_head is not None
-            self.tok_embeddings.weight = self.lm_head.weight
+            # Go through ``_parameters`` rather than the attribute: a
+            # parametrization installed by an earlier ``parallelize_fn``
+            # (SimpleFSDP replaces ``weight`` with a property that returns the
+            # gathered plain tensor) makes the attribute form raise from
+            # ``nn.Module.__setattr__``. Without a parametrization the two are
+            # the same object.
+            # A backend may wrap ``lm_head`` (e.g. to return ``(x, weight)`` for
+            # a fused loss kernel), which nests the projection one level down.
+            # Resolve to whichever module in the subtree owns the parameter.
+            lm_head = self.lm_head
+            if "weight" not in lm_head._parameters:
+                lm_head = next(
+                    m for m in lm_head.modules() if "weight" in m._parameters
+                )
+            self.tok_embeddings._parameters["weight"] = lm_head._parameters["weight"]
         super().init_states(buffer_device=buffer_device)
 
     def forward(
