@@ -19,18 +19,60 @@ import jax.numpy as jnp
 import torch
 from torchtitan.models.common.attention import segment_ids_from_positions
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
 
-try:
-  from torch.distributed.tensor import DTensor
-except ImportError:
-  DTensor = None
-
 custom_jax_kernel = pallas.custom_jax_kernel
 
 _DEFAULT_MASK_VALUE = splash_attention_kernel.DEFAULT_MASK_VALUE
+
+
+def _document_aware_mask_info(mask_info, segment_ids_b, block_q, block_kv, is_dkv):
+  """Extend block sparsity to skip tiles that are entirely cross-document.
+
+  `segment_ids` alone masks scores *inside* tiles the kernel already chose to
+  visit; that choice comes from `block_mask`, built from the static `CausalMask`
+  and blind to documents -- so packed sequences still multiply fully-masked
+  tiles and discard them.
+
+  `segment_ids` is non-decreasing, so a block's documents are the interval
+  [min, max] over it and a tile has a same-document pair iff two intervals
+  overlap: exact, and O(num_blocks). Only `block_mask` and `data_next` change,
+  the latter mirroring JAX's `_process_dynamic_mask`.
+  """
+  base_block_mask = mask_info.block_mask
+  base_data_next = mask_info.data_next
+  if base_block_mask is None or base_data_next is None:
+    return mask_info
+
+  seq_len = segment_ids_b.shape[-1]
+  num_q_blocks, q_rem = divmod(seq_len, block_q)
+  num_kv_blocks, kv_rem = divmod(seq_len, block_kv)
+  if q_rem or kv_rem:
+    return mask_info
+  if base_block_mask.shape[-2:] != (num_q_blocks, num_kv_blocks):
+    # Sharded or otherwise unexpected layout: leave the static metadata alone.
+    return mask_info
+
+  q_seg = segment_ids_b.reshape(num_q_blocks, block_q)
+  kv_seg = segment_ids_b.reshape(num_kv_blocks, block_kv)
+  q_lo, q_hi = jnp.min(q_seg, axis=-1), jnp.max(q_seg, axis=-1)
+  kv_lo, kv_hi = jnp.min(kv_seg, axis=-1), jnp.max(kv_seg, axis=-1)
+  overlaps = (q_lo[:, None] <= kv_hi[None, :]) & (kv_lo[None, :] <= q_hi[:, None])
+
+  block_mask = jnp.where(overlaps[None], base_block_mask, 0).astype(
+      base_block_mask.dtype
+  )
+  if is_dkv:
+    data_next = jnp.arange(num_q_blocks, dtype=jnp.int32)[None, :, None]
+  else:
+    data_next = jnp.arange(num_kv_blocks, dtype=jnp.int32)[None, None, :]
+  data_next = jnp.where(
+      block_mask == 0, 0, jnp.broadcast_to(data_next, block_mask.shape)
+  ).astype(base_data_next.dtype)
+  return mask_info._replace(block_mask=block_mask, data_next=data_next)
 
 
 def _make_splash_attention_fn(
@@ -145,13 +187,21 @@ def _make_splash_attention_fn(
     """Forward for one batch element; returns (out_b, logsumexp_b)."""
     # q_b is already scaled (q * 1/sqrt(head_dim)) from the caller.
     seg_ids = None
+    fwd_mask_info_b = fwd_mask_info
     if segment_ids_b is not None:
       seg_ids = splash_attention_kernel.SegmentIds(
           q=segment_ids_b, kv=segment_ids_b
       )
+      fwd_mask_info_b = _document_aware_mask_info(
+          fwd_mask_info,
+          segment_ids_b,
+          block_sizes.block_q,
+          block_sizes.block_kv,
+          is_dkv=False,
+      )
 
     out_b, (logsumexp_b,) = splash_attention_kernel._splash_attention_forward(
-        fwd_mask_info,
+        fwd_mask_info_b,
         q_b,
         k_b,
         v_b,
@@ -199,10 +249,27 @@ def _make_splash_attention_fn(
       segment_ids_b: Segment IDs for a single batch element.
     """
     seg_ids = None
+    dq_mask_info_b = dq_mask_info
+    dkv_mask_info_b = dkv_mask_info
     if segment_ids_b is not None:
       seg_ids = splash_attention_kernel.SegmentIds(
           q=segment_ids_b, kv=segment_ids_b
       )
+      dkv_mask_info_b = _document_aware_mask_info(
+          dkv_mask_info,
+          segment_ids_b,
+          block_sizes.block_q_dkv,
+          block_sizes.block_kv_dkv,
+          is_dkv=True,
+      )
+      if dq_mask_info is not None:
+        dq_mask_info_b = _document_aware_mask_info(
+            dq_mask_info,
+            segment_ids_b,
+            block_sizes.block_q_dq,
+            block_sizes.block_kv_dq,
+            is_dkv=False,
+        )
 
     res = (
         q_scaled_b,
@@ -212,8 +279,8 @@ def _make_splash_attention_fn(
         None,  # sinks
         out_b,
         logsumexp_b,
-        dq_mask_info,
-        dkv_mask_info,
+        dq_mask_info_b,
+        dkv_mask_info_b,
     )
     all_grads = splash_attention_kernel._splash_attention_bwd(
         False,  # save_residuals (nondiff)
@@ -539,19 +606,19 @@ class SplashAttention(nn.Module):
     # Override is_causal if passed explicitly, else use stored value
     causal = is_causal if is_causal is not None else self.is_causal
 
-    q_is_dt = DTensor is not None and isinstance(q, DTensor)
+    q_is_dt = isinstance(q, DTensor)
     q_mesh = q_placements = None
     if q_is_dt:
       q_mesh, q_placements = q.device_mesh, q.placements
       q = q.to_local()
 
-    if DTensor is not None and isinstance(k, DTensor):
+    if isinstance(k, DTensor):
       k = k.to_local()
-    if DTensor is not None and isinstance(v, DTensor):
+    if isinstance(v, DTensor):
       v = v.to_local()
-    if DTensor is not None and isinstance(positions, DTensor):
+    if isinstance(positions, DTensor):
       positions = positions.to_local()
-    if DTensor is not None and isinstance(segment_ids, DTensor):
+    if isinstance(segment_ids, DTensor):
       segment_ids = segment_ids.to_local()
 
     # TorchTitan passes tensors as (B, S, H, D). However, the splash_sdpa
