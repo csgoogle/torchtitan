@@ -16,6 +16,13 @@ import time
 from typing import Any, Callable
 
 import torch
+
+from torchtitan.experiments.graph_trainer.remove_noop_passes import (
+    remove_parameter_gradient_markers_pass,
+)
+from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+    apply_tpu_remat_schedule,
+)
 from torchtitan.tools.logging import logger
 
 
@@ -113,7 +120,7 @@ def construct_tpu_pass_pipeline(
     config: "GraphTrainer.Config",
 ) -> list[Callable]:
     """Build the pass list for the 'tpu' pipeline."""
-    passes: list[Callable] = []
+    passes: list[Callable] = [remove_parameter_gradient_markers_pass]
 
     memory_policy = getattr(config.compile, "memory_policy", "none")
     if memory_policy and memory_policy != "none":
@@ -126,6 +133,16 @@ def construct_tpu_pass_pipeline(
             functools.partial(tag_with_memory_policy_pass, config=config)
         )
         passes.append(selective_activation_remat_pass)
+        # This pass pipeline is constructed only by TpuGraphTrainer. Do not
+        # gate on use_graph_trainer here: compile_mode="aot_fx_trace" also
+        # selects TpuGraphTrainer without setting that legacy selector.
+        if config.tpu_config.enable_graph_trainer_remat_schedule:
+            passes.append(
+                functools.partial(
+                    apply_tpu_remat_schedule,
+                    num_static_inputs=traced_result.num_static_inputs,
+                )
+            )
         logger.info(
             f"[tpu_backend_pass] activation checkpointing enabled "
             f"(memory_policy={memory_policy!r}); prepended "
