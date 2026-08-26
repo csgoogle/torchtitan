@@ -9,6 +9,7 @@ import torch
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
+import torchtitan.distributed.activation_checkpoint
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
     data_parallel as simple_fsdp_data_parallel,
@@ -29,6 +30,8 @@ def parallelize_llama(
     dump_folder: str,
     skip_dp: bool = False,
     tpu_compile_mode: str = "layer",
+    tpu_use_scan: bool = False,
+    tpu_scan_peel_first_layer: bool = False,
     **kwargs,
 ) -> nn.Module:
   """Parallelizes the Llama model based on the provided configuration and applies TPU-specific workarounds.
@@ -43,6 +46,15 @@ def parallelize_llama(
     dump_folder: Folder for dumped artifacts.
     skip_dp: Whether to skip data parallelism wrapping.
     tpu_compile_mode: TPU compile mode ('layer' or 'fullgraph').
+    tpu_use_scan: Replace the decoder's per-layer Python loop with a single
+      `scan` HOP, so the N identical blocks compile to one `stablehlo.while`.
+    tpu_scan_peel_first_layer: Run layer 0 outside the scan. Required when the
+      block calls a JAX-exported kernel (splash attention); see
+      `scan_model.ScannedLayerStack.forward`.
+
+  Raises:
+    ValueError: if `tpu_use_scan` is set outside the configuration it is known
+      to be correct in.
   """
   # TODO b/499075866: re-enable CPU offload for TPU torchtitan run.
   if training.enable_cpu_offload:
@@ -53,8 +65,52 @@ def parallelize_llama(
 
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
+  scanned_layers = None
   if compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
+
+  if tpu_use_scan:
+    # Must run before anything else rewrites `model.layers`: AC wrapping and
+    # FSDP both iterate the ModuleDict's children, and the scanned stack has a
+    # different child structure. The guards below fence off the combinations
+    # that are not validated yet rather than letting them fail silently.
+    if compile_mode != "fullgraph":
+      raise ValueError(
+          "tpu_config.use_scan requires tpu_config.compile_mode='fullgraph' on"
+          " this path. 'layer' compiles each block separately, which is exactly"
+          " what the scan removes. 'aot_fx_trace' is not unsupported, it just"
+          " lives elsewhere: scan + aot_fx_trace runs through the graph"
+          " trainer's parallelize_scan.py, so pass"
+          " --tpu-config.use-graph-trainer with it."
+      )
+    if ac_config is not None and not isinstance(
+        ac_config, torchtitan.distributed.activation_checkpoint.FullAC.Config
+    ):
+      raise ValueError(
+          "tpu_config.use_scan supports activation_checkpoint=none or =full."
+          " `torch.utils.checkpoint` inside a scan body is a SILENT no-op --"
+          " the HOP re-traces the body and drops the recompute tags, so you"
+          " get min-cut's saved set with no warning. Activation memory for the"
+          " scanned stack comes from an FX tagging pass on the body's joint"
+          " graph instead, and only the 'full' policy has one."
+      )
+    from torchtitan.experiments.tpu.scan.fsdp import (  # pylint: disable=g-import-not-at-top
+        shard_stacked_layers,
+    )
+    from torchtitan.experiments.tpu.scan.layer_stack import (  # pylint: disable=g-import-not-at-top
+        install_scan_over_layers,
+    )
+
+    scanned_layers = install_scan_over_layers(
+        model,
+        parallel_dims=parallel_dims,
+        peel_first_layer=tpu_scan_peel_first_layer,
+    )
+
+    # The block-wrapping AC policies iterate `layers`' children, which the
+    # scanned stack no longer has; the tagging pass below replaces them.
+    recompute_scan_body = ac_config is not None
+    ac_config = None
 
   if effective_compile_config.enable and hasattr(model, "layers"):
     for layer in model.layers.values():
@@ -88,6 +144,19 @@ def parallelize_llama(
           dp_mesh,
           mode=dp_mode,
           mp_policy=mp_policy,
+          ignored_params=(
+              None
+              if scanned_layers is None
+              else set(scanned_layers.stacked_parameters())
+          ),
+      )
+    if scanned_layers is not None:
+      shard_stacked_layers(
+          scanned_layers,
+          dp_mesh=dp_mesh,
+          dp_mode=dp_mode,
+          mp_policy=mp_policy,
+          recompute_body=recompute_scan_body,
       )
     logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
   else:

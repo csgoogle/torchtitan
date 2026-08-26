@@ -28,6 +28,23 @@ def _extract_splash_kwargs(sa_config: Any) -> dict[str, Any]:
   return kwargs
 
 
+def _attention_modules(model: nn.Module):
+  """`named_modules()`, plus the per-layer modules a `ScannedLayerStack` hides.
+
+  The stack keeps its layers in a plain list rather than the module tree, so
+  their post-stacking `meta` parameters never reach `.parameters()` /
+  `state_dict()`. Layer 0 is the template `functional_call` runs on inside the
+  scan body, so a patch that rewrites `forward` has to reach it — on the
+  graph_trainer lane the patches are applied after parallelization, when the
+  stack already exists.
+  """
+  for name, module in model.named_modules():
+    yield name, module
+    for i, layer in enumerate(getattr(module, "_shadow_layers", ()) or ()):
+      for sub_name, sub in layer.named_modules():
+        yield f"{name}._shadow_layers.{i}.{sub_name}", sub
+
+
 def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
   """Patches splash attention into the model."""
   from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa as standard_splash_sdpa  # pylint: disable=g-import-not-at-top
@@ -146,7 +163,7 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
   _patched = 0
   _windowed = 0
   _causal = 0
-  for _, module in model.named_modules():
+  for _, module in _attention_modules(model):
     cls_name = type(module).__name__
     if "ScaledDotProductAttention" in cls_name:
       if "[redacted]" in type(module).__module__:
@@ -160,7 +177,7 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
         _causal += 1
 
   if _patched == 0:
-    all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
+    all_classes = sorted(list({type(m).__name__ for _, m in _attention_modules(model)}))
     raise ValueError(
         "Splash attention patch was requested but NO matching attention "
         f"modules (ScaledDotProductAttention) were found in the model. Found module types: {all_classes}"
@@ -266,7 +283,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
   _patched = 0
   _windowed = 0
   _causal = 0
-  for _, module in model.named_modules():
+  for _, module in _attention_modules(model):
     cls_name = type(module).__name__
     if "ScaledDotProductAttention" in cls_name:
       if "[redacted]" in type(module).__module__:
@@ -280,7 +297,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         _causal += 1
 
   if _patched == 0:
-    all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
+    all_classes = sorted(list({type(m).__name__ for _, m in _attention_modules(model)}))
     raise ValueError(
         "Tokamax splash attention patch was requested but NO matching "
         f"attention modules (ScaledDotProductAttention) were found in the model. Found module types: {all_classes}"

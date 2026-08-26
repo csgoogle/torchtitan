@@ -30,6 +30,7 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 )
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
+from torchtitan.experiments.tpu.scan import resolve_peel_first_layer
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
@@ -270,6 +271,11 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
           kwargs.pop("tpu_compile_mode", None)
         else:
           kwargs["tpu_compile_mode"] = train_config.tpu_config.compile_mode
+      if model_spec.name == "llama3" and train_config.tpu_config.use_scan:
+        kwargs["tpu_use_scan"] = True
+        kwargs["tpu_scan_peel_first_layer"] = resolve_peel_first_layer(
+            train_config
+        )
     if model_spec.name in (
         "redacted",
         "redacted_tpu",
