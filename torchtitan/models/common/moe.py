@@ -228,6 +228,7 @@ class MoELoadBalanceAuxLoss(Module):
         self.dp_mesh: DeviceMesh | None = None
         self.cp_mesh: DeviceMesh | None = None
         self.tp_mesh: DeviceMesh | None = None
+        self.collect_routing_metrics = False
 
     def set_meshes(
         self,
@@ -268,6 +269,10 @@ class MoELoadBalanceAuxLoss(Module):
                 cp_mesh=self.cp_mesh,
                 tp_mesh=self.tp_mesh,
             )
+            if self.collect_routing_metrics:
+                self._last_local_normalized_aux_loss = (
+                    aux_loss / scaled_coeff
+                ).detach().float()
         return _AuxLossAutograd.apply(topk_scores_BLK, aux_loss)
 
 
@@ -299,6 +304,19 @@ def configure_moe_aux_loss_reduction(model: nn.Module, parallel_dims) -> None:
 
 
 # END PR3000 cherry-pick.
+
+
+def _tokens_per_expert(
+    topk_expert_ids_BLK: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Count selected routes without materializing a ``(B, L, E)`` map."""
+    return torch.histc(
+        topk_expert_ids_BLK.reshape(-1).float(),
+        bins=num_experts,
+        min=0,
+        max=num_experts,
+    ).to(torch.int64)
 
 
 class GroupedExperts(Module):
@@ -725,16 +743,18 @@ class MoE(Module):
                 topk_expert_ids_BLK,
             )
 
-        # Build a one-hot routing map (B, L, E) marking the experts each token
-        # is routed to. Under TP/SP the router outputs are DTensors sharded on
-        # the token dim; scatter_ writes along the (replicated) expert dim, so
-        # DTensor runs it as a local op with no redistribution.
-        routing_map_BLE = torch.zeros_like(scores_BLE, dtype=torch.bool).scatter_(
-            -1,
+        num_local_tokens_per_expert_E = _tokens_per_expert(
             topk_expert_ids_BLK,
-            True,
+            scores_BLE.size(-1),
         )
-        num_local_tokens_per_expert_E = routing_map_BLE.sum(dim=(0, 1))
+        if (
+            self.training
+            and self.aux_loss is not None
+            and self.aux_loss.collect_routing_metrics
+        ):
+            self.aux_loss._last_local_tokens_per_expert_E = (
+                num_local_tokens_per_expert_E.detach().float()
+            )
 
         # tokens_per_expert_E will be used to update the expert bias for load balancing,
         # and also to count the expert usage.

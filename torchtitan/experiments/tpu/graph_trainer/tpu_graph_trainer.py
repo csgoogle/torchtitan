@@ -28,6 +28,10 @@ from typing import Any, Optional
 
 import torch
 
+from torchtitan.components.optimizer import (
+    collect_moe_routing_metric_tensors,
+    set_moe_routing_metric_tensors,
+)
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.functional import (
@@ -102,7 +106,10 @@ class TpuGraphTrainer(GraphTrainer):
 
         super().__init__(config)
 
-        if isinstance(config, TPUTrainerConfig):
+        if (
+            isinstance(config, TPUTrainerConfig)
+            and config.loss_kernel.use_loss_kernel
+        ):
             from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
 
             self.loss_fn = build_cross_entropy_loss(config)
@@ -304,7 +311,11 @@ class TpuGraphTrainer(GraphTrainer):
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
             else:
-                fwd_bwd_fn = make_fwd_bwd_step(model, self.loss_fn)
+                fwd_bwd_fn = make_fwd_bwd_step(
+                    model,
+                    self.loss_fn,
+                    collect_moe_routing_metrics=self._collect_moe_routing_metrics,
+                )
                 maybe_register_blockmask_pytree_node()
                 with self.train_context():
                     self._traced_step = minimal_fx_tracer(
@@ -336,7 +347,11 @@ class TpuGraphTrainer(GraphTrainer):
                 extra_kwargs,
             )
         loss = outputs[0]
-        grads = outputs[1:]
+        grads = outputs[1 : 1 + len(params)]
+        if self._collect_moe_routing_metrics:
+            set_moe_routing_metric_tensors(
+                [model], list(outputs[1 + len(params) :])
+            )
 
         for param, grad in zip(params, grads, strict=True):
             if param.requires_grad and grad is not None:
@@ -389,6 +404,7 @@ class TpuGraphTrainer(GraphTrainer):
                 eps=eps,
                 weight_decay=wd,
                 max_norm=max_norm,
+                collect_moe_routing_metrics=self._collect_moe_routing_metrics,
             )
 
             with self.train_context():
@@ -424,6 +440,10 @@ class TpuGraphTrainer(GraphTrainer):
         new_exp_avgs = outputs[1 + n : 1 + 2 * n]
         new_exp_avg_sqs = outputs[1 + 2 * n : 1 + 3 * n]
         new_step = outputs[1 + 3 * n]
+        if self._collect_moe_routing_metrics:
+            set_moe_routing_metric_tensors(
+                [model], list(outputs[2 + 3 * n :])
+            )
 
         from torchtitan.experiments.tpu.compiled_optimizers.functional import update_model_and_optstate_buffers
 
@@ -455,6 +475,7 @@ def _make_fwd_bwd_adamw_fn(
     eps: float,
     weight_decay: float,
     max_norm: float | None = None,
+    collect_moe_routing_metrics: bool = False,
 ):
     from torchtitan.experiments.graph_trainer.common_utils import compute_annotated_loss
     from torchtitan.experiments.tpu.compiled_optimizers.functional import (
@@ -467,6 +488,11 @@ def _make_fwd_bwd_adamw_fn(
         inputs, labels, global_valid_tokens, extra_kwargs
     ):
         pred = model(inputs, **extra_kwargs)
+        routing_metrics = (
+            collect_moe_routing_metric_tensors([model])
+            if collect_moe_routing_metrics
+            else []
+        )
         loss = compute_annotated_loss(
             loss_fn,
             pred,
@@ -514,7 +540,14 @@ def _make_fwd_bwd_adamw_fn(
             foreach=False,
             capturable=True,
         )
-        return [loss, *new_params, *new_eas, *new_eass, new_steps[0]]
+        return [
+            loss,
+            *new_params,
+            *new_eas,
+            *new_eass,
+            new_steps[0],
+            *routing_metrics,
+        ]
 
     return fwd_bwd_adamw
 

@@ -255,7 +255,7 @@ def qwen3_30b_a3b() -> Trainer.Config:
 def qwen3_30b_a3b_global_aux() -> Trainer.Config:
     config = qwen3_30b_a3b()
     config.model_spec = model_registry("30B-A3B-global-aux")
-    config.metrics = MetricsProcessor.Config(log_freq=1)
+    config.metrics = MetricsProcessor.Config(log_freq=1, enable_moe_routing=True)
     config.optimizer = default_adamw(lr=3e-4)
     config.lr_scheduler = LRSchedulersContainer.Config(
         warmup_steps=200,
