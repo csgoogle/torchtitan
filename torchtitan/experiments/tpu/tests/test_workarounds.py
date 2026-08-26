@@ -173,7 +173,7 @@ class WorkaroundsTest(parameterized.TestCase):
     torch.testing.assert_close(upstream_out, patched_out)
 
   def test_wrapper_conversion_positions_to_segment_ids(self):
-    """Test that patched splash attention receives positions and converts them correctly."""
+    """Patched splash attention converts positions to segment ids."""
     import unittest.mock
     from torchtitan.experiments.tpu import workarounds
     from torchtitan.models.common.attention import GQAttention as Attention
@@ -253,6 +253,127 @@ class WorkaroundsTest(parameterized.TestCase):
           .to("cpu")
       )
       torch.testing.assert_close(segment_ids, expected_segment_ids)
+
+
+  def test_pallas_loss_linear_preserves_state_dict_keys(self):
+    """The loss-kernel wrapper must not rename the output-projection parameter.
+
+    use_output_projection_patch replaces lm_head with PallasLossLinear. If the
+    wrapper holds the Linear as a child module the parameter becomes
+    `lm_head.original_linear.weight`, which the model state dict adapters cannot
+    map -- loading pretrained HF safetensors then dies with
+    KeyError: 'lm_head.original_linear.weight'.
+    """
+    import torch.nn as nn
+    from torchtitan.experiments.tpu import workarounds
+
+    class _TinyModel(nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.lm_head = nn.Linear(8, 16, bias=False)
+
+    model = _TinyModel()
+    before = sorted(model.state_dict().keys())
+    original_weight = model.lm_head.weight
+
+    workarounds.use_output_projection_patch(model)
+
+    self.assertIsInstance(model.lm_head, workarounds.PallasLossLinear)
+    self.assertEqual(
+        sorted(model.state_dict().keys()),
+        before,
+        "loss-kernel patch renamed the output projection parameter",
+    )
+    # The Parameter object must be the same one, so FSDP shards it in place and
+    # weight tying (lm_head.weight is tok_embeddings.weight) still holds.
+    self.assertIs(model.lm_head.weight, original_weight)
+    self.assertIsInstance(model.lm_head.weight, nn.Parameter)
+
+    # And the wrapper still does its job: return (x, W^T) for the Pallas loss.
+    x = torch.randn(2, 3, 8)
+    out, weight_t = model.lm_head(x)
+    torch.testing.assert_close(out, x)
+    self.assertEqual(tuple(weight_t.shape), (8, 16))
+
+  def test_pallas_loss_linear_patches_output_and_output_transform(self):
+    """Key preservation must also hold for `output` / `output_transform`."""
+    import torch.nn as nn
+    from torchtitan.experiments.tpu import workarounds
+
+    for attr in ("output", "output_transform"):
+      model = nn.Module()
+      setattr(model, attr, nn.Linear(4, 6, bias=False))
+      before = sorted(model.state_dict().keys())
+
+      workarounds.use_output_projection_patch(model)
+
+      self.assertIsInstance(getattr(model, attr), workarounds.PallasLossLinear)
+      self.assertEqual(
+          sorted(model.state_dict().keys()), before, f"{attr} was renamed"
+      )
+
+
+  def test_loss_kernel_patch_keeps_hf_state_dict_adapter_working(self):
+    """A patched model must still convert through the HF state dict adapter.
+
+    This is the end-to-end regression: apply_patches runs before
+    checkpointer.load(), so if the loss-kernel patch renames the output
+    projection, loading pretrained HF safetensors dies in to_hf with
+    KeyError: 'lm_head.original_linear.weight'.
+    """
+    from torchtitan.models.llama3 import llama3_configs
+    from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
+    from torchtitan.experiments.tpu import workarounds
+
+    config = llama3_configs["debugmodel"](attn_backend="sdpa")
+    adapter = Llama3StateDictAdapter(config, None)
+
+    with torch.device("meta"):
+      model = config.build()
+    workarounds.use_output_projection_patch(model)
+    self.assertIsInstance(model.lm_head, workarounds.PallasLossLinear)
+
+    # Must not raise, and must produce the HF-side name.
+    hf_state_dict = adapter.to_hf(dict(model.state_dict()))
+    self.assertIn("lm_head.weight", hf_state_dict)
+
+
+  def test_loss_kernel_patch_preserves_weight_initialization(self):
+    """A patched model must still have its output projection initialized.
+
+    apply_patches runs before the trainer materializes weights, and
+    Module.init_states initializes by recursing over children(). A wrapper that
+    adopts the Parameter instead of keeping the Linear as a child drops out of
+    that walk, leaving lm_head.weight all zeros for any run that does not load a
+    checkpoint -- i.e. every from-scratch pretraining run, which then NaNs on
+    the first step. SFT-from-pretrained cannot catch this, because the
+    checkpoint load
+    overwrites the zeros.
+    """
+    from torchtitan.models.llama3 import llama3_configs
+    from torchtitan.experiments.tpu import workarounds
+
+    config = llama3_configs["debugmodel"](attn_backend="sdpa")
+
+    def build(patch):
+      torch.manual_seed(0)
+      with torch.device("meta"):
+        model = config.build()
+      if patch:
+        workarounds.use_output_projection_patch(model)
+      model.to_empty(device="cpu")
+      model.init_states()
+      return model.lm_head.weight
+
+    baseline = build(patch=False)
+    patched = build(patch=True)
+
+    self.assertTrue(torch.isfinite(patched).all(), "lm_head weight is not finite")
+    self.assertGreater(
+        patched.float().std().item(), 0.0, "lm_head weight was never initialized"
+    )
+    torch.testing.assert_close(patched, baseline)
 
 
 if __name__ == "__main__":

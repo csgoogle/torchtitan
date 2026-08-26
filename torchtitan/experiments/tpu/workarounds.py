@@ -336,11 +336,39 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
 
 
 class PallasLossLinear(nn.Module):
-  """Wrapper for model.output to return (x, weight) for Pallas loss."""
+  """Wrapper for model.output to return (x, weight) for Pallas loss.
+
+  Holding the Linear module as a child names the parameter
+  ``lm_head.original_linear.weight`` which is not mapped by model state dict
+  adapters and breaks loading from checkpoint with a KeyError. We add hooks to
+  fix at state-dict layer to strip the ``original_linear`` infix on save and
+  restore on load, making the wrapper invisible to checkpointing paths but
+  preserving module tree hierarchy.
+  """
+
+  _INFIX = "original_linear."
 
   def __init__(self, original_linear: nn.Linear):
     super().__init__()
     self.original_linear = original_linear
+    self._register_state_dict_hook(PallasLossLinear._strip_infix)
+    self._register_load_state_dict_pre_hook(self._restore_infix)
+
+  @staticmethod
+  def _strip_infix(module, state_dict, prefix, local_metadata):
+    """Rename ``<prefix>original_linear.X`` -> ``<prefix>X`` on the way out."""
+    for key in [k for k in state_dict if k.startswith(prefix + module._INFIX)]:
+      state_dict[prefix + key[len(prefix + module._INFIX):]] = state_dict.pop(key)
+    return state_dict
+
+  def _restore_infix(self, state_dict, prefix, *args, **kwargs):
+    """Rename ``<prefix>X`` -> ``<prefix>original_linear.X`` on the way in."""
+    for key in [
+        k
+        for k in state_dict
+        if k.startswith(prefix) and not k.startswith(prefix + self._INFIX)
+    ]:
+      state_dict[prefix + self._INFIX + key[len(prefix):]] = state_dict.pop(key)
 
   @property
   def weight(self) -> torch.Tensor:
