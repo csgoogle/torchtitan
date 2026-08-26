@@ -18,6 +18,7 @@ from torchtitan.components.optimizer import (
 from torchtitan.experiments.graph_trainer.common_utils import (
     accumulate_param_grads_,
     compute_annotated_loss,
+    compute_parameter_gradients,
     log_timer,
     maybe_register_blockmask_pytree_node,
 )
@@ -41,6 +42,9 @@ from torchtitan.experiments.graph_trainer.registry import (
     PRE_TRAIN_STEP_HOOKS,
     TRACE_CALL_INPUT_PREPARERS,
     TRACE_INPUT_PREPARERS,
+)
+from torchtitan.experiments.graph_trainer.remove_noop_passes import (
+    remove_parameter_gradient_markers_pass,
 )
 from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
@@ -96,12 +100,12 @@ def make_fwd_bwd_step(model, loss_fn, collect_moe_routing_metrics: bool = False)
             labels,
             {"global_valid_tokens": global_valid_tokens},
         )
-        params = [
-            p
-            for _, p in model.named_parameters(remove_duplicate=False)
-            if p.requires_grad
+        named_params = [
+            (name, parameter)
+            for name, parameter in model.named_parameters(remove_duplicate=False)
+            if parameter.requires_grad
         ]
-        grads = torch.autograd.grad(loss, params)
+        grads = compute_parameter_gradients(loss, named_params)
         return [loss, *grads, *routing_metrics]
 
     return fwd_bwd_step
@@ -260,7 +264,6 @@ class GraphTrainer(Trainer):
                         global_valid_tokens,
                         extra_kwargs,
                     )
-
             if self.config.compile.enable_passes:
                 pipeline_fn = PASS_PIPELINE_REGISTRY.get(
                     self.config.compile.pass_pipeline,
@@ -277,6 +280,10 @@ class GraphTrainer(Trainer):
                     self._traced_step.example_inputs,
                     passes,
                     compile_config=self.config.compile,
+                )
+            else:
+                self._traced_step.gm = remove_parameter_gradient_markers_pass(
+                    self._traced_step.gm, self._traced_step.example_inputs
                 )
         with self.train_context():
             outputs = run_traced(self._traced_step, module=model)(
