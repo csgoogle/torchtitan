@@ -18,7 +18,6 @@ class TpuGraphTrainerDistributedTest(
 ):
   """Tests the distributed training setup under TpuGraphTrainer."""
 
-  # Tests only for Qwen3 Dense model for now
   @parameterized.named_parameters([
       dict(
           testcase_name="qwen3_simple_fsdp",
@@ -28,6 +27,36 @@ class TpuGraphTrainerDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--tpu_config.use_simple_fsdp",
+          ],
+      ),
+      # The 70B target configuration, on a debug model and the devices of one
+      # host. Every part of it is covered somewhere already -- the scan lowers
+      # to one `stablehlo.while` (`tests/test_scan_lowering.py`), the loop
+      # survives XLA (`tests/test_scan_compiled_hlo.py`), the in-body gather
+      # lands inside the body (`tests/test_scan_fsdp_lowering.py`), the
+      # compiled optimizer steps on device
+      # (`compiled_optimizers/tests/test_functional.py`) -- each in isolation
+      # and most of them structurally. Nothing ran the four together, which is
+      # the only form the target actually uses, so until now the first check
+      # that the combination trains at all was a 70B job on four slices.
+      dict(
+          testcase_name="llama3_scan_compiled_optimizer",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              # Both spellings: the graph-trainer lane reads
+              # `parallelism.use_simple_fsdp` (scan's in-body gather is a
+              # simple_fsdp parametrization plan) while the TPU trainer reads
+              # its own. `llama3_70b` sets the first from the config function;
+              # the debug config does not, so the target's shape has to be
+              # asked for here.
+              "--parallelism.use_simple_fsdp",
+              "--tpu_config.use_simple_fsdp",
+              "--tpu_config.use_scan",
+              "--tpu_config.compile_optimizer",
+              "--tpu_config.graph_trainer_memory_policy=full",
           ],
       ),
   ])

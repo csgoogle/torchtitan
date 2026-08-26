@@ -407,16 +407,15 @@ def apply_cp_to_attention(
     apply_cp_to_forward(attention_modules, parallel_dims.get_mesh("cp"))
 
 
-def apply_simple_fsdp(
-    model: nn.Module,
-    *,
+def resolve_dp_plan(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
-) -> nn.Module:
-    """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
+) -> tuple[Any, str, MixedPrecisionPolicy]:
+    """Return the ``(dp_mesh, dp_mode, mp_policy)`` triple simple_fsdp wraps with.
 
-    For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
-    on the EDP mesh when expert parallelism is enabled.
+    Split out of ``apply_simple_fsdp`` so a caller that wraps two disjoint
+    parameter groups on the same mesh (e.g. a scanned layer stack sharded on a
+    different dim than the rest of the model) derives both from one plan.
     """
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
@@ -429,11 +428,32 @@ def apply_simple_fsdp(
         dp_mesh_dim_names = ["fsdp"]
         dp_mode = "fully_shard"
 
-    dp_mesh = parallel_dims.get_mesh(dp_mesh_dim_names)
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+    return (
+        parallel_dims.get_mesh(dp_mesh_dim_names),
+        dp_mode,
+        MixedPrecisionPolicy(
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        ),
     )
+
+
+def apply_simple_fsdp(
+    model: nn.Module,
+    *,
+    parallel_dims: ParallelDims,
+    training: TrainingConfig,
+    ignored_params: set[nn.Parameter] | None = None,
+) -> nn.Module:
+    """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
+
+    For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
+    on the EDP mesh when expert parallelism is enabled.
+
+    ``ignored_params`` are left unwrapped, for a caller that wraps them itself
+    under a different sharding plan.
+    """
+    dp_mesh, dp_mode, mp_policy = resolve_dp_plan(parallel_dims, training)
 
     if parallel_dims.ep_enabled and isinstance(model, Decoder):
         edp_mesh_names = (
@@ -467,6 +487,7 @@ def apply_simple_fsdp(
         dp_mesh,
         dp_mode,
         mp_policy=mp_policy,
+        ignored_params=ignored_params,
     )
     logger.info(
         "Applied Data Parallel (simple_fsdp) (dp mode=%s) to the model", dp_mode
