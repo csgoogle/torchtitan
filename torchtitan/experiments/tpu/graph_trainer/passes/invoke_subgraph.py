@@ -162,6 +162,23 @@ def _replace_call_modules(gm: fx.GraphModule) -> tuple[int, set[str]]:
     return replaced, identifiers
 
 
+def _split_convex_regions(nodes: list[fx.Node]) -> list[list[fx.Node]]:
+    """Split a layer into maximal convex regions around outer-graph nodes."""
+    regions: list[list[fx.Node]] = []
+    current: list[fx.Node] = []
+    for node in nodes:
+        candidate = [*current, node]
+        if validate_partition(candidate):
+            current = candidate
+            continue
+        if current:
+            regions.append(current)
+        current = [node]
+    if current:
+        regions.append(current)
+    return regions
+
+
 def outline_transformer_layers_pass(
     gm: fx.GraphModule,
     example_inputs=None,
@@ -183,16 +200,15 @@ def outline_transformer_layers_pass(
     partitions = []
     skipped = []
     for key, nodes in grouped.items():
-        if len(nodes) < min_region_nodes:
-            skipped.append((key, "too small"))
-            continue
         if not _has_tensor_boundary(nodes):
             skipped.append((key, "non-tensor boundary"))
             continue
-        if not validate_partition(nodes):
-            skipped.append((key, "dependency cycle"))
-            continue
-        partitions.append(dict.fromkeys(nodes))
+        regions = _split_convex_regions(nodes)
+        for region_index, region in enumerate(regions):
+            if len(region) < min_region_nodes:
+                skipped.append(((key, region_index), "too small"))
+                continue
+            partitions.append(dict.fromkeys(region))
 
     if not partitions:
         logger.warning(

@@ -138,6 +138,30 @@ def _make_overlap_graph() -> fx.GraphModule:
     return fx.GraphModule(torch.nn.Module(), graph)
 
 
+def _make_nonconvex_layer_graph() -> fx.GraphModule:
+    graph = fx.Graph()
+    x = _set_tensor_meta(graph.placeholder("x"))
+    weight = _set_tensor_meta(graph.placeholder("weight"))
+    first = _set_layer_meta(
+        graph.call_function(torch.ops.aten.mm.default, args=(x, weight)),
+        0,
+        backward=False,
+    )
+    barrier = _set_tensor_meta(
+        graph.call_function(
+            torch.ops._c10d_functional.wait_tensor.default,
+            args=(first,),
+        )
+    )
+    second = _set_layer_meta(
+        graph.call_function(torch.ops.aten.mm.default, args=(barrier, weight)),
+        0,
+        backward=False,
+    )
+    graph.output(second)
+    return fx.GraphModule(torch.nn.Module(), graph)
+
+
 class InvokeSubgraphPassTest(unittest.TestCase):
 
     def test_prototype_flags_default_off(self) -> None:
@@ -255,6 +279,22 @@ class InvokeSubgraphPassTest(unittest.TestCase):
                 if node.op == "call_function"
             }
             self.assertEqual(subgraph_targets, {torch.ops.aten.mm.default})
+
+    def test_nonconvex_layer_is_split_around_outer_node(self) -> None:
+        gm = _make_nonconvex_layer_graph()
+        gm = outline_transformer_layers_pass(gm, min_region_nodes=1)
+        nodes = list(gm.graph.nodes)
+        invoke_nodes = [
+            node
+            for node in nodes
+            if node.op == "call_function"
+            and node.target is torch.ops.higher_order.invoke_subgraph
+        ]
+        self.assertEqual(len(invoke_nodes), 2)
+        self.assertIn(
+            torch.ops._c10d_functional.wait_tensor.default,
+            {node.target for node in nodes if node.op == "call_function"},
+        )
 
 
 if __name__ == "__main__":
