@@ -302,7 +302,12 @@ class TpuGraphTrainer(GraphTrainer):
             minimal_fx_tracer,
         )
         from torchtitan.experiments.graph_trainer.trainer import make_fwd_bwd_step
-        from torchtitan.experiments.graph_trainer.passes import apply_graph_passes
+        from torchtitan.experiments.graph_trainer.passes import (
+            apply_graph_passes,
+        )
+        from torchtitan.experiments.graph_trainer.remove_noop_passes import (
+            remove_parameter_gradient_markers_pass,
+        )
         from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
             PASS_PIPELINE_REGISTRY,
         )
@@ -329,7 +334,6 @@ class TpuGraphTrainer(GraphTrainer):
                         global_valid_tokens,
                         extra_kwargs,
                     )
-
             if self.config.compile.enable_passes:
                 pipeline_fn = PASS_PIPELINE_REGISTRY["tpu"]
                 passes = pipeline_fn(self._traced_step, self.config)
@@ -338,6 +342,10 @@ class TpuGraphTrainer(GraphTrainer):
                     self._traced_step.example_inputs,
                     passes,
                     compile_config=self.config.compile,
+                )
+            else:
+                self._traced_step.gm = remove_parameter_gradient_markers_pass(
+                    self._traced_step.gm, self._traced_step.example_inputs
                 )
         with self.train_context():
             outputs = run_traced(self._traced_step, module=model)(
@@ -477,7 +485,10 @@ def _make_fwd_bwd_adamw_fn(
     max_norm: float | None = None,
     collect_moe_routing_metrics: bool = False,
 ):
-    from torchtitan.experiments.graph_trainer.common_utils import compute_annotated_loss
+    from torchtitan.experiments.graph_trainer.common_utils import (
+        compute_annotated_loss,
+        compute_parameter_gradients,
+    )
     from torchtitan.experiments.tpu.compiled_optimizers.functional import (
         _get_param_by_fqn,
         _get_optstate_buffer,
@@ -503,7 +514,9 @@ def _make_fwd_bwd_adamw_fn(
         canonical_params: list[torch.Tensor] = [
             _get_param_by_fqn(model, fqn) for fqn in param_fqns
         ]
-        grads = torch.autograd.grad(loss, canonical_params)
+        grads = compute_parameter_gradients(
+            loss, zip(param_fqns, canonical_params, strict=True)
+        )
 
         if max_norm is not None and max_norm > 0.0:
             total_norm = torch.linalg.vector_norm(

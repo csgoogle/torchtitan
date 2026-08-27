@@ -10,6 +10,12 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.graph_trainer import configs as gt_configs
 from torchtitan.experiments.graph_trainer import make_fx_tracer
 from torchtitan.experiments.graph_trainer import qwen3 as qwen3_gt
+from torchtitan.experiments.graph_trainer.common_utils import (
+    PARAMETER_GRADIENT_FQNS_META,
+)
+from torchtitan.experiments.graph_trainer.remove_noop_passes import (
+    remove_parameter_gradient_markers_pass,
+)
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
 from torchtitan.experiments.tpu.graph_trainer import tpu_graph_trainer
 from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
@@ -200,6 +206,35 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
         torch.fx.GraphModule,
         "traced_step.gm must be a valid FX GraphModule when max_norm > 0.",
     )
+    marker_nodes = [
+        node
+        for node in traced_step.gm.graph.nodes
+        if node.target is torch.ops.aten.alias.default
+        and PARAMETER_GRADIENT_FQNS_META in node.meta.get("custom", {})
+    ]
+    self.assertSequenceEqual(
+        [
+            node.meta["custom"][PARAMETER_GRADIENT_FQNS_META][0]
+            for node in marker_nodes
+        ],
+        param_fqns,
+    )
+    graph_outputs = set(
+        traced_step.gm.graph.find_nodes(op="output")[0].all_input_nodes
+    )
+    self.assertTrue(all(node not in graph_outputs for node in marker_nodes))
+
+    remove_parameter_gradient_markers_pass(
+        traced_step.gm, traced_step.example_inputs
+    )
+    tagged_fqns = {
+        fqn
+        for node in traced_step.gm.graph.nodes
+        for fqn in node.meta.get("custom", {}).get(
+            PARAMETER_GRADIENT_FQNS_META, ()
+        )
+    }
+    self.assertSetEqual(tagged_fqns, set(param_fqns))
 
     outputs = make_fx_tracer.run_traced(traced_step, module=model)(
         inputs, labels, valid_tokens, {}
@@ -212,4 +247,3 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
 
 if __name__ == "__main__":
   absltest.main()
-
