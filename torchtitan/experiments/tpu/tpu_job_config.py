@@ -27,6 +27,14 @@ class TPUConfig:
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  # Allow FSDP scheduling and invoke_subgraph experiments without graph SAC.
+  graph_trainer_enable_sac: bool = True
+  # Schedule SimpleFSDP collectives across neighboring transformer layers in
+  # the GraphTrainer FX graph.
+  graph_trainer_fsdp_overlap: bool = False
+  # Outline transformer-layer compute as invoke_subgraph calls before the TPU
+  # backend compiles the joint graph.
+  graph_trainer_invoke_subgraph: bool = False
   # Disable Automatic Mixed Precision (AMP), so all training is done in uniform
   # precision.
   enable_amp: bool = True

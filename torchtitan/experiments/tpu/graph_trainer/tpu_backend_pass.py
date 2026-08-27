@@ -115,8 +115,13 @@ def construct_tpu_pass_pipeline(
     """Build the pass list for the 'tpu' pipeline."""
     passes: list[Callable] = []
 
+    tpu_config = getattr(config, "tpu_config", None)
     memory_policy = getattr(config.compile, "memory_policy", "none")
-    if memory_policy and memory_policy != "none":
+    if (
+        getattr(tpu_config, "graph_trainer_enable_sac", True)
+        and memory_policy
+        and memory_policy != "none"
+    ):
         from torchtitan.experiments.graph_trainer.passes import (
             selective_activation_remat_pass,
             tag_with_memory_policy_pass,
@@ -136,6 +141,36 @@ def construct_tpu_pass_pipeline(
         apply_combine_barrier_pass,
     )
     passes.append(apply_combine_barrier_pass)
+
+    if getattr(tpu_config, "graph_trainer_fsdp_overlap", False):
+        from torchtitan.experiments.graph_trainer.fsdp_passes import (
+            deduplicate_fsdp_unshard_chains_pass,
+            schedule_fsdp_comms_to_dense_regions_pass,
+        )
+
+        model_config = config.model_spec.model
+        n_layers = len(model_config.layers)
+        moe_layer_ids = frozenset(
+            index
+            for index, layer in enumerate(model_config.layers)
+            if getattr(layer, "moe", None) is not None
+        )
+        passes.extend([
+            deduplicate_fsdp_unshard_chains_pass,
+            functools.partial(
+                schedule_fsdp_comms_to_dense_regions_pass,
+                moe_layer_ids=moe_layer_ids,
+                n_layers=n_layers,
+                strict=False,
+            ),
+        ])
+
+    if getattr(tpu_config, "graph_trainer_invoke_subgraph", False):
+        from torchtitan.experiments.tpu.graph_trainer.passes.invoke_subgraph import (
+            outline_transformer_layers_pass,
+        )
+
+        passes.append(outline_transformer_layers_pass)
 
     passes.append(tpu_backend_compile_pass)
     return passes
