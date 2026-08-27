@@ -8,7 +8,7 @@ import hashlib
 import math
 import os
 import typing
-from typing import Optional
+from typing import Any, Optional
 
 # JAX imports
 import jax
@@ -17,9 +17,16 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ma
 from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_kernel import QKVLayout
 import jax.numpy as jnp
 import torch
+from torchtitan.models.common.attention import segment_ids_from_positions
+from torch import nn
 
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
+
+try:
+  from torch.distributed.tensor import DTensor
+except ImportError:
+  DTensor = None
 
 custom_jax_kernel = pallas.custom_jax_kernel
 
@@ -134,15 +141,21 @@ def _make_splash_attention_fn(
   )
   _interpret = splash_kernel.kwargs.get("interpret", False)
 
-  def _single_fwd_with_lse(q_b, k_b, v_b):
+  def _single_fwd_with_lse(q_b, k_b, v_b, segment_ids_b):
     """Forward for one batch element; returns (out_b, logsumexp_b)."""
     # q_b is already scaled (q * 1/sqrt(head_dim)) from the caller.
+    seg_ids = None
+    if segment_ids_b is not None:
+      seg_ids = splash_attention_kernel.SegmentIds(
+          q=segment_ids_b, kv=segment_ids_b
+      )
+
     out_b, (logsumexp_b,) = splash_attention_kernel._splash_attention_forward(
         fwd_mask_info,
         q_b,
         k_b,
         v_b,
-        segment_ids=None,
+        segment_ids=seg_ids,
         sinks=None,
         mask_value=_mask_value,
         is_mqa=is_mqa,
@@ -156,15 +169,22 @@ def _make_splash_attention_fn(
     return out_b, logsumexp_b
 
   @jax.jit
-  def splash_fn(q, k, v):
+  def splash_fn(q, k, v, segment_ids=None):
     """Forward: returns (out, logsumexp) for the whole batch."""
     head_dim = q.shape[-1]
     scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
     q_scaled = q * scale
-    out, logsumexp = jax.vmap(_single_fwd_with_lse)(q_scaled, k, v)
+    if segment_ids is None:
+      out, logsumexp = jax.vmap(_single_fwd_with_lse, in_axes=(0, 0, 0, None))(
+          q_scaled, k, v, None
+      )
+    else:
+      out, logsumexp = jax.vmap(_single_fwd_with_lse)(
+          q_scaled, k, v, segment_ids
+      )
     return out, logsumexp
 
-  def _single_bwd(q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b):
+  def _single_bwd(q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b, segment_ids_b):
     """Backward for one batch element using precomputed residuals.
 
     Calls _splash_attention_bwd directly — no extra forward pass.
@@ -176,12 +196,19 @@ def _make_splash_attention_fn(
       out_b: Output of the forward pass for a single batch element.
       logsumexp_b: Logsumexp from the forward pass for a single batch element.
       g_b: Gradient of the loss with respect to the output (`out_b`).
+      segment_ids_b: Segment IDs for a single batch element.
     """
+    seg_ids = None
+    if segment_ids_b is not None:
+      seg_ids = splash_attention_kernel.SegmentIds(
+          q=segment_ids_b, kv=segment_ids_b
+      )
+
     res = (
         q_scaled_b,
         k_b,
         v_b,
-        None,  # segment_ids
+        seg_ids,
         None,  # sinks
         out_b,
         logsumexp_b,
@@ -206,14 +233,15 @@ def _make_splash_attention_fn(
 
   def _scan_bwd_body(carry, args):
     """Single-element backward body for jax.lax.scan (sequential over batch)."""
-    q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b = args
+    q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b = args[:6]
+    segment_ids_b = args[6] if len(args) > 6 else None
     dq_scaled_b, dk_b, dv_b = _single_bwd(
-        q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b
+        q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b, segment_ids_b
     )
     return carry, (dq_scaled_b, dk_b, dv_b)
 
   @jax.jit
-  def splash_bwd_fn(q, k, v, out, logsumexp, g):
+  def splash_bwd_fn(q, k, v, out, logsumexp, g, segment_ids=None):
     """Backward: uses saved (out, logsumexp) — no extra forward pass.
 
     Supports both `jax.vmap` and `jax.lax.scan` over the batch dimension.
@@ -229,21 +257,32 @@ def _make_splash_attention_fn(
       out: Output of the forward pass.
       logsumexp: Logsumexp values from the forward pass.
       g: Gradient of the loss with respect to the output (`out`).
+      segment_ids: Segment IDs.
     """
     head_dim = q.shape[-1]
     scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
     q_scaled = q * scale
 
     if use_vmap_bwd:
-      dq_scaled, dk, dv = jax.vmap(_single_bwd)(
-          q_scaled, k, v, out, logsumexp, g
-      )
+      if segment_ids is None:
+        dq_scaled, dk, dv = jax.vmap(
+            _single_bwd, in_axes=(0, 0, 0, 0, 0, 0, None)
+        )(q_scaled, k, v, out, logsumexp, g, None)
+      else:
+        dq_scaled, dk, dv = jax.vmap(_single_bwd)(
+            q_scaled, k, v, out, logsumexp, g, segment_ids
+        )
     else:
+      scan_xs = (q_scaled, k, v, out, logsumexp, g)
+      if segment_ids is not None:
+        scan_xs += (segment_ids,)
+
       _, (dq_scaled, dk, dv) = jax.lax.scan(
           _scan_bwd_body,
           None,
-          (q_scaled, k, v, out, logsumexp, g),
+          scan_xs,
       )
+
     # Chain rule: q_scaled = q * scale  =>  dq = dq_scaled * scale
     dq = dq_scaled * scale
     return dq, dk, dv
@@ -273,11 +312,14 @@ def _get_splash_op_names(**splash_kwargs):
       f"pallas::{op_fwd_name}",
       torch_fwd_fn,
       mutates_args=(),
-      schema="(Tensor q, Tensor k, Tensor v) -> (Tensor, Tensor)",
+      schema=(
+          "(Tensor q, Tensor k, Tensor v, Tensor? segment_ids) -> (Tensor,"
+          " Tensor)"
+      ),
   )
   torch_fwd_fn.register_fake(  # pyrefly: ignore[missing-attribute]
       # lse: (batch, num_q_heads, q_seq_len, ??)
-      lambda q, k, v: (
+      lambda q, k, v, segment_ids=None: (
           torch.empty_like(q),
           torch.empty(
               q.shape[0],
@@ -295,11 +337,11 @@ def _get_splash_op_names(**splash_kwargs):
       mutates_args=(),
       schema=(
           "(Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, Tensor"
-          " grad_out) -> (Tensor, Tensor, Tensor)"
+          " grad_out, Tensor? segment_ids) -> (Tensor, Tensor, Tensor)"
       ),
   )
   torch_bwd_fn.register_fake(  # pyrefly: ignore[missing-attribute]
-      lambda q, k, v, out, lse, grad_out: (
+      lambda q, k, v, out, lse, grad_out, segment_ids=None: (
           torch.empty_like(q),
           torch.empty_like(k),
           torch.empty_like(v),
@@ -307,14 +349,16 @@ def _get_splash_op_names(**splash_kwargs):
   )
 
   def setup_context(ctx, inputs, output):
-      q, k, v = inputs
-      out, lse = output
-      ctx.save_for_backward(q, k, v, out, lse)
+    q, k, v, segment_ids = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse, segment_ids)
 
   def backward(ctx, grad_out, grad_lse):
-      q, k, v, out, lse = ctx.saved_tensors
-      grad_q, grad_k, grad_v = torch_bwd_fn(q, k, v, out, lse, grad_out)
-      return grad_q, grad_k, grad_v
+    q, k, v, out, lse, segment_ids = ctx.saved_tensors
+    grad_q, grad_k, grad_v = torch_bwd_fn(
+        q, k, v, out, lse, grad_out, segment_ids
+    )
+    return grad_q, grad_k, grad_v, None
 
   torch_fwd_fn.register_autograd(backward, setup_context=setup_context)
 
@@ -332,6 +376,7 @@ def splash_sdpa(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
+    segment_ids: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     is_causal: bool = True,
     local_window_size: Optional[int] = None,
@@ -361,6 +406,7 @@ def splash_sdpa(
     q: Query tensor.
     k: Key tensor.
     v: Value tensor.
+    segment_ids: Optional segment IDs for document packing.
     scale: Scale factor for attention logits.
     is_causal: Whether to apply causal mask.
     enable_gqa: Kept for API compatibility.
@@ -376,7 +422,8 @@ def splash_sdpa(
     block_q_dq: Block size for Q in DQ.
     block_kv_dq: Block size for KV in DQ.
     use_fused_bwd_kernel: Whether to use fused backward kernel.
-    use_vmap_bwd: Whether to use vmap in backward pass. Default False (uses scan for memory safety).
+    use_vmap_bwd: Whether to use vmap in backward pass. Default False (uses scan
+      for memory safety).
     q_layout: Layout for Q.
     k_layout: Layout for K.
     v_layout: Layout for V.
@@ -431,9 +478,110 @@ def splash_sdpa(
     # head dimension to be squeezed.
     k = torch.squeeze(k, dim=1)
     v = torch.squeeze(v, dim=1)
-  result, _ = torch_fwd_fn(q, k, v)
+  result, _ = torch_fwd_fn(q, k, v, segment_ids)
   result = typing.cast(torch.Tensor, result)
 
   if result.dtype != input_dtype:
     result = result.to(input_dtype)
   return result
+
+
+class SplashAttention(nn.Module):
+  """Inner attention using custom Splash Attention Pallas kernel."""
+
+  def __init__(
+      self,
+      is_causal: bool = True,
+      local_window_size: Optional[int] = None,
+      original_module: Optional[nn.Module] = None,
+      **sa_kwargs,
+  ) -> None:
+    super().__init__()
+    self.is_causal = is_causal
+    self.local_window_size = local_window_size
+    self.original_module = original_module
+    self.sa_kwargs = sa_kwargs
+
+  def forward(
+      self,
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      *,
+      scale: Optional[float] = None,
+      enable_gqa: bool = False,
+      is_causal: Optional[bool] = None,
+      attention_masks: Any = None,
+      positions: Optional[torch.Tensor] = None,
+      segment_ids: Optional[torch.Tensor] = None,
+      **kwargs,
+  ) -> torch.Tensor:
+    # Fallback to original module if on CPU or sequence length is too small
+    # for the Pallas kernel
+    seq_len = q.shape[1]
+    causal = is_causal if is_causal is not None else self.is_causal
+    if (
+        q.device.type == "cpu" or seq_len < 128
+    ) and self.original_module is not None:
+      return self.original_module(
+          q,
+          k,
+          v,
+          scale=scale,
+          enable_gqa=enable_gqa,
+          is_causal=causal,
+          attention_masks=attention_masks,
+          positions=positions,
+          segment_ids=segment_ids,
+          **kwargs,
+      )
+
+    # Override is_causal if passed explicitly, else use stored value
+    causal = is_causal if is_causal is not None else self.is_causal
+
+    q_is_dt = DTensor is not None and isinstance(q, DTensor)
+    q_mesh = q_placements = None
+    if q_is_dt:
+      q_mesh, q_placements = q.device_mesh, q.placements
+      q = q.to_local()
+
+    if DTensor is not None and isinstance(k, DTensor):
+      k = k.to_local()
+    if DTensor is not None and isinstance(v, DTensor):
+      v = v.to_local()
+    if DTensor is not None and isinstance(positions, DTensor):
+      positions = positions.to_local()
+    if DTensor is not None and isinstance(segment_ids, DTensor):
+      segment_ids = segment_ids.to_local()
+
+    # TorchTitan passes tensors as (B, S, H, D). However, the splash_sdpa
+    # Pallas kernel expects (B, H, S, D). We transpose them here to match the
+    # kernel's expected layout.
+    q_trans = q.transpose(1, 2).contiguous()
+    k_trans = k.transpose(1, 2).contiguous()
+    v_trans = v.transpose(1, 2).contiguous()
+
+    # `segment_ids` is computed once per step in `Decoder.forward` and threaded
+    # down. The fallback is for callers that pass only `positions` --
+    # correct, but
+    # it runs once per layer, which profiling showed to be 25% of device time.
+    if segment_ids is None and positions is not None:
+      segment_ids = segment_ids_from_positions(positions)
+
+    out = splash_sdpa(
+        q_trans,
+        k_trans,
+        v_trans,
+        segment_ids=segment_ids,
+        scale=scale,
+        is_causal=causal,
+        local_window_size=self.local_window_size,
+        enable_gqa=enable_gqa,
+        **self.sa_kwargs,
+    )
+
+    # Transpose back to (B, S, H, D)
+    out = out.transpose(1, 2)
+    if q_is_dt:
+      out = DTensor.from_local(out, q_mesh, q_placements)
+    return out

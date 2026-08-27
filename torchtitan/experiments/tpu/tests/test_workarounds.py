@@ -172,6 +172,88 @@ class WorkaroundsTest(parameterized.TestCase):
 
     torch.testing.assert_close(upstream_out, patched_out)
 
+  def test_wrapper_conversion_positions_to_segment_ids(self):
+    """Test that patched splash attention receives positions and converts them correctly."""
+    import unittest.mock
+    from torchtitan.experiments.tpu import workarounds
+    from torchtitan.models.common.attention import GQAttention as Attention
+    from torchtitan.experiments.tpu.llama3 import llama3_configs
+
+    config = llama3_configs["testmodel"]
+
+    captured_segment_ids = []
+
+    def mock_splash_sdpa_capture(
+        q,
+        k,
+        v,
+        segment_ids=None,
+        scale=None,
+        is_causal=True,
+        local_window_size=None,
+        enable_gqa=False,
+        **kwargs,
+    ):
+      captured_segment_ids.append(segment_ids)
+      return torch.zeros_like(q)
+
+    with unittest.mock.patch(
+        "torchtitan.experiments.tpu.kernels.splash_attention.splash_sdpa",
+        side_effect=mock_splash_sdpa_capture,
+    ):
+      attention_config = config.layers[0].attention
+      attention_block = Attention(config=attention_config).to("cpu")
+
+      patch_kwargs = {"block_q": 128}
+      workarounds.use_splash_attention_patch(attention_block, patch_kwargs)
+
+      # Force the CPU to run the patched kernel by removing the CPU fallback
+      attention_block.inner_attention.original_module = None
+
+      # Ensure seq_len >= 128 to avoid fallback
+      seq_len = 128
+      tokens = torch.randn(
+          1,
+          seq_len,
+          config.dim,
+          requires_grad=False,
+          device="cpu",
+      )
+
+      # Create positions for two segments of length 64
+      positions = (
+          torch.cat([torch.arange(64), torch.arange(64)])
+          .unsqueeze(0)
+          .to("cpu")
+      )
+      kwargs = {"positions": positions}
+
+      out = attention_block(tokens, None, **kwargs)
+
+      self.assertEqual(
+          len(captured_segment_ids),
+          1,
+          "splash_sdpa was not called, patch might have failed.",
+      )
+      segment_ids = captured_segment_ids[0]
+
+      self.assertIsNotNone(
+          segment_ids,
+          "segment_ids was None, meaning document packing logic didn't"
+          " trigger.",
+      )
+
+      # Expected: 64 zeros followed by 64 ones
+      expected_segment_ids = (
+          torch.cat([
+              torch.zeros(64, dtype=torch.int32),
+              torch.ones(64, dtype=torch.int32),
+          ])
+          .unsqueeze(0)
+          .to("cpu")
+      )
+      torch.testing.assert_close(segment_ids, expected_segment_ids)
+
 
 if __name__ == "__main__":
   absltest.main()

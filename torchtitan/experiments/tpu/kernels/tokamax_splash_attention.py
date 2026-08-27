@@ -132,6 +132,8 @@ def _make_splash_attention_fn(
     )
 
   # Static mask infos and kernel kwargs from creation time.
+  # TODO: once segment_ids is wired in, also apply _document_aware_mask_info to
+  # fwd_mask_info/dkv_mask_info so entirely cross-document blocks are skipped.
   fwd_mask_info = splash_kernel.fwd_mask_info
   dkv_mask_info = splash_kernel.dkv_mask_info
   _mask_value = splash_kernel.kwargs.get("mask_value", _DEFAULT_MASK_VALUE)
@@ -139,6 +141,7 @@ def _make_splash_attention_fn(
   _fwd_mask_sparsity = splash_kernel.kwargs.get("fwd_mask_sparsity", 1.0)
   _dkv_mask_sparsity = splash_kernel.kwargs.get("dkv_mask_sparsity", 1.0)
 
+  # TODO: wire segment_ids through for document packing
   def _single_fwd_with_lse(q_b, k_b, v_b):
     """Forward for one batch element; returns (out_b, logsumexp_b)."""
     # q_b is already scaled (q * 1/sqrt(head_dim)) from the caller.
