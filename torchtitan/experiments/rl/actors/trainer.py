@@ -40,6 +40,7 @@ from torchtitan.models.common.attention import FlexAttention
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
+from torchtitan.tools.profiler import Profiler
 from torchtitan.tools.logging import init_logger
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,8 @@ class PolicyTrainer(Actor, Configurable):
         Separate from the generator's override so the two can differ."""
         dump_folder: str = ""
         """Folder for AC debug dumps when using memory_budget mode."""
+        profiler: Profiler.Config = field(default_factory=Profiler.Config)
+        """Profiler configuration."""
 
     def __init__(
         self,

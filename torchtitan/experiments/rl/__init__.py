@@ -47,8 +47,22 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
         )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-from torchtitan.experiments.rl.models.vllm_registry import register_to_vllm
-from torchtitan.experiments.rl.models.vllm_wrapper import VLLMModelWrapper
+# from torchtitan.experiments.rl.models.vllm_registry import (
+#     register_to_vllm,
+# )
+
+# To prevent importing the heavy 'vllm' library (and hitting ImportErrors on
+# hardware environments like standard TPUs where 'vllm' is not installed),
+# we lazily load 'TorchTitanVLLMModelWrapper' only when explicitly requested.
+# Importing other RL submodules (e.g., sum_digits.py) is therefore completely safe.
+def __getattr__(name: str):
+    if name == "TorchTitanVLLMModelWrapper":
+        from torchtitan.experiments.rl.models.vllm_wrapper import (
+            TorchTitanVLLMModelWrapper,
+        )
+
+        return TorchTitanVLLMModelWrapper
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 __all__ = [

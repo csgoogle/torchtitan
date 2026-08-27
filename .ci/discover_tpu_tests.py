@@ -20,10 +20,9 @@ DISABLED_TESTS = {
     "torchtitan.experiments.tpu.redacted.tests.test_kernels",
     # TODO: Unknown command line flag 'device'
     "torchtitan.experiments.tpu.conformer.tests.test_jax_ctc_loss",
-    # TODO: unrecognized arguments: --device=tpu
-    "torchtitan.experiments.tpu.rl.tests.test_grpo",
-    "torchtitan.experiments.tpu.rl.tests.test_grpo_sampler",
-    "torchtitan.experiments.tpu.rl.tests.test_grpo_token",
+    # RL Ray non-colocated tests (require multi-host Ray TPU cluster)
+    "torchtitan.experiments.tpu.rl_nc_ray.tests.test_mini_rl",
+    "torchtitan.experiments.tpu.rl_nc_ray.tests.test_varlen_attn_tpu",
     # TODO: ModuleNotFoundError: No module named 'internal'
     "torchtitan.experiments.tpu.tests.test_profiler",
     # TODO: add copybara handling for this test

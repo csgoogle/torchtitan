@@ -48,6 +48,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.sharding import resolve_placements, SpmdLayout
 from torchtitan.tools.logging import init_logger
 from torchtitan.tools.utils import has_cuda_capability
+from torchtitan.tools.profiler import Profiler
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig, ParallelConfig
 from vllm.config.compilation import CompilationMode
@@ -721,6 +722,9 @@ class VLLMGenerator(Actor, Configurable):
         """Affects requests ALREADY running at the pull: preempts them and recomputes their KV under
         the new weights. No effect under strict-drain (engine idle at pull time); async hot-swap only.
         Default True to avoid reusing stale-weight KV."""
+
+        profiler: Profiler.Config = field(default_factory=Profiler.Config)
+        """Profiler configuration."""
 
         def __post_init__(self):
             # The generator runs vLLM full expert parallelism: vLLM forms the EP
