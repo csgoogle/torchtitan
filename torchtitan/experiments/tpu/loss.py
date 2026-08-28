@@ -6,6 +6,7 @@ a Pallas implementation of cross-entropy loss with fallback to XLA.
 
 from dataclasses import dataclass
 
+import math
 import torch
 from torchtitan.components import loss as components_loss
 import torchtitan.config
@@ -26,6 +27,16 @@ def pallas_cross_entropy_loss(
       x = x.flatten(0, 1)
     if labels.ndim == 2:
       labels = labels.flatten(0, 1)
+
+    # This is added for SFT and no-ops for pretraining. ChatDataset marks prompt
+    # and padding tokens with IGNORE_INDEX (-100) so loss is response-only, but
+    # the kernel indexes the vocab with raw labels. We zero the input at those
+    # positions so their logits come out uniform: each adds exactly log(V),
+    # which we subtract off below, and no gradient. We keep them rather than
+    # dropping them so the batch size stays fixed.
+    ignored = labels == components_loss.IGNORE_INDEX
+    x = torch.where(ignored.unsqueeze(-1), torch.zeros_like(x), x)
+    labels = torch.where(ignored, torch.zeros_like(labels), labels)
 
     implementation = "mosaic_tpu"
     b_block_size = 1024
@@ -49,7 +60,7 @@ def pallas_cross_entropy_loss(
 
     from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss  # pylint: disable=g-import-not-at-top
 
-    return linear_softmax_cross_entropy_loss.linear_softmax_cross_entropy_loss(
+    loss_sum = linear_softmax_cross_entropy_loss.linear_softmax_cross_entropy_loss(
         x,
         labels,
         weights,
@@ -58,6 +69,9 @@ def pallas_cross_entropy_loss(
         h_block_size=h_block_size,
         v_block_size=v_block_size,
     )
+    # Remove the constant log(V) each ignored position contributed above.
+    vocab_size = weights.shape[-1]
+    return loss_sum - ignored.sum().to(loss_sum.dtype) * math.log(vocab_size)
   else:
     raise ValueError("Pallas loss requires (x, weights) as input")
 

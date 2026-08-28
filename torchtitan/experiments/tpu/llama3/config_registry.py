@@ -23,6 +23,10 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     LossKernelConfig,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.hf_datasets.text_datasets import (
+    ChatDataLoader,
+    HuggingFaceTextDataLoader,
+)
 from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama as tpu_parallelize_llama
 from torchtitan.models.llama3.config_registry import model_registry
 
@@ -303,3 +307,84 @@ def llama3_405b() -> TPUTrainerConfig:
           use_loss_kernel=True,
       ),
   )
+
+
+def sft_llama3_8b_metamath() -> TPUTrainerConfig:
+  """Llama3 8B SFT on MetaMathQA for TPU."""
+
+  def process_sample(sample):
+    # Required by ChatDataset: maps this dataset's columns onto chat messages.
+    # `response` holds the full chain-of-thought and the final answer, so it
+    # passes through whole -- splitting reasoning into its own key risks a chat
+    # template that does not reference that key silently dropping it.
+    return [
+        {"role": "user", "content": sample["query"]},
+        {"role": "assistant", "content": sample["response"]},
+    ]
+
+  model_spec = model_registry("8B", attn_backend="sdpa")
+  model_spec.parallelize_fn = tpu_parallelize_llama
+  config = TPUTrainerConfig(
+      loss=CrossEntropyLoss.Config(),
+      hf_assets_path="./assets/hf/Llama-3.1-8B",
+      model_spec=model_spec,
+      optimizer=default_adamw(lr=2e-5),
+      lr_scheduler=LRSchedulersContainer.Config(
+          warmup_steps=25,
+          decay_ratio=0.9,
+          decay_type="cosine",
+          min_lr_factor=0.1,
+      ),
+      training=TrainingConfig(
+          local_batch_size=2,
+          seq_len=8192,
+          steps=500,
+      ),
+      dataloader=ChatDataLoader.Config(
+          dataset_path="meta-math/MetaMathQA",
+          load_dataset_kwargs={"split": "train"},
+          sample_processor=process_sample,
+      ),
+      metrics=MetricsProcessor.Config(
+          log_freq=5,
+          enable_tensorboard=True,
+          save_tb_folder="tb_logs/sft_llama3_8b_metamath",
+      ),
+      parallelism=ParallelismConfig(use_simple_fsdp=True),
+      checkpoint=CheckpointManager.Config(
+          # `enable` is on only so the initial HF weight load happens;
+          # `load_only` then suppresses every save, including the
+          # unconditional last-step one.
+          enable=True,
+          load_only=True,
+          initial_load_in_hf=True,
+          initial_load_model_only=True,
+      ),
+      activation_checkpoint=FullAC.Config(),
+      tpu_config=TPUConfig(
+          eager_mode="DEFER_AND_FUSE",
+          use_graph_split=False,
+      ),
+      compile=CompileConfig(
+          enable=True,
+          backend="tpu",
+          components=["model"],
+      ),
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          use_splash_attention_kernel=True,
+          sa_block_q=2048,
+          sa_block_kv=2048,
+          sa_block_dkv=2048,
+          sa_block_kv_compute=2048,
+          sa_block_q_dkv=2048,
+          sa_block_kv_dkv=2048,
+          sa_block_kv_dkv_compute=2048,
+          sa_block_q_dq=2048,
+          sa_block_kv_dq=2048,
+      ),
+      loss_kernel=LossKernelConfig(
+          use_loss_kernel=True,
+      ),
+  )
+  config.optimizer.implementation = "foreach"
+  return config

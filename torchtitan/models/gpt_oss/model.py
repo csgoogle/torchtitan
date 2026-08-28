@@ -88,6 +88,7 @@ class Attention(BaseAttention):
         x: torch.Tensor,
         attention_masks: AttentionMasksType,
         positions: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
@@ -114,6 +115,8 @@ class Attention(BaseAttention):
             scale=self.softmax_scale,
             enable_gqa=self.enable_gqa,
             out_transform=self._apply_sinks,
+            positions=positions,
+            segment_ids=segment_ids,
         )
 
         # Reshape and project output
@@ -161,6 +164,7 @@ class GptOssTransformerBlock(TransformerBlock):
         x: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer block.
@@ -181,7 +185,9 @@ class GptOssTransformerBlock(TransformerBlock):
         if isinstance(attention_masks, dict):  # flex
             attention_masks = attention_masks[self.attn_mask_key]
 
-        x = x + self.attention(self.attention_norm(x), attention_masks, positions)
+        x = x + self.attention(
+            self.attention_norm(x), attention_masks, positions, segment_ids
+        )
         x = x + self.moe(self.ffn_norm(x))
         return x
 

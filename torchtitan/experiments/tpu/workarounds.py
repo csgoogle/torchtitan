@@ -143,33 +143,75 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
   # whether each layer has a local sliding-window — useful for mixed
   # local/global models (REDACTED PT MoE) so the kernel cache shows the expected
   # mix of CausalMask and LocalMask compiled ops.
+  from torchtitan.experiments.tpu.kernels.splash_attention import SplashAttention  # pylint: disable=g-import-not-at-top
+
+  replacements = []
   _patched = 0
   _windowed = 0
   _causal = 0
-  for _, module in model.named_modules():
-    cls_name = type(module).__name__
-    if "ScaledDotProductAttention" in cls_name:
-      if "[redacted]" in type(module).__module__:
-        module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
-      else:
-        module.forward = types.MethodType(_splash_forward, module)
-      _patched += 1
-      if getattr(module, "sliding_window_size", None) is not None:
-        _windowed += 1
-      else:
-        _causal += 1
+
+  # Identify attention modules to replace
+  # (ScaledDotProductAttention & FlexAttention).
+  for parent_module in model.modules():
+    for child_name, child_module in parent_module.named_children():
+      cls_name = type(child_module).__name__
+
+      if "ScaledDotProductAttention" in cls_name:
+        if "[redacted]" in type(child_module).__module__:
+          # [redacted] patching (in-place method replacement)
+          child_module._sdpa_native_torch = types.MethodType(
+              _splash_sdpa_redacted, child_module
+          )
+          _patched += 1
+          if getattr(child_module, "sliding_window_size", None) is not None:
+            _windowed += 1
+          else:
+            _causal += 1
+        else:
+          replacements.append((parent_module, child_name, child_module))
+      elif "FlexAttention" in cls_name:
+        if "[redacted]" not in type(child_module).__module__:
+          replacements.append((parent_module, child_name, child_module))
+
+  # Apply replacements
+  for parent_module, child_name, child_module in replacements:
+    # SplashAttention needs the window size to pick its mask: LocalMask for a
+    # sliding-window layer, CausalMask otherwise. The child is the inner
+    # attention being replaced (ScaledDotProductAttention / FlexAttention), the
+    # parent the attention module that owns it (e.g. GQAttention). Models set
+    # sliding_window_size on either one, so check the child then the parent.
+    local_window_size = getattr(child_module, "sliding_window_size", None)
+    if local_window_size is None:
+      local_window_size = getattr(parent_module, "sliding_window_size", None)
+
+    splash_attn = SplashAttention(
+        is_causal=True,  # Default for LMs
+        local_window_size=local_window_size,
+        original_module=child_module,
+        **sa_kwargs,
+    )
+
+    setattr(parent_module, child_name, splash_attn)
+    _patched += 1
+    if local_window_size is not None:
+      _windowed += 1
+    else:
+      _causal += 1
 
   if _patched == 0:
     all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
     raise ValueError(
-        "Splash attention patch was requested but NO matching attention "
-        f"modules (ScaledDotProductAttention) were found in the model. Found module types: {all_classes}"
+        "Splash attention patch was requested but NO matching attention"
+        " modules (ScaledDotProductAttention, FlexAttention) were found in the"
+        f" model. Found module types: {all_classes}"
     )
   else:
     logger.info(
-        "Splash attention ENABLED: patched %d attention modules "
+        "Splash attention ENABLED: replaced %d attention modules "
         "(causal=%d, sliding-window=%d)",
-        _patched, _causal, _windowed,
+        _patched,
+        _causal,
+        _windowed,
     )
 
 
@@ -294,11 +336,39 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
 
 
 class PallasLossLinear(nn.Module):
-  """Wrapper for model.output to return (x, weight) for Pallas loss."""
+  """Wrapper for model.output to return (x, weight) for Pallas loss.
+
+  Holding the Linear module as a child names the parameter
+  ``lm_head.original_linear.weight`` which is not mapped by model state dict
+  adapters and breaks loading from checkpoint with a KeyError. We add hooks to
+  fix at state-dict layer to strip the ``original_linear`` infix on save and
+  restore on load, making the wrapper invisible to checkpointing paths but
+  preserving module tree hierarchy.
+  """
+
+  _INFIX = "original_linear."
 
   def __init__(self, original_linear: nn.Linear):
     super().__init__()
     self.original_linear = original_linear
+    self._register_state_dict_hook(PallasLossLinear._strip_infix)
+    self._register_load_state_dict_pre_hook(self._restore_infix)
+
+  @staticmethod
+  def _strip_infix(module, state_dict, prefix, local_metadata):
+    """Rename ``<prefix>original_linear.X`` -> ``<prefix>X`` on the way out."""
+    for key in [k for k in state_dict if k.startswith(prefix + module._INFIX)]:
+      state_dict[prefix + key[len(prefix + module._INFIX):]] = state_dict.pop(key)
+    return state_dict
+
+  def _restore_infix(self, state_dict, prefix, *args, **kwargs):
+    """Rename ``<prefix>X`` -> ``<prefix>original_linear.X`` on the way in."""
+    for key in [
+        k
+        for k in state_dict
+        if k.startswith(prefix) and not k.startswith(prefix + self._INFIX)
+    ]:
+      state_dict[prefix + self._INFIX + key[len(prefix):]] = state_dict.pop(key)
 
   @property
   def weight(self) -> torch.Tensor:

@@ -63,6 +63,7 @@ __all__ = [
     "get_causal_mask_mod",
     "get_document_mask_mod",
     "get_efficient_causal_mask_mod_for_packed_document",
+    "segment_ids_from_positions",
     "get_fixed_block_mask_mod",
     "get_sliding_window_mask_mod",
 ]
@@ -870,6 +871,30 @@ class FusedQKVLinear(BaseQKVLinear):
             )
 
 
+def segment_ids_from_positions(positions: torch.Tensor) -> torch.Tensor:
+    """Compute SplashAttention `segment_ids` from dataloader `positions`.
+
+    This can be called once per step and passed to each decoder layer, as every
+    layer shares the same `positions` tensor. Calling it from within the
+    attention module is wasteful: each layer is its own activation-checkpoint
+    region, so the compiler cannot share the result across them.
+
+    `positions` restarts at 0 at each document boundary:
+
+        [0, 1, 2, 3, 0, 1, 2, 3, 4, ...]
+
+    so we find the document starts
+
+        [1, 0, 0, 0, 1, 0, 0, 0, 0, ...]
+
+    and take the cumsum to yield a document index per token, minus 1 to shift
+    to 0-indexed
+
+        [0, 0, 0, 0, 1, 1, 1, 1, 1, ...]
+    """
+    return (torch.cumsum((positions == 0).int(), dim=1) - 1).int()
+
+
 class GQAttention(BaseAttention):
     """Grouped-Query Attention with pluggable Q/K/V projection.
 
@@ -924,6 +949,7 @@ class GQAttention(BaseAttention):
         x_BLD: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, L, _ = x_BLD.shape
         xq_BLNH, xk_BLNH, xv_BLNH = self.qkv_linear(x_BLD)
@@ -945,6 +971,8 @@ class GQAttention(BaseAttention):
             attention_masks=attention_masks,
             scale=self.scaling,
             enable_gqa=self.enable_gqa,
+            positions=positions,
+            segment_ids=segment_ids,
         ).contiguous()
         out_BLD = out_BLNH.view(B, L, -1)
         return self.wo(out_BLD)

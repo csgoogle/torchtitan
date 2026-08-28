@@ -95,6 +95,7 @@ class Attention(BaseAttention):
         x: torch.Tensor,
         attention_masks: AttentionMasksType,
         positions: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ):
         bsz, seqlen, _ = x.size()
 
@@ -141,7 +142,8 @@ class Attention(BaseAttention):
                     )
 
         output = self.inner_attention(
-            q, k, v, attention_masks=attention_masks, scale=self.softmax_scale
+            q, k, v, attention_masks=attention_masks, scale=self.softmax_scale,
+            positions=positions, segment_ids=segment_ids,
         ).contiguous()
         output = output.view(bsz, seqlen, -1)
         return self.wo(output)
@@ -175,8 +177,11 @@ class DeepSeekV3TransformerBlock(TransformerBlock):
         x: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ):
-        x = x + self.attention(self.attention_norm(x), attention_masks, positions)
+        x = x + self.attention(
+            self.attention_norm(x), attention_masks, positions, segment_ids
+        )
         if self.moe_enabled:
             x = x + self.moe(self.ffn_norm(x))
         else:
