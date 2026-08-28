@@ -159,25 +159,45 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
           got.cpu(), want.cpu(), rtol=8e-2, atol=8e-2, msg=name
       )
 
+  def _assert_matches_tokamax(self, q, k, v, name, **kwargs):
+    """Forward AND backward bit-exact against the stock tokamax wrapper."""
+    q_a = q.clone().requires_grad_(True)
+    k_a = k.clone().requires_grad_(True)
+    v_a = v.clone().requires_grad_(True)
+    out_a = splash_bias_dropout.sbd_splash_attention(q_a, k_a, v_a, **kwargs)
+    out_a.sum().backward()
+
+    q_b = q.clone().requires_grad_(True)
+    k_b = k.clone().requires_grad_(True)
+    v_b = v.clone().requires_grad_(True)
+    out_b = tokamax_splash_attention.splash_sdpa(q_b, k_b, v_b, **kwargs)
+    out_b.sum().backward()
+
+    torch.testing.assert_close(
+        out_a.detach().cpu(), out_b.detach().cpu(), rtol=0.0, atol=0.0, msg=name
+    )
+    for gname, ga, gb in (
+        ("dq", q_a.grad, q_b.grad),
+        ("dk", k_a.grad, k_b.grad),
+        ("dv", v_a.grad, v_b.grad),
+    ):
+      self.assertIsNotNone(ga, f"{name}:{gname} is None")
+      torch.testing.assert_close(
+          ga.cpu(), gb.cpu(), rtol=0.0, atol=0.0, msg=f"{name}:{gname}"
+      )
+
   def test_matches_tokamax(self):
-    """The no-regression contract: parity with the stock tokamax wrapper
-    across its full user surface (causal, scale, sliding window, MQA)."""
+    """The no-regression contract: forward and backward parity with the
+    stock tokamax wrapper across its full user surface."""
     device = self.accelerator_device
     q, k, v = self._qkv(2, 512, 4, 4, 64, device, seed=3)
-    for name, kwargs in (
-        ("causal", dict(is_causal=True)),
-        ("scale", dict(is_causal=True, scale=0.05)),
-        ("window", dict(is_causal=True, local_window_size=128)),
-    ):
-      ours = splash_bias_dropout.sbd_splash_attention(q, k, v, **kwargs)
-      theirs = tokamax_splash_attention.splash_sdpa(q, k, v, **kwargs)
-      torch.testing.assert_close(
-          ours.cpu(), theirs.cpu(), rtol=0.0, atol=0.0, msg=name
-      )
+    self._assert_matches_tokamax(q, k, v, "causal", is_causal=True)
+    self._assert_matches_tokamax(q, k, v, "scale", is_causal=True, scale=0.05)
+    self._assert_matches_tokamax(
+        q, k, v, "window", is_causal=True, local_window_size=128
+    )
     q1, k1, v1 = self._qkv(2, 512, 4, 1, 64, device, seed=5)
-    ours = splash_bias_dropout.sbd_splash_attention(q1, k1, v1)
-    theirs = tokamax_splash_attention.splash_sdpa(q1, k1, v1, is_causal=True)
-    torch.testing.assert_close(ours.cpu(), theirs.cpu(), rtol=0.0, atol=0.0, msg="mqa")
+    self._assert_matches_tokamax(q1, k1, v1, "mqa", is_causal=True)
 
   def test_sliding_window_parity(self):
     device = self.accelerator_device

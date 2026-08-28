@@ -351,6 +351,12 @@ def jax_attention_bwd(
 
   dq_tr, dk_tr, dv_tr = splash_bwd_fn(q_tr, k_tr, v_tr, out_tr, logsumexp, grad_out_tr)
 
+  # Chain rule for the q pre-scaling above: splash_bwd_fn returns the
+  # gradient wrt the SCALED q, so a non-default scale needs the same
+  # ratio applied to dq (without it, dq is off by default_scale/scale).
+  if abs(scale - default_scale) > 1e-6:
+    dq_tr = dq_tr * (scale / default_scale)
+
   # Transpose/Expand back to original PyTorch layouts
   dq = jnp.transpose(dq_tr, (0, 2, 1, 3))
 

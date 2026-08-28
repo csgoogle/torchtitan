@@ -115,6 +115,48 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         head_dim=64,
     )
 
+  def test_custom_scale_backward(self):
+    """Regression: dq must carry the chain-rule factor for the custom-scale
+    q pre-multiply in the backward (it was off by default_scale/scale)."""
+    device = self.accelerator_device
+    torch.manual_seed(11)
+    b, s, h, d = 2, 128, 4, 64
+    scale = 0.05
+    q = torch.randn(b, s, h, d, dtype=torch.float32)
+    k = torch.randn(b, s, h, d, dtype=torch.float32)
+    v = torch.randn(b, s, h, d, dtype=torch.float32)
+
+    q_ref = q.clone().requires_grad_(True)
+    k_ref = k.clone().requires_grad_(True)
+    v_ref = v.clone().requires_grad_(True)
+    with attention.sdpa_kernel([attention.SDPBackend.MATH]):
+      out_ref = F.scaled_dot_product_attention(
+          q_ref.transpose(1, 2),
+          k_ref.transpose(1, 2),
+          v_ref.transpose(1, 2),
+          is_causal=True,
+          scale=scale,
+      )
+    out_ref.sum().backward()
+
+    q_t = q.to(device).requires_grad_(True)
+    k_t = k.to(device).requires_grad_(True)
+    v_t = v.to(device).requires_grad_(True)
+    out = tokamax_splash_attention.splash_sdpa(
+        q_t, k_t, v_t, is_causal=True, scale=scale
+    )
+    out.sum().backward()
+
+    for name, got, want in (
+        ("dq", q_t.grad, q_ref.grad),
+        ("dk", k_t.grad, k_ref.grad),
+        ("dv", v_t.grad, v_ref.grad),
+    ):
+      self.assertIsNotNone(got, f"{name} is None")
+      torch.testing.assert_close(
+          got.cpu(), want, rtol=5e-2, atol=5e-2, msg=name
+      )
+
   def test_gpu_available(self):
     device = self.accelerator_device
     self.assertEqual(device.type, "tpu")
