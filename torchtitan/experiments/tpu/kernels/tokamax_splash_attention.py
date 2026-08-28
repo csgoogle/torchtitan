@@ -11,9 +11,33 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask
-import torch
+
+# Workaround for https://github.com/openxla/tokamax/issues/240 (same as
+# linear_softmax_cross_entropy_loss.py): tokamax applies @jaxtyping.jaxtyped
+# at import time, and typeguard's AST instrumentation cannot parse jaxtyping
+# shape-string annotations ("*B T H d"). Swap in a pass-through decorator for
+# the duration of the tokamax import.
+import jaxtyping
+
+_real_jaxtyped = jaxtyping.jaxtyped
+
+
+def _dummy_jaxtyped(*args, **kwargs):
+  def decorator(f):
+    return f
+
+  if len(args) == 1 and callable(args[0]):
+    return args[0]
+  return decorator
+
+
+jaxtyping.jaxtyped = _dummy_jaxtyped
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel  # noqa: E402  pylint: disable=g-import-not-at-top
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask  # noqa: E402  pylint: disable=g-import-not-at-top
+
+jaxtyping.jaxtyped = _real_jaxtyped
+
+import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
 
