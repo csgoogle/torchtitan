@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      image:
+        description: 'Container image to run the suite in. Defaults to :latest.'
+        required: false
+        type: string
+    secrets:
+      GAR_JSON_KEY:
+        description: 'Service account key used to pull the test image from GAR'
+        required: true
 
 concurrency:  # Cancel older jobs for the same PR
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -17,6 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       test_matrix: ${{ steps.set-matrix.outputs.test_matrix }}
+      # Callers may pass an image; push/pull_request runs get no inputs at all,
+      # so fall back to :latest here rather than in each job.
+      image: ${{ inputs.image || 'us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: Generate Matrix
@@ -36,7 +49,7 @@ jobs:
     timeout-minutes: 30
 
     container:
-      image: us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest # zizmor: ignore[unpinned-images]
+      image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
       credentials:
         username: _json_key
         password: ${{ secrets.GAR_JSON_KEY }}
@@ -78,7 +91,7 @@ jobs:
     timeout-minutes: 30
 
     container:
-      image: us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest # zizmor: ignore[unpinned-images]
+      image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
       credentials:
         username: _json_key
         password: ${{ secrets.GAR_JSON_KEY }}
@@ -120,7 +133,7 @@ jobs:
     timeout-minutes: 30
 
     container:
-      image: us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest # zizmor: ignore[unpinned-images]
+      image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
       credentials:
         username: _json_key
         password: ${{ secrets.GAR_JSON_KEY }}

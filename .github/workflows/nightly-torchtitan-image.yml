@@ -95,6 +95,9 @@ jobs:
     needs: [build-wheel]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      candidate_tag: ${{ steps.meta.outputs.candidate_tag }}
+      promote_latest: ${{ steps.meta.outputs.promote_latest }}
     defaults:
       run:
         shell: bash
@@ -163,21 +166,28 @@ jobs:
             IS_CUSTOM=true
           fi
 
+          # We do not tag with :latest here, we promote an image from candidate
+          # to latest after it passes OSS CI suite in promote-latest job
           if [ "$IS_CUSTOM" = "true" ]; then
+            CANDIDATE_TAG="${IMAGE_REPO}:torch-tpu-${SAFE_TORCH_TPU_REF}-torchtitan-${SAFE_TORCHITAN_REF}"
             {
               echo "tags<<EOF"
-              echo "${IMAGE_REPO}:torch-tpu-${SAFE_TORCH_TPU_REF}-torchtitan-${SAFE_TORCHITAN_REF}"
+              echo "${CANDIDATE_TAG}"
               echo "EOF"
+              echo "candidate_tag=${CANDIDATE_TAG}"
+              echo "promote_latest=false"
             } >> "${GITHUB_OUTPUT}"
           else
+            CANDIDATE_TAG="${IMAGE_REPO}:${NIGHTLY_DATE}"
             {
               echo "tags<<EOF"
-              echo "${IMAGE_REPO}:latest"
-              echo "${IMAGE_REPO}:${NIGHTLY_DATE}"
+              echo "${CANDIDATE_TAG}"
               echo "${IMAGE_REPO}:torchtitan-commit-${SHORT_SHA}"
               echo "${IMAGE_REPO}:torch-tpu-commit-${TORCH_TPU_SHA}"
               echo "EOF"
               echo "NIGHTLY_DATE=${NIGHTLY_DATE}"
+              echo "candidate_tag=${CANDIDATE_TAG}"
+              echo "promote_latest=true"
             } >> "${GITHUB_OUTPUT}"
           fi
 
@@ -219,7 +229,7 @@ jobs:
 
       - name: Print published tags
         run: |
-          echo "Published tags:"
+          echo "Published tags (':latest' is added later, by promote-latest):"
           echo "${STEPS_META_OUTPUTS_TAGS}"
         env:
           STEPS_META_OUTPUTS_TAGS: ${{ steps.meta.outputs.tags }}
@@ -230,3 +240,42 @@ jobs:
           echo "${STEPS_BUILD_OUTPUTS_DIGEST}"
         env:
           STEPS_BUILD_OUTPUTS_DIGEST: ${{ steps.build.outputs.digest }}
+
+  validate-image:
+    name: Validate nightly image
+    needs: [build-and-push-image]
+    if: ${{ github.event.inputs.push_image != 'false' }}
+    uses: ./.github/workflows/tpu-test.yml
+    with:
+      image: ${{ needs.build-and-push-image.outputs.candidate_tag }}
+    secrets:
+      GAR_JSON_KEY: ${{ secrets.GAR_JSON_KEY }}
+
+  promote-latest:
+    name: Promote validated image to :latest
+    needs: [build-and-push-image, validate-image]
+    if: ${{ needs.build-and-push-image.outputs.promote_latest == 'true' && github.event.inputs.push_image != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      IMAGE_REPO: us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container
+
+    steps:
+      - name: Authenticate to Google Cloud via service account key
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed  # v2
+        with:
+          credentials_json: ${{ secrets.GAR_JSON_KEY }}
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f  # v2
+
+      - name: Add :latest tag to the validated image
+        run: |
+          set -euo pipefail
+          gcloud artifacts docker tags add "${CANDIDATE_TAG}" "${IMAGE_REPO}:latest" --quiet
+          echo "Promoted ${CANDIDATE_TAG} to ${IMAGE_REPO}:latest"
+        env:
+          CANDIDATE_TAG: ${{ needs.build-and-push-image.outputs.candidate_tag }}
