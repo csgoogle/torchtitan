@@ -12,6 +12,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
     data_parallel as simple_fsdp_data_parallel,
 )
+from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
 def parallelize_qwen3(
@@ -35,6 +36,10 @@ def parallelize_qwen3(
   """
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
+  if effective_compile_config.enable and hasattr(model, "layers"):
+    for layer in model.layers.values():
+      apply_spmd_safe(layer)
+
   if compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
 
@@ -80,5 +85,6 @@ def parallelize_qwen3(
           training=training,
       )
   if compile_mode == "fullgraph":
+    apply_spmd_safe(model)
     model = torch.compile(model, fullgraph=True, backend="tpu")
   return model
