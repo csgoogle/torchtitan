@@ -95,12 +95,12 @@ class TPUTrainer(torchtitan.train.Trainer):
     from torch_tpu._internal.sync import synchronize  # pylint: disable=g-import-not-at-top
 
     assert len(self.model_parts) == 1
-    inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
+    inputs, labels, extra_kwargs = self.post_dataloading_process(
         input_dict, labels
     )
 
     with self.train_context():
-      pred = self.model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+      pred = self.model_parts[0](inputs, **extra_kwargs)
       loss_sum, _ = self.loss_fn(pred, labels)
       loss = loss_sum / global_valid_tokens
       del pred
