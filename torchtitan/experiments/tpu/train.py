@@ -73,7 +73,7 @@ class TPUTrainer(torchtitan.train.Trainer):
       *,
       input_dict: dict[str, torch.Tensor],
       labels: torch.Tensor,
-      global_valid_tokens: torch.Tensor,
+      global_valid_tokens: float,
   ) -> torch.Tensor:
     config = self.config
     use_graph_split = (
@@ -101,8 +101,7 @@ class TPUTrainer(torchtitan.train.Trainer):
 
     with self.train_context():
       pred = self.model_parts[0](inputs, **extra_kwargs)
-      loss_sum, _ = self.loss_fn(pred, labels)
-      loss = loss_sum / global_valid_tokens
+      loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
       del pred
 
       # Materialize the forward graph without waiting for execution to
