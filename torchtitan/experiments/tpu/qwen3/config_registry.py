@@ -13,6 +13,7 @@ from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, default_adamw
+from torchtitan.tools.profiler import Profiler
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
@@ -398,7 +399,7 @@ def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
 
 def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
   """Qwen3 8B model configuration for TPU (regular trainer)."""
-  model_spec = model_registry("8B")
+  model_spec = model_registry("8B", attn_backend="sdpa")
   model_config = cast(Qwen3Model.Config, model_spec.model)
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
@@ -410,7 +411,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=OptimizersContainer.Config(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
           decay_ratio=0.8,

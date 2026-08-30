@@ -235,3 +235,5 @@ def model_registry(
   assert isinstance(model_spec.model, Qwen3Model.Config)
   model_spec.model = MaxTextQwen3Config.from_qwen3(model_spec.model)
   return model_spec
+
+from .config_registry import *
