@@ -13,7 +13,6 @@ from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, default_adamw
-from torchtitan.tools.profiler import Profiler
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
@@ -429,12 +428,6 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
           dataset="c4_test",
       ),
       metrics=MetricsProcessor.Config(log_freq=1),
-      profiler=Profiler.Config(
-          enable_profiling=False,
-          profile_freq=4,
-          profiler_warmup=2,
-          profiler_active=1,
-      ),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
       ),
