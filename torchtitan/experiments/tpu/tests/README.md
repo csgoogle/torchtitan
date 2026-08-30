@@ -1,6 +1,6 @@
 # TPU experiments — test coverage
 
-What each test module protects, and why it exists. Fifteen modules, **148
+What each test module protects, and why it exists. Fifteen modules, **144
 tests**. Nine run on CPU, four need a TPU, one runs on both, and one needs
 eight chips.
 
@@ -15,10 +15,10 @@ failures are visible.
 
 Last full run: 2026-08-26, image
 `torchtitan-container:llama3-gtscan-v013b-338fd5e6`, on a v6e-8 host, against
-tree `e4034997`. All fifteen modules pass — 97 CPU-tier, 47 single-chip, 3
+tree `e4034997`. All fifteen modules pass — 93 CPU-tier, 47 single-chip, 3
 distributed. One CPU test has been added since
 (`PublicApiTest::test_the_docstrings_worked_example_actually_binds`, taking the
-CPU tier to 98); it needs no device and was verified outside the container. The only failures are the two documented CPU-only ones below, both
+CPU tier to 94); it needs no device and was verified outside the container. The only failures are the two documented CPU-only ones below, both
 of which pass on a device.
 
 Two cases skip on that image, both correctly:
@@ -35,7 +35,7 @@ Two cases skip on that image, both correctly:
 python -m torchtitan.experiments.tpu.tests.test_scan_over_layers
 python -m torchtitan.experiments.tpu.tests.test_scan_memory_policy
 python -m torchtitan.experiments.tpu.tests.test_scan_fsdp_lowering
-python -m torchtitan.experiments.tpu.tests.test_scan_collective_recompute
+python -m torchtitan.experiments.tpu.tests.test_scan_body_ac_shim
 python -m torchtitan.experiments.tpu.tests.test_rope_real_arithmetic
 python -m torchtitan.experiments.tpu.tests.test_parallelize_scan
 python -m torchtitan.experiments.tpu.tests.test_torch_tpu_fix
@@ -122,7 +122,7 @@ minutes and observe nothing extra.
 
 | Tier | Modules | Why this tier is the right one |
 |---|---|---|
-| **CPU** | `test_scan_over_layers`, `test_scan_memory_policy`, `test_scan_collective_recompute`, `test_parallelize_scan`, `test_torch_tpu_fix`, `test_workarounds`, `test_rope_real_arithmetic`, `test_scan_fsdp_lowering`, `test_tpu_graph_trainer_config` | The assertion is about an fx graph, a tag set, a call order, a source-text detector, or an FQN — none of which a device changes. Two are subtler: `test_rope_real_arithmetic` guards a **trace-time** `NotImplementedError`, which fires before any device is involved and asserts bit-exactness at `atol=0` that a device's fused arithmetic would break; `test_scan_fsdp_lowering` runs a real gloo world — of one for the placement checks, and of **four** for `InBodyCollectiveTest`, where the size is load-bearing (on a mesh of one, SimpleFSDP's `redistribute(Shard(1) -> Replicate)` emits no collective at all, so the checks would pass against the broken read) — because the structural claim is *where the collective sits in the graph*, not what it computes. |
+| **CPU** | `test_scan_over_layers`, `test_scan_memory_policy`, `test_scan_body_ac_shim`, `test_parallelize_scan`, `test_torch_tpu_fix`, `test_workarounds`, `test_rope_real_arithmetic`, `test_scan_fsdp_lowering`, `test_tpu_graph_trainer_config` | The assertion is about an fx graph, a tag set, a call order, a source-text detector, or an FQN — none of which a device changes. Two are subtler: `test_rope_real_arithmetic` guards a **trace-time** `NotImplementedError`, which fires before any device is involved and asserts bit-exactness at `atol=0` that a device's fused arithmetic would break; `test_scan_fsdp_lowering` runs a real gloo world — of one for the placement checks, and of **four** for `InBodyCollectiveTest`, where the size is load-bearing (on a mesh of one, SimpleFSDP's `redistribute(Shard(1) -> Replicate)` emits no collective at all, so the checks would pass against the broken read) — because the structural claim is *where the collective sits in the graph*, not what it computes. |
 | **One chip** | `test_scan_lowering`, `test_scan_compiled_hlo`, `test_scan_reverse`, `test_tpu_graph_trainer_unit` | These assert on what the **compiler** did — StableHLO, post-optimization HLO, the `kReverse` lowering — and there is no compiler without a device. |
 | **CPU + one chip** | `compiled_optimizers/tests/test_functional` | The math is device-independent; the capturable path is not. |
 | **Eight chips** | `graph_trainer/tests/test_tpu_graph_trainer_distributed` | Sharding, collectives, and the composition of the whole target stack. |
@@ -158,8 +158,8 @@ no longer exists: every node reports `_NOT_IN_LAYERS` and the boundary pass can
 never fire, with no error and no log line saying so.
 
 **This does not mean activation checkpointing is absent under scan.** It comes
-from `scan/fsdp.py`'s `install_scan_collective_recompute`, which tags the body
-for the HOP's own partitioner — see `test_scan_collective_recompute.py`. What
+from `ScannedLayerStack.set_recompute_body`, whose ambient `current_meta`
+window tags the body for the HOP's own partitioner — see `test_scan_body_ac_shim.py`. What
 is inert is specifically this pass's layer-boundary `MUST_SAVE`. The two
 mechanisms must not be assumed to compose, and that is what this module pins.
 
@@ -171,18 +171,19 @@ off. Widening the comparison from `>` to `!=` does not fix it: both sides of a
 scan boundary report the same sentinel, so both spellings are false. The
 missing layer index is the defect, not the operator.
 
-### `test_scan_collective_recompute.py` — 15 tests, CPU
+### `test_scan_body_ac_shim.py` — 11 tests, CPU
 
 The mechanism that *does* provide activation checkpointing inside a scan body.
 `torch.utils.checkpoint` is a silent no-op there — the HOP re-traces the body
-and discards the tags — so the body is instead tagged `MUST_RECOMPUTE` for the
-min-cut partitioner, which is a hard constraint rather than a hint.
+and discards the tags — so the tag is instead delivered through
+`fx_traceback.current_meta`, the ambient channel the tracer copies into every
+node it creates, and which therefore survives that re-trace.
 
 | Group | Protects |
 |---|---|
-| Tagging (6) | The all-gather and its wait are tagged, and so are view-like descendants, including through a chain. Equally important, the things that must *not* be tagged are not: a compute consumer of a gathered tensor, a `reduce_scatter`, and a wait on an untagged collective. Over-tagging is as wrong as under-tagging and much harder to notice. |
-| `recompute_body` (4) | Off by default. On, it tags the **forward** region and leaves the backward alone, and still tags collectives. This is the switch `--tpu-config.graph-trainer-memory-policy=full` actually flips. |
-| Lifecycle (5) | Install replaces and uninstall restores *the same object*; install is idempotent; uninstall without install is a no-op; a second install with a different policy warns and is ignored rather than silently winning; a failed install does not leak the wrapper. |
+| Ambient window (3) | Joint-tracing a real `scan` under the window tags the body's compute; without the window the body is untagged; and the window does not outlive the call. The first is the claim the whole mechanism rests on, and it is asserted through a real HOP rather than a hand-built graph precisely because the interesting part is surviving the re-trace. The trace is `aot_export_joint_simple`, not `torch.compile` — dynamo would trace the window block instead of executing it. |
+| Strip (4) | The shim removes the tag from `placeholder` nodes (min-cut raises `NetworkXError` on them) and from the outer `scan` node (left tagged, min-cut recomputes the whole layer loop in backward — the forward runs twice per step, silently, while the saved-set metric *improves*). Equally, it keeps the tag on real body compute and leaves untagged nodes alone. Over-stripping is as wrong as under-stripping and much harder to notice. |
+| Lifecycle (4) | Install replaces and uninstall restores *the same object*; install is idempotent; uninstall without install is a no-op; a failed install does not leak the wrapper. |
 
 ### `test_parallelize_scan.py` — 19 tests, CPU
 

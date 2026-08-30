@@ -83,6 +83,8 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch._higher_order_ops.scan import scan
+from torch.fx import traceback as fx_traceback
+from torch.utils.checkpoint import CheckpointPolicy
 from torch.distributed.tensor import DTensor
 from torch.func import functional_call
 
@@ -218,6 +220,9 @@ class ScannedLayerStack(Module):
     # "read the parameters straight through" — the single-device path.
     self._fsdp_plan: dict[str, ScanFSDPSpec] = {}
 
+    # Set by `set_recompute_body`; see `forward`'s ambient AC window.
+    self._recompute_body = False
+
     logger.info(
         "ScannedLayerStack: %d layers, %d stacked parameter tensors (%s).",
         self.n_layers,
@@ -279,6 +284,24 @@ class ScannedLayerStack(Module):
   def set_fsdp_plan(self, plan: dict[str, ScanFSDPSpec]) -> None:
     """Installs the per-parameter in-body gather plan (see `fsdp.py`)."""
     self._fsdp_plan = plan
+
+  def set_recompute_body(self, recompute_body: bool) -> None:
+    """Selects full activation checkpointing of the scan body.
+
+    The in-body all-gather is only recomputed in backward when this is set --
+    see the ambient AC window in `forward` and the shim in `fsdp.py`. A caller
+    that shards the stack without it gets the *gathered* per-layer weights in
+    the saved set, which is the memory profile scan exists to avoid.
+    """
+    if not recompute_body and self._fsdp_plan:
+      logger.warning(
+          "ScannedLayerStack: recompute_body is off while FSDP is on. The scan"
+          " body's all-gathers will be saved across the backward cut rather"
+          " than recomputed, so peak activation memory scales with the gathered"
+          " (not sharded) layer weights. Pass memory_policy='full' to recompute"
+          " them."
+      )
+    self._recompute_body = recompute_body
 
   # -- ModuleDict compatibility ------------------------------------------------
   # `Decoder.forward` does `for layer in self.layers.values(): h = layer(h, ...)`.
@@ -372,7 +395,35 @@ class ScannedLayerStack(Module):
       )
       xs = {mangled: value[1:] for mangled, value in xs.items()}
 
-    carry, _ = scan(body, h, xs)
+    if not self._recompute_body:
+      carry, _ = scan(body, h, xs)
+      return carry
+
+    # Full activation checkpointing of the scan body, expressed the ordinary
+    # AOT way. `current_meta` is copied into every node the tracer creates while
+    # the window is open (`torch/fx/proxy.py`), and that includes the nodes of
+    # the HOP body's joint graph -- so the body's own partitioner sees the tag
+    # even though `torch.utils.checkpoint` is a silent no-op inside a HOP.
+    #
+    # Three things here are load-bearing:
+    #  * `preserve_node_meta()` is required. Bare `current_meta` delivers
+    #    nothing; the copy into `node.meta` is gated on
+    #    `should_preserve_node_meta()`.
+    #  * Only `_COPY_META_FIELDS` keys travel (`recompute`, `ac_graph_id`,
+    #    `custom`, `partitioner_tag`). A marker key added here would not arrive,
+    #    so it is not a valid probe for whether the channel is open.
+    #  * The dict is saved and restored, not just cleared of the two keys: the
+    #    window must not outlive the call, or every node traced afterwards
+    #    inherits the policy.
+    with fx_traceback.preserve_node_meta():
+      saved_meta = dict(fx_traceback.current_meta)
+      fx_traceback.current_meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+      fx_traceback.current_meta["ac_graph_id"] = 0
+      try:
+        carry, _ = scan(body, h, xs)
+      finally:
+        fx_traceback.current_meta.clear()
+        fx_traceback.current_meta.update(saved_meta)
     return carry
 
   # -- state_dict adapter ------------------------------------------------------

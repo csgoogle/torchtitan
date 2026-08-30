@@ -61,15 +61,18 @@ False)` around each block: the whole block is recomputed in backward and only
 its input is saved. The scanned arm cannot use that wrapper —
 `torch.utils.checkpoint` inside a scan body is a silent no-op, since the HOP
 re-traces the body and drops the recompute tags. It gets the equivalent from
-`install_scan_collective_recompute(recompute_body=True)` in `fsdp.py`,
-which tags every value-producing forward node in the body `MUST_RECOMPUTE`
-before the body's min-cut partitioner runs. `memory_policy=full` is what sets
-that flag.
+`set_recompute_body(True)`, which makes `ScannedLayerStack.forward` open an
+`fx_traceback.current_meta` window around its `scan(...)` call: every node the
+tracer creates inside the body inherits `MUST_RECOMPUTE`, including through the
+HOP's re-trace, so the body's min-cut partitioner sees the tag.
+`memory_policy=full` is what sets that flag. `install_scan_body_ac_shim()` in
+`fsdp.py` then strips the tag from the two node classes the window necessarily
+over-tags — `placeholder` nodes and the outer `scan` node itself.
 
 Both halves are observable in a run's logs, and both were checked at 8B:
 
-- the tagging pass fires — `tagged 135 node(s) MUST_RECOMPUTE out of 262 graph
-  nodes (recompute_body=True)`;
+- the shim fires — `stripped ambient recompute tags from 12 placeholder/scan
+  node(s) before min-cut`;
 - and the saved-set audit (`SCAN_FSDP_AUDIT_SAVED_SET=1`) shows what actually
   survives the cut: **12 tensors** — the carry in, the carry out, the seven
   weight shards, the RoPE table, the position tensor, and one scalar. No

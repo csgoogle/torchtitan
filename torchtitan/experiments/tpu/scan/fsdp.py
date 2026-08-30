@@ -35,6 +35,15 @@ The fix has two halves, and **both** are required — measured, not assumed:
    tag gets through, because `ban_recomputation_if_allowed` honours a user tag
    ahead of both the collective ban and the allowlist.
 
+   `ScannedLayerStack.forward` sets that tag the ordinary way -- an ambient
+   `fx_traceback.current_meta["recompute"]` window around the `scan` call, which
+   reaches every node the body traces. Tagging the whole body is also what
+   removes the gathered weight from the saved set: with no untagged view op left
+   in the body, min-cut has nothing to save in the gathered tensor's place, so
+   the *shards* cross the cut instead. `install_scan_body_ac_shim` below is the
+   only machinery required, and it exists solely to work around two upstream
+   nodes the ambient channel over-tags.
+
 Safety of forcing recompute of a collective: upstream's *Note [Recomputing
 collectives in the partitioner]* bans it because a pass that
 reorders/deletes/duplicates a collective **inconsistently across ranks**
@@ -231,167 +240,88 @@ def log_saved_set(fwd: torch.fx.GraphModule, bwd: torch.fx.GraphModule) -> None:
 
 
 _ORIGINAL_MIN_CUT = None
-_INSTALLED_RECOMPUTE_BODY = None
-
-# Ops that are free (or near-free) to recompute and that therefore must not be
-# allowed to act as a saved stand-in for a tensor tagged MUST_RECOMPUTE. The
-# functionalized `*_copy` spellings are what actually reach the partitioner
-# inside a scan body; the aliasing spellings are listed for the non-HOP path.
-_VIEW_LIKE_OPS = frozenset({
-    torch.ops.aten.t_copy.default,
-    torch.ops.aten.t.default,
-    torch.ops.aten.view_copy.default,
-    torch.ops.aten.view.default,
-    torch.ops.aten.reshape.default,
-    torch.ops.aten.transpose_copy.int,
-    torch.ops.aten.transpose.int,
-    torch.ops.aten.permute_copy.default,
-    torch.ops.aten.permute.default,
-    torch.ops.aten.expand_copy.default,
-    torch.ops.aten.expand.default,
-    torch.ops.aten.squeeze_copy.dim,
-    torch.ops.aten.unsqueeze_copy.default,
-    torch.ops.aten.unsqueeze.default,
-    torch.ops.aten.slice_copy.Tensor,
-    torch.ops.aten.select_copy.int,
-    torch.ops.aten.alias_copy.default,
-    torch.ops.aten.alias.default,
-    torch.ops.aten.detach.default,
-    torch.ops.aten._to_copy.default,
-})
 
 
-def _forward_region(graph) -> list:
-  """The joint graph's forward nodes — everything the tangents cannot reach.
+def install_scan_body_ac_shim() -> None:
+  """Lets a caller's ambient AC tags reach the scan body's partitioner.
 
-  A joint graph is topologically ordered fwd-then-bwd, so one forward sweep
-  marking each user of a `tangents_*` placeholder classifies the backward
-  region exactly. Tagging a backward node `MUST_RECOMPUTE` is mostly inert
-  (min-cut handles `required_bw_nodes` before it consults the policy), but it
-  is inert by accident, and a tagged nondeterministic op there would be
-  rewritten through `run_with_rng_state`. Cheaper to not tag them.
+  `fx_traceback.current_meta["recompute"]`, set around a `scan(...)` call inside
+  `preserve_node_meta()`, reaches every node of the body's joint graph -- so the
+  caller can express "recompute this whole region" with the ordinary AOT
+  mechanism instead of a graph pass that has to recognise collectives by name.
+  `ScannedLayerStack.forward` opens that window when `recompute_body` is set.
+
+  Two properties of the ambient channel make the shim necessary:
+
+  1. It also tags `placeholder` nodes, which upstream's dispatch-mode tagger
+     never does and `must_recompute()` does not exclude. Min-cut then builds a
+     flow network referencing nodes it does not own and raises
+     `NetworkXError: node source not in graph`. A graph input is by definition
+     not recomputable, so stripping the key from placeholders cannot change any
+     partition upstream's own tagger would produce.
+  2. The window is necessarily open while the *outer* tracer creates the `scan`
+     node itself. Left tagged, min-cut recomputes the whole layer loop in
+     backward -- the forward runs twice per step, silently, and the saved-set
+     metric *improves* while doing it. Clearing the tag from the `scan` node is
+     enough; its `getitem` users then inherit nothing.
+
+  Both are local stands-in for one-line upstream guards in
+  `torch/_functorch/partitioners.py`. Wrapping
+  `min_cut_rematerialization_partition` is what reaches the scan body: the HOP
+  partitions its body with that same function
+  (`torch/_higher_order_ops/partitioner.py`, `HopGraphMinCutPartitioner`), and
+  there is no per-HOP partitioner hook to use instead.
+
+  Idempotent.
   """
-  backward = set()
-  for node in graph.nodes:
-    if node.op == "placeholder":
-      if node.name.startswith("tangents"):
-        backward.add(node)
-    elif any(inp in backward for inp in node.all_input_nodes):
-      backward.add(node)
-  return [node for node in graph.nodes if node not in backward]
-
-
-def install_scan_collective_recompute(recompute_body: bool = False) -> None:
-  """Makes the scan body's partitioner recompute its all-gathers in backward.
-
-  With `recompute_body`, every value-producing node in the body is tagged too,
-  which is what full activation checkpointing means for a scanned stack: the
-  only thing that crosses the cut is the loop carry, so the `ys` residual stops
-  growing with the width of the block. `torch.utils.checkpoint` cannot express
-  this — the HOP re-traces the body through `materialize_as_graph` and drops the
-  recompute tags before this partitioner ever runs, silently.
-
-  Idempotent. The scan HOP partitions its body with the ordinary
-  `min_cut_rematerialization_partition`
-  (`torch/_higher_order_ops/partitioner.py`, `HopGraphMinCutPartitioner`), so
-  wrapping that function is what reaches the scan body — there is no per-HOP
-  partitioner hook to use instead.
-
-  `all_gather*`, the `wait_tensor` that consumes it, and every *view-like*
-  descendant of that wait (transpose / view / reshape / dtype cast) are tagged.
-  The descendants matter as much as the gather: tagging the gather alone leaves
-  min-cut free to save `t_copy(gathered_weight)` instead — a full-size tensor of
-  exactly the shape we were trying not to keep — and it will, because a
-  transpose is free to save and an all-gather is expensive to recompute.
-  Measured on `debugmodel`: gather-only tagging left 5 × `t_copy` of the
-  gathered `[768,256]` / `[256,768]` / `[256,256]` weights in the saved set.
-
-  `reduce_scatter` is left alone: it lives in the backward region already and
-  tagging it would only confuse the cut.
-  """
-  global _ORIGINAL_MIN_CUT, _INSTALLED_RECOMPUTE_BODY
+  global _ORIGINAL_MIN_CUT
   if _ORIGINAL_MIN_CUT is not None:
-    if _INSTALLED_RECOMPUTE_BODY != recompute_body:
-      # The wrapper closes over `recompute_body`, so the first install wins and
-      # the second caller silently gets a different activation-memory policy
-      # from the one it asked for. Two models in one process with different
-      # `memory_policy` settings is the way to hit this.
-      logger.warning(
-          "scan in-body FSDP: install_scan_collective_recompute(%s) ignored;"
-          " already installed with recompute_body=%s. Call"
-          " uninstall_scan_collective_recompute() first to change it.",
-          recompute_body,
-          _INSTALLED_RECOMPUTE_BODY,
-      )
     return
 
   import torch._functorch.partitioners as partitioners  # pylint: disable=g-import-not-at-top
+  # `torch._higher_order_ops.scan` the attribute is the exported `scan`
+  # *function*, which shadows the submodule of the same name -- so the class has
+  # to come in by `from`-import, not by attribute access off the package.
+  from torch._higher_order_ops.scan import ScanOp  # pylint: disable=g-import-not-at-top
 
   _ORIGINAL_MIN_CUT = partitioners.min_cut_rematerialization_partition
-  _INSTALLED_RECOMPUTE_BODY = recompute_body
 
-  def tag_then_partition(joint_module, joint_inputs, **kwargs):
-    tagged = set()
-    if recompute_body:
-      tagged.update(
-          node
-          for node in _forward_region(joint_module.graph)
-          if node.op == "call_function" and node.meta.get("val") is not None
+  def strip_untaggable_then_partition(joint_module, joint_inputs, **kwargs):
+    stripped = 0
+    for node in joint_module.graph.nodes:
+      if "recompute" not in node.meta:
+        continue
+      if node.op == "placeholder" or isinstance(node.target, ScanOp):
+        node.meta.pop("recompute", None)
+        stripped += 1
+    if stripped:
+      logger.info(
+          "scan in-body FSDP: stripped ambient recompute tags from %d"
+          " placeholder/scan node(s) before min-cut.",
+          stripped,
       )
-    for node in joint_module.graph.nodes:
-      if not isinstance(node.target, torch._ops.OpOverload):  # pylint: disable=protected-access
-        continue
-      if node.target.namespace != "_c10d_functional":
-        continue
-      opname = node.target._schema.name.split("::")[-1]  # pylint: disable=protected-access
-      if opname.startswith("all_gather"):
-        tagged.add(node)
-      elif opname == "wait_tensor" and any(
-          inp in tagged for inp in node.all_input_nodes
-      ):
-        tagged.add(node)
-
-    # Close the set over view-like users. `graph.nodes` is topologically
-    # ordered, so a single forward sweep reaches every descendant.
-    for node in joint_module.graph.nodes:
-      if node in tagged or node.op != "call_function":
-        continue
-      if node.target not in _VIEW_LIKE_OPS:
-        continue
-      if any(inp in tagged for inp in node.all_input_nodes):
-        tagged.add(node)
-
-    for node in tagged:
-      node.meta["recompute"] = partitioners.CheckpointPolicy.MUST_RECOMPUTE
-      node.meta.setdefault("ac_graph_id", 0)
-    logger.info(
-        "scan in-body FSDP: tagged %d node(s) MUST_RECOMPUTE out of %d graph"
-        " nodes (recompute_body=%s).",
-        len(tagged),
-        len(joint_module.graph.nodes),
-        recompute_body,
-    )
     fwd, bwd = _ORIGINAL_MIN_CUT(joint_module, joint_inputs, **kwargs)
     if os.environ.get("SCAN_FSDP_AUDIT_SAVED_SET") == "1":
       log_saved_set(fwd, bwd)
     return fwd, bwd
 
-  partitioners.min_cut_rematerialization_partition = tag_then_partition
+  partitioners.min_cut_rematerialization_partition = (
+      strip_untaggable_then_partition
+  )
   logger.info(
-      "scan in-body FSDP: forced recompute of in-body all-gathers"
+      "scan in-body FSDP: ambient-AC shim installed"
       " (min_cut_rematerialization_partition wrapped)."
   )
 
 
-def uninstall_scan_collective_recompute() -> None:
+def uninstall_scan_body_ac_shim() -> None:
   """Restores the stock partitioner. Idempotent; safe to call when not installed.
 
   The install wraps a module-level function in `torch._functorch.partitioners`,
   which is process-global: without this, a test that installs it leaks the
-  wrapper into every later partition in the same process, and a caller that
-  wants a different `recompute_body` cannot get one.
+  wrapper into every later partition in the same process.
   """
-  global _ORIGINAL_MIN_CUT, _INSTALLED_RECOMPUTE_BODY
+  global _ORIGINAL_MIN_CUT
   if _ORIGINAL_MIN_CUT is None:
     return
 
@@ -399,7 +329,6 @@ def uninstall_scan_collective_recompute() -> None:
 
   partitioners.min_cut_rematerialization_partition = _ORIGINAL_MIN_CUT
   _ORIGINAL_MIN_CUT = None
-  _INSTALLED_RECOMPUTE_BODY = None
   logger.info("scan in-body FSDP: restored the stock min-cut partitioner.")
 
 
@@ -429,10 +358,12 @@ def shard_stacked_layers(
   the property instead gathers all 80 layers at graph-build time: 136.9 GB
   resident at 70B, measured.
 
-  `install_scan_collective_recompute` is not optional either: without it the
+  Recompute of the in-body gather is not optional either: without it the
   min-cut partitioner saves the *gathered* per-layer weight as a scan `ys`
   residual and the 136.9 GB comes straight back, just materialized
-  layer-by-layer.
+  layer-by-layer. `recompute_body` is what asks for it -- the stack opens an
+  ambient AC window around its `scan` call, and `install_scan_body_ac_shim`
+  makes that window survive to the body's partitioner.
   """
   from torchtitan.experiments.graph_trainer.simple_fsdp import (  # pylint: disable=g-import-not-at-top
       data_parallel as simple_fsdp_data_parallel,
@@ -452,4 +383,5 @@ def shard_stacked_layers(
           reduce_dtype=mp_policy.reduce_dtype,
       )
   )
-  install_scan_collective_recompute(recompute_body=recompute_body)
+  stack.set_recompute_body(recompute_body)
+  install_scan_body_ac_shim()

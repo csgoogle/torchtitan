@@ -66,11 +66,11 @@ graph_trainer (aot_fx_trace) lanes. See `README.md` in this directory.
 """
 
 from torchtitan.experiments.tpu.scan.fsdp import (
-    install_scan_collective_recompute,
+    install_scan_body_ac_shim,
     ScanFSDPSpec,
     shard_stacked_layers,
     shard_stacked_layers as shard_scanned_layers,
-    uninstall_scan_collective_recompute,
+    uninstall_scan_body_ac_shim,
 )
 from torchtitan.experiments.tpu.scan.layer_stack import (
     apply_scan_over_layers,
@@ -91,8 +91,8 @@ __all__ = [
     "install_scan_over_layers",
     "shard_stacked_layers",
     "ScanFSDPSpec",
-    "install_scan_collective_recompute",
-    "uninstall_scan_collective_recompute",
+    "install_scan_body_ac_shim",
+    "uninstall_scan_body_ac_shim",
     # Config -> scan parameters, shared by both lanes.
     "resolve_peel_first_layer",
 ]

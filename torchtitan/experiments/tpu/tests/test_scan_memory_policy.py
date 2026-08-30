@@ -14,9 +14,9 @@ Scan replaces the N per-layer modules with a single `layer_template`, so that
 integer no longer exists anywhere in the graph. Every node under the stack
 reports `_NOT_IN_LAYERS` and the boundary pass can never fire -- with no error
 and no log line saying so. Activation checkpointing under scan is not therefore
-absent: it comes from `scan/fsdp.py`'s `install_scan_collective_recompute`,
-which tags the body for the HOP's own partitioner (see
-`test_scan_collective_recompute.py`). What is inert is this pass's layer-
+absent: it comes from `ScannedLayerStack.set_recompute_body`, whose ambient
+`current_meta` window tags the body for the HOP's own partitioner (see
+`test_scan_body_ac_shim.py`). What is inert is this pass's layer-
 boundary `MUST_SAVE`, so the two mechanisms must not be assumed to compose.
 
 Note that widening the comparison from `>` to `!=` does not fix this: both
