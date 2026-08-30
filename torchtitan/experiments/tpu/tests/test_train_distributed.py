@@ -204,7 +204,7 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
       ),
       dict(
-          testcase_name="llama3_simple_fsdp",
+          testcase_name="llama3_simplefsdp",
           module="torchtitan.experiments.tpu.llama3",
           config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
@@ -296,6 +296,14 @@ class TrainDistributedTest(
           config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+      ),
+      dict(
+          testcase_name="qwen3_simplefsdp",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
       ),
       dict(
           testcase_name="qwen3_fsdp_compile",
@@ -429,11 +437,11 @@ class TrainDistributedTest(
         tensor_parallel_degree=tensor_parallel_degree,
         data_parallel_replicate_degree=data_parallel_replicate_degree,
         skip_devices=skip_devices,
-        start_trainer=torchtitan.experiments.tpu.train.start_trainer,
+        start_trainer=torchtitan.experiments.tpu.train.start_trainer,  # pyrefly: ignore[bad-argument-type]
         enable_compile=enable_compile,
     )
 
 
 if __name__ == "__main__":
-  mp.set_start_method("spawn")
+  mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]
   absltest.main()

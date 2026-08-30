@@ -12,13 +12,13 @@ def parse_log(log_file):
     total_times = []
     
     # Regexes for robust parsing
-    sync_pattern = re.compile(r"Weight sync:.*total=(?P<time>[-+]?\d*\.\d+)s")
-    step_pattern = re.compile(r"Step\s+(?P<step>\d+)")
-    loss_pattern = re.compile(r"Loss:\s*(?P<loss>[-+]?\d*\.\d+)")
-    reward_pattern = re.compile(r"Reward:\s*(?P<reward>[-+]?\d*\.\d+)")
-    total_time_pattern = re.compile(r"\|\s*Time:\s*(?P<time>[-+]?\d*\.\d+)s")
-    gen_time_pattern = re.compile(r"Gen Time:\s*(?P<time>[-+]?\d*\.\d+)s")
-    train_time_pattern = re.compile(r"Train Time:\s*(?P<time>[-+]?\d*\.\d+)s")
+    sync_pattern = re.compile(r"Weight sync:.*total=(?P<time>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)s")
+    step_pattern = re.compile(r"(?:Train\s*\|\s*)?Step:\s*(?P<step>\d+)")
+    loss_pattern = re.compile(r"(?:Loss|loss/mean):\s*(?P<loss>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
+    reward_pattern = re.compile(r"(?:Reward|rollout_reward/_mean):\s*(?P<reward>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
+    total_time_pattern = re.compile(r"\|\s*Time:\s*(?P<time>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)s")
+    gen_time_pattern = re.compile(r"(?:Gen Time:\s*(?P<time>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)s|generator/decode_time_ms/mean:\s*(?P<time_ms>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?))")
+    train_time_pattern = re.compile(r"Train Time:\s*(?P<time>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)s")
     
     latest_weight_sync = 0.0
     
@@ -46,7 +46,11 @@ def parse_log(log_file):
                     rewards.append(float(reward_match.group('reward')))
                     
                     # Optional/new fields
-                    gen_times.append(float(gen_match.group('time')) if gen_match else 0.0)
+                    if gen_match:
+                        gen_t = float(gen_match.group('time')) if gen_match.group('time') is not None else float(gen_match.group('time_ms')) / 1000.0
+                    else:
+                        gen_t = 0.0
+                    gen_times.append(gen_t)
                     train_times.append(float(train_match.group('time')) if train_match else 0.0)
                     total_times.append(float(total_match.group('time')) if total_match else 0.0)
                     weight_sync_times.append(latest_weight_sync)

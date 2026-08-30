@@ -4,47 +4,109 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.nn as nn
 
+from torchtitan.components.optimizer import (
+    collect_moe_routing_metric_tensors,
+    set_moe_routing_metric_tensors,
+)
 from torchtitan.experiments.graph_trainer.common_utils import (
+    accumulate_param_grads_,
+    compute_annotated_loss,
+    compute_parameter_gradients,
+    log_timer,
     maybe_register_blockmask_pytree_node,
 )
-from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.experiments.graph_trainer.configs import (
+    GraphTrainerCompileConfig,
+    trace_input_preparer_keys,
+)
 from torchtitan.experiments.graph_trainer.cudagraph import cudagraph_teardown
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
-    run_traced_train_step,
-    trace_train_step,
+    minimal_fx_tracer,
+    run_traced,
     TracedResult,
 )
 from torchtitan.experiments.graph_trainer.passes import (
     apply_graph_passes,
     construct_default_graph_passes,
 )
+from torchtitan.experiments.graph_trainer.registry import (
+    PASS_PIPELINE_REGISTRY,
+    POST_INIT_HOOKS,
+    PRE_TRAIN_STEP_HOOKS,
+    TRACE_CALL_INPUT_PREPARERS,
+    TRACE_INPUT_PREPARERS,
+)
+from torchtitan.experiments.graph_trainer.remove_noop_passes import (
+    remove_parameter_gradient_markers_pass,
+)
+from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
 
-def make_fwd_bwd_step(loss_fn):
+def _maybe_apply_numa_binding(device_index: int, device_type: str) -> None:
+    """Pin this process to the NUMA node of its GPU for local memory bandwidth.
+
+    On multi-NUMA machines (e.g. GB200 NVLink-C2C), pinned-memory allocations
+    that land on the GPU's local NUMA node get ~350 GB/s D2H bandwidth vs
+    ~120 GB/s cross-NUMA. Must run before any pinned memory is allocated.
+    """
+    if device_type != "cuda":
+        return
+    from torch.numa.binding import (
+        _maybe_apply_numa_binding_to_current_process,
+        AffinityMode,
+        NumaOptions,
+    )
+
+    _maybe_apply_numa_binding_to_current_process(
+        device_index=device_index,
+        numa_options=NumaOptions(
+            affinity_mode=AffinityMode.NODE,
+            should_fall_back_if_binding_fails=True,
+        ),
+    )
+    logger.info("NUMA binding applied for GPU %d", device_index)
+
+
+def make_fwd_bwd_step(model, loss_fn, collect_moe_routing_metrics: bool = False):
     """Return a plain function that traces the entire fwd+loss+bwd step.
 
-    ``loss_fn`` is captured in the closure so it is not a graph input.
+    ``model`` and ``loss_fn`` are captured in the closure so neither shows up
+    as a graph input. Pass ``model`` through ``minimal_fx_tracer(fn, module=model)``
+    to thread its parameters/buffers as static graph inputs.
     """
 
-    def fwd_bwd_step(
-        model, inputs, labels, global_valid_tokens, extra_inputs, extra_kwargs
-    ):
-        pred = model(inputs, **extra_inputs, **extra_kwargs)
-        loss = loss_fn(pred, labels) / global_valid_tokens
-        params = [
-            p
-            for _, p in model.named_parameters(remove_duplicate=False)
-            if p.requires_grad
+    def fwd_bwd_step(inputs, labels, global_valid_tokens, extra_kwargs):
+        pred = model(inputs, **extra_kwargs)
+        routing_metrics = (
+            collect_moe_routing_metric_tensors([model])
+            if collect_moe_routing_metrics
+            else []
+        )
+        # The loss function is not a submodule of the model, so
+        # annotate_module_fqns won't tag it. Annotate it here so that
+        # downstream passes (bucketing, SAC, kernel annotations) can
+        # attribute loss nodes in the traced graph.
+        loss = compute_annotated_loss(
+            loss_fn,
+            pred,
+            labels,
+            {"global_valid_tokens": global_valid_tokens},
+        )
+        named_params = [
+            (name, parameter)
+            for name, parameter in model.named_parameters(remove_duplicate=False)
+            if parameter.requires_grad
         ]
-        grads = torch.autograd.grad(loss, params)
-        return [loss] + list(grads)
+        grads = compute_parameter_gradients(loss, named_params)
+        return [loss, *grads, *routing_metrics]
 
     return fwd_bwd_step
 
@@ -59,23 +121,39 @@ class GraphTrainer(Trainer):
     def __init__(self, config):
         super().__init__(config)
 
-        if self.config.compile.mode == "aot_fx_trace" and self.parallel_dims.pp_enabled:
-            raise ValueError(
-                "aot_fx_trace compile mode does not support Pipeline Parallel"
-            )
+        _maybe_apply_numa_binding(self.device.index, self.device.type)
 
         # Lazy state for aot_fx_trace mode
         self._traced_step: TracedResult | None = None
+
+        if self.config.compile.memory_policy == "sac_and_offload":
+            from torch._functorch._activation_offloading.offload_ops import (
+                pinned_memory_pool,
+            )
+
+            self._pinned_pool_ctx = pinned_memory_pool()
+            self._pinned_pool_ctx.__enter__()
+        else:
+            self._pinned_pool_ctx = None
+
+        # Run post-init hook for the active pass pipeline
+        POST_INIT_HOOKS.get(self.config.compile.pass_pipeline, lambda _: None)(self)
 
     def forward_backward_step(
         self,
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor,
+        global_valid_tokens: float,
     ) -> torch.Tensor:
         if self.config.compile.mode != "aot_fx_trace":
             return super().forward_backward_step(
+                input_dict=input_dict,
+                labels=labels,
+                global_valid_tokens=global_valid_tokens,
+            )
+        if self.parallel_dims.pp_enabled:
+            return self._graph_pp_forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
                 global_valid_tokens=global_valid_tokens,
@@ -84,9 +162,7 @@ class GraphTrainer(Trainer):
         assert len(self.model_parts) == 1
         model = self.model_parts[0]
 
-        inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
-            input_dict, labels
-        )
+        inputs, labels, extra_kwargs = self.post_dataloading_process(input_dict, labels)
         # remove_duplicate=False to preserve duplicate parameter entries
         # from weight tying (e.g. shared embedding/output weights).
         params = [
@@ -100,9 +176,34 @@ class GraphTrainer(Trainer):
             labels,
             global_valid_tokens,
             params,
-            extra_inputs,
             extra_kwargs,
         )
+
+    def _graph_pp_forward_backward_step(
+        self,
+        *,
+        input_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+        global_valid_tokens: float,
+    ) -> torch.Tensor:
+        inputs, labels, extra_kwargs = self.post_dataloading_process(input_dict, labels)
+        loss_kwargs = {"global_valid_tokens": global_valid_tokens}
+        with self.train_context():
+            targets, losses = (labels, []) if self.pp_has_last_stage else (None, None)
+            schedule_args = (inputs,) if self.pp_has_first_stage else ()
+            self.pp_schedule.step(
+                *schedule_args,
+                **extra_kwargs,
+                target=targets,
+                losses=losses,
+                loss_kwargs=loss_kwargs,
+                return_outputs=False,
+            )
+
+        if self.pp_has_last_stage:
+            assert losses is not None
+            return torch.sum(torch.stack(losses)).to(self.device)
+        return torch.tensor([-1.0], device=self.device)
 
     def _load_precompiled_fx_trace(self, model: nn.Module) -> None:
         """Load a precompiled aot_fx_trace artifact from disk."""
@@ -137,60 +238,106 @@ class GraphTrainer(Trainer):
         model: nn.Module,
         inputs: torch.Tensor,
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor,
+        global_valid_tokens: float,
         params: list[torch.Tensor],
-        extra_inputs: dict[str, torch.Tensor],
         extra_kwargs: dict[str, Any],
     ) -> torch.Tensor:
+        maybe_register_blockmask_pytree_node()
         if self._traced_step is None:
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
             else:
-                fwd_bwd_fn = make_fwd_bwd_step(self.loss_fn)
-                maybe_register_blockmask_pytree_node()
-                with self.train_context():
-                    self._traced_step = trace_train_step(fwd_bwd_fn)(
-                        model,
+                fwd_bwd_fn = make_fwd_bwd_step(
+                    model,
+                    self.loss_fn,
+                    collect_moe_routing_metrics=self._collect_moe_routing_metrics,
+                )
+                with self.train_context(), log_timer("minimal_fx_tracer"):
+                    self._traced_step = minimal_fx_tracer(
+                        fwd_bwd_fn,
+                        module=model,
+                        prepare_inputs=self._prepare_trace_inputs,
+                        prepare_call_inputs=self._prepare_trace_call_inputs,
+                    )(
                         inputs,
                         labels,
                         global_valid_tokens,
-                        extra_inputs,
                         extra_kwargs,
                     )
-
             if self.config.compile.enable_passes:
-                passes = construct_default_graph_passes(
+                pipeline_fn = PASS_PIPELINE_REGISTRY.get(
+                    self.config.compile.pass_pipeline,
+                    construct_default_graph_passes,
+                )
+                passes = pipeline_fn(
                     self._traced_step,
                     self.config,
+                    parallel_dims=self.parallel_dims,
                 )
+
                 self._traced_step.gm = apply_graph_passes(
                     self._traced_step.gm,
                     self._traced_step.example_inputs,
                     passes,
                     compile_config=self.config.compile,
                 )
+            else:
+                self._traced_step.gm = remove_parameter_gradient_markers_pass(
+                    self._traced_step.gm, self._traced_step.example_inputs
+                )
         with self.train_context():
-            outputs = run_traced_train_step(
-                self._traced_step,
-                model,
+            outputs = run_traced(self._traced_step, module=model)(
                 inputs,
                 labels,
                 global_valid_tokens,
-                extra_inputs,
                 extra_kwargs,
             )
         loss = outputs[0]
-        grads = outputs[1:]
+        grads = outputs[1 : 1 + len(params)]
+        if self._collect_moe_routing_metrics:
+            set_moe_routing_metric_tensors(
+                [model], list(outputs[1 + len(params) :])
+            )
 
-        for param, grad in zip(params, grads, strict=True):
-            if param.grad is None:
-                param.grad = grad
-            else:
-                param.grad += grad
-
+        accumulate_param_grads_(params, grads)
         return loss
 
+    def _prepare_trace_inputs(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        for pass_name in trace_input_preparer_keys(self.config.compile):
+            prepare = TRACE_INPUT_PREPARERS.get(pass_name)
+            if prepare is not None:
+                prepare(self.config.compile, args, kwargs)
+
+    def _prepare_trace_call_inputs(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        for pass_name in trace_input_preparer_keys(self.config.compile):
+            prepare = TRACE_CALL_INPUT_PREPARERS.get(pass_name)
+            if prepare is not None:
+                prepared = prepare(self.config.compile, args, kwargs)
+                if prepared is not None:
+                    args, kwargs = prepared
+        return args, kwargs
+
+    def train_step(
+        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ):
+        PRE_TRAIN_STEP_HOOKS.get(self.config.compile.pass_pipeline, lambda _: None)(
+            self
+        )
+        super().train_step(data_iterator)
+
     def close(self) -> None:
+        if self._pinned_pool_ctx is not None:
+            self._pinned_pool_ctx.__exit__(None, None, None)
+            self._pinned_pool_ctx = None
+
         super().close()
 
         # See Note [explicit cudagraph teardown] in cudagraph.py

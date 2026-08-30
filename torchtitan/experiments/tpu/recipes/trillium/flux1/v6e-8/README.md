@@ -53,13 +53,14 @@ xpk workload create \
     --splash-attention-kernel.use-splash-attention-kernel \
     --compile.enable \
     --compile.backend=tpu \
-    --activation-checkpoint.no-preserve_rng_state"
+    activation-checkpoint:full \
+    --activation-checkpoint.no-preserve-rng-state"
 ```
 
-**5/21/26: With this configuration you should observe the following metrics**
+**5/28/26: With this configuration you should observe the following metrics**
 
-- Average Step time: **2.70s**
-- Average Step time / PDB: **1.35s**
+- Average Step time: **2.44s**
+- Average Step time / PDB: **1.22s**
 
 ### bfloat16
 
@@ -97,10 +98,11 @@ xpk workload create \
     --splash-attention-kernel.use-splash-attention-kernel \
     --compile.enable \
     --compile.backend=tpu \
-    --activation-checkpoint.no-preserve_rng_state"
+    activation-checkpoint:full \
+    --activation-checkpoint.no-preserve-rng-state"
 ```
 
-**5/21/26: With this configuration you should observe the following metrics**
+**5/28/26: With this configuration you should observe the following metrics**
 
-- Average Step time: **3.15s**
-- Average Step time / PDB: **1.05s**
+- Average Step time: **2.87s**
+- Average Step time / PDB: **0.95s**

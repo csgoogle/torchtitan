@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Kineto profiler + memory-snapshot lifecycle."""
+
 import os as os
 import pickle
 import time
@@ -14,12 +16,23 @@ import torch
 import tyro
 from torchtitan.config import Configurable
 from torchtitan.config.function import Function
+from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import device_module, device_type
 
-from torchtitan.tools.utils import get_device_module, get_device_type
+# Paths expects by meta internal tooling
+PROFILE_DIR = "profiling/traces"  # Profiler.Config.save_traces_folder default
+PROFILE_ITER_DIR = "iteration_{step}"  # PROFILE_DIR/{PROFILE_ITER_DIR}
+PROFILE_FILE = "rank{rank}_trace.json.gz"  # PROFILE_DIR/PROFILE_ITER_DIR/{PROFILE_FILE}
 
-# how much memory allocation/free ops to record in memory snapshots
-MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
+MEMORY_DIR = (
+    "profiling/memory_snapshot"  # Profiler.Config.save_memory_snapshot_folder default
+)
+MEMORY_STEP_DIR = "step_{step:012d}"  # MEMORY_DIR/{MEMORY_STEP_DIR}
+MEMORY_EXIT_DIR = "step_{step:012d}_exit"  # OOM dump variant
+MEMORY_FILE = (
+    "{rank:06d}_step_{step}.pickle"  # MEMORY_DIR/MEMORY_STEP_DIR/{MEMORY_FILE}
+)
 
 
 class MemoryProfiler:
@@ -37,9 +50,15 @@ class MemoryProfiler:
         snapshot_dir: str,
         leaf_folder: str,
         rank: int,
+        max_entries: int,
     ) -> None:
-        get_device_module().memory._record_memory_history(
-            max_entries=MEMORY_SNAPSHOT_MAX_ENTRIES
+        device_module.memory._record_memory_history(
+            # stacks="python" records only Python frames (not C++), which is much
+            # cheaper to capture and serialize, keeping the snapshot dump from
+            # taking minutes -- the default stacks="all" symbolizes C++ frames,
+            # which is very slow for torchtitan workload.
+            stacks="python",
+            max_entries=max_entries,
         )
         # when resume training, we start from the last step
         self.step_num = step_num
@@ -54,11 +73,11 @@ class MemoryProfiler:
             return
         if not exit_ctx:
             curr_step = self.step_num
-            dir_name = f"iteration_{curr_step}"
+            dir_name = MEMORY_STEP_DIR.format(step=curr_step)
         else:
-            # dump as iteration_0_exit if OOM at iter 1
+            # dump as step_000000000000_exit if OOM at iter 1
             curr_step = self.step_num - 1
-            dir_name = f"iteration_{curr_step}_exit"
+            dir_name = MEMORY_EXIT_DIR.format(step=curr_step)
         curr_snapshot_dir = os.path.join(
             self._snapshot_dir, dir_name, self._leaf_folder
         )
@@ -67,10 +86,11 @@ class MemoryProfiler:
         logger.info(f"Dumping memory snapshot at step {curr_step}")
         begin = time.monotonic()
         output_file = os.path.join(
-            curr_snapshot_dir, f"rank{self._rank}_memory_snapshot.pickle"
+            curr_snapshot_dir, MEMORY_FILE.format(rank=self._rank, step=curr_step)
         )
         with open(output_file, "wb") as output:
-            pickle.dump(get_device_module().memory._snapshot(), output)
+            # Protocol 4 for compatibility with pytorch.org/memory_viz JS parser
+            pickle.dump(device_module.memory._snapshot(), output, protocol=4)
         logger.info(
             f"Finished dumping memory snapshot in {time.monotonic() - begin:.2f} seconds"
         )
@@ -103,7 +123,7 @@ class Profiler(Configurable):
         enable_profiling: bool = False
         """Whether to enable pytorch profiler."""
 
-        save_traces_folder: str = "profile_traces"
+        save_traces_folder: str = PROFILE_DIR
         """Trace files location."""
 
         profile_freq: int = 10
@@ -144,32 +164,18 @@ class Profiler(Configurable):
         This is used to configure torch.profiler.schedule.
         """
 
-        profiler_repeat: int | None = None
-        """
-        The number of times to repeat the profiling cycle
-
-        This is used to configure torch.profiler.schedule.
-        """
-
-        profiler_skip_first: int | None = None
-        """
-        The number of initial profiling cycles to skip
-
-        This is used to configure torch.profiler.schedule.
-        """
-
-        profiler_skip_first_wait: int | None = None
-        """
-        The number of initial profiling cycles to skip the wait time
-
-        This is used to configure torch.profiler.schedule.
-        """
-
         enable_memory_snapshot: bool = False
         """Whether to dump memory snapshot."""
 
-        save_memory_snapshot_folder: str = "memory_snapshot"
+        save_memory_snapshot_folder: str = MEMORY_DIR
         """Memory snapshot files location."""
+
+        memory_snapshot_max_entries: int = 1_000_000
+        """Max alloc/free events recorded per memory snapshot (ring buffer).
+
+        Caps the history passed to ``_record_memory_history``; the oldest events
+        are dropped once full. Bounds host memory and snapshot size / dump time.
+        """
 
         trace_post_processor: Annotated[
             Function.Config | None, tyro.conf.Suppress
@@ -242,10 +248,13 @@ class Profiler(Configurable):
 
     def step(self) -> None:
         """Advance all active profilers by one training step."""
+
         if self.torch_profiler is not None:
-            self.torch_profiler.step()
+            with sl.log_trace_span("kineto_profiler_step_call"):
+                self.torch_profiler.step()
         if self.memory_profiler is not None:
-            self.memory_profiler.step()
+            with sl.log_trace_span("memory_profiler_step_call"):
+                self.memory_profiler.step()
 
     def build_torch_profiler(
         self,
@@ -270,23 +279,13 @@ class Profiler(Configurable):
             cfg.profiler_active,
         )
 
-        additional_params = {
-            key: val
-            for key, val in [
-                ("repeat", cfg.profiler_repeat),
-                ("skip_first", cfg.profiler_skip_first),
-                ("skip_first_wait", cfg.profiler_skip_first_wait),
-            ]
-            if val is not None
-        }
-
         rank = torch.distributed.get_rank()
         post_processor = (
             cfg.trace_post_processor.build() if cfg.trace_post_processor else None
         )
 
         def trace_handler(prof):
-            curr_trace_dir_name = "iteration_" + str(prof.step_num)
+            curr_trace_dir_name = PROFILE_ITER_DIR.format(step=prof.step_num)
             curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name, leaf_folder)
             if not os.path.exists(curr_trace_dir):
                 os.makedirs(curr_trace_dir, exist_ok=True)
@@ -294,7 +293,7 @@ class Profiler(Configurable):
             logger.info(f"Dumping profiler traces at step {prof.step_num}")
             begin = time.monotonic()
 
-            output_file = os.path.join(curr_trace_dir, f"rank{rank}_trace.json")
+            output_file = os.path.join(curr_trace_dir, PROFILE_FILE.format(rank=rank))
             prof.export_chrome_trace(output_file)
 
             if post_processor is not None:
@@ -323,12 +322,21 @@ class Profiler(Configurable):
         assert (
             wait >= 0
         ), "profile_freq must be greater than or equal to warmup + active"
-        device_type = get_device_type()
+        from torchtitan.tools.utils import device_type
+        
         activities = [torch.profiler.ProfilerActivity.CPU]
+        experimental_config = None
         if device_type == "tpu":
-            # Use PrivateUse1 for TPU until it is fully upstreamed in PyTorch
-            # TODO: b/470479047 - confirm torch.profiler working for TPU on Cloud.
-            activities.append(torch.profiler.ProfilerActivity.PrivateUse1)
+            activities.append(torch.profiler.ProfilerActivity.TPU)  # type: ignore
+            from torch_tpu._internal.profiler import TpuProfilerConfig  # pylint: disable=g-import-not-at-top
+            import pathlib  # pylint: disable=g-import-not-at-top
+
+            tpu_trace_dir = os.path.join(trace_dir, f"rank_{rank}")
+            experimental_config = TpuProfilerConfig(
+                host_tracer_level=2,
+                device_tracer_level=1,
+                run_dir=pathlib.Path(tpu_trace_dir),
+            )
         elif torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         elif torch.xpu.is_available():
@@ -341,6 +349,7 @@ class Profiler(Configurable):
             ),
             on_trace_ready=trace_handler,
             record_shapes=True,
+            experimental_config=experimental_config,
         )
         torch_profiler.__enter__()
         torch_profiler.step_num = global_step
@@ -368,5 +377,10 @@ class Profiler(Configurable):
 
         logger.info(f"Memory profiler active. Snapshot will be saved at {snapshot_dir}")
         return MemoryProfiler(
-            global_step, cfg.profile_freq, snapshot_dir, leaf_folder, rank
+            global_step,
+            cfg.profile_freq,
+            snapshot_dir,
+            leaf_folder,
+            rank,
+            cfg.memory_snapshot_max_entries,
         )

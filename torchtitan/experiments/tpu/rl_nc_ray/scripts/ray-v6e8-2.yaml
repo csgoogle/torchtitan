@@ -35,7 +35,7 @@ spec:
         serviceAccountName: ray-ksa
         containers:
           - name: ray-head
-            image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/torchtitan-ray:vllm-0612
+            image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/torchtitan-ray:rebase-0828
             imagePullPolicy: Always
             env:
             - name: RAY_TRAIN_V2_ENABLED
@@ -81,7 +81,7 @@ spec:
           serviceAccountName: ray-ksa
           containers:
             - name: ray-worker
-              image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/torchtitan-ray:vllm-0612
+              image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/torchtitan-ray:rebase-0828
               imagePullPolicy: Always
               resources:
                 limits:

@@ -1,6 +1,5 @@
 """Config registry for Conformer on Torchax."""
 
-import torchtitan.experiments.torchax.conformer.loss as conformer_loss
 import torchtitan.experiments.torchax.torchax_job_config as torchax_job_config_module
 import torchtitan.experiments.tpu.conformer
 import torchtitan.experiments.tpu.conformer.config_registry as tpu_conformer
@@ -30,8 +29,6 @@ def conformer_test() -> torchax_job_config_module.TorchaxJobConfig:
   cfg.model_spec = _model_spec(cfg.model_spec.flavor)
   cfg.torchax_config.use_torchax = True
   cfg.torchax_config.use_scan = True
-  # Inject our JAX CTCLoss config
-  cfg.loss = conformer_loss.CTCLoss.Config()
   return cfg
 
 
@@ -46,8 +43,6 @@ def conformer_debugmodel() -> torchax_job_config_module.TorchaxJobConfig:
   cfg.model_spec = _model_spec(cfg.model_spec.flavor)
   cfg.torchax_config.use_torchax = True
   cfg.torchax_config.use_scan = True
-  # Inject our JAX CTCLoss config
-  cfg.loss = conformer_loss.CTCLoss.Config()
   return cfg
 
 

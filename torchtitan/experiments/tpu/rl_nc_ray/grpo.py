@@ -14,7 +14,7 @@ generator to TPU to bypass PJRT client deadlock limitations.
 import asyncio
 import copy
 import os
-import sys
+import math
 import typing
 from dataclasses import dataclass
 
@@ -24,8 +24,7 @@ import ray.util.scheduling_strategies
 import torchtitan.experiments.tpu.rl_nc_ray  # Ensure mock runs first
 
 from torchtitan.config.manager import ConfigManager
-from torchtitan.experiments.rl.grpo import RLTrainer
-from torchtitan.experiments.rl.types import Trajectory
+from torchtitan.experiments.rl.controller import Controller
 from torchtitan.experiments.tpu.rl_nc_ray.trainer import RayTPUPolicyTrainer
 from torchtitan.experiments.tpu.rl_nc_ray.generator import RayVLLMGenerator
 from torchtitan.tools.logging import init_logger
@@ -37,31 +36,31 @@ from torchtitan.experiments.tpu.rl_nc_ray.tpu_env_utils import (
 )
 
 
+class ValueMeshProxy:
+    """Mocks the Monarch ValueMesh returned by awaiting a future"""
+    def __init__(self, vals):
+        self.vals = vals
+
+    def get(self, rank):
+        if rank < len(self.vals):
+            return self.vals[rank]
+        return None
+
 class FutureProxy:
     """Mocks the Monarch Future returned by .call()"""
     def __init__(self, obj_refs):
         self.obj_refs = obj_refs if isinstance(obj_refs, list) else [obj_refs]
 
+    async def _await_internal(self):
+        vals = await asyncio.gather(*self.obj_refs)
+        return ValueMeshProxy(vals)
+
+    def __await__(self):
+        return self._await_internal().__await__()
+
     def get(self):
         vals = ray.get(self.obj_refs)
-        val = vals[0] if vals else None
-        
-        class ItemProxy:
-            def item(self, **kwargs):
-                return val
-            # Some operations (like pull_model_state_dict) just return None
-            def __getattr__(self, name):
-                return getattr(val, name)
-        
-        # If the value is a dict/list/tuple, we still might need to support .item() for metrics
-        if isinstance(val, (dict, list, tuple, float, int, str, bool)) or val is None:
-            class Wrapper:
-                def __init__(self, v):
-                    self.v = v
-                def item(self, **kwargs):
-                    return self.v
-            return Wrapper(val)
-        return ItemProxy()
+        return vals[0] if vals else None
 
 
 class RayTrainerProxy:
@@ -80,80 +79,70 @@ class RayTrainerProxy:
                     return FutureProxy([ray.put(None)] * len(self.proxy.ray_trainers))
                 
                 futures = []
-                if name == "forward_backward":
-                    batches = args[0]
-                    for i, trainer in enumerate(self.proxy.ray_trainers):
-                        method = getattr(trainer, name)
-                        # Pass the ENTIRE batches list so the trainer can slice it via self.dp_rank
-                        futures.append(method.remote(batches))
-                else:
-                    for trainer in self.proxy.ray_trainers:
-                        method = getattr(trainer, name)
-                        futures.append(method.remote(*args, **kwargs))
+                for trainer in self.proxy.ray_trainers:
+                    method = getattr(trainer, name)
+                    futures.append(method.remote(*args, **kwargs))
                 return FutureProxy(futures)
         return MethodProxy(self)
 
-
-class RayGeneratorProxy:
-    """Mocks the Monarch Actor wrapper for the Generator"""
-    def __init__(self, ray_generator, ray_trainers):
+# TODO: currently we only allow num_generator to be 1, route and fanout are the same.
+class RayInterGeneratorRouter:
+    """Mocks the InterGeneratorRouter for Ray"""
+    def __init__(self, ray_generator, trainer_proxy, hot_swap=True):
         self.ray_generator = ray_generator
-        self.ray_trainers = ray_trainers if isinstance(ray_trainers, list) else [ray_trainers]
+        self.trainer_proxy = trainer_proxy
+        self.hot_swap = hot_swap
 
-    def __getattr__(self, name):
-        class MethodProxy:
-            def __init__(self, generator, trainers):
-                self.generator = generator
-                self.trainers = trainers
-            def call(self, *args, **kwargs):
-                if name == "pull_model_state_dict":
-                    version = args[0]
-                    # We bypass torchstore and use Ray object store directly
-                    # Call on all trainers to participate in collective operation!
-                    refs = []
-                    for trainer in self.trainers:
-                        refs.append(getattr(trainer, "get_model_state_dict").remote())
-                    
-                    # [TPU HACK / OPTIMIZATION]
-                    # Why: Passing refs[0] directly to the remote actor auto-resolves/deserializes it on the generator driver.
-                    # This double-serialization on the generator driver CPU causes massive CPU/memory bottlenecks.
-                    # Solution: Wrap refs[0] in a list [refs[0]] to bypass auto-resolution, passing raw ObjectRef.
-                    # TODO: Remove this container-wrapping hack once Ray supports a cleaner way to pass
-                    # unresolved ObjectRefs directly.
-                    return FutureProxy([self.generator.load_model_state_dict.remote(version, [refs[0]])])
-                method = getattr(self.generator, name)
-                return FutureProxy([method.remote(*args, **kwargs)])
-        return MethodProxy(self.ray_generator, self.ray_trainers)
+    async def route(self, method, *args, routing_ctx, **kwargs):
+        # Delegate to Ray actor's method (e.g. generate)
+        return await getattr(self.ray_generator, method).remote(*args, **kwargs)
+
+     
+    async def fanout(self, method, *args, return_exceptions=False, **kwargs):
+        # Call on all generators (we only have one).
+        try:
+            return [await getattr(self.ray_generator, method).remote(*args, **kwargs)]
+        except Exception as e:
+            if return_exceptions:
+                return [e]
+            raise
+
+    async def pull_model_state_dict(self, *, policy_version: int) -> None:
+        """Ray-native weight injection."""
+        # Call on all trainers to participate in collective operation!
+        future_proxy = self.trainer_proxy.get_model_state_dict.call()
+        
+        # [TPU HACK / OPTIMIZATION]
+        # Why: Passing refs[0] directly to the remote actor auto-resolves/deserializes it on the generator driver.
+        # This double-serialization on the generator driver CPU causes massive CPU/memory bottlenecks.
+        # Solution: Wrap refs[0] in a list [refs[0]] to bypass auto-resolution, passing raw ObjectRef.
+        ref = self.ray_generator.load_model_state_dict.remote(policy_version, [future_proxy.obj_refs[0]])
+        await ref
 
 
-class RayRLTrainer(RLTrainer):
-    """Subclasses the GPU RLTrainer, overriding ONLY setup() to inject Ray."""
+class RayController(Controller):
+    """Subclasses the GPU Controller, overriding ONLY setup() to inject Ray."""
 
-    def __init__(self, config: RLTrainer.Config, trainer_profiler_config=None, generator_profiler_config=None):
+    def __init__(self, config: Controller.Config, trainer_profiler_config=None, generator_profiler_config=None):
         super().__init__(config)
         self.trainer_profiler_config = trainer_profiler_config or config.trainer.profiler
         self.generator_profiler_config = generator_profiler_config or config.generator.profiler
 
-    async def setup(self, **kwargs):
+    async def setup_async(self, **kwargs):
         config = self.config
         
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
 
-        # 1. Discover physical TPU cluster nodes, topology layout, bounds, and process counts
         layout = discover_tpu_cluster_layout(config)
         
-        is_local_run = layout["is_local_run"]
         sampler_nodes_info = layout["sampler_nodes_info"]
-        chips_per_host = layout["chips_per_host"]
-
         self.trainer_world_size = layout["trainer_world_size"]
         self.generator_world_size = layout["generator_world_size"]
         self.trainer_dp_degree = self.trainer_world_size
         self._multi_node = False
-        
+ 
         trainer_device_type = layout["trainer_device_type"]
-        generator_device_type = layout["generator_device_type"]
 
         # Compute absolute paths for the worker runtime environment
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
@@ -183,6 +172,7 @@ class RayRLTrainer(RLTrainer):
                 generator_dtype=config.generator.model_dtype,
                 compile_config=config.compile,
                 profiler_config=self.trainer_profiler_config,
+                output_dir=config.dump_folder or "./outputs",
             )
             trainer_actors.append(trainer_actor)
 
@@ -201,6 +191,23 @@ class RayRLTrainer(RLTrainer):
         generator_compile_config = copy.deepcopy(config.compile)
         generator_compile_config.enable = False
 
+        async_loop = config.async_loop
+        max_active_rollout_groups = (
+            async_loop.max_offpolicy_steps + 1
+        ) * async_loop.num_groups_per_train_step
+        rollout_concurrency = max(
+            max_active_rollout_groups * async_loop.group_size,
+            async_loop.validation.num_samples,
+        )
+        generator_dp_degree = max(config.generator.parallelism.data_parallel_degree, 1)
+        # Note: In RayRLTrainer, we only launch one generator actor wrapper 
+        # (generator_world_size specifies total TPUs for it, handled inside).
+        # We can assume num_generator_dp_shards = 1 * generator_dp_degree 
+        num_generator_dp_shards = 1 * generator_dp_degree
+        max_num_seqs = min(
+            math.ceil(rollout_concurrency / num_generator_dp_shards), 512
+        )
+
         generator_actor = RayVLLMGenerator.options(
             resources=generator_resources,
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
@@ -215,89 +222,40 @@ class RayRLTrainer(RLTrainer):
             model_spec=config.model_spec,
             model_path=config.hf_assets_path,
             compile_config=generator_compile_config,
-            max_num_seqs=max(
-                config.num_prompts_per_step * config.generator.sampling.n,
-                config.num_validation_samples,
-            ),
+            max_num_seqs=max_num_seqs,
             dump_folder=config.dump_folder,
         )
 
-        # 4. Wrap actors in Monarch-compatible proxies
+        # 4. Wrap actors in Monarch-compatible proxies / routers
         self.trainer = RayTrainerProxy(trainer_actors)
-        self.generator = RayGeneratorProxy(generator_actor, trainer_actors)
+        self.generator_router = RayInterGeneratorRouter(generator_actor, self.trainer)
         
         self._proc_meshes = [] # Dummy out Monarch meshes for cleanup
 
-        print("@@@ Setup: Pushing initial weights...")
-        self.trainer.push_model_state_dict.call().get()
-        print("@@@ Setup: Pulling initial weights to vLLM...")
-        self.generator.pull_model_state_dict.call(0).get()
-        print("@@@ Setup: Completed!")
-
-    # TODO(b/540981746): consider upstream this function because GPU also needs it. 
-    def _is_generator_profiling_step(self, step: int) -> bool:
-        """Check if the given step falls into the active phase of the generator profiler schedule."""
-        if not self.generator_profiler_config or not self.generator_profiler_config.enable_profiling:
-            return False
-            
-        cfg = self.generator_profiler_config
-        # PyTorch's profiler schedule runs repeatedly in cycles of `profile_freq` steps.
-        # In each cycle, the steps are partitioned into:
-        # 1. `wait` steps: profiler is off (0 <= cycle_step < wait)
-        # 2. `warmup` steps: profiler is on, but traces are discarded (wait <= cycle_step < wait + warmup)
-        # 3. `active` steps: profiler is on, and traces are recorded (wait + warmup <= cycle_step < wait + warmup + active)
-        wait = cfg.profile_freq - (cfg.profiler_active + cfg.profiler_warmup)
-        cycle_step = step % cfg.profile_freq
+        await self.trainer.push_model_state_dict.call()
         
-        # We only capture traces for the `active` phase of the profiling cycle to save storage.
-        start_active_bound = wait + cfg.profiler_warmup
-        end_active_bound = wait + cfg.profiler_warmup + cfg.profiler_active
-        return start_active_bound <= cycle_step < end_active_bound
+        self.start_step = self._get_rank_0_value(
+            await self.trainer.get_policy_version.call()
+        )
+        if self.start_step > 0:
+            print(f"Resuming RL training from step {self.start_step}")
 
-    def _collect_rollouts(self, num_groups: int, step: int) -> list[Trajectory]:
-        is_profiling_step = self._is_generator_profiling_step(step)
-                
-        if is_profiling_step:
-            profile_prefix = f"step_{step}"
-            print(f"@@@ Generator: Starting profiler trace for step {step} with prefix {profile_prefix}", flush=True)
-            self.generator.start_profile.call(profile_prefix).get()
-            
-        try:
-            res = super()._collect_rollouts(num_groups, step)
-        finally:
-            if is_profiling_step:
-                print(f"@@@ Generator: Stopping profiler trace for step {step}", flush=True)
-                self.generator.stop_profile.call().get()
-                
-        return res
+        await self.generator_router.fanout("start_engine_loop")
 
-    async def cleanup(self):
-        print("@@@ Cleanup: calling finish on trainer and generator...")
-        if hasattr(self, "trainer") and self.trainer:
-            try:
-                self.trainer.finish.call().get()
-            except Exception as e:
-                print(f"Trainer finish failed: {e}")
-        if hasattr(self, "generator") and self.generator:
-            try:
-                self.generator.finish.call().get()
-            except Exception as e:
-                print(f"Generator finish failed: {e}")
-        
-        if ray.is_initialized():
-            ray.shutdown()
-
+        await self.generator_router.pull_model_state_dict(policy_version=self.start_step)
 
 def main():
     init_logger()
-    config = typing.cast(RLTrainer.Config, ConfigManager().parse_args())
+    config = typing.cast(Controller.Config, ConfigManager().parse_args())
 
-    rl_trainer = RayRLTrainer(config)
+    rl_trainer = RayController(config)
     try:
-        asyncio.run(rl_trainer.setup())
-        asyncio.run(rl_trainer.train())
+        asyncio.run(rl_trainer.setup_async())
+        asyncio.run(rl_trainer.run())
     finally:
-        asyncio.run(rl_trainer.cleanup())
+        asyncio.run(rl_trainer.close())
+        if ray.is_initialized():
+            ray.shutdown()
 
 if __name__ == "__main__":
     main()

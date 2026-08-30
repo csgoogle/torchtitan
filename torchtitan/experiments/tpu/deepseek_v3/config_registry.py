@@ -5,16 +5,19 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
-    ActivationCheckpointConfig,
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+    SplashAttentionKernelConfig,
+    TPUTrainerConfig,
+)
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.deepseek_v3.config_registry import model_registry
 
@@ -25,9 +28,9 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=MetricsProcessor.Config(log_freq=1),
-      model_spec=model_registry("debugmodel"),
+      model_spec=model_registry("debugmodel", attn_backend="sdpa"),
       dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-      optimizer=OptimizersContainer.Config(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -46,7 +49,5 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
           interval=10,
           last_save_model_only=False,
       ),
-      activation_checkpoint=ActivationCheckpointConfig(
-          mode="selective",
-      ),
+      activation_checkpoint=SelectiveAC.Config(),
   )

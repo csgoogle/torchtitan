@@ -37,3 +37,5 @@ if not hasattr(_typeguard, "TypeCheckError"):
     _typeguard.TypeCheckError = TypeError
 
 del _typeguard
+
+from torchtitan.experiments.tpu import utils as _tpu_utils

@@ -7,25 +7,27 @@
 """Trainer compatible with TorchTpu."""
 
 import argparse
-import contextlib
 import functools
 import json
 import tempfile
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple, cast
 
 from absl import flags
 from absl.flags import argparse_flags
-import os as os
+import os
 import torch
 import torch.distributed as dist
-from torchtitan.config import ConfigManager, Configurable
+from torchtitan.config.configurable import Configurable
+from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu import profiler_workaround
-from torchtitan.experiments.tpu import utils as tpu_utils
+import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    to_tpu_graph_trainer_config,
+)
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
@@ -55,19 +57,16 @@ class TPUTrainer(torchtitan.train.Trainer):
     super().__init__(job_config)
 
     if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
+      from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
+      self.loss_fn = build_cross_entropy_loss(job_config)
+
       tpu_config = job_config.tpu_config
       if not tpu_config.enable_amp:
         logger.info("AMP is disabled, using uniform precision training.")
-        self.maybe_enable_amp = contextlib.nullcontext()
-      if self.parallel_dims.dp_replicate_enabled and self.device.type == "tpu":
-        # TODO b/494360665: remove this once torch.autocast is supported on TPU.
-        # DDP-replicate on TPU uses fully_shard instead of autocast.
-        logger.info(
-            "Mixed precision training is handled by fully_shard (TPU replicate,"
-            f"param={self.config.training.mixed_precision_param}, "
-            f"reduce={self.config.training.mixed_precision_reduce})"
-        )
-        self.maybe_enable_amp = contextlib.nullcontext()
+      if tpu_config.compile_optimizer:
+        from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
+        apply_compiled_optimizer(self)
+
 
   def forward_backward_step(
       self,
@@ -101,10 +100,9 @@ class TPUTrainer(torchtitan.train.Trainer):
     )
 
     with self.train_context():
-      with self.maybe_enable_amp:
-        pred = self.model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-        loss_sum = self.loss_fn(pred, labels)
-        loss = loss_sum / global_valid_tokens
+      pred = self.model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+      loss_sum, _ = self.loss_fn(pred, labels)
+      loss = loss_sum / global_valid_tokens
       del pred
 
       # Materialize the forward graph without waiting for execution to
@@ -125,7 +123,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     init_logger()
 
   if (
-      tpu_utils.get_device_type() == "tpu"
+      utils.device_type == "tpu"
       and train_config.optimizer.implementation == "fused"
   ):
     # TODO: b/45811390 - Remove this once fused optimizer is supported on TPU.
@@ -134,9 +132,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     )
     train_config.optimizer.implementation = "foreach"
 
-  torchtitan.train.maybe_enable_profiling = functools.partial(
-      profiler_workaround.maybe_enable_profiling, job_config=train_config
-  )
+  profiler_workaround.init(train_config)
 
   trainer: Optional[torchtitan.trainer.Trainer] = None
   model_spec = train_config.model_spec
@@ -145,7 +141,99 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   if model_name == "flux":
     from torchtitan.models.flux.trainer import FluxTrainer
     trainer_cls = FluxTrainer
+  # Note: TpuGraphTrainer is designed primarily for joint full-graph tracing
+  # ("aot_fx_trace" / "fullgraph"). We keep `--tpu-config.use-graph-trainer`
+  # as an independent switch for experimentation, but enabling `use_graph_trainer`
+  # without fullgraph compilation (e.g. alongside `layer` compile mode) can cause
+  # severe HBM fragmentation and stack reservation collisions (e.g. 78.46G memory
+  # reservation bottlenecks across multiple disjoint overlay modules).
+  elif (
+      isinstance(train_config, tpu_job_config_module.TPUTrainerConfig)
+      and (
+          train_config.tpu_config.use_graph_trainer
+          or train_config.tpu_config.compile_mode == "aot_fx_trace"
+      )
+  ):
+    if (
+        train_config.tpu_config.use_graph_trainer
+        and train_config.tpu_config.compile_mode
+        not in ("aot_fx_trace", "fullgraph")
+    ):
+      logger.warning(
+          "TpuGraphTrainer enabled without fullgraph compile mode"
+          f" (current mode: {train_config.tpu_config.compile_mode}). This may"
+          " lead to severe HBM fragmentation and stack reservation OOMs."
+      )
+    from torchtitan.experiments.tpu.graph_trainer import TpuGraphTrainer, TpuGraphTrainerConfig
+
+    if model_name == "qwen3":
+      from torchtitan.experiments.graph_trainer.qwen3 import model_registry as gt_registry
+    elif model_name == "llama3":
+      from torchtitan.experiments.graph_trainer.llama3 import model_registry as gt_registry
+    elif model_name == "deepseek_v3":
+      from torchtitan.experiments.graph_trainer.deepseek_v3 import model_registry as gt_registry
+    else:
+      raise ValueError(
+          f"Model {model_name} is not currently supported with GraphTrainer."
+      )
+
+    gt_cfg = to_tpu_graph_trainer_config(
+        train_config, gt_registry, target_cls=TpuGraphTrainer.Config
+    )
+
+    splash_obj = cast(Any, getattr(train_config, "splash_attention_kernel", None))
+    moe_obj = cast(Any, getattr(train_config, "moe", getattr(train_config, "redacted", None)))
+    tpu_extra = TpuGraphTrainerConfig(
+        device="tpu",
+        attention_backend=getattr(
+            splash_obj,
+            "sa_attention_backend",
+            "splash"
+            if getattr(splash_obj, "use_splash_attention_kernel", False)
+            else "sdpa-no-scale",
+        )
+        if splash_obj is not None
+        else "sdpa-no-scale",
+        moe_enabled=getattr(moe_obj, "enabled", False)
+        if moe_obj is not None
+        else False,
+        moe_padded_dispatcher=getattr(moe_obj, "padded_dispatcher", False)
+        if moe_obj is not None
+        else False,
+        moe_capacity_factor=getattr(moe_obj, "capacity_factor", 1.25)
+        if moe_obj is not None
+        else 1.25,
+        ep_degree=getattr(
+            train_config.parallelism,
+            "expert_parallel_degree",
+            getattr(train_config.parallelism, "ep", 1),
+        ),
+        optimizer_in_graph=train_config.tpu_config.optimizer_in_graph,
+        optimizer_compile=train_config.tpu_config.compile_optimizer,
+        compile_mode=train_config.tpu_config.compile_mode,
+        job_config=train_config,
+    )
+
+    def trainer_cls(cfg):
+      return TpuGraphTrainer(gt_cfg, tpu_extra=tpu_extra)
   else:
+    if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
+      if train_config.tpu_config.compile_mode == "fullgraph":
+        logger.warning(
+            "Running fullgraph compile mode (`%s`) on regular Trainer (`--tpu-config.use-graph-trainer=False`). "
+            "Note: this wraps forward+backward together via `torch.compile(model, fullgraph=True, backend='tpu')`, "
+            "but does NOT capture the optimizer step right inside the graph.",
+            train_config.tpu_config.compile_mode,
+        )
+      if getattr(train_config.compile, "optimizer_in_graph", False) or getattr(
+          train_config.tpu_config, "optimizer_in_graph", False
+      ):
+        logger.warning(
+            "`optimizer_in_graph` (`--compile.optimizer-in-graph` or `--tpu-config.optimizer-in-graph`) "
+            "is set while running on regular Trainer (`use_graph_trainer=False`). "
+            "Regular Trainer does not support optimizer-in-graph (capturing `optimizer.step()` inside the graph). "
+            "To enable joint fwd+bwd+optimizer compilation, you must use `--tpu-config.use-graph-trainer`."
+        )
     trainer_cls = TPUTrainer
 
   # Synchronize all ranks before trainer initialization. On TPU (XLA), the
@@ -173,6 +261,15 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     from torchtitan.experiments.tpu import workarounds
 
     workarounds.apply_patches(model, train_config)
+    if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
+      if model_spec.name in ("llama3", "qwen3"):
+        if (
+            train_config.tpu_config.use_graph_trainer
+            or train_config.tpu_config.compile_mode == "aot_fx_trace"
+        ):
+          kwargs.pop("tpu_compile_mode", None)
+        else:
+          kwargs["tpu_compile_mode"] = train_config.tpu_config.compile_mode
     if model_spec.name in (
         "redacted",
         "redacted_tpu",

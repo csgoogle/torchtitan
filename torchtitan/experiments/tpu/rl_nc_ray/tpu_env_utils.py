@@ -56,12 +56,10 @@ def discover_tpu_cluster_layout(config) -> dict:
         
         tpu_type = trainer_nodes_info[0].get("Labels", {}).get("ray.io/tpu-pod-type")
         trainer_tpu_count = int(sum([n.get("Resources", {}).get("TPU", 0) for n in trainer_nodes_info]))
-        sampler_tpu_count = int(sum([n.get("Resources", {}).get("TPU", 0) for n in sampler_nodes_info]))
     else:
         trainer_nodes_info = []
         sampler_nodes_info = []
         trainer_tpu_count = 0
-        sampler_tpu_count = 0
         tpu_type = None
 
     is_local_run = os.environ.get("LOCAL_VM_RUN") == "1"
@@ -115,6 +113,23 @@ def build_trainer_env_vars(rank: int, layout: dict, worker_pythonpath: str) -> t
     host_index = rank // chips_per_host
     host_ip = trainer_node_ips[host_index]
     
+    # 1. Base distributed environment common to both CPU and TPU
+    env_vars = {
+        "TORCHTITAN_DEVICE_TYPE": trainer_device_type,
+        "RANK": str(rank),
+        "LOCAL_RANK": str(local_chip_index),
+        "WORLD_SIZE": str(trainer_world_size),
+        "MASTER_ADDR": trainer_node_ips[0],
+        "MASTER_PORT": TRAINER_MASTER_PORT,
+        "PYTHONPATH": worker_pythonpath,
+    }
+
+    # 2. Device-specific configurations
+    if trainer_device_type == "cpu":
+        env_vars["TPU_VISIBLE_DEVICES"] = ""
+        return env_vars, host_ip
+
+    # Build TPU SliceBuilder / PJRT process addresses
     trainer_sb_addresses = []
     if trainer_nodes_info:
         for node in trainer_nodes_info:
@@ -124,14 +139,8 @@ def build_trainer_env_vars(rank: int, layout: dict, worker_pythonpath: str) -> t
     else:
         for chip_idx in range(chips_per_host):
             trainer_sb_addresses.append(f"127.0.0.1:{TRAINER_BASE_PORT + chip_idx}")
-            
-    env_vars = {
-        "TORCHTITAN_DEVICE_TYPE": trainer_device_type,
-        "RANK": str(rank),
-        "LOCAL_RANK": str(local_chip_index),
-        "WORLD_SIZE": str(trainer_world_size),
-        "MASTER_ADDR": trainer_node_ips[0],
-        "MASTER_PORT": TRAINER_MASTER_PORT,
+
+    env_vars.update({
         "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(trainer_sb_addresses),
         "TPU_PROCESS_ADDRESSES": ",".join(trainer_sb_addresses),
         "TPU_PROCESS_PORT": str(TRAINER_BASE_PORT + local_chip_index),
@@ -141,10 +150,9 @@ def build_trainer_env_vars(rank: int, layout: dict, worker_pythonpath: str) -> t
         "JAX_THREE_G_MEM_ALLOC_ON_FREE": JAX_THREE_G_MEM_ALLOC_ON_FREE,
         "XLA_PYTHON_CLIENT_PREALLOCATE": XLA_PYTHON_CLIENT_PREALLOCATE,
         "XLA_PYTHON_CLIENT_MEM_FRACTION": XLA_PYTHON_CLIENT_MEM_FRACTION,
+        "LIBTPU_INIT_ARGS": f"--xla_tpu_use_enhanced_launch_barrier=false --deepsea_slice_builder_worker_port={TRAINER_BASE_PORT + local_chip_index}",
         "TORCH_DYNAMO_RECOMPILE_LIMIT": str(TORCH_DYNAMO_RECOMPILE_LIMIT),
-        "PYTHONPATH": worker_pythonpath,
-    }
-    
+    })
 
     if tpu_type == "v6e-32":
         # TODO: confirm this actually works for v6e-32
@@ -168,7 +176,7 @@ def build_trainer_env_vars(rank: int, layout: dict, worker_pythonpath: str) -> t
             "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1" if trainer_world_size == 4 else "1,1,1",
             "CHIPS_PER_HOST": "4",
         })
-        
+
     return env_vars, host_ip
 
 
@@ -203,22 +211,39 @@ def build_generator_env_vars(layout: dict, worker_pythonpath: str, dump_folder: 
     else:
         topo = "1,1,1"
 
+    is_local_run = os.environ.get("LOCAL_VM_RUN") == "1"
+
+    # =====================================================================
+    # TPU Mesh Bounds Semantics:
+    # 1. Single VM (is_local_run == True): All TPU chips reside on the same physical
+    #    machine. PJRT requires TPU_HOST_BOUNDS to be "1,1,1" (as only 1 host exists in the
+    #    torus) and expresses the full chip coordinate grid via TPU_CHIPS_PER_HOST_BOUNDS (e.g. "2,2,1").
+    # 2. Multi-Host Cluster (is_local_run == False): TPUs are distributed across multiple network
+    #    hosts. PJRT defines the mesh across host dimensions in TPU_HOST_BOUNDS (e.g. "2,4,1")
+    #    with TPU_CHIPS_PER_HOST_BOUNDS set to "1,1,1".
+    # =====================================================================
     generator_env_vars = {
         "TORCHTITAN_DEVICE_TYPE": generator_device_type,
         "SKIP_JAX_PRECOMPILE": "1",
+        "VLLM_PLUGINS": "torchtpu,torchtpu_layers",
         "VLLM_ENABLE_V1_MULTIPROCESSING": VLLM_ENABLE_V1_MULTIPROCESSING,
-        "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-        "TPU_HOST_BOUNDS": topo,
         "TORCH_TPU_TOPOLOGY": topo,
-        "CHIPS_PER_HOST": "4",
+        "TPU_CHIPS_PER_HOST_BOUNDS": topo if is_local_run else "1,1,1",
+        "TPU_HOST_BOUNDS": "1,1,1" if is_local_run else topo,
+        "CHIPS_PER_HOST": str(chips_per_host),
         "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(generator_sb_addresses),
         "TPU_PROCESS_ADDRESSES": ",".join(generator_sb_addresses),
-        "LIBTPU_INIT_ARGS": LIBTPU_INIT_ARGS,
+        "JAX_MEM_FRACTION": JAX_MEM_FRACTION,
+        "JAX_THREE_G_MEM_ALLOC_ON_FREE": JAX_THREE_G_MEM_ALLOC_ON_FREE,
+        "XLA_PYTHON_CLIENT_PREALLOCATE": XLA_PYTHON_CLIENT_PREALLOCATE,
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": XLA_PYTHON_CLIENT_MEM_FRACTION,
+        "LIBTPU_INIT_ARGS": "--xla_tpu_use_enhanced_launch_barrier=false",
         "TORCH_DYNAMO_RECOMPILE_LIMIT": str(TORCH_DYNAMO_RECOMPILE_LIMIT),
         "PYTHONPATH": worker_pythonpath,
+        "TORCH_LOGS": "recompiles,recompiles_verbose",
     }
-    
+
     if generator_world_size > 1:
         generator_env_vars["TPU_MULTIHOST_BACKEND"] = "ray"
-        
+
     return generator_env_vars

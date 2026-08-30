@@ -13,32 +13,16 @@ import os
 import torch
 import ray
 import torch.distributed.checkpoint as dcp
-import torch_tpu
-
-import torchtitan.experiments.tpu.rl_nc_ray  # Ensure mock runs first
-from torchtitan.experiments.tpu.rl_nc_ray.weight_transfer_utils import (
-    prepare_trainer_state_dict,
-)
 from torchtitan.experiments.tpu.rl_nc_ray.padding_packing_utils import (
-    pad_train_batch_to_static,
     patch_varlen_attention,
+    patch_create_varlen_metadata,
 )
 
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 from torch.distributed.tensor import DTensor
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
-from torchtitan.experiments.rl.types import TrainBatch
-from torchtitan.tools.profiler import Profiler
-from torchtitan.experiments.tpu import utils as tpu_utils
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools import utils
-from torchtitan.experiments.rl.actors.utils import (
-    compute_logprobs,
-    create_positions_from_seq_lens,
-    create_varlen_metadata,
-    extract_response_logprobs,
-    verify_logprob_identity,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -77,9 +61,14 @@ def patch_torch_and_dist_for_trainer(target_device: str) -> None:
             return torch.sqrt(var)
         torch.Tensor.std = patched_std
         
-    # Monkey patch distributed backend lookup
+    # When running the trainer on CPU (e.g. single-VM development/testing),
+    # force distributed backend to Gloo and disable TPU device probing so PyTorch
+    # does not attempt to initialize libtpu/PJRT, avoiding hardware lock conflicts
+    # with the co-located TPU vLLM generator actor.
     if target_device == "cpu":
         dist_utils._get_distributed_backend = lambda x: "gloo"
+        if hasattr(torch, "tpu"):
+            torch.tpu.is_available = lambda: False
 
 
 def load_initial_hf_weights_on_cpu(model, torchtitan_state_dict: dict) -> None:
@@ -138,15 +127,15 @@ class RayTPUPolicyTrainer(PolicyTrainer):
         os.environ.setdefault("MASTER_PORT", "29500")
         
         target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
-        tpu_utils.set_device_type(target_device)
         
         # Apply trainer-specific PyTorch and distributed backend patches
         patch_torch_and_dist_for_trainer(target_device)
         
-        # Monkey patch torchtitan utils before super().__init__ calls it
-        if not hasattr(utils, "device_module"):
-            utils.device_module = utils.get_device_module()  
-            utils.device_type = target_device  
+        # Ensure torchtitan utils has device_type and device_module populated
+        if not hasattr(utils, "device_type") or not hasattr(utils, "device_module"):
+            detected_device_type, device_module = utils.get_device_info()
+            utils.device_type = target_device if target_device else detected_device_type
+            utils.device_module = device_module
             
         # Manually initialize distributed for CPU to prevent XLA from hijacking it
         if target_device == "cpu" and not torch.distributed.is_initialized():
@@ -167,22 +156,58 @@ class RayTPUPolicyTrainer(PolicyTrainer):
             self.profiler.__enter__()
         else:
             self.profiler = None
-        print("@@@ Trainer: Finished init!")
 
     def _build_model(
         self,
         model_spec,
         config,
         device_type: str,
-        hf_assets_path: str,
     ):
+        from dataclasses import replace
+        from torchtitan.config import apply_overrides, TORCH_DTYPE_MAP
+        from torchtitan.tools import utils as titan_utils
+
         target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
-        print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Patching VarlenAttention for target_device={target_device}")
-        
-        # Apply VarlenAttention patched forward method
         patch_varlen_attention(target_device)
-            
-        return super()._build_model(model_spec, config, device_type, hf_assets_path)
+
+        model_spec.model.update_from_config(config=config)
+        max_seq_len = model_spec.model.max_seq_len
+        seq_len = config.training.seq_len
+        if seq_len > max_seq_len:
+            raise ValueError(
+                f"Training sequence length {seq_len} exceeds "
+                f"attention RoPE maximum supported sequence length {max_seq_len}."
+            )
+
+        for layer_cfg in model_spec.model.layers:
+            attention_cfg = getattr(layer_cfg, "attention", None)
+            if attention_cfg is not None:
+                attention_cfg.rope = replace(attention_cfg.rope, max_seq_len=seq_len)
+
+        if config.override.imports:
+            apply_overrides(config.override, model_spec.model)
+
+        with torch.device("meta"):
+            with titan_utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]):
+                model = model_spec.model.build()
+
+        skip_dp_val = (target_device == "cpu" or not self.parallel_dims.dp_enabled)
+        model = model_spec.parallelize_fn(
+            model,
+            parallel_dims=self.parallel_dims,
+            training=config.training,
+            parallelism=config.parallelism,
+            compile_config=self.compile_config,
+            ac_config=config.ac_config,
+            dump_folder=config.dump_folder,
+            skip_dp=skip_dp_val,
+        )
+
+        model.to_empty(device=device_type)
+        with torch.no_grad():
+            model.init_weights(buffer_device=None)
+
+        return model
 
     def _load_initial_hf_weights(self, model, checkpoint_path: str) -> None:
         if os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu") != "cpu":
@@ -204,11 +229,15 @@ class RayTPUPolicyTrainer(PolicyTrainer):
     def get_model_state_dict(self) -> dict:
         """Ray-native weight extraction. Returns state dict on CPU."""
         print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Extracting model state dict...")
-        
+
         target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
         if target_device == "tpu":
-            torch_tpu._internal.sync.synchronize(wait=True)
+            import torch_tpu
+            from torchtitan.experiments.tpu.rl_nc_ray.weight_transfer_utils import (
+                prepare_trainer_state_dict,
+            )
             print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Sync 1 done")
+            torch_tpu._internal.sync.synchronize(wait=True)
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
             print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Barrier 1 done")
@@ -217,126 +246,23 @@ class RayTPUPolicyTrainer(PolicyTrainer):
             cpu_sd = prepare_trainer_state_dict(self.model)
             
             torch_tpu._internal.sync.synchronize(wait=True)
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
         else:
             cpu_sd = {}
+            raw_params = dict(self.model.named_parameters())
+            if "lm_head.weight" not in raw_params and "tok_embeddings.weight" in raw_params:
+                raw_params["lm_head.weight"] = raw_params["tok_embeddings.weight"]
             with torch.no_grad():
-                for k, v in self.model.state_dict().items():
+                for k, v in raw_params.items():
                     if hasattr(v, "to_local"):
                         cpu_sd[k] = v.to_local().detach().cpu().clone().contiguous()
                     else:
                         cpu_sd[k] = v.detach().cpu().clone().contiguous()
             print("@@@ Trainer: Finished extracting model state dict on CPU.")
-            
-        print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Returning cpu_sd!")
+
+        print(f"@@@ Trainer Rank {os.environ.get('RANK', '0')}: Returning cpu_sd!")            
         return cpu_sd
 
-    def forward_backward(self, train_data: list[TrainBatch]) -> dict:
-        """
-        Run forward pass, compute loss, and call backward.
 
-        This method overrides the base PolicyTrainer.forward_backward to bridge GPU/Monarch
-        with TPU/Ray execution. The core mathematical RL logic remains identical, but introduces
-        the following mechanical differences:
-        
-        1. Synchronous vs Asynchronous: The base class uses `async def` for Monarch. We override 
-           with a synchronous `def` because Ray actors natively wrap synchronous methods into 
-           asynchronous futures via `.remote()`.
-        2. Batch Copying: We deepcopy `train_data` so mutating the batch (e.g. by appending
-           padding tokens) doesn't corrupt the original data structure in Ray shared memory.
-        3. Static Padding: XLA Dynamo compiles a new graph for every unique sequence length,
-           quickly hitting the recompilation limit on TPU. To prevent this, we pad `token_ids`,
-           `advantages`, and lengths to statically sized bounds (e.g., exactly 4096 tokens and 
-           64 sequences).
-        4. Padding Slicing: Before passing outputs to `loss_fn`, we slice out the dummy 
-           padding sequences to prevent them from polluting the mean loss calculations.
-        """
-        logger.debug(
-            f"{os.getpid()=} PolicyTrainer forward_backward "
-            f"step {self.policy_version}"
-        )
-
-        local_batch = copy.copy(train_data[self.dp_rank])
-        device = self.device
-        target_device = os.environ.get("TORCHTITAN_DEVICE_TYPE", "cpu")
-
-        # Pad all tensors to a static batch size of 4096 tokens
-        # to avoid Dynamo recompilations from varying sequence shapes across RL steps.
-        if target_device == "tpu":
-            actual_seqs = len(local_batch.seq_lens)
-            token_ids, advantages, actual_seqs = pad_train_batch_to_static(
-                local_batch, device, PAD_LEN, MAX_SEQS
-            )
-            seq_lens = local_batch.seq_lens
-            prompt_lens = local_batch.prompt_lens
-            response_lens = local_batch.response_lens
-        else:
-            token_ids = local_batch.token_ids.to(device)
-            advantages = local_batch.advantages.to(device)
-            seq_lens = local_batch.seq_lens
-            prompt_lens = local_batch.prompt_lens
-            response_lens = local_batch.response_lens
-
-        max_seq_len = max(seq_lens)
-        rope_cache_len = self.model.freqs_cis.shape[0]
-        if max_seq_len > rope_cache_len:
-            raise ValueError(
-                f"Episode length {max_seq_len} exceeds rope cache size "
-                f"{rope_cache_len}. Increase model max_seq_len or reduce "
-                f"generation max_tokens."
-            )
-
-        attention_masks = create_varlen_metadata(seq_lens, device)
-        positions = create_positions_from_seq_lens(seq_lens, device)
-
-        logits = self.model(
-            token_ids, attention_masks=attention_masks, positions=positions
-        )
-        all_policy_logprobs = compute_logprobs(logits, token_ids)
-        policy_logprobs = extract_response_logprobs(
-            all_policy_logprobs, seq_lens, prompt_lens, response_lens
-        )
-
-        if target_device == "tpu":
-            # Slice out the dummy sequences so they don't affect loss or crash mean()
-            policy_logprobs = policy_logprobs[:actual_seqs]
-            advantages = advantages[:actual_seqs]
-
-        loss, loss_metrics = self.loss_fn(
-            policy_logprobs=policy_logprobs,
-            advantages=advantages,
-        )
-
-        verification_result = verify_logprob_identity(
-            local_batch.token_logprobs,
-            policy_logprobs,
-        )
-
-        logger.debug(
-            f"Logprob verification: bitwise_identical={verification_result['logprob_bitwise_identical']}, "
-            f"max_delta={verification_result['logprob_max_delta']:.6e}, "
-            f"diff_mean={verification_result['logprob_diff_mean']:.6e}, "
-            f"diff_max={verification_result['logprob_diff_max']:.6e}, "
-            f"tokens_checked={verification_result['total_tokens_checked']}"
-        )
-
-        # Backward pass
-        self.optimizers.zero_grad()
-        loss.backward()
-
-        return {
-            "loss": loss.item(),
-            "advantage_mean": advantages.mean().item(),
-            "advantage_std": advantages.std().item(),
-            "logprob_diff_mean": verification_result["logprob_diff_mean"],
-            "logprob_diff_max": verification_result["logprob_diff_max"],
-            "logprob_max_delta": verification_result["logprob_max_delta"],
-            "logprob_bitwise_identical": verification_result[
-                "logprob_bitwise_identical"
-            ],
-            **loss_metrics,
-        }
 
     async def optim_step(self) -> dict:
         res = await super().optim_step()

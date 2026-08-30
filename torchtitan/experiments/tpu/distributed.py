@@ -8,13 +8,13 @@ import os
 from typing import Any, Callable, Tuple
 
 from absl import logging
-
 import torch
 import torch.distributed as dist
 from torchtitan.experiments.tpu import gdist
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
+from torchtitan.experiments.tpu import device_env
 from torchtitan.experiments.tpu import distributed_utils
-from torchtitan.experiments.tpu import utils as tpu_utils
+from torchtitan.tools import utils
 
 
 def _ensure_device_type_set(
@@ -22,7 +22,7 @@ def _ensure_device_type_set(
   """Sets the device type for the current process."""
   if accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
     # We have to force TPU device to be registered here
-    available_device_type = tpu_utils.get_device_type()
+    available_device_type = utils.device_type
     if available_device_type != "tpu":
       raise RuntimeError(
           "TPU requested but TPU device is not available."
@@ -30,10 +30,15 @@ def _ensure_device_type_set(
   elif accelerator_device_type == device_type.AcceleratorDeviceType.CUDA:
     if not torch.cuda.is_available():
       raise RuntimeError("GPU requested but CUDA is not available.")
-    tpu_utils.set_device_type(device_type.AcceleratorDeviceType.CUDA.value)
+    # No need to select CUDA: detection already reports it whenever it is
+    # available, since _get_available_device_type() checks CUDA first.
 
   elif accelerator_device_type == device_type.AcceleratorDeviceType.CPU:
-    tpu_utils.set_device_type(device_type.AcceleratorDeviceType.CPU.value)
+    # CPU is always available, so there is nothing to verify. Reaching here
+    # means the caller already resolved CPU (test_utils.resolve_device_type or
+    # gmain), and workers get it from the CPU-only environment set before the
+    # spawn below.
+    pass
 
   else:
     raise ValueError(f"Unsupported device type: {device_type}")
@@ -88,6 +93,12 @@ def _run_in_gdist_worker(
       )
     func(device, global_rank, world_size, *worker_args)
   elif accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
+    # Bootstrap TORCH_TPU_SLICEBUILDER_ADDRESSES / TORCH_TPU_TOPOLOGY here, in
+    # the worker: _maybe_init_distributed_on_tpu_vm() reads WORLD_SIZE from the
+    # environment, which torchrun sets per worker and which is absent in the
+    # spawning parent -- so the pre-spawn call cannot do it for us. Must precede
+    # the first TPU device use, or the PJRT client is never created.
+    distributed_utils.maybe_init_distributed()
     if not dist.is_initialized() and run_init_process_group:
       device = torch.device("tpu")
 
@@ -161,6 +172,10 @@ def run_distributed(
     if accelerator_device_type == device_type.AcceleratorDeviceType.CPU:
       # workaround for Google3: `backend=gloo` is only allowed in tests.
       os.environ["TEST_TARGET"] = "1"
+      # Workers are spawned, so they re-detect their device from scratch and do
+      # not inherit this process's device-type global. Hide the accelerator in
+      # the environment they inherit instead, so their detection returns CPU.
+      os.environ.update(device_env.cpu_only_env())
     if accelerator_device_type == device_type.AcceleratorDeviceType.CUDA:
       # Hide GPUs from TF so that it won't occupy any GPU memory.
       pass

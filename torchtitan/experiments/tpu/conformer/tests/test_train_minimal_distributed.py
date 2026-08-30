@@ -8,7 +8,6 @@ from torchtitan.experiments.tpu.conformer import train_minimal as conformer_trai
 
 
 
-
 class TrainMinimalDistributedTest(
     base_distributed_device_test.BaseDistributedDeviceTest
 ):
@@ -56,10 +55,10 @@ class TrainMinimalDistributedTest(
         data_parallel_shard_degree=data_parallel_shard_degree,
         data_parallel_replicate_degree=data_parallel_replicate_degree,
         skip_devices=skip_devices,
-        start_trainer=conformer_train_minimal.start_trainer,
+        start_trainer=conformer_train_minimal.start_trainer,  # pyrefly: ignore[bad-argument-type]
     )
 
 
 if __name__ == "__main__":
-  mp.set_start_method("spawn")
+  mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]
   absltest.main()

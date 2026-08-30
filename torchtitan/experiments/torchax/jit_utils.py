@@ -39,7 +39,7 @@ def make_split_train_step(model_fn, loss_fn, optax_optimizer, remat_policy=None)
 
   def opt_step(weights, gradient, opt_state):
     with jax.named_scope("optimizer_updates"):
-      updates, opt_state = interop.call_jax(
+      updates, opt_state = interop.call_jax(  # pyrefly: ignore[not-iterable]
           optax_optimizer.update, gradient, opt_state, weights
       )
       weights = interop.call_jax(optax.apply_updates, weights, updates)
@@ -138,6 +138,6 @@ def compile_step_func(step, weights, buffers, opt_state, inputs, labels, mesh):
   step_compiled = lowered.compile()
   end = time.perf_counter()
   logger.info('Compilation done. It took %.4f seconds', end - start)
-  for co in step_compiled.cost_analysis():
+  for co in step_compiled.cost_analysis():  # pyrefly: ignore[not-iterable]
     logger.debug('Cost analysis: %s', co)
   return interop.torch_view(step_compiled)

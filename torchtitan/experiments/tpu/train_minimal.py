@@ -12,30 +12,52 @@ from typing import Callable, List, Optional, Tuple
 from absl import flags
 from absl.flags import argparse_flags
 import torch
+import torch.distributed as dist
 from torch import nn
 import torchtitan.components.tokenizer
 import torchtitan.config
 import torchtitan.distributed
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
-from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
+import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
 import torchtitan.experiments.tpu.workarounds as workarounds
-import torchtitan.trainer
 from torchtitan.tools import utils
 import torchtitan.tools.logging
+import torchtitan.tools.profiler as torchtitan_profiler
+import torchtitan.trainer
 # import torchtitan.tools.profiling  # Deprecated upstream
+
 
 TORCH_DTYPE_MAP = torchtitan.config.TORCH_DTYPE_MAP
 JobConfig = torchtitan.trainer.Trainer.Config
 ParallelDims = torchtitan.distributed.ParallelDims
 logger = torchtitan.tools.logging.logger
 
-TrainStepCallback = Callable[[int, nn.Module, torch.Tensor], None]
+TrainStepCallback = Callable[[int, nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], None]
+
+
+def _gather_along_first_dim(tensor: torch.Tensor, group) -> torch.Tensor:
+  """Gathers a standard PyTorch tensor along its first (batch) dimension across ranks.
+
+  This is used to reconstruct the full global batch of tokens/labels from the sharded
+  local batches on each rank, allowing the step callback to record/verify the global state.
+  """
+  world_size = dist.get_world_size(group)
+  if world_size <= 1:
+    return tensor
+
+  output_shape = list(tensor.shape)
+  output_shape[0] *= world_size
+  output_tensor = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
+
+  dist.all_gather_into_tensor(output_tensor, tensor, group=group)
+  return output_tensor
 
 
 class TrainerMinimal:
@@ -91,11 +113,12 @@ class TrainerMinimal:
 
     # Workaround if we run without distrubuted training.
     batch_degree, batch_rank = 1, 0
+    self.batch_mesh = None
     if world_size > 1:
       if self.parallel_dims.dp_enabled:
-        batch_mesh = self.parallel_dims.get_mesh("batch")
+        self.batch_mesh = self.parallel_dims.get_mesh("batch")
         batch_degree, batch_rank = (
-            batch_mesh.size(), batch_mesh.get_local_rank())
+            self.batch_mesh.size(), self.batch_mesh.get_local_rank())
       else:
         batch_degree, batch_rank = 1, 0
 
@@ -135,7 +158,7 @@ class TrainerMinimal:
     )
 
     model_config = self.model_spec.model
-    model_config.update_from_config(trainer_config=job_config)
+    model_config.update_from_config(config=job_config)
     self.model_config = model_config
 
     if (
@@ -149,7 +172,7 @@ class TrainerMinimal:
           self.tokenizer.vocab_size,
           self.model_config.vocab_size,
       )
-      self.model_config.vocab_size = self.tokenizer.vocab_size
+      self.model_config.vocab_size = self.tokenizer.vocab_size  # pyrefly: ignore[missing-attribute]
 
     logger.info(
         f"Building {self.model_spec.name} {self.model_spec.flavor}"
@@ -196,11 +219,10 @@ class TrainerMinimal:
     self.model = model.to_empty(device=self.device)
     with torch.no_grad():
       self.model.init_weights()
-
-    from torchtitan.components.loss import ChunkedCELoss
-    if isinstance(self.loss_fn, ChunkedCELoss):
+    from torchtitan.components.loss import ChunkedLossWrapper
+    if isinstance(self.loss_fn, ChunkedLossWrapper):
       lm_head = self.model.lm_head
-      assert lm_head is not None, "Model must have lm_head for ChunkedCELoss"
+      assert lm_head is not None, "Model must have lm_head for ChunkedLossWrapper"
       self.loss_fn.set_lm_head(lm_head)
       self.model._skip_lm_head = True
 
@@ -211,11 +233,14 @@ class TrainerMinimal:
         "You can disable this by setting --optimizer.implementation=foreach")
     self.optimizers = job_config.optimizer.build(model_parts=[self.model])
 
-    loss_parallel_enabled = (
-        self.parallel_dims.tp_enabled and
-        not parallelism_config.disable_loss_parallel
+    # get_spmd_context activates the configured SPMD backend (default,
+    # full_dtensor, or spmd_types) and global DeviceMesh. Components such as
+    # ChunkedLossWrapper then natively support loss parallelism automatically,
+    # eliminating need to handle loss_parallellism explicitly in the training
+    # loop.
+    self.train_context = dist_utils.get_spmd_context(
+        parallel_dims=self.parallel_dims,
     )
-    self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
     self.step_callback = step_callback
 
   def train(self):
@@ -256,25 +281,36 @@ class TrainerMinimal:
       total_tokens = 0
       total_time = 0.0
 
-      import functools
-      from torchtitan.experiments.tpu import profiler_workaround
-      maybe_enable_profiling = functools.partial(
-          profiler_workaround.maybe_enable_profiling, job_config=self.job_config
-      )
-      for step in range(self.job_config.training.steps):
-        with maybe_enable_profiling(
-            self.job_config.profiler,
-            global_step=step,
-            base_folder=self.job_config.dump_folder,
-        ) as torch_profiler:
+      with torchtitan_profiler.Profiler(
+          self.job_config.profiler,
+          global_step=0,
+          base_folder=self.job_config.dump_folder,
+      ) as profiler:
+        for step in range(self.job_config.training.steps):
           step_start_time = time.time()
           self.optimizers.zero_grad()
           tokens, labels = get_batch()
+          # In distributed settings, we sum locally calculated valid tokens
+          # across all data-parallel ranks to get the global token count,
+          # which is used to scale the loss and gradients.
+          # We need this global count because TorchTitan's FSDP
+          # implementation disables automatic gradient division in favor of
+          # global token-based scaling.
+          # Valid tokens exclude those marked with IGNORE_INDEX (pytorch
+          # default is -100), representing padding or ignored tokens.
+          local_valid_tokens = (labels != IGNORE_INDEX).sum().to(self.device)
+          if self.world_size > 1 and self.parallel_dims.dp_enabled:
+            global_valid_tokens = dist_utils.dist_sum(
+                local_valid_tokens, self.batch_mesh
+            )
+          else:
+            global_valid_tokens = local_valid_tokens.float()
+
           # train_context would take care of converting labels to DTensors using
           # https://docs.pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.loss_parallel
           with self.train_context():  # pytype: disable=not-callable
             pred = self.model(tokens)
-            loss = self.loss_fn(pred, labels)
+            loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
             # need to free pred before bwd to avoid peaking memory
             del pred
             loss.backward()
@@ -283,7 +319,13 @@ class TrainerMinimal:
           step_time = time.time() - step_start_time
 
           if self.step_callback is not None:
-            self.step_callback(step, self.model, loss)
+            gathered_tokens = tokens
+            gathered_labels = labels
+            if self.batch_mesh is not None:
+              dp_group = self.batch_mesh.get_group()
+              gathered_tokens = _gather_along_first_dim(tokens, dp_group)
+              gathered_labels = _gather_along_first_dim(labels, dp_group)
+            self.step_callback(step, self.model, loss, gathered_tokens, gathered_labels)
 
           if step >= self.job_config.lr_scheduler.warmup_steps:
             total_tokens += (
@@ -304,8 +346,8 @@ class TrainerMinimal:
               step_time,
               tokens_per_sec,
           )
-        if torch_profiler:
-          torch_profiler.step()
+          if profiler:
+            profiler.step()
 
       # Calculate average throughput excluding burn-in steps
       avg_throughput = total_tokens / total_time if total_time > 0 else 0
@@ -333,7 +375,7 @@ def start_trainer(config: JobConfig):
   if rank == 0:
     torchtitan.tools.logging.init_logger()
 
-  device = tpu_utils.get_device()
+  device = utils.get_local_device()
 
   if config.optimizer.implementation == "fused" and device.type == "tpu":
     # TODO b/45811390 - Remove this once fused optimizer is supported on TPU.
@@ -342,6 +384,10 @@ def start_trainer(config: JobConfig):
     )
     config.optimizer.implementation = "foreach"
 
+  import sys
+  logger.info("JAX LOADED BEFORE INIT: %s", "jax" in sys.modules)
+  profiler_workaround.init(config)
+  logger.info("JAX LOADED AFTER INIT: %s", "jax" in sys.modules)
   try:
     trainer = TrainerMinimal(device, rank, world_size, config)
     if rank == 0:

@@ -62,12 +62,12 @@ class TrainMinimalDistributedTest(
           config="llama3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
-          loss_atol=1e2,
-          loss_rtol=5e-3,
-          grad_atol=1.5e1,
-          grad_rtol=5e-2,
-          param_atol=5e-2,
-          param_rtol=5e-2,
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
       ),
       dict(
           testcase_name="llama3_fsdp",
@@ -75,14 +75,34 @@ class TrainMinimalDistributedTest(
           config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          # b/495494788: Trainer/parallelize differences causing large
-          # numerical discrepancies.
-          loss_atol=1e2,
-          loss_rtol=5e-2,
-          grad_atol=6e2,
-          grad_rtol=5e-2,
-          param_atol=5e-1,
-          param_rtol=5e-2,
+          skip_devices=[
+              # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
+              device_type.AcceleratorDeviceType.CPU,
+          ],
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=8e-4,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
+      ),
+      dict(
+          testcase_name="llama3_simplefsdp",
+          module="llama3",
+          config="llama3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+          skip_devices=[
+              # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
+              device_type.AcceleratorDeviceType.CPU,
+          ],
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=8e-4,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
       ),
       # qwen3
       dict(
@@ -91,18 +111,12 @@ class TrainMinimalDistributedTest(
           config="qwen3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
-          skip_devices=[
-              # TODO(tbajpai): Re-examine cause of b/513645397
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-              device_type.AcceleratorDeviceType.TPU,
-          ],
-          loss_atol=1e2,
-          loss_rtol=5e-3,
-          grad_atol=1e1,
-          grad_rtol=5e-2,
-          param_atol=5e-2,
-          param_rtol=5e-2,
+          loss_atol=2e-2,
+          loss_rtol=1e-3,
+          grad_atol=2e-2,
+          grad_rtol=1e-3,
+          param_atol=1e-2,
+          param_rtol=1e-3,
       ),
       dict(
           testcase_name="qwen3_fsdp",
@@ -111,19 +125,33 @@ class TrainMinimalDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           skip_devices=[
-              # TODO(tbajpai): Re-examine cause of b/513645397
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
+             # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
               device_type.AcceleratorDeviceType.TPU,
           ],
-          # b/495494788: Trainer/parallelize differences causing large
-          # numerical discrepancies.
-          loss_atol=2000.0,
-          loss_rtol=5e-2,
-          grad_atol=10000.0,
-          grad_rtol=5e-2,
-          param_atol=5e1,
-          param_rtol=5e-2,
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=2e-3,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
+      ),
+      dict(
+          testcase_name="qwen3_simplefsdp",
+          module="qwen3",
+          config="qwen3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+          skip_devices=[
+              # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
+              device_type.AcceleratorDeviceType.TPU,
+          ],
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=2e-3,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
       ),
   ])
   def test_train_minimal_distributed_parity(
@@ -141,6 +169,7 @@ class TrainMinimalDistributedTest(
       param_rtol=5e-3,
       optimizer_implementation="foreach",
       enable_compile=False,
+      args=None,
   ):
     """Runs a distributed parameter and gradient parity test against a CPU reference.
 
@@ -167,8 +196,8 @@ class TrainMinimalDistributedTest(
             "--training.steps=3",
             "--training.mixed_precision_param=float32",
             "--training.mixed_precision_reduce=float32",
-            "--training.local_batch_size=4",
-        ],
+            "--training.local_batch_size=2",
+        ] + (args or []),
         tensor_parallel_degree=tensor_parallel_degree,
         data_parallel_shard_degree=data_parallel_shard_degree,
         skip_devices=skip_devices,
@@ -183,5 +212,5 @@ class TrainMinimalDistributedTest(
 
 
 if __name__ == "__main__":
-  mp.set_start_method("spawn")
+  mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]
   absltest.main()

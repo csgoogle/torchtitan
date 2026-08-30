@@ -18,18 +18,20 @@ from torch.distributed.tensor.parallel import (
 )
 
 from torchtitan.config import (
-    ActivationCheckpointConfig,
     CompileConfig,
     ParallelismConfig,
     TORCH_DTYPE_MAP,
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import apply_ac
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
-from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
+from torchtitan.distributed.fsdp import (
+    disable_fsdp_gradient_division,
+    enable_fsdp_symm_mem,
+    get_fsdp_reshard_after_forward_policy,
+)
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp, NoParallel
-from torchtitan.models.llama3.parallelize import disable_fsdp_gradient_division
 from torchtitan.tools.logging import logger
 
 
@@ -40,7 +42,7 @@ def parallelize_hf_transformers(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
-    ac_config: ActivationCheckpointConfig,
+    ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
     """
@@ -64,7 +66,6 @@ def parallelize_hf_transformers(
         apply_non_moe_tp(
             model,
             parallel_dims.get_mesh("tp"),
-            enable_loss_parallel=not parallelism.disable_loss_parallel,
         )
         maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
 
@@ -72,8 +73,8 @@ def parallelize_hf_transformers(
         compile_config.enable and "model" in compile_config.components
     )
 
-    if ac_config.mode != "none":
-        apply_ac(model, ac_config)
+    if ac_config is not None:
+        ac_config.build(dump_folder=dump_folder).apply(model)
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if model_compile_enabled:
@@ -90,6 +91,7 @@ def parallelize_hf_transformers(
         pp_enabled=parallel_dims.pp_enabled,
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
 
     logger.info("Applied fully_shard to the model")
@@ -99,6 +101,15 @@ def parallelize_hf_transformers(
 
     if parallel_dims.cp_enabled:
         model.set_cp_mesh(parallel_dims.get_mesh("cp"))
+        # Collect HFFlexAttention kernel modules for CP wrapping
+        flex_modules = []
+        for layer in model.layers.values():
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "_flex_kernel"):
+                flex_modules.append(layer.self_attn._flex_kernel)
+        if flex_modules:
+            from torchtitan.distributed.context_parallel import apply_cp_to_forward
+
+            apply_cp_to_forward(flex_modules, parallel_dims.get_mesh("cp"))
         logger.info("Applied Context Parallel to the model")
 
     return model
@@ -107,7 +118,6 @@ def parallelize_hf_transformers(
 def apply_non_moe_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh,
-    enable_loss_parallel: bool,
 ):
     """Apply tensor parallelism."""
     # 1. Parallelize the embedding and shard its outputs (which are the first
@@ -120,9 +130,7 @@ def apply_non_moe_tp(
 
     if hasattr(model, "tok_embeddings"):
         if isinstance(model.tok_embeddings, nn.Identity):
-            root_plan["tok_embeddings"] = NoParallel(
-                local_output_grad_placements=(Replicate(),),
-            )
+            root_plan["tok_embeddings"] = NoParallel(use_local_output=True)
         else:
             root_plan["tok_embeddings"] = RowwiseParallel(
                 input_layouts=Replicate(),
@@ -131,22 +139,18 @@ def apply_non_moe_tp(
 
     if hasattr(model, "norm"):
         if isinstance(model.norm, nn.Identity):
-            root_plan["norm"] = NoParallel(
-                local_output_grad_placements=(Replicate(),),
-            )
+            root_plan["norm"] = NoParallel(use_local_output=True)
         else:
             root_plan["norm"] = SequenceParallel()
 
     if hasattr(model, "lm_head"):
         if isinstance(model.lm_head, nn.Identity):
-            root_plan["lm_head"] = NoParallel(
-                local_output_grad_placements=(Replicate(),),
-            )
+            root_plan["lm_head"] = NoParallel(use_local_output=True)
         else:
             root_plan["lm_head"] = ColwiseParallel(
                 input_layouts=Shard(1),
-                output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
-                use_local_output=not enable_loss_parallel,
+                output_layouts=Shard(-1),
+                use_local_output=False,
             )
     if root_plan:  # Only call if there's something to parallelize
         parallelize_module(model, tp_mesh, root_plan)
@@ -173,19 +177,11 @@ def apply_non_moe_tp(
         else:
             layer_plan.update(
                 {
-                    "self_attn.q_a_proj": NoParallel(
-                        local_output_grad_placements=(Replicate(),),
-                    ),
-                    "self_attn.q_a_layernorm": NoParallel(
-                        local_output_grad_placements=(Replicate(),),
-                    ),
+                    "self_attn.q_a_proj": NoParallel(use_local_output=True),
+                    "self_attn.q_a_layernorm": NoParallel(use_local_output=True),
                     "self_attn.q_b_proj": ColwiseParallel(),
-                    "self_attn.kv_a_proj_with_mqa": NoParallel(
-                        local_output_grad_placements=(Replicate(),),
-                    ),
-                    "self_attn.kv_a_layernorm": NoParallel(
-                        local_output_grad_placements=(Replicate(),),
-                    ),
+                    "self_attn.kv_a_proj_with_mqa": NoParallel(use_local_output=True),
+                    "self_attn.kv_a_layernorm": NoParallel(use_local_output=True),
                     "self_attn.kv_b_proj": ColwiseParallel(),
                 }
             )
@@ -254,6 +250,7 @@ def apply_fsdp(
     ep_degree: int = 1,
     dp_mod_ep_mesh: DeviceMesh | None = None,
     gradient_divide_factor: int | None = None,
+    enable_symm_mem: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -285,7 +282,30 @@ def apply_fsdp(
         reshard_after_forward_policy, pp_enabled
     )
 
-    if model.tok_embeddings is not None:
+    # When input/output embeddings are tied (e.g. Qwen3), tok_embeddings and
+    # lm_head share one parameter. FSDP2 forbids a parameter being managed by
+    # two FSDP groups, so they must be grouped into a single unit.
+    tok_emb_weight = getattr(model.tok_embeddings, "weight", None)
+    lm_head_weight = getattr(model.lm_head, "weight", None)
+    # Detect tying by parameter identity (the exact thing FSDP2 checks); this
+    # also skips PP nn.Identity placeholders, which have no `.weight`.
+    tie_word_embeddings = (
+        tok_emb_weight is not None
+        and lm_head_weight is not None
+        and tok_emb_weight is lm_head_weight
+    )
+
+    if tie_word_embeddings:
+        fully_shard(
+            [
+                m
+                for m in (model.tok_embeddings, model.norm, model.lm_head)
+                if m is not None
+            ],
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward_policy == "always",
+        )
+    elif model.tok_embeddings is not None:
         fully_shard(
             model.tok_embeddings,
             **fsdp_config,
@@ -329,8 +349,9 @@ def apply_fsdp(
         )
 
     # As an optimization, do not reshard_after_forward the last layers by default
-    # since FSDP would prefetch them immediately after the forward pass
-    if model.norm is not None and model.lm_head is not None:
+    # since FSDP would prefetch them immediately after the forward pass. When
+    # weights are tied, norm/lm_head are already grouped with tok_embeddings above.
+    if not tie_word_embeddings and model.norm is not None and model.lm_head is not None:
         fully_shard(
             [model.norm, model.lm_head],
             **fsdp_config,
@@ -338,6 +359,9 @@ def apply_fsdp(
         )
 
     fully_shard(model, **fsdp_config)
+
+    if enable_symm_mem:
+        enable_fsdp_symm_mem(model)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)

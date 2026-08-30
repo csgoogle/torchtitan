@@ -6,21 +6,32 @@
 
 import contextlib
 import gc
+import os
 import subprocess
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
+import psutil
 import torch
+import torch.distributed as dist
 from torch._utils import _get_available_device_type, _get_device_module
+
+from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger
 
 
+def round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 def has_cuda_capability(major: int, minor: int) -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
-        major,
-        minor,
+    # torch.version.hip is None excludes ROCm (capability is a tuple on AMD too).
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability() >= (major, minor)
     )
 
 
@@ -32,18 +43,130 @@ def has_rocm_capability(major: int, minor: int) -> bool:
     )
 
 
+def _patch_cpu_device_module(device_module: ModuleType) -> None:
+    """Adds the device-module functions torch.cpu does not provide."""
+
+    def get_device_name(device=None):
+        return "cpu"
+
+    def current_device():
+        # torch.cpu.current_device() returns the string "cpu"; callers need an
+        # index, e.g. torch.device(device_type, current_device()). A process
+        # has exactly one CPU device, so it is always index 0.
+        return 0
+
+    def get_device_properties(device=None):
+        return SimpleNamespace(total_memory=psutil.virtual_memory().total)
+
+    def reset_peak_memory_stats(device=None):
+        pass
+
+    def empty_cache():
+        pass
+
+    def memory_stats(device=None):
+        return {}
+
+    setattr(device_module, "get_device_name", get_device_name)
+    setattr(device_module, "current_device", current_device)
+    setattr(device_module, "get_device_properties", get_device_properties)
+    setattr(device_module, "reset_peak_memory_stats", reset_peak_memory_stats)
+    setattr(device_module, "empty_cache", empty_cache)
+    setattr(device_module, "memory_stats", memory_stats)
+
+
+def _patch_tpu_device_module(device_module: ModuleType) -> None:
+    """Adds the device-module functions torch_tpu does not provide.
+
+    torch_tpu natively provides get_device_name, get_device_properties,
+    set_device, current_device, device_count and synchronize; it gained
+    is_triton_capable on 2026-08-11, so that one is only back-filled for older
+    builds. Drop these once torch_tpu exposes the memory-management trio.
+    """
+
+    def reset_peak_memory_stats(device=None):
+        pass
+
+    def empty_cache():
+        pass
+
+    def memory_stats(device=None):
+        # torch_tpu exposes memory stats through the modern torch.accelerator
+        # namespace, but torchtitan expects them on the legacy device-module
+        # namespace (torch.tpu). Route them across.
+        return torch.accelerator.memory_stats()
+
+    def is_triton_capable(*args, **kwargs):
+        return False
+
+    setattr(device_module, "reset_peak_memory_stats", reset_peak_memory_stats)
+    setattr(device_module, "empty_cache", empty_cache)
+    setattr(device_module, "memory_stats", memory_stats)
+    if not hasattr(device_module, "is_triton_capable"):
+        setattr(device_module, "is_triton_capable", is_triton_capable)
+
+
 def get_device_info() -> tuple[str, ModuleType]:
-    device_type = _get_available_device_type() or "cuda"
-    device_module = _get_device_module(device_type)  # default device_module:torch.cuda
+    # Upstream falls back to "cuda"; this fork falls back to "cpu" so that a
+    # machine with no accelerator -- or one where the accelerator was hidden on
+    # purpose, see experiments/tpu/device_env.py -- reports what it will run on.
+    device_type = _get_available_device_type() or "cpu"
+    device_module = _get_device_module(device_type)
+    if device_type == "cpu":
+        _patch_cpu_device_module(device_module)
+    elif device_type == "tpu":
+        _patch_tpu_device_module(device_module)
     return device_type, device_module
 
 
-# device_type, device_module = get_device_info()
-from torchtitan.experiments.tpu import utils as tpu_utils
-get_device_type = tpu_utils.get_device_type
-get_device_module = tpu_utils.get_device_module
-set_device_type = tpu_utils.set_device_type
+device_type, device_module = get_device_info()
 
+
+def get_local_device() -> torch.device:
+    """Return this process's device under LOCAL_RANK or visible-device launch.
+
+    Launchers normally expose multiple accelerators per process and set
+    LOCAL_RANK to identify which local device the process should use. Some
+    launchers instead mask each process down to a single accelerator with
+    CUDA_VISIBLE_DEVICES or another backend-specific visible-device mask. When
+    exactly one device is visible, target device index 0; otherwise preserve
+    the existing LOCAL_RANK mapping.
+
+    cpu and tpu are index-free: a process owns exactly one of them, so
+    LOCAL_RANK is not a device index on those lanes. tpu cannot use the
+    visible-device heuristic below either, because torch.tpu.device_count()
+    reports the host's chip count -- not the process's single addressable chip
+    -- until the PJRT runtime is initialized, which happens after callers of
+    this function have already selected a device.
+    """
+    if device_type in ["cpu", "tpu"]:
+        return torch.device(device_type)
+
+    local_rank_str = os.environ.get("LOCAL_RANK")
+    if local_rank_str is None:
+        raise ValueError("LOCAL_RANK must be set before selecting a local device.")
+    try:
+        local_rank = int(local_rank_str)
+    except ValueError as e:
+        raise ValueError(
+            "LOCAL_RANK environment variable must be a valid integer, "
+            f"got: {local_rank_str}"
+        ) from e
+    if local_rank < 0:
+        raise ValueError(f"LOCAL_RANK must be non-negative, got: {local_rank}")
+
+    num_devices = None
+    if hasattr(device_module, "device_count"):
+        num_devices = device_module.device_count()
+    device_index = 0 if num_devices == 1 else local_rank
+    if num_devices is not None and num_devices > 1 and device_index >= num_devices:
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} is outside the visible {device_type} "
+            f"device count ({num_devices}). If each process is launched with a "
+            f"single visible {device_type} device, set the visible-device mask "
+            "per process so device_count() returns 1."
+        )
+    return torch.device(device_type, device_index)
 
 
 # used to avoid stragglers in garbage collection
@@ -60,15 +183,23 @@ class GarbageCollection:
             if torch.distributed.get_rank() == 0:
                 warn_tensor_cycles()
 
-    def run(self, step_count: int):
+    @sl.log_trace_span("gc_collect")
+    def run(self, step_count: int) -> bool:
+        """Run a GC cycle if this step should collect. Returns True when a
+        collection actually ran, False otherwise."""
         if self.debug:
             self.collect(
                 "Force GC to perform collection to obtain debug information",
                 generation=2,
             )
             gc.collect()
-        elif step_count > 1 and step_count % self.gc_freq == 0:
+            sl.add_step_tag("gc")
+            return True
+        if step_count > 1 and step_count % self.gc_freq == 0:
             self.collect("Performing periodic GC collection")
+            sl.add_step_tag("gc")
+            return True
+        return False
 
     @staticmethod
     def collect(reason: str, generation: int = 1):
@@ -155,25 +286,31 @@ def get_peak_flops(device_name: str) -> float:
     elif "l40s" in device_name:
         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
         return 362e12
-    elif device_name.startswith("tpu-"):
-        if "v4" in device_name:
+    elif "tpu" in device_name.lower():
+        # torch_tpu reports "TPU v6e"; older torchtitan builds reported
+        # "tpu-v6e" (and "tpu-7x" for v7). Match both, case-insensitively.
+        tpu_name = device_name.lower().replace("-", " ")
+        if "v4" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/v4
             return 275e12
-        elif "v5e" in device_name:
+        elif "v5e" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/v5e
             return 197e12
-        elif "v5p" in device_name:
+        elif "v5p" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/v5p
             # The quoted number is per chip. We use this number as we assume
             # megacore is enabled for v5p.
             return 459e12
-        elif "v6e" in device_name:
+        elif "v6e" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/v6e
             return 918e12
-        elif "7x" in device_name:
+        elif "v7" in tpu_name or "7x" in tpu_name:
             # data from https://docs.cloud.google.com/tpu/docs/tpu7x
             # The quoted number is per chip. We halve it for per-core FLOPS.
             return 2307e12 / 2
+        logger.warning(
+            f"Unrecognized TPU device name: {device_name}, fallback to A100"
+        )
     elif "neuron" in device_name:
         # AWS Trainium/Inferentia: query chip type via torch.neuron
         # TensorEngine BF16 TFLOPS per NeuronCore × default Logical NeuronCore (LNC) count per device

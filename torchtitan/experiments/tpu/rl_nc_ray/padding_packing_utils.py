@@ -1,9 +1,7 @@
 """
 padding_packing_utils.py
-
 Holds utilities and patching helpers related to static batch padding, sequence absorbing,
 and varlen/masked attention execution for TPU.
-
 =====================================================================
 TPU vs GPU Compilation & Shape Semantics:
 1. GPU Dynamic Shapes: GPUs run in PyTorch eager mode or use specialized kernels (like flash-attention's
@@ -22,6 +20,43 @@ import torch.nn.functional as F
 from torchtitan.models.common.attention import VarlenAttention
 
 
+def patch_create_varlen_metadata(max_seqs: int = 64) -> None:
+    """
+    Monkey-patch create_varlen_metadata_for_document to pad metadata to static shapes.
+    Prevents XLA recompilation due to varying number of sequences in a microbatch.
+    """
+    import torchtitan.models.common.attention as attn
+    
+    if hasattr(attn, "_original_create_varlen_metadata"):
+        return # Already patched
+        
+    attn._original_create_varlen_metadata = attn.create_varlen_metadata_for_document
+    
+    def padded_create_varlen_metadata(positions):
+        metadata = attn._original_create_varlen_metadata(positions)
+        cu_seq_q = metadata.cu_seq_q
+        cu_seq_k = metadata.cu_seq_k
+        
+        pad_val_q = cu_seq_q[-1]
+        pad_val_k = cu_seq_k[-1]
+        
+        seq_count = cu_seq_q.shape[0] - 1
+        if seq_count > max_seqs:
+            raise ValueError(f"Number of sequences {seq_count} exceeds max_seqs {max_seqs}")
+            
+        pad_len = max_seqs + 1 - cu_seq_q.shape[0]
+        if pad_len > 0:
+            padded_cu_seq_q = torch.cat([cu_seq_q, pad_val_q.repeat(pad_len)])
+            padded_cu_seq_k = torch.cat([cu_seq_k, pad_val_k.repeat(pad_len)])
+        else:
+            padded_cu_seq_q = cu_seq_q
+            padded_cu_seq_k = cu_seq_k
+            
+        return metadata._replace(cu_seq_q=padded_cu_seq_q, cu_seq_k=padded_cu_seq_k)
+
+    attn.create_varlen_metadata_for_document = padded_create_varlen_metadata
+
+
 def patch_varlen_attention(target_device: str) -> None:
     """
     Monkey-patch VarlenAttention for CPU and TPU execution.
@@ -30,15 +65,16 @@ def patch_varlen_attention(target_device: str) -> None:
     """
 
     if target_device == "cpu":
-        def cpu_varlen_forward(self, xq, xk, xv, *, attention_masks, scale=None, **kwargs):
+        def cpu_varlen_forward(self, q_BLNH, k_BLNH, v_BLNH, *, attention_masks, scale=None, **kwargs):
             cu_seqs = attention_masks.cu_seq_q.tolist()
-            out = torch.zeros_like(xq)
+            chunks = []
             for i in range(len(cu_seqs) - 1):
                 start, end = cu_seqs[i], cu_seqs[i+1]
-                if start == end: continue
-                q = xq[:, start:end, :, :].transpose(1, 2)
-                k = xk[:, start:end, :, :].transpose(1, 2)
-                v = xv[:, start:end, :, :].transpose(1, 2)
+                if start == end:
+                    continue
+                q = q_BLNH[:, start:end, :, :].transpose(1, 2)
+                k = k_BLNH[:, start:end, :, :].transpose(1, 2)
+                v = v_BLNH[:, start:end, :, :].transpose(1, 2)
                 
                 if q.shape[1] != k.shape[1]:
                     num_repeat = q.shape[1] // k.shape[1]
@@ -48,15 +84,33 @@ def patch_varlen_attention(target_device: str) -> None:
                 attn_out = F.scaled_dot_product_attention(
                     q, k, v, is_causal=True, scale=scale
                 )
-                out[:, start:end, :, :] = attn_out.transpose(1, 2)
+                chunks.append(attn_out.transpose(1, 2))
+                
+            if len(chunks) == 0:
+                return torch.zeros_like(q_BLNH)
+            out = torch.cat(chunks, dim=1)
+            if out.shape[1] < q_BLNH.shape[1]:
+                pad = torch.zeros(
+                    (q_BLNH.shape[0], q_BLNH.shape[1] - out.shape[1], q_BLNH.shape[2], q_BLNH.shape[3]),
+                    dtype=q_BLNH.dtype,
+                    device=q_BLNH.device,
+                )
+                out = torch.cat([out, pad], dim=1)
             return out
         VarlenAttention.forward = cpu_varlen_forward
     else:
-        def tpu_varlen_forward(self, xq, xk, xv, *, attention_masks, scale=None, **kwargs):
-            total_tokens = xq.shape[1]
+        def tpu_varlen_forward(self, q_BLNH, k_BLNH, v_BLNH, *, attention_masks, scale=None, **kwargs):
+            B, L, N, H = q_BLNH.shape
+            N_kv = k_BLNH.shape[2]
+            T = B * L
+            
+            q_flat = q_BLNH.view(1, T, N, H)
+            k_flat = k_BLNH.view(1, T, N_kv, H)
+            v_flat = v_BLNH.view(1, T, N_kv, H)
+            
             cu_seqs = attention_masks.cu_seq_q
             
-            positions = torch.arange(total_tokens, device=xq.device)
+            positions = torch.arange(T, device=q_BLNH.device)
             seq_indices = (positions.unsqueeze(1) >= cu_seqs.unsqueeze(0)).sum(dim=1) - 1
             same_seq_mask = seq_indices.unsqueeze(1) == seq_indices.unsqueeze(0)
             causal_mask = positions.unsqueeze(1) >= positions.unsqueeze(0)
@@ -64,9 +118,9 @@ def patch_varlen_attention(target_device: str) -> None:
             mask = same_seq_mask & causal_mask
             mask = mask.unsqueeze(0).unsqueeze(0)
             
-            q = xq.transpose(1, 2)
-            k = xk.transpose(1, 2)
-            v = xv.transpose(1, 2)
+            q = q_flat.transpose(1, 2)
+            k = k_flat.transpose(1, 2)
+            v = v_flat.transpose(1, 2)
             
             if q.shape[1] != k.shape[1]:
                 num_repeat = q.shape[1] // k.shape[1]
@@ -76,7 +130,7 @@ def patch_varlen_attention(target_device: str) -> None:
             attn_out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, scale=scale
             )
-            return attn_out.transpose(1, 2)
+            return attn_out.transpose(1, 2).view(B, L, N, H)
             
         VarlenAttention.forward = tpu_varlen_forward
 

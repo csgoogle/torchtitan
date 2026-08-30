@@ -61,7 +61,7 @@ class TestJaxDistributed(parameterized.TestCase):
         "--training.seq_len=128",
         "--training.steps=3",
         "--training.local_batch_size=8",
-        "--activation_checkpoint.mode=full",
+        "activation-checkpoint:full",
     ]
 
     job_config = ConfigManager().parse_args(args)

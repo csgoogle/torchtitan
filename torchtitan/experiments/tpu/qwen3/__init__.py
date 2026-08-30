@@ -1,5 +1,5 @@
-from torchtitan.components.loss import ChunkedCELoss
-from torchtitan.components.optimizer import OptimizersContainer
+import torchtitan.components.loss as loss
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.components.validate import Validator
@@ -11,10 +11,14 @@ from .infra.parallelize import parallelize_qwen3
 
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
+from torchtitan.protocols.model_spec import ModelSpec
 
 __all__ = [
     "parallelize_qwen3",
     "qwen3_configs",
+    "qwen3_debugmodel",
+    "qwen3_debugmodel_moe",
+    "model_registry",
 ]
 
 def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
@@ -35,14 +39,9 @@ def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
         lm_head=common_models.Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=qwen3_models._output_linear_init(dim),
+            param_init=qwen3_models._LINEAR_INIT,
         ),
-        rope=common_models.RoPE.Config(
-            dim=head_dim,
-            max_seq_len=128,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
+
         # pytype: disable=wrong-keyword-args
         layers=qwen3_models._build_qwen3_layers(
             n_layers=n_layers,
@@ -52,6 +51,11 @@ def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
             head_dim=head_dim,
             hidden_dim=256,
             attn_backend=attn_backend,
+            rope=common_models.CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=128,
+                theta=1000000.0,
+            ),
         ),
         # pytype: enable=wrong-keyword-args
     )
@@ -75,14 +79,9 @@ def _testmodel_moe(
         lm_head=common_models.Linear.Config(
             in_features=dim,
             out_features=vocab_size,
-            param_init=qwen3_models._output_linear_init(dim),
+            param_init=qwen3_models._LINEAR_INIT,
         ),
-        rope=common_models.RoPE.Config(
-            dim=head_dim,
-            max_seq_len=128,
-            theta=1000000.0,
-            backend="cos_sin",
-        ),
+
         # pytype: disable=wrong-keyword-args
         layers=qwen3_models._build_qwen3_moe_layers(
             n_layers=n_layers,
@@ -95,6 +94,55 @@ def _testmodel_moe(
             top_k=2,
             attn_backend=attn_backend,
             moe_comm_backend=moe_comm_backend,
+            rope=common_models.CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=128,
+                theta=1000000.0,
+            ),
+        ),
+        # pytype: enable=wrong-keyword-args
+    )
+
+
+def _8b_tpu(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
+    """TPU-specific Qwen3 8B model configuration.
+
+    Differs from the baseline models/qwen3/_8b config by setting fuse_qkv=False
+    to avoid running attention projection GEMMs as a single fused block on TPU.
+    """
+    dim = 4096
+    head_dim = 128
+    n_layers = 36
+    vocab_size = 151936
+    return qwen3_models.Qwen3Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        norm=qwen3_models._qwen3_norm(dim),
+        tok_embeddings=common_models.Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=qwen3_models._EMBEDDING_INIT,
+        ),
+        lm_head=common_models.Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=qwen3_models._LINEAR_INIT,
+        ),
+        # pytype: disable=wrong-keyword-args
+        layers=qwen3_models._build_qwen3_layers(
+            fuse_qkv=False,
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=32,
+            n_kv_heads=8,
+            head_dim=head_dim,
+            hidden_dim=12288,
+            attn_backend=attn_backend,
+            rope=common_models.CosSinRoPE.Config(
+                dim=head_dim,
+                max_seq_len=40960,
+                theta=1000000.0,
+            ),
         ),
         # pytype: enable=wrong-keyword-args
     )
@@ -108,8 +156,16 @@ qwen3_configs = {
     "0.6B": qwen3_models.qwen3_configs["0.6B"]("sdpa"),
     "1.7B": qwen3_models.qwen3_configs["1.7B"]("sdpa"),
     "4B": qwen3_models.qwen3_configs["4B"]("sdpa"),
+    "8B": _8b_tpu("sdpa"),
     "32B": qwen3_models.qwen3_configs["32B"]("sdpa"),
+    "30B-A3B": qwen3_models.qwen3_configs["30B-A3B"]("sdpa"),
 }
+
+def qwen3_debugmodel():
+    return qwen3_configs["debugmodel"]
+
+def qwen3_debugmodel_moe():
+    return qwen3_configs["debugmodel_moe"]
 
 # pytype: disable=wrong-arg-types
 register_train_spec(
@@ -119,8 +175,8 @@ register_train_spec(
         model_args=qwen3_configs,
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=None,
-        loss_config=ChunkedCELoss.Config(),
-        optimizer_config=OptimizersContainer.Config(lr=8e-4),
+        loss_config=loss.ChunkedLossWrapper.Config(),
+        optimizer_config=default_adamw(lr=8e-4),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
         dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         validator_config=Validator.Config(enable=True),
@@ -128,3 +184,34 @@ register_train_spec(
     )
 )
 # pytype: enable=wrong-arg-types
+
+
+def model_registry(
+    flavor: str,
+    attn_backend: str = "flex",
+    moe_comm_backend: str | None = None,
+    converters: list = None,
+) -> ModelSpec:
+  if flavor == "8B" and attn_backend == "sdpa":
+    config = _8b_tpu(attn_backend="sdpa")
+    # Since we return a custom ModelSpec for 8B, apply converters here.
+    if converters is not None:
+      qwen3_models.validate_converter_order(converters)
+      for c in converters:
+        config = c.build().convert(config)
+    return ModelSpec(
+        name="qwen3",
+        flavor=flavor,
+        model=config,
+        parallelize_fn=parallelize_qwen3,
+        pipelining_fn=qwen3_models.pipeline_llm,
+        post_optimizer_build_fn=qwen3_models.register_moe_load_balancing_hook,
+        state_dict_adapter=Qwen3StateDictAdapter,
+    )
+  # Other models do not have TPU specific changes, use upstream model_registry.
+  return qwen3_models.model_registry(
+      flavor,
+      attn_backend=attn_backend,
+      moe_comm_backend=moe_comm_backend,
+      converters=converters,
+  )
