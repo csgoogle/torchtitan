@@ -12,6 +12,7 @@ from typing import Any, TypeAlias
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
 from torch.fx.traceback import annotate, annotate_fn
 from torch.utils._pytree import register_constant, register_pytree_node, tree_map
@@ -435,16 +436,17 @@ def apply_cp_to_attention(
     apply_cp_to_forward(attention_modules, parallel_dims.get_mesh("cp"))
 
 
-def apply_simple_fsdp(
-    model: nn.Module,
-    *,
+def resolve_dp_plan(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
-) -> nn.Module:
-    """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
+) -> tuple[DeviceMesh, str, MixedPrecisionPolicy]:
+    """Return the ``(dp_mesh, dp_mode, mp_policy)`` triple simple_fsdp wraps with.
 
-    For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
-    on the EDP mesh when expert parallelism is enabled.
+    Split out of ``apply_simple_fsdp`` so a caller that wraps two disjoint
+    parameter groups on the same mesh -- e.g. a scanned layer stack, whose
+    stacked parameters carry a leading layer axis and so shard on dim 1 while
+    the rest of the model shards on dim 0 -- derives both from one plan instead
+    of re-deriving the mesh and reading the placements back off the DTensors.
     """
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
@@ -457,11 +459,32 @@ def apply_simple_fsdp(
         dp_mesh_dim_names = ["fsdp"]
         dp_mode = "fully_shard"
 
-    dp_mesh = parallel_dims.get_mesh(dp_mesh_dim_names)
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+    return (
+        parallel_dims.get_mesh(dp_mesh_dim_names),
+        dp_mode,
+        MixedPrecisionPolicy(
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        ),
     )
+
+
+def apply_simple_fsdp(
+    model: nn.Module,
+    *,
+    parallel_dims: ParallelDims,
+    training: TrainingConfig,
+    ignored_params: set[nn.Parameter] | None = None,
+) -> nn.Module:
+    """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
+
+    For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
+    on the EDP mesh when expert parallelism is enabled.
+
+    ``ignored_params`` are left unwrapped, for a caller that shards them itself
+    under a different plan.
+    """
+    dp_mesh, dp_mode, mp_policy = resolve_dp_plan(parallel_dims, training)
 
     if parallel_dims.ep_enabled and isinstance(model, Decoder):
         edp_mesh_names = (
@@ -495,6 +518,7 @@ def apply_simple_fsdp(
         dp_mesh,
         dp_mode,
         mp_policy=mp_policy,
+        ignored_params=ignored_params,
     )
     logger.info(
         "Applied Data Parallel (simple_fsdp) (dp mode=%s) to the model", dp_mode

@@ -22,6 +22,12 @@ class TPUConfig:
   compile_optimizer: bool = False
   # Run via TpuGraphTrainer (joint fwd+loss+bwd aot_fx_trace and FX-graph SAC passes).
   use_graph_trainer: bool = False
+  # Run the decoder's blocks under a single `scan` HOP, so the N identical
+  # blocks lower to one `stablehlo.while` instead of N unrolled copies.
+  # Requires llama3 on the graph-trainer lane (use_graph_trainer, or
+  # compile_mode='aot_fx_trace'); TP/CP/PP are not supported yet. Every one of
+  # those is a hard error with the specific reason, never a silent fallback.
+  use_scan: bool = False
   # Whether to compile the optimizer step into the joint fwd+loss+bwd graph.
   optimizer_in_graph: bool = False
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of

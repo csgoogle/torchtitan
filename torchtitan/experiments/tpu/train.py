@@ -138,6 +138,23 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   model_spec = train_config.model_spec
   assert model_spec is not None
   model_name = model_spec.name
+  on_graph_trainer = isinstance(
+      train_config, tpu_job_config_module.TPUTrainerConfig
+  ) and (
+      train_config.tpu_config.use_graph_trainer
+      or train_config.tpu_config.compile_mode == "aot_fx_trace"
+  )
+  if (
+      isinstance(train_config, tpu_job_config_module.TPUTrainerConfig)
+      and train_config.tpu_config.use_scan
+      and not on_graph_trainer
+  ):
+    # Only the graph_trainer lane is wired for scan. Any other lane would
+    # accept the flag, log it as enabled and run unrolled anyway.
+    raise ValueError(
+        "tpu_config.use_scan requires --tpu-config.use-graph-trainer (or"
+        " --tpu-config.compile-mode=aot_fx_trace)."
+    )
   if model_name == "flux":
     from torchtitan.models.flux.trainer import FluxTrainer
     trainer_cls = FluxTrainer
@@ -147,13 +164,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   # without fullgraph compilation (e.g. alongside `layer` compile mode) can cause
   # severe HBM fragmentation and stack reservation collisions (e.g. 78.46G memory
   # reservation bottlenecks across multiple disjoint overlay modules).
-  elif (
-      isinstance(train_config, tpu_job_config_module.TPUTrainerConfig)
-      and (
-          train_config.tpu_config.use_graph_trainer
-          or train_config.tpu_config.compile_mode == "aot_fx_trace"
-      )
-  ):
+  elif on_graph_trainer:
     if (
         train_config.tpu_config.use_graph_trainer
         and train_config.tpu_config.compile_mode
