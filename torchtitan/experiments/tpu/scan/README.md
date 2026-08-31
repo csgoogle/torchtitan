@@ -153,11 +153,15 @@ mesh or placement the in-body gather cannot express before the first step runs.
 
 ### Activation checkpointing -- `recompute.py`
 
-`torch.utils.checkpoint` inside a scan body is a **silent no-op**. The HOP
-re-traces the body through `materialize_as_graph`, and that re-trace runs
-outside the checkpoint context, so nothing tags the nodes; you get min-cut's
-saved set with no warning and no error. This is why the block-wrapping AC
-policies are rejected rather than ignored.
+`torch.utils.checkpoint` inside a scan body is a **silent no-op**, and the
+reason is narrower than "the context is lost". Vanilla AC is tagged by Dynamo,
+in `TagActivationCheckpoint.tag_nodes` (`torch/_higher_order_ops/wrap.py:288`).
+The HOP re-traces the body through `materialize_as_graph`, whose inner tracer
+runs under `@torch._dynamo.disable(recursive=True)`
+(`torch/_higher_order_ops/utils.py:1271`). Dynamo never sees the body, so the
+tagging pass never runs; you get min-cut's saved set with no warning and no
+error. This is why the block-wrapping AC policies are rejected rather than
+ignored.
 
 That matters because without a recompute tag the partitioner saves the
 *gathered* weights across the forward/backward boundary and hands back
@@ -176,9 +180,11 @@ min-cut raise `NetworkXError`, and a tagged `scan` node recomputes the whole
 layer loop in backward -- silently, while the saved-set metric improves.
 `install()` wraps the module-level `min_cut_rematerialization_partition` (which
 `HopGraphMinCutPartitioner` calls directly; there is no per-HOP hook) to strip
-those two back off. **The clean upstream fix is for scan's HOP to preserve
-`node.meta["recompute"]` through `materialize_as_graph`**, which would delete
-this file.
+those two back off. Note that Dynamo's own tagger has the same rule and solves
+it at the source: `tag_nodes` tags only `call_function` / `call_method` /
+`call_module`, never a placeholder.
+
+Upstream asks 1 and 2 delete this file and its monkeypatch respectively.
 
 ### Backward direction -- `reverse.py`
 
@@ -196,6 +202,8 @@ flip cancel and both can be dropped. This file installs a sibling HOP that does
 that. It is a sibling rather than a new argument because `ScanOp.__call__` and
 `ScanOp.gen_schema` share a fixed four-argument signature that nine dispatch
 registrations are written against.
+
+Upstream ask 3 deletes this file.
 
 ### Pallas kernels and `peel_first_layer` -- `api.py`
 
@@ -237,22 +245,62 @@ optional, so there is none.
 
 ## Upstream asks
 
-Four changes would delete code here. None is required to use the feature.
+Four changes to PyTorch would delete code here. **None is required to use the
+feature** -- everything below works today against stock torch. They are listed
+so a reviewer can see which lines are a design and which are a workaround with
+a known expiry.
 
-1. **Preserve `node.meta["recompute"]` through the scan HOP's
-   `materialize_as_graph`.** Deletes `recompute.py` and makes
-   `torch.utils.checkpoint` around a scan body mean what it says.
+Verified against `pytorch/pytorch` v2.12.0 (`0d62256a`); line numbers are that
+tag.
+
+| # | Upstream change | Deletes here | Prod | Test |
+|---|---|---|---:|---:|
+| 1 | AC works inside a HOP body | `recompute.py` | 149 | ~170 |
+| 2 | `partition_fn` argument | `recompute.install()`'s monkeypatch | (in 1) | -- |
+| 3 | `reverse=` on the scan HOP | `reverse.py` | 359 | ~220 |
+| 4 | `ScriptObject` in HOP additional inputs | `_AllGatherReduceScatter` | ~50 | -- |
+
+Total if all four land: ~558 of 1,197 production lines, and both of the tree's
+two monkeypatches.
+
+1. **Make `torch.utils.checkpoint` work inside a HOP body.** Today it is a
+   silent no-op, because vanilla AC is tagged by Dynamo
+   (`torch/_higher_order_ops/wrap.py:288`) and `materialize_as_graph` traces the
+   body under `@torch._dynamo.disable(recursive=True)`
+   (`torch/_higher_order_ops/utils.py:1271`). This is not a metadata-plumbing
+   bug: the meta is never set rather than dropped in transit. The fix touches
+   every HOP -- `cond`, `while_loop`, `scan`, `associative_scan`,
+   `flex_attention` -- so it wants a design discussion before a diff. The
+   reproducer is fifteen lines on CPU and needs no accelerator. Deletes
+   `recompute.py`.
+
+   Worth testing before asking: the *selective* AC path
+   (`create_selective_checkpoint_contexts`) does not go through Dynamo. It tags
+   from a `TorchDispatchMode` that writes `fx_traceback.current_meta`
+   (`torch/utils/checkpoint.py:1345`), and `materialize_as_graph` calls
+   `_disable_current_modes()` *before* running the body, so a mode entered
+   inside the body should survive. Tagging by dispatch would also hit exactly
+   the body's `call_function` nodes -- no placeholders, no outer `scan` node,
+   so no strip. If that works, most of `recompute.py` goes away with no
+   upstream change at all.
+
 2. **Let `HopGraphMinCutPartitioner.create_partitioned_graph` take a
    `partition_fn`.** `HopJointGraph.partition` already accepts one
-   (`torch/_higher_order_ops/partitioner.py:281`); only the caller two frames
-   up hardcodes `min_cut_rematerialization_partition` (lines 356-380). Adding
-   the argument and forwarding it from `scan_autograd` is ~10 lines, and turns
+   (`torch/_higher_order_ops/partitioner.py:280`); only the caller two frames up
+   hardcodes `min_cut_rematerialization_partition` (lines 357-380). Adding the
+   argument and forwarding it is ~10 lines, purely additive, and turns
    `recompute.install()`'s process-global monkeypatch into a function argument.
-   The smaller companion: `must_recompute` at
-   `torch/_functorch/partitioners.py:162` should exclude `placeholder` nodes,
-   which is what the `NetworkXError` half of the strip works around.
-3. **A `reverse` argument on the scan HOP.** Deletes `reverse.py`, and fixes the
-   `torch.flip` TODO upstream already carries.
+   This is the smallest and most landable of the four, and it is worth doing
+   even if ask 1 never happens.
+
+3. **A `reverse` argument on the scan HOP.** `scan()` the Python API already
+   takes `reverse` (`torch/_higher_order_ops/scan.py:86`) but implements it by
+   flipping the inputs and the outputs (lines 194, 219); the HOP itself has a
+   fixed four-argument signature (line 229). Deletes `reverse.py` and fixes the
+   `torch.flip` TODO upstream already carries. Most of this file's 359 lines are
+   scaffolding that exists only because the patch lives outside torch, so the
+   upstream version is the smaller one.
+
 4. **Let the HOP's additional inputs carry a lifted `ScriptObject`.** A
    `DeviceMesh` would then survive into the body, and SimpleFSDP's own
    `ReplicateComputation` could replace `_AllGatherReduceScatter`. Needs a

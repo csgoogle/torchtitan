@@ -40,9 +40,10 @@ backward -- silently, while the saved-set metric it is judged by improves.
 `install()` wraps `min_cut_rematerialization_partition` to strip the tag off
 exactly those nodes before delegating.
 
-The upstream ask that would delete this file is for the scan HOP to preserve
-`node.meta["recompute"]` across `materialize_as_graph`; then
-`torch.utils.checkpoint` would just work and neither half would be needed.
+Upstream ask 1 in `README.md` deletes this file: make `torch.utils.checkpoint`
+work inside a HOP body, and neither half is needed. Ask 2 -- a `partition_fn`
+argument on `HopGraphMinCutPartitioner.create_partitioned_graph` -- deletes
+`install()`/`uninstall()` on their own, and is much the smaller change.
 
 On recomputing a collective: upstream's *Note [Recomputing collectives in the
 partitioner]* bans it because a pass that reorders, deletes, or duplicates a

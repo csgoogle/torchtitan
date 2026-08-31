@@ -33,8 +33,8 @@ Two shapes of workaround, both deliberate:
     `call_backward` are what make that safe -- if upstream's shape changes,
     this raises instead of silently returning a reversed gradient.
 
-The upstream ask that deletes this file is a `reverse=` argument on the scan
-HOP, lowered by whoever owns the backend.
+Upstream ask 3 in `README.md` deletes this file: a `reverse=` argument on the
+scan HOP, lowered by whoever owns the backend.
 """
 
 import contextlib
