@@ -1,5 +1,7 @@
 # Recipe for training Qwen3-8B model on 8 TPU trillium cluster (v6e-8)
 
+> **Note (8/30/2026):** This recipe uses the Regular Trainer configuration for Qwen3-8B. The Graph Trainer currently still encounters Out Of Memory (OOM) errors on v6e.
+
 These are instructions for deploying Qwen3-8B training using the regular trainer to an 8 chip v6e cluster using `xpk`.
 
 For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
