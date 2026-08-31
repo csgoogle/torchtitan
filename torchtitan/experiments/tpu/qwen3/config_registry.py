@@ -188,7 +188,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
   )
 
 
-def graph_trainer_qwen3_8b() -> TPUTrainerConfig:
+def qwen3_8b() -> TPUTrainerConfig:
   """Qwen3 8B model configuration for TPU."""
   model_spec = model_registry("8B", attn_backend="sdpa")
   model_config = cast(Qwen3Model.Config, model_spec.model)
