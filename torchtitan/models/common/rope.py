@@ -257,12 +257,32 @@ class ComplexRoPE(RoPE):
         key: torch.Tensor,
         rope_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply complex RoPE using adjacent-dim pairs."""
-        xq_ = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
-        xk_ = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
-        xq_out = torch.view_as_real(xq_ * rope_cache).flatten(3)
-        xk_out = torch.view_as_real(xk_ * rope_cache).flatten(3)
-        return xq_out.type_as(query), xk_out.type_as(key)
+        """Apply complex RoPE using adjacent-dim pairs.
+
+        Written as the expanded real multiply rather than
+        ``view_as_complex(q) * rope_cache``. The two are the same arithmetic --
+        ``(a + bi)(c + di) = (ac - bd) + (ad + bc)i`` is what PyTorch's complex
+        multiply evaluates -- but ``view_as_complex`` on a differentiable input
+        does not survive functional re-tracing: inside a higher-order op body it
+        becomes ``view_as_complex_copy``, which has no autograd formula
+        (``NotImplementedError: view_as_complex_copy does not support automatic
+        differentiation for outputs with complex dtype``). ``rope_cache`` is a
+        non-persistent buffer that never requires grad, so reading it through
+        ``view_as_real`` is not differentiated and stays fine.
+        """
+        # cos/sin are the real and imaginary parts of the cached rotation.
+        cache = torch.view_as_real(rope_cache)
+        cos, sin = cache[..., 0], cache[..., 1]
+
+        def rotate(x: torch.Tensor) -> torch.Tensor:
+            pairs = x.float().reshape(*x.shape[:-1], -1, 2)
+            real, imag = pairs[..., 0], pairs[..., 1]
+            out = torch.stack(
+                [real * cos - imag * sin, real * sin + imag * cos], dim=-1
+            )
+            return out.flatten(3).type_as(x)
+
+        return rotate(query), rotate(key)
 
 
 class CosSinRoPE(RoPE):
