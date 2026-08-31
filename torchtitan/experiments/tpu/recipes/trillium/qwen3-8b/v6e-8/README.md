@@ -55,7 +55,27 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.qwen3 \
-    --config=reg_trainer_qwen3_8b"
+    --config=reg_trainer_qwen3_8b \
+    --training.local_batch_size=6 \
+    --training.seq_len=2048 \
+    --training.mixed_precision_reduce=float32 \
+    --compile.enable \
+    --parallelism.use_simple_fsdp \
+    --parallelism.enable_tpu_topo_mesh \
+    --splash_attention_kernel.use_splash_attention_kernel \
+    --splash_attention_kernel.sa_block_q=1024 \
+    --splash_attention_kernel.sa_block_kv=1024 \
+    --splash_attention_kernel.sa_block_dkv=1024 \
+    --splash_attention_kernel.sa_block_kv_compute=1024 \
+    --splash_attention_kernel.sa_block_q_dkv=1024 \
+    --splash_attention_kernel.sa_block_kv_dkv=1024 \
+    --splash_attention_kernel.sa_block_kv_dkv_compute=1024 \
+    --splash_attention_kernel.sa_block_q_dq=1024 \
+    --splash_attention_kernel.sa_block_kv_dq=1024 \
+    --loss_kernel.use_loss_kernel \
+    --tpu_config.eager_mode=DEFER_AND_FUSE \
+    --tpu_config.use_graph_split \
+    --tpu_config.compile_mode=layer"
 ```
 
 ## Expected Metrics
