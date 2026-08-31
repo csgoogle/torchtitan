@@ -60,9 +60,12 @@ xpk workload create \
 
 ## Expected Metrics
 
-With this configuration, you should observe the following metrics at step 15 (run from 8/30/2026):
+With this configuration, you should observe the following metrics at step 15 (run from 8/31/2026):
 
-- **TPS (Tokens per second)**: 5,253
-- **MFU**: 28.06%
-- **Step Time**: 2.34s
-- **HBM Peak**: ~32GB (Saturated)
+- **TPS (Tokens per second)**: 5,642
+- **TFLOPS**: 276.65
+- **MFU**: 30.14%
+- **Step Time (time_end_to_end)**: 2.18s
+- **Loss**: 7.82703
+- **Grad Norm**: 31.0801
+- **Memory**: 2.01GiB (6.28%)
