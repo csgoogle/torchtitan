@@ -1455,6 +1455,7 @@ class TestApplySACPass(TestCase):
         for memory_policy in ("default", "full", "eager"):
             for reshard_after_forward, pp_degree, expect_save in (
                 ("never", 1, True),
+                ("default", 1, False),
                 ("default", 2, True),
                 ("always", 1, False),
             ):
@@ -1483,6 +1484,8 @@ class TestApplySACPass(TestCase):
         """Saves the helper-selected FSDP unshard output only when needed."""
         cases = (
             ("never", 1, CheckpointPolicy.MUST_SAVE),
+            # Without PP, the default policy reshares after forward.
+            ("default", 1, CheckpointPolicy.PREFER_RECOMPUTE),
             # Under PP, the default FSDP policy keeps params unsharded across
             # forward/backward, so SAC must save the same unshard boundary.
             ("default", 2, CheckpointPolicy.MUST_SAVE),

@@ -70,6 +70,14 @@ def _configured_fsdp_force_save_nodes(
     gm: torch.fx.GraphModule,
     config: "GraphTrainer.Config",
 ) -> set[torch.fx.Node] | None:
+    """Return the unshard values SAC must save for an explicit Zero-2 policy.
+
+    ``reshard_after_forward=False`` means the full parameters stay materialized
+    through backward. GraphTrainer implements that contract by overriding the
+    selected SAC policy with ``MUST_SAVE`` on each FSDP all-gather output. When
+    resharding is enabled (Zero-3), the policy remains free to recompute those
+    all-gathers during backward.
+    """
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         config.parallelism.fsdp_reshard_after_forward,
         pp_enabled=config.parallelism.pipeline_parallel_degree > 1,
