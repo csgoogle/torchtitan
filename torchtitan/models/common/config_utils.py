@@ -10,9 +10,14 @@ These helpers construct fully-specified sub-configs with all dimensional
 fields set at config creation time.
 """
 
+import dataclasses
 from collections.abc import Callable
 from typing import Literal
 
+import torch
+from torch.distributed.tensor import DTensor
+
+from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
 from torchtitan.models.common.attention import (
     FlexAttention,
     FusedQKVLinear,
@@ -21,26 +26,51 @@ from torchtitan.models.common.attention import (
     ScaledDotProductAttention,
     VarlenAttention,
 )
+from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.moe import GroupedExperts, MoE, TokenChoiceTopKRouter
-from torchtitan.models.common.rmsnorm import RMSNorm
+from torchtitan.models.common.moe import (
+    GroupedExperts,
+    MoE,
+    MoELoadBalanceAuxLoss,
+    TokenChoiceTopKRouter,
+)
+from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.rope import RoPE
 from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
     DeepEPTokenDispatcher,
+    HybridEPTokenDispatcher,
     LocalTokenDispatcher,
+    MinimalAsyncEPTokenDispatcher,
 )
+from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
+
+
+def decoder_vocab_size(model_spec: ModelSpec) -> int:
+    """Assert Decoder.Config type so lint is not annoyed."""
+    model_config = model_spec.model
+    assert isinstance(model_config, Decoder.Config)
+    return model_config.vocab_size
 
 
 def get_attention_config(
     backend: str,
-) -> tuple[Module.Config, str]:
-    """Map backend string to (inner_attention config, mask_type)."""
+) -> Module.Config:
+    """Map backend string to an inner_attention config.
+
+    Language models always use block_causal masking (the dataloaders always
+    emit per-document positions), so every backend here is a masked attention
+    backend. ``ScaledDotProductAttention`` only supports a boolean ``is_causal``
+    flag and cannot consume per-document positions, so it is not a valid
+    language-model backend (it remains available for Flux, which builds it
+    directly).
+    """
     if backend == "sdpa":
-        return ScaledDotProductAttention.Config(), "causal"
+        return ScaledDotProductAttention.Config()
     elif backend == "flex":
-        return FlexAttention.Config(), "block_causal"
+        return FlexAttention.Config()
     elif backend == "flex_flash":
         from torchtitan.tools.utils import has_cuda_capability
 
@@ -48,16 +78,74 @@ def get_attention_config(
             raise ValueError(
                 "Flash backend of FlexAttention is only supported on Hopper or Blackwell"
             )
-        return (
-            FlexAttention.Config(
-                block_size=(256, 128), kernel_options={"BACKEND": "FLASH"}
-            ),
-            "block_causal",
+        return FlexAttention.Config(
+            block_size=(256, 128), kernel_options={"BACKEND": "FLASH"}
         )
     elif backend == "varlen":
-        return VarlenAttention.Config(), "block_causal"
+        return VarlenAttention.Config()
+
     else:
         raise ValueError(f"Unknown backend: {backend}")
+
+
+class _FusedQKVInit:
+    def __init__(
+        self,
+        base_init: Callable,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+    ):
+        self.base_init = base_init
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.heads_per_kv = n_heads // n_kv_heads
+
+    def __call__(self, t):
+        n_heads = self.n_heads
+        n_kv_heads = self.n_kv_heads
+        head_dim = self.head_dim
+        heads_per_kv = self.heads_per_kv
+        base_init = self.base_init
+
+        tail = t.shape[1:]
+        q = t.new_empty(n_heads * head_dim, *tail)
+        k = t.new_empty(n_kv_heads * head_dim, *tail)
+        v = t.new_empty(n_kv_heads * head_dim, *tail)
+        base_init(q)
+        base_init(k)
+        base_init(v)
+        fused = torch.cat(
+            [
+                q.view(n_kv_heads, heads_per_kv, head_dim, *tail),
+                k.view(n_kv_heads, 1, head_dim, *tail),
+                v.view(n_kv_heads, 1, head_dim, *tail),
+            ],
+            dim=1,
+        ).view(-1, *tail)
+        with torch.no_grad():
+            if not isinstance(t, DTensor) and (tp_size := spmd_mesh_size("tp")) > 1:
+                mesh = current_spmd_mesh()
+                assert mesh is not None
+                tp_rank = mesh.get_local_rank("tp")
+                fused = fused.chunk(tp_size, dim=0)[tp_rank]
+            t.copy_(fused)
+
+
+def _fused_qkv_param_init(
+    base_param_init: dict[str, Callable],
+    *,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+) -> dict[str, Callable]:
+    out: dict[str, Callable] = {}
+    for param in ("weight", "bias"):
+        base_init = base_param_init.get(param)
+        if base_init is not None:
+            out[param] = _FusedQKVInit(base_init, n_heads, n_kv_heads, head_dim)
+    return out
 
 
 def make_gqa_config(
@@ -67,17 +155,16 @@ def make_gqa_config(
     wqkv_param_init: dict[str, Callable],
     wo_param_init: dict[str, Callable],
     inner_attention: Module.Config,
+    rope: RoPE.Config,
     n_kv_heads: int | None = None,
     head_dim: int | None = None,
     fuse_qkv: bool = False,
-    use_rope: bool = True,
-    mask_type: str = "causal",
-    rope_backend: str = "complex",
     qk_norm: RMSNorm.Config | None = None,
 ) -> GQAttention.Config:
     """Build a fully-specified GQAttention.Config."""
     n_kv = n_kv_heads if n_kv_heads is not None else n_heads
     per_head_dim = head_dim if head_dim is not None else dim // n_heads
+    rope = dataclasses.replace(rope)
 
     if fuse_qkv:
         qkv = FusedQKVLinear.Config(
@@ -87,7 +174,14 @@ def make_gqa_config(
             wqkv=Linear.Config(
                 in_features=dim,
                 out_features=(n_heads + 2 * n_kv) * per_head_dim,
-                param_init=wqkv_param_init,
+                # Per-slice init so the fused wqkv is bit-identical to the stock
+                # separate wq/wk/wv (see _fused_qkv_param_init).
+                param_init=_fused_qkv_param_init(
+                    wqkv_param_init,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv,
+                    head_dim=per_head_dim,
+                ),
             ),
         )
     else:
@@ -117,10 +211,8 @@ def make_gqa_config(
             param_init=wo_param_init,
         ),
         qk_norm=qk_norm,
-        use_rope=use_rope,
         inner_attention=inner_attention,
-        mask_type=mask_type,
-        rope_backend=rope_backend,
+        rope=rope,
     )
 
 
@@ -145,6 +237,16 @@ def make_ffn_config(
     )
 
 
+def make_aux_loss_config(
+    *,
+    type: Literal["sequence_wise", "batch_wise"],
+    coeff: float,
+    top_k: int,
+) -> MoELoadBalanceAuxLoss.Config:
+    """Build a MoELoadBalanceAuxLoss.Config."""
+    return MoELoadBalanceAuxLoss.Config(type=type, coeff=coeff, top_k=top_k)
+
+
 def make_moe_config(
     *,
     num_experts: int = 8,
@@ -152,15 +254,64 @@ def make_moe_config(
     experts: GroupedExperts.Config,
     shared_experts: FeedForward.Config | None = None,
     load_balance_coeff: float | None = 1e-3,
+    aux_loss_type: str | None = None,
+    aux_loss_coeff: float | None = None,
 ) -> MoE.Config:
     """Build a fully-specified MoE.Config."""
+    aux_loss = None
+    if aux_loss_type is not None:
+        assert (
+            aux_loss_coeff is not None
+        ), "aux_loss_coeff required when aux_loss_type is set"
+        aux_loss = make_aux_loss_config(
+            type=aux_loss_type,  # pyrefly: ignore [bad-argument-type]
+            coeff=aux_loss_coeff,
+            top_k=router.top_k,
+        )
+
     return MoE.Config(
         num_experts=num_experts,
         load_balance_coeff=load_balance_coeff,
+        aux_loss=aux_loss,
         router=router,
         experts=experts,
         shared_experts=shared_experts,
     )
+
+
+def update_moe_aux_loss_configs(
+    layers: list,
+    *,
+    pp_enabled: bool,
+    local_global_batch_size: int,
+    global_batch_size: int,
+) -> None:
+    """Update aux loss configs for all MoE layers from trainer config.
+
+    Call this from each model's ``update_from_config`` to set
+    ``global_batch_size`` for gradient normalization across PP microbatches,
+    gradient accumulation steps, and DP ranks (FSDP sum). Also validates
+    that batch-wise aux loss is not used with PP or gradient accumulation.
+    """
+    for layer_cfg in layers:
+        moe_cfg = getattr(layer_cfg, "moe", None)
+        if moe_cfg is None:
+            continue
+        aux_loss = moe_cfg.aux_loss
+        if aux_loss is None:
+            continue
+        if aux_loss.type == "batch_wise" and pp_enabled:
+            raise ValueError(
+                "batch_wise MoE aux loss is incompatible with pipeline "
+                "parallelism. Use sequence_wise instead."
+            )
+        if aux_loss.type == "batch_wise" and global_batch_size != local_global_batch_size:
+            raise ValueError(
+                "batch_wise MoE aux loss is incompatible with gradient "
+                "accumulation. Use sequence_wise instead or set "
+                "training.global_batch_size to local_batch_size * data-parallel degree."
+            )
+        aux_loss.global_batch_size = global_batch_size
 
 
 def make_router_config(
@@ -198,9 +349,11 @@ def make_token_dispatcher_config(
     *,
     num_experts: int,
     top_k: int,
-    score_before_experts: bool = True,
     comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    hidden_dim: int | None = None,
+    num_max_tokens_per_rank: int | None = None,
+    cudagraphable: bool = False,
 ) -> LocalTokenDispatcher.Config:
     """Build the appropriate token dispatcher config.
 
@@ -209,6 +362,7 @@ def make_token_dispatcher_config(
       dispatch when EP=1, i.e. ep_mesh is None at runtime)
     - "deepep": Uses DeepEP custom kernels for H100/NVLink Switch
     - "hybridep": Uses HybridEP with TMA optimization for GB200/NVLink72
+    - "minimal_async_ep": Uses MinimalAsyncEP for constrained DP>=EP
 
     DeepEP/HybridEP requires installation:
     https://github.com/deepseek-ai/DeepEP
@@ -217,24 +371,42 @@ def make_token_dispatcher_config(
     - HYBRIDEP_NUM_SMS_DISPATCH (default: 16)
     - HYBRIDEP_NUM_SMS_COMBINE (default: 16)
     """
-    if comm_backend in ("deepep", "hybridep"):
+    # TODO(unify-ep-dispatch-knobs): unify the per-backend static-shape/cudagraph knobs --
+    # HybridEP non_blocking_capacity_factor vs DeepEP cudagraphable + num_max_tokens_per_rank.
+    if comm_backend == "deepep":
+        # DeepEP v2: a single ElasticBuffer handles training and inference. ``hidden_dim``
+        # (model dim) sizes the buffer; wire_meshes creates it eagerly. ``cudagraphable``
+        # selects the static no-host-sync expand layout (set on the generator by the
+        # deepep_inference override). ``num_max_tokens_per_rank`` is the per-rank EXPAND
+        # capacity: training infers it (the compact path auto-sizes), inference must set it
+        # >= the largest per-rank token count for droplessness.
         return DeepEPTokenDispatcher.Config(
             num_experts=num_experts,
             top_k=top_k,
-            score_before_experts=score_before_experts,
-            comm_backend=comm_backend,
+            hidden_dim=hidden_dim,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            cudagraphable=cudagraphable,
+        )
+    elif comm_backend == "hybridep":
+        return HybridEPTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
             non_blocking_capacity_factor=non_blocking_capacity_factor,
+        )
+    elif comm_backend == "minimal_async_ep":
+        return MinimalAsyncEPTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
         )
     elif comm_backend == "standard":
         return AllToAllTokenDispatcher.Config(
             num_experts=num_experts,
             top_k=top_k,
-            score_before_experts=score_before_experts,
         )
     else:
         raise ValueError(
             f"Unknown comm_backend: '{comm_backend}'. "
-            "Must be one of 'standard', 'deepep', 'hybridep'."
+            "Must be one of 'standard', 'deepep', 'hybridep', 'minimal_async_ep'."
         )
 
 
@@ -245,23 +417,24 @@ def make_experts_config(
     num_experts: int,
     top_k: int,
     param_init: dict[str, Callable],
-    score_before_experts: bool = True,
-    use_grouped_mm: bool = True,
     comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    num_max_tokens_per_rank: int | None = None,
+    cudagraphable: bool = False,
 ) -> GroupedExperts.Config:
     """Build a fully-specified GroupedExperts.Config."""
     return GroupedExperts.Config(
         dim=dim,
         hidden_dim=hidden_dim,
         num_experts=num_experts,
-        use_grouped_mm=use_grouped_mm,
         param_init=param_init,
         token_dispatcher=make_token_dispatcher_config(
             num_experts=num_experts,
             top_k=top_k,
-            score_before_experts=score_before_experts,
             comm_backend=comm_backend,
             non_blocking_capacity_factor=non_blocking_capacity_factor,
+            hidden_dim=dim,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            cudagraphable=cudagraphable,
         ),
     )

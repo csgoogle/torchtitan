@@ -4,6 +4,7 @@ import dataclasses
 from typing import Literal
 
 import torchtitan.config
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerMemoryPolicy
 import torchtitan.trainer
 
 
@@ -17,6 +18,17 @@ class TPUConfig:
   # and the backward pass. This compiles two smaller XLA graphs instead of one
   # monolithic graph, significantly reducing first-step compilation time.
   use_graph_split: bool = False
+  # Compile AdamW step into its own separate FX graph.
+  compile_optimizer: bool = False
+  # Run via TpuGraphTrainer (joint fwd+loss+bwd aot_fx_trace and FX-graph SAC passes).
+  use_graph_trainer: bool = False
+  # Whether to compile the optimizer step into the joint fwd+loss+bwd graph.
+  optimizer_in_graph: bool = False
+  # GraphTrainer rematerializes its joint forward/backward FX graph instead of
+  # tracing eager activation-checkpoint wrappers.
+  graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  # Keep rematerialized layer workspaces local in the XLA schedule.
+  enable_graph_trainer_remat_schedule: bool = False
   # Disable Automatic Mixed Precision (AMP), so all training is done in uniform
   # precision.
   enable_amp: bool = True
@@ -56,6 +68,7 @@ class redactedConfig:
 @dataclasses.dataclass
 class ConformerConfig:
   use_ctc_loss: bool = False
+  use_jax_ctc_loss: bool = False
   # Target sequence length for synthetic data generation when CTC loss is enabled.
   # Input sequence length must be >= target sequence length.
   ctc_loss_target_len: int = 30
@@ -69,10 +82,10 @@ class Qwen3Config:
 
 @dataclasses.dataclass
 class FluxConfig:
-    precomputed_dataset_path: str | None = None
-    """Path to the precomputed embeddings"""
-    random_dataset: bool = False
-    """Whether to train on random instead of real data"""
+  precomputed_dataset_path: str | None = None
+  """Path to the precomputed embeddings"""
+  random_dataset: bool = False
+  """Whether to train on random instead of real data"""
 
 
 @dataclasses.dataclass
@@ -90,6 +103,7 @@ class LoRAConfig:
 @dataclasses.dataclass
 class SplashAttentionKernelConfig:
   use_splash_attention_kernel: bool = False
+  use_tokamax_splash_attention_kernel: bool = False
   use_vmap_bwd: bool = False
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
@@ -175,12 +189,13 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     )
 
 
-
-
 @dataclasses.dataclass(kw_only=True, slots=True)
 class TPUTrainerConfig(BaseTPUTrainerConfig):
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()
-    self.dump_folder = "/tmp/outputs"
+    # Set the default location of dump_folder. Allow the runtime CLI
+    # configuration (i.e. --job.dump_folder=...) to override this parameter.
+    if not self.dump_folder:
+      self.dump_folder = "/tmp/outputs"

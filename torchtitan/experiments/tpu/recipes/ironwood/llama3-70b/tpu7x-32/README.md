@@ -1,0 +1,84 @@
+# Recipe for training Llama3-70B model on a 32 device TPU ironwood cluster (tpu7x-32)
+
+These are instructions for deploying Llama3-70B training to a 32 device (16 chip) tpu7x cluster using `xpk`.
+
+For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+
+After setting up your cluster, the following variables should be set:
+
+```bash
+export PROJECT_ID=YOUR_PROJECT_ID
+export ZONE=YOUR_ZONE
+export CLUSTER_NAME=YOUR_CLUSTER_NAME
+export REPOSITORY=YOUR_REPOSITORY # Artifact Registry repo holding torchtitan-container
+export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
+```
+
+## Notes
+
+- **Devices vs chips**: an ironwood chip exposes two TensorCores, and torchtitan runs one
+  process per core. `tpu7x-32` is therefore 32 devices on 16 chips, run as 4 hosts x 8
+  processes. Throughput and MFU below are per device (per core); MFU is measured against
+  the per-core bf16 peak of 1,153.5 TFLOP/s (half of the 2,307 TFLOP/s chip peak).
+- **Master weights are float32** (config_registry default). Compute runs in bf16 via `mixed_precision_param=bfloat16`.
+- VMEM tuning: `--xla_tpu_scoped_vmem_limit_kib=131072`.
+- Dataset: `c4_test` (synthetic/test dataset).
+- Tokenizer: `tests/assets/tokenizer`.
+- Model configuration used is `llama3_70b` from [`llama3/config_registry.py`](../../../../llama3/config_registry.py).
+
+## Training Configuration Details
+
+Defaults from [`llama3_70b`](../../../../llama3/config_registry.py):
+- **Sequence Length**: 8192
+- **Torch Compile**: Layerwise, with the `tpu` backend. `compile.components=["model"]`
+  together with the default `tpu_config.compile_mode="layer"` compiles each
+  TransformerBlock separately (`fullgraph=True`) rather than the model as one graph.
+- **Simple FSDP**: Enabled.
+- **Splash Attention**: Enabled with block size 2048.
+- **Loss Kernel**: Enabled.
+- **Activation Checkpointing**: Full.
+
+Overridden on the command line:
+- **Local Batch Size**: 4 (Global batch size = 4 * 32 = 128)
+- **Topology-Aware Mesh**: Enabled via `--parallelism.enable_tpu_topo_mesh`.
+
+## Training Command
+
+```bash
+export WORKLOAD_NAME="llama3-70b-tpu7x32-$(date +%Y%m%d-%H%M%S)"
+
+xpk workload create \
+  --workload="$WORKLOAD_NAME" \
+  --cluster="$CLUSTER_NAME" \
+  --tpu-type="tpu7x-32" \
+  --project="$PROJECT_ID" \
+  --zone="$ZONE" \
+  --no-use-parallel-containers \
+  --base-docker-image="us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest" \
+  --script-dir="$SCRIPT_DIR" \
+  --env="LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=131072" \
+  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
+  --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
+  --command="torchrun \
+    --nnodes=4 \
+    --nproc_per_node=8 \
+    --rdzv_backend=static \
+    --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
+    --node_rank=\$TPU_WORKER_ID \
+    -m torchtitan.experiments.tpu.train \
+    --module=torchtitan.experiments.tpu.llama3 \
+    --config=llama3_70b \
+    --hf_assets_path=tests/assets/tokenizer \
+    --dataloader.dataset_path=tests/assets/c4_test \
+    --training.steps=20 \
+    --training.local_batch_size=4 \
+    --parallelism.enable_tpu_topo_mesh"
+```
+
+## Expected Metrics
+
+With this configuration you should observe the following metrics at step 15:
+
+- TPS/device: **1,067**
+- MFU: **44.54%**
+- Total TPS (32 devices / 16 chips): 34,144

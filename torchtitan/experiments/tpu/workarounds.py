@@ -1,5 +1,5 @@
 import logging
-from typing import Any
+from typing import Any, Optional
 import torch
 from torch import nn
 from torch.nn.attention import sdpa_kernel
@@ -8,29 +8,33 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.tools.logging import logger
 
 
-def use_splash_attention_patch(
-    model: nn.Module,
-    block_q: int | None = None,
-    block_kv: int | None = None,
-    block_dkv: int | None = None,
-    block_kv_compute: int | None = None,
-    block_q_dkv: int | None = None,
-    block_kv_dkv: int | None = None,
-    block_kv_dkv_compute: int | None = None,
-    block_q_dq: int | None = None,
-    block_kv_dq: int | None = None,
-    use_fused_bwd_kernel: bool | None = None,
-    q_layout: str | None = None,
-    k_layout: str | None = None,
-    v_layout: str | None = None,
-) -> None:
+_SPLASH_KEYS = {
+    "block_q", "block_kv", "block_dkv", "block_kv_compute",
+    "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute",
+    "block_q_dq", "block_kv_dq", "use_fused_bwd_kernel",
+    "use_vmap_bwd", "q_layout", "k_layout", "v_layout"
+}
+
+
+def _extract_splash_kwargs(sa_config: Any) -> dict[str, Any]:
+  """Safe prefix-mapping helper to map sa_config attributes to standard names."""
+  if sa_config is None:
+    return {}
+  kwargs = {}
+  for k in _SPLASH_KEYS:
+    val = getattr(sa_config, f"sa_{k}", getattr(sa_config, k, None))
+    if val is not None:
+      kwargs[k] = val
+  return kwargs
+
+
+def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
   """Patches splash attention into the model."""
-  from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa as standard_splash_sdpa  # pylint: disable=g-import-not-at-top
   import types
 
-  # Helper to filter out None values so we don't override defaults in splash_sdpa
-  def _get_kwargs(**kwargs):
-    return {k: v for k, v in kwargs.items() if v is not None}
+  # Extract parameters internally using our safe prefix mapper
+  sa_kwargs = _extract_splash_kwargs(sa_config)
 
   def _splash_forward(
       self,
@@ -66,22 +70,8 @@ def use_splash_attention_patch(
 
     local_window_size = getattr(self, "sliding_window_size", None)
 
-    sa_kwargs = _get_kwargs(
-        block_q=block_q,
-        block_kv=block_kv,
-        block_dkv=block_dkv,
-        block_kv_compute=block_kv_compute,
-        block_q_dkv=block_q_dkv,
-        block_kv_dkv=block_kv_dkv,
-        block_kv_dkv_compute=block_kv_dkv_compute,
-        block_q_dq=block_q_dq,
-        block_kv_dq=block_kv_dq,
-        use_fused_bwd_kernel=use_fused_bwd_kernel,
-        q_layout=q_layout,
-        k_layout=k_layout,
-        v_layout=v_layout,
-    )
-    out = splash_sdpa(
+
+    out = standard_splash_sdpa(
         q,
         k,
         v,
@@ -135,23 +125,8 @@ def use_splash_attention_patch(
     # default to None ⇒ same behavior as before this change.
     local_window_size = getattr(self, "sliding_window_size", None)
 
-    call_kwargs = _get_kwargs(
-        block_q=block_q,
-        block_kv=block_kv,
-        block_dkv=block_dkv,
-        block_kv_compute=block_kv_compute,
-        block_q_dkv=block_q_dkv,
-        block_kv_dkv=block_kv_dkv,
-        block_kv_dkv_compute=block_kv_dkv_compute,
-        block_q_dq=block_q_dq,
-        block_kv_dq=block_kv_dq,
-        use_fused_bwd_kernel=use_fused_bwd_kernel,
-        q_layout=q_layout,
-        k_layout=k_layout,
-        v_layout=v_layout,
-    )
     # splash_sdpa expects enable_gqa=False as heads are already tiled.
-    out = splash_sdpa(
+    out = standard_splash_sdpa(
         query,
         key,
         value,
@@ -159,7 +134,7 @@ def use_splash_attention_patch(
         is_causal=True,
         local_window_size=local_window_size,
         enable_gqa=False,
-        **call_kwargs,
+        **sa_kwargs,
     )
     # Transpose back to match [redacted]'s expected layout
     return out.transpose(-3, -2).contiguous()
@@ -168,12 +143,174 @@ def use_splash_attention_patch(
   # whether each layer has a local sliding-window — useful for mixed
   # local/global models (REDACTED PT MoE) so the kernel cache shows the expected
   # mix of CausalMask and LocalMask compiled ops.
+  from torchtitan.experiments.tpu.kernels.splash_attention import SplashAttention  # pylint: disable=g-import-not-at-top
+
+  replacements = []
+  _patched = 0
+  _windowed = 0
+  _causal = 0
+
+  # Identify attention modules to replace
+  # (ScaledDotProductAttention & FlexAttention).
+  for parent_module in model.modules():
+    for child_name, child_module in parent_module.named_children():
+      cls_name = type(child_module).__name__
+
+      if "ScaledDotProductAttention" in cls_name:
+        if "[redacted]" in type(child_module).__module__:
+          # [redacted] patching (in-place method replacement)
+          child_module._sdpa_native_torch = types.MethodType(
+              _splash_sdpa_redacted, child_module
+          )
+          _patched += 1
+          if getattr(child_module, "sliding_window_size", None) is not None:
+            _windowed += 1
+          else:
+            _causal += 1
+        else:
+          replacements.append((parent_module, child_name, child_module))
+      elif "FlexAttention" in cls_name:
+        if "[redacted]" not in type(child_module).__module__:
+          replacements.append((parent_module, child_name, child_module))
+
+  # Apply replacements
+  for parent_module, child_name, child_module in replacements:
+    # SplashAttention needs the window size to pick its mask: LocalMask for a
+    # sliding-window layer, CausalMask otherwise. The child is the inner
+    # attention being replaced (ScaledDotProductAttention / FlexAttention), the
+    # parent the attention module that owns it (e.g. GQAttention). Models set
+    # sliding_window_size on either one, so check the child then the parent.
+    local_window_size = getattr(child_module, "sliding_window_size", None)
+    if local_window_size is None:
+      local_window_size = getattr(parent_module, "sliding_window_size", None)
+
+    splash_attn = SplashAttention(
+        is_causal=True,  # Default for LMs
+        local_window_size=local_window_size,
+        original_module=child_module,
+        **sa_kwargs,
+    )
+
+    setattr(parent_module, child_name, splash_attn)
+    _patched += 1
+    if local_window_size is not None:
+      _windowed += 1
+    else:
+      _causal += 1
+
+  if _patched == 0:
+    all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
+    raise ValueError(
+        "Splash attention patch was requested but NO matching attention"
+        " modules (ScaledDotProductAttention, FlexAttention) were found in the"
+        f" model. Found module types: {all_classes}"
+    )
+  else:
+    logger.info(
+        "Splash attention ENABLED: replaced %d attention modules "
+        "(causal=%d, sliding-window=%d)",
+        _patched,
+        _causal,
+        _windowed,
+    )
+
+
+def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None:
+  """Patches zero-overhead Tokamax layout-fused splash attention into the model."""
+  from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import TokamaxConfig  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import splash_sdpa as tokamax_splash_sdpa  # pylint: disable=g-import-not-at-top
+  import types
+
+  # Update core JAX trace compilation configs internally from config registry
+  TokamaxConfig.update(
+      block_q=getattr(sa_config, "block_q", None),
+      block_kv=getattr(sa_config, "block_kv", None),
+      block_kv_compute=getattr(sa_config, "block_kv_compute", None),
+      block_q_dkv=getattr(sa_config, "block_q_dkv", None),
+      block_kv_dkv=getattr(sa_config, "block_kv_dkv", None),
+      block_kv_dkv_compute=getattr(sa_config, "block_kv_dkv_compute", None),
+      block_q_dq=getattr(sa_config, "block_q_dq", None),
+      block_kv_dq=getattr(sa_config, "block_kv_dq", None),
+      use_fused_bwd_kernel=getattr(sa_config, "use_fused_bwd_kernel", None),
+      q_layout=getattr(sa_config, "q_layout", None),
+      k_layout=getattr(sa_config, "k_layout", None),
+      v_layout=getattr(sa_config, "v_layout", None),
+  )
+
+  def _get_kwargs(**kwargs):
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+  def _filter_splash_kwargs(kwargs_dict):
+    return {k: v for k, v in kwargs_dict.items() if k in _SPLASH_KEYS}
+
+  # Extract parameters dynamically using our shared prefix mapper helper!
+  sa_kwargs = _extract_splash_kwargs(sa_config)
+
+  def _splash_forward(
+      self,
+      q,
+      k,
+      v,
+      *,
+      scale=None,
+      enable_gqa=False,
+      is_causal=True,
+      **extra_args,
+  ):
+    if extra_args.get("attention_masks") is not None:
+      raise ValueError(
+          "TPU SplashAttention Pallas kernel does not support runtime"
+          " attention_masks."
+      )
+
+    local_window_size = getattr(self, "sliding_window_size", None)
+
+    # Tokamax JAX-side transpositions path (Direct pass-through of contiguous layouts)
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    combined_args = {**extra_args, **sa_kwargs}
+    forward_kwargs = _filter_splash_kwargs(combined_args)
+    out = tokamax_splash_sdpa(
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=is_causal,
+        local_window_size=local_window_size,
+        enable_gqa=enable_gqa,
+        **forward_kwargs,
+    )
+    return out
+
+  def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
+    query, key, value = self._maybe_tile_qkv_for_gqa(query, key, value)
+    local_window_size = getattr(self, "sliding_window_size", None)
+
+    # Tokamax JAX-side transpositions path (Direct pass-through of GQA tiled buffers)
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    combined_args = {**kwargs, **sa_kwargs}
+    forward_kwargs = _filter_splash_kwargs(combined_args)
+    out = tokamax_splash_sdpa(
+        query,
+        key,
+        value,
+        scale=scale,
+        is_causal=True,
+        local_window_size=local_window_size,
+        enable_gqa=False,
+        **forward_kwargs,
+    )
+    return out
+
   _patched = 0
   _windowed = 0
   _causal = 0
   for _, module in model.named_modules():
     cls_name = type(module).__name__
-    if cls_name == "ScaledDotProductAttention":
+    if "ScaledDotProductAttention" in cls_name:
       if "[redacted]" in type(module).__module__:
         module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
       else:
@@ -185,25 +322,59 @@ def use_splash_attention_patch(
         _causal += 1
 
   if _patched == 0:
+    all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
     raise ValueError(
-        "Splash attention patch was requested but NO matching attention "
-        "modules (ScaledDotProductAttention) were found in the model."
+        "Tokamax splash attention patch was requested but NO matching "
+        f"attention modules (ScaledDotProductAttention) were found in the model. Found module types: {all_classes}"
     )
   else:
     logger.info(
-        "Splash attention ENABLED: patched %d attention modules "
+        "Tokamax splash attention ENABLED: patched %d attention modules "
         "(causal=%d, sliding-window=%d)",
         _patched, _causal, _windowed,
     )
 
 
 class PallasLossLinear(nn.Module):
-  """Wrapper for model.output to return (x, weight) for Pallas loss."""
+  """Wrapper for model.output to return (x, weight) for Pallas loss.
+
+  Holding the Linear module as a child names the parameter
+  ``lm_head.original_linear.weight`` which is not mapped by model state dict
+  adapters and breaks loading from checkpoint with a KeyError. We add hooks to
+  fix at state-dict layer to strip the ``original_linear`` infix on save and
+  restore on load, making the wrapper invisible to checkpointing paths but
+  preserving module tree hierarchy.
+  """
+
+  _INFIX = "original_linear."
 
   def __init__(self, original_linear: nn.Linear):
     super().__init__()
     self.original_linear = original_linear
-    self.weight = original_linear.weight
+    self._register_state_dict_hook(PallasLossLinear._strip_infix)
+    self._register_load_state_dict_pre_hook(self._restore_infix)
+
+  @staticmethod
+  def _strip_infix(module, state_dict, prefix, local_metadata):
+    """Rename ``<prefix>original_linear.X`` -> ``<prefix>X`` on the way out."""
+    for key in [k for k in state_dict if k.startswith(prefix + module._INFIX)]:
+      state_dict[prefix + key[len(prefix + module._INFIX):]] = state_dict.pop(key)
+    return state_dict
+
+  def _restore_infix(self, state_dict, prefix, *args, **kwargs):
+    """Rename ``<prefix>X`` -> ``<prefix>original_linear.X`` on the way in."""
+    for key in [
+        k
+        for k in state_dict
+        if k.startswith(prefix) and not k.startswith(prefix + self._INFIX)
+    ]:
+      state_dict[prefix + self._INFIX + key[len(prefix):]] = state_dict.pop(key)
+
+  @property
+  def weight(self) -> torch.Tensor:
+    # Dynamically retrieve the weight to avoid caching a stale, unsharded
+    # reference before FSDP sharding.
+    return self.original_linear.weight
 
   def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return x, self.weight.t()
@@ -213,20 +384,21 @@ def use_output_projection_patch(
     model: nn.Module,
 ) -> None:
   """Replaces model.output with an identity-like module that returns (x, weight)."""
-  if hasattr(model, "output") or hasattr(model, "output_transform"):
-    if isinstance(model.output, nn.Linear):
-      model.output = PallasLossLinear(model.output)
-      logger.info("Patched model.output to return (x, weight) for Pallas loss")
-    elif model.output is None:
-      logger.warning("model.output is None, cannot wrap for Pallas loss")
-    else:
-      logger.warning(
-          "model.output is of type %s, not nn.Linear, "
-          "cannot wrap for Pallas loss",
-          type(model.output),
-      )
+  if hasattr(model, "output") and isinstance(model.output, nn.Linear):
+    model.output = PallasLossLinear(model.output)
+    logger.info("Patched model.output to return (x, weight) for Pallas loss")
+  elif hasattr(model, "output_transform") and isinstance(model.output_transform, nn.Linear):
+    # redacted uses output_transform as output projection layer
+    model.output_transform = PallasLossLinear(model.output_transform)
+    logger.info(
+        "Patched model.output_transform to return (x, weight) for Pallas loss"
+    )
+  elif hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Linear):
+    # Original torchtitan models (e.g. Llama) use lm_head for output projection
+    model.lm_head = PallasLossLinear(model.lm_head)
+    logger.info("Patched model.lm_head to return (x, weight) for Pallas loss")
   else:
-    logger.warning("model has no output attribute, cannot wrap for Pallas loss")
+    logger.warning("Failed to patch output projection layer. Model output projection layer not found (output, output_transform, or lm_head) or is not nn.Linear.")
 
 
 def use_gmm_kernel_patch(
@@ -276,7 +448,7 @@ def use_gmm_kernel_patch(
     )
     return fn
 
-  torchtitan_moe.indices_padding_wrapper = bypassed_padding_wrapper
+  torchtitan_moe.indices_padding_wrapper = bypassed_padding_wrapper  # pyrefly: ignore[missing-attribute]
   torchtitan_moe._run_experts_grouped_mm = _custom_run_experts_grouped_mm
 
 
@@ -312,17 +484,103 @@ def use_cpu_safe_histc_patch() -> None:
   logger.info("Monkey-patched torch.histc to support int dtypes on CPU")
 
 
+def use_rope_tpu_optimization_patch() -> None:
+  """Monkey patches torchtitan.models.common.rope._reshape_for_broadcast with a TPU-optimized path.
+
+  Why upstream torch.gather is slow on TPU:
+  1. Index Tensor Bloat: Upstream expands the 2D `positions` tensor into a
+     massive 4D index tensor, multiplying its memory size by `cache_width`
+     (e.g., 33.5 MB vs 262 KB).
+  2. Forced Scalar Memory Lookups: The mathematical API of `torch.gather`
+     requires an independent scalar index for every single element in the
+     output tensor. Because XLA cannot assume the indices are identical at
+     runtime, it must generate machine code that computes a dynamic memory
+     address and fetches exactly 1 scalar number at a time (millions of
+     scattered scalar fetches), destroying memory bandwidth.
+
+  Why direct 2D advanced indexing is fast on TPU:
+  1. 128x Smaller Index: Uses the 2D `positions` tensor directly without
+     expanding it.
+  2. Fast Contiguous Vector Loads: By writing `rope_cache[positions]`, we
+     semantically request entire rows of the matrix. Because XLA knows the
+     elements of a row are stored contiguously in physical memory
+     (Row-Major order), it compiles a single Vector Load instruction
+     (HLO Gather with slice_sizes=[1, cache_width]). The TPU calculates just
+     one dynamic address per row and scoops up the entire vector block in a
+     single fast hardware cycle.
+  3. O(1) Metadata Unsqueeze: We reshape the 3D result to 4D via
+     `.unsqueeze(2)`, which only modifies shape metadata and does zero
+     memory work.
+
+  Equivalence: Both methods mathematically compute
+  `rope_cache[positions[b, s], k]`, providing exact bitwise parity while
+  eliminating the TPU scalar lookup bottleneck.
+  """
+  try:
+    import torchtitan.models.common.rope as rope
+    import spmd_types as spmd
+    from torch.fx.experimental.symbolic_shapes import guard_or_false  # pylint: disable=g-import-not-at-top,g-importing-member
+  except ImportError:
+    return
+
+  @spmd.local_map(out_types={"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R})
+  def _reshape_for_broadcast_patched(
+      rope_cache: torch.Tensor,
+      query_shape: torch.Size | tuple[int, ...],
+      positions: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    ndim = len(query_shape)
+    assert ndim > 1
+    bsz, seqlen = query_shape[:2]
+    cache_width = rope_cache.shape[-1]
+
+    # Case 1: No positions (sequential). Unchanged from original.
+    if positions is None:
+      rope_cache = rope_cache[0:seqlen]
+      shape = [
+          d if i == 1 else cache_width if i == ndim - 1 else 1
+          for i, d in enumerate(query_shape)
+      ]
+      return rope_cache.view(*shape)
+
+    # Case 2: Singleton positions (bsz=1). Unchanged from original.
+    if guard_or_false(positions.size(0) == 1):
+      rope_cache = rope_cache[positions.squeeze(0)]
+      shape = [
+          d if i == 1 else cache_width if i == ndim - 1 else 1
+          for i, d in enumerate(query_shape)
+      ]
+      return rope_cache.view(*shape)
+    # Case 3: Per-batch positions (bsz > 1).
+    # Replaces slow 4D torch.gather (33.5 MB index, scalar HLO lookups)
+    # with fast 2D indexing rope_cache[positions].unsqueeze(2) (262 KB index,
+    # native TPU 2D embedding lookup copying contiguous vector rows).
+    else:
+      # Index 2D cache [max_seqlen, cache_width] with 2D positions [bsz, seqlen]:
+      # yields [bsz, seqlen, cache_width]. unsqueeze(2) inserts head
+      # dimension, returning shape [bsz, seqlen, 1, cache_width].
+      return rope_cache[positions].unsqueeze(2)
+
+  rope._reshape_for_broadcast = _reshape_for_broadcast_patched
+  logger.info(
+      "Monkey-patched "
+      "torchtitan.models.common.rope._reshape_for_broadcast "
+      "with TPU optimized path"
+  )
+
+
 def apply_patches(model: nn.Module, job_config: Any) -> None:
   """Applies all TPU-specific patches and workarounds to the model."""
   # Enable CPU safe histc workaround.
   use_cpu_safe_histc_patch()
 
   # Splash Attention Patch
-  if (
-      hasattr(job_config, "splash_attention_kernel")
-      and job_config.splash_attention_kernel.use_splash_attention_kernel
-  ):
-    use_splash_attention_patch(model)
+  if hasattr(job_config, "splash_attention_kernel"):
+    sa_config = job_config.splash_attention_kernel
+    if sa_config.use_tokamax_splash_attention_kernel:
+      use_tokamax_splash_attention_patch(model, sa_config)
+    elif sa_config.use_splash_attention_kernel:
+      use_splash_attention_patch(model, sa_config)
 
   # Pallas Loss Patch (Output Projection)
   if (
@@ -336,3 +594,6 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
     use_gmm_kernel_patch(model)
   if hasattr(job_config, "qwen3") and job_config.qwen3.use_fill_indices_kernel:
     use_fill_indices_patch(model)
+
+  # Apply RoPE TPU Optimization Patch
+  use_rope_tpu_optimization_patch()

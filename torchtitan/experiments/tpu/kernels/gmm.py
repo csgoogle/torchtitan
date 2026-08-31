@@ -85,7 +85,7 @@ class TorchGMM(torch.autograd.Function):
     return cast(torch.Tensor, result)
 
   @staticmethod
-  def backward(ctx, grad_output):
+  def backward(ctx, grad_output):  # pyrefly: ignore[bad-override]
     lhs, rhs = ctx.saved_tensors
     _, bwd_fn = _get_gmm_kernels(ctx.group_sizes_tpu)
 

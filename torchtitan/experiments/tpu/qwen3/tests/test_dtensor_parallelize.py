@@ -5,7 +5,8 @@ from absl.testing import absltest
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 import torch.nn as nn
-from torchtitan.config.configs import ActivationCheckpointConfig, CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
@@ -13,8 +14,7 @@ from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu.base_distributed_device_test import InputDistribution
 import torchtitan.experiments.tpu.qwen3 as qwen3_tpu
 from torchtitan.models.qwen3.model import Qwen3Model
-import torchtitan.models.qwen3.parallelize as qwen3_dtensor_parallelize
-
+from torchtitan.experiments.tpu.qwen3.infra import parallelize as qwen3_dtensor_parallelize
 
 
 
@@ -58,7 +58,7 @@ def _verify_dtensor_qwen3_non_moe_tp_forward_worker(
     # pytype: disable=wrong-arg-types
     qwen3_dtensor_parallelize.parallelize_qwen3(
         model,
-        ac_config=ActivationCheckpointConfig(),
+        ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -99,7 +99,7 @@ def _verify_dtensor_qwen3_tp_backward_worker(
     # pytype: disable=wrong-arg-types
     qwen3_dtensor_parallelize.parallelize_qwen3(
         model,
-        ac_config=ActivationCheckpointConfig(),
+        ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -147,7 +147,7 @@ def _verify_dtensor_qwen3_fsdp_training_loop_worker(
     # pytype: disable=wrong-arg-types
     qwen3_dtensor_parallelize.parallelize_qwen3(
         model,
-        ac_config=ActivationCheckpointConfig(),
+        ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,

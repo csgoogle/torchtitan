@@ -159,7 +159,14 @@ def main(argv):
   # When running on TPU via CI, the infra automatically injects some flags
   # starting with --deepsea_ which are not recognized by tyro, so we filter
   # them out.
-  clean_args = [arg for arg in sys.argv[1:] if not arg.startswith("--deepsea_")]
+  ignored_prefixes = (
+      '--deepsea_',
+      '--xprof_',
+      '--alsologtostderr',
+  )
+  clean_args = [
+      arg for arg in sys.argv[1:] if not arg.startswith(ignored_prefixes)
+  ]
   config = typing.cast(
       torchax_job_config.TorchaxJobConfig,
       ConfigManager().parse_args(clean_args),

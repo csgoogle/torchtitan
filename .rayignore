@@ -1,9 +1,0 @@
-__pycache__/
-logs/
-*.log
-
-# Ignore large weights in assets/ but keep the tokenizer files and config metadata
-assets/**/*.safetensors
-assets/**/*.bin
-assets/**/*.pt
-assets/**/*.msgpack

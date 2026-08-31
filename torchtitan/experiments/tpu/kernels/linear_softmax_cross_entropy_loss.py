@@ -15,6 +15,8 @@
 
 """Linear Softmax Cross-Entropy Loss wrapped for TPU."""
 
+import hashlib
+
 # Workaround for https://github.com/openxla/tokamax/issues/240
 import jaxtyping
 # 1. Save the real decorator
@@ -156,7 +158,8 @@ def _get_loss_op_names(
         v_block_size,
     )
 
-  identifier = abs(hash(cache_key))
+  # Truncate SHA-256 to 16 hex characters (64 bits) for op name readability.
+  identifier = hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()[:16]
   op_fwd_name = f"linear_loss_fwd_{identifier}"
   op_bwd_name = f"linear_loss_bwd_{identifier}"
 
@@ -225,7 +228,7 @@ class TorchLinearLoss(torch.autograd.Function):
     return loss
 
   @staticmethod
-  def backward(ctx, grad_output):
+  def backward(ctx, grad_output):  # pyrefly: ignore[bad-override]
     x, labels, weights, lse = ctx.saved_tensors
     reduction = ctx.reduction
     implementation = ctx.implementation

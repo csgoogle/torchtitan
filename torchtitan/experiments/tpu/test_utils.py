@@ -2,6 +2,7 @@
 
 import functools
 import json
+import os
 import subprocess
 import sys
 from typing import Any
@@ -9,14 +10,21 @@ from absl import flags
 from absl import logging
 import torch
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
+from torchtitan.experiments.tpu import device_env
 
 
 _DEVICE = flags.DEFINE_enum_class(
     "device",
     None,  # Default value
     device_type.AcceleratorDeviceType,
-    help="Accelerator to test.",
-    required=True,
+    help=(
+        "Device to test on. Optional: when omitted, the detected accelerator"
+        " is used. Pass cpu to force CPU; passing an accelerator that is not"
+        " present is an error. Detection follows the environment, so"
+        " TORCH_DEVICE_BACKEND_AUTOLOAD=0 (unregisters the TPU backend) and"
+        " CUDA_VISIBLE_DEVICES= (hides GPUs) also select CPU."
+    ),
+    required=False,
 )
 
 _NUM_DEVICES = flags.DEFINE_integer(
@@ -25,6 +33,45 @@ _NUM_DEVICES = flags.DEFINE_integer(
     required=False,
     help="Number of devices to run the test on.",
 )
+
+
+def resolve_device_type() -> device_type.AcceleratorDeviceType:
+  """Returns the device to test on, honoring --device if it was given.
+
+  Omitting --device runs on whatever accelerator is detected. Passing
+  --device=cpu forces CPU, which is always possible: it is a downgrade from
+  whatever accelerator is present. Passing an accelerator that is not present
+  is an error rather than a silent fallback, so a stale or copy-pasted value
+  fails loudly instead of running on the wrong hardware.
+
+  Raises:
+    ValueError: If --device names an accelerator that was not detected.
+  """
+  # Imported here: tpu_utils pulls in torch device modules, which tests that
+  # only need the flags should not pay for at import time.
+  from torchtitan.tools import utils  # pylint: disable=g-import-not-at-top
+
+  detected = device_type.AcceleratorDeviceType(utils.device_type)
+  requested = _DEVICE.value
+  if requested is None or requested == detected:
+    return detected
+
+  if requested == device_type.AcceleratorDeviceType.CPU:
+    # Nothing in this process reads the device-type global after resolution --
+    # tests use the returned value via self.accelerator_device -- so returning
+    # CPU is enough here. Spawned workers do re-detect, so hide the accelerator
+    # in the environment they inherit.
+    os.environ.update(device_env.cpu_only_env())
+    return requested
+
+  raise ValueError(
+      f"--device={requested.value} was requested but {detected.value} was"
+      f" detected: no {requested.value} device is available. Omit --device to"
+      " use the detected device, or pass --device=cpu to force CPU. Detection"
+      " itself follows the environment, so TORCH_DEVICE_BACKEND_AUTOLOAD=0"
+      " (unregisters the TPU backend) and CUDA_VISIBLE_DEVICES= (hides GPUs)"
+      " also select CPU."
+  )
 
 EXPECTED_CPU_DTYPE = torch.float32
 EXPECTED_DEVICE_DTYPE = torch.float32
@@ -180,6 +227,7 @@ def run_in_subprocess(
     function_name: str,
     args: list[Any] | None = None,
     kwargs: dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
 ) -> None:
   """Runs a function in an isolated Python subprocess.
 
@@ -194,6 +242,10 @@ def run_in_subprocess(
         JSON-serializable).
       kwargs: Keyword arguments to pass to the function (must be
         JSON-serializable).
+      env: Environment for the subprocess. Defaults to inheriting this
+        process's environment. Pass device_env.cpu_only_env() to make the
+        subprocess detect CPU, which is the supported way to run a verification
+        step on CPU while an accelerator is attached.
 
   Raises:
       subprocess.CalledProcessError: If the subprocess fails.
@@ -234,12 +286,21 @@ func = getattr(module, function_name)
 func(*args, **kwargs)
 """
 
-  result = subprocess.run(
-      [sys.executable, "-c", script],
-      capture_output=True,
-      text=True,
-      check=True,
-  )
-  logging.info("Isolated subprocess output:\n%s", result.stdout)
-  if result.stderr:
-    logging.warning("Isolated subprocess stderr:\n%s", result.stderr)
+  try:
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    logging.info("Isolated subprocess output:\n%s", result.stdout)
+    if result.stderr:
+      logging.warning("Isolated subprocess stderr:\n%s", result.stderr)
+  # Wrap in try/except to reveal underlying Python crash traces when the
+  # isolated subprocess fails.
+  except subprocess.CalledProcessError as e:
+    logging.error("Isolated subprocess failed! stdout:\n%s", e.stdout)
+    if e.stderr:
+      logging.error("Isolated subprocess failed! stderr:\n%s", e.stderr)
+    raise

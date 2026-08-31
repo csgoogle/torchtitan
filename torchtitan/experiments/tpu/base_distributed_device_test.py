@@ -2,6 +2,7 @@
 
 import enum
 import os
+import subprocess
 import tempfile
 from typing import Any, Callable, Dict, Tuple, Type
 
@@ -16,11 +17,11 @@ from torchtitan.experiments.tpu import gdist
 import torchtitan.config
 import torchtitan.trainer
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
+from torchtitan.experiments.tpu import device_env
 from torchtitan.experiments.tpu import distributed_utils
 from torchtitan.experiments.tpu import numerical_validation
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import train_minimal
-from torchtitan.experiments.tpu import utils as tpu_utils
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools import utils
 
@@ -434,8 +435,8 @@ def _capture_distributed_state(
 
   # Perform reduction if needed (on device)
   if input_distribution == InputDistribution.SPLIT_BATCH and world_size > 1:
-    # Average across ranks (e.g. for FSDP split batch)
-    dist.all_reduce(loss_on_device, op=dist.ReduceOp.AVG)
+    # Sum across ranks (loss is already globally scaled by tokens)
+    dist.all_reduce(loss_on_device, op=dist.ReduceOp.SUM)
 
   # Move result
   loss_cpu = loss_on_device.cpu()
@@ -447,10 +448,12 @@ def _capture_distributed_state(
   }
 
   for name, param in model.named_parameters():
-    state["params"][name] = _gather_distributed_tensor(param).cpu()
+    gathered_param = _gather_distributed_tensor(param).cpu()
+    state["params"][name] = gathered_param
 
     if param.grad is not None:
-      state["grads"][name] = _gather_distributed_tensor(param.grad).cpu()
+      gathered_grad = _gather_distributed_tensor(param.grad).cpu()
+      state["grads"][name] = gathered_grad
 
   return state
 
@@ -487,8 +490,8 @@ def _run_cpu_verification(
   """Runs the CPU verification in a separate process."""
   logging.info("[Child Process] Starting CPU Training (Verifying)...")
 
-  # Force device type to CPU in this process
-  tpu_utils.set_device_type("cpu")
+  # The device is CPU because run_in_subprocess launched this process with a
+  # CPU-only environment (see device_env), so detection reports CPU here.
 
   # Load recorded data from the file
   if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
@@ -515,10 +518,16 @@ def _run_cpu_verification(
   cpu_config.parallelism.data_parallel_replicate_degree = 1
   cpu_config.compile.enable = False
 
+  # Disable splash attention patch on CPU to avoid ValueError
+  if hasattr(cpu_config, "splash_attention_kernel"):
+    cpu_config.splash_attention_kernel.use_splash_attention_kernel = False
+    cpu_config.splash_attention_kernel.use_tokamax_splash_attention_kernel = False
+
   # Setup validator callback
   validator = numerical_validation.StateValidatorCallback(
       recorded_history=recorded_history,
       capture_fn=numerical_validation.capture_local_state,
+      init_state=init_state,
       loss_atol=loss_atol,
       loss_rtol=loss_rtol,
       grad_atol=grad_atol,
@@ -538,18 +547,47 @@ def _run_cpu_verification(
     )
 
     # Load the captured distributed weights into the CPU model
-    current_cpu_dict = trainer_cpu.model.state_dict()
+    current_cpu_dict = dict(trainer_cpu.model.named_parameters())
 
     for name, param in init_state["params"].items():
-      if name in current_cpu_dict:
+      # Strip wrapper prefixes (e.g. checkpointing) to match CPU reference model
+      cleaned_name = numerical_validation.clean_parameter_name(name)
+      if cleaned_name in current_cpu_dict:
+        cpu_param = current_cpu_dict[cleaned_name]
         with torch.no_grad():
-          current_cpu_dict[name].copy_(param)
+          cpu_param.copy_(param)
+        after_diff = torch.max(torch.abs(cpu_param - param))
+        if after_diff > 0.0:
+          logging.error(
+              "INIT COPY FAILED for %s! Remaining Diff: %e",
+              cleaned_name,
+              after_diff,
+          )
       else:
         logging.warning(
-            "Param %s from distributed run not found in CPU model.", name
+            "Param %s (cleaned: %s) from distributed run not found in CPU"
+            " model.",
+            name,
+            cleaned_name,
         )
 
     logging.info("CPU model initialized with distributed weights.")
+
+    # Build mock dataloader from recorded inputs/labels to ensure exact data parity
+    mock_dataloader = []
+    for step in sorted(recorded_history.keys()):
+      if "inputs" in recorded_history[step] and "labels" in recorded_history[step]:
+        mock_dataloader.append(
+            (
+                {"input": recorded_history[step]["inputs"]},
+                recorded_history[step]["labels"],
+            )
+        )
+      else:
+        raise RuntimeError(f"Step {step} missing recorded inputs/labels!")
+
+    trainer_cpu.dataloader = mock_dataloader
+
     trainer_cpu.train()
 
   logging.info("[Child Process] Parity Test Passed Successfully.")
@@ -557,6 +595,29 @@ def _run_cpu_verification(
 # Chose for wrapper to be class so that output_path can written to/read from
 # outside the function.
 # (alternative is to use functools.partial)
+class _DistributedInitWrapper:
+  """Bootstraps the TPU distributed environment, then runs the real entry point.
+
+  gdist.torchrun() invokes the trainer directly, bypassing gmain, which is what
+  performs this bootstrap in production. It has to run inside the worker:
+  maybe_init_distributed() derives per-worker values (TPU_VISIBLE_CHIPS,
+  CLOUD_TPU_TASK_ID) from LOCAL_RANK / WORLD_SIZE, which only torchrun-spawned
+  workers have, so the spawning process cannot do it on their behalf.
+
+  A class rather than a closure because elastic_launch pickles the entry point,
+  and it carries __name__ because gdist.torchrun uses it for the launch role.
+  """
+
+  def __init__(self, fn):
+    self.fn = fn
+    self.__name__ = getattr(fn, "__name__", "start_trainer")
+    self.__qualname__ = self.__name__
+
+  def __call__(self, *args, **kwargs):
+    distributed_utils.maybe_init_distributed()
+    return self.fn(*args, **kwargs)
+
+
 class DistributedTrainWithRecorder:
   """Runs a distributed training job while recording model state history to a temporary file."""
 
@@ -568,7 +629,7 @@ class DistributedTrainWithRecorder:
   def __call__(self, config):
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    device = tpu_utils.get_device()
+    device = utils.get_local_device()
 
     dist_type = config_to_input_distribution(config)
 
@@ -617,7 +678,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
     super().setUp()
     torch.compiler.reset()
     self.num_devices = test_utils._NUM_DEVICES.value
-    self.accelerator_device_type = test_utils._DEVICE.value
+    self.accelerator_device_type = test_utils.resolve_device_type()
 
     if not test_utils.flags.FLAGS["num_devices"].present:
       if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
@@ -664,42 +725,53 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       )
       return
 
+    global_flags = []
     if enable_compile:
       if self.accelerator_device_type == device_type.AcceleratorDeviceType.CPU:
         self.skipTest("Skipping CPU test for torch.compile: b/327271919")
         return
-      config_args.append("--compile.enable")
+      global_flags.append("--compile.enable")
       if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
-        config_args.append("--compile.backend=tpu")
+        global_flags.append("--compile.backend=tpu")
 
     if tensor_parallel_degree is not None:
       if tensor_parallel_degree == -1:
         tensor_parallel_degree = self.num_devices
-      config_args.append(
+      global_flags.append(
           f"--parallelism.tensor_parallel_degree={tensor_parallel_degree}"
       )
     if data_parallel_shard_degree is not None:
       if data_parallel_shard_degree == -1:
         data_parallel_shard_degree = self.num_devices
-      config_args.append(
+      global_flags.append(
           f"--parallelism.data_parallel_shard_degree={data_parallel_shard_degree}"
       )
     if data_parallel_replicate_degree is not None:
       if data_parallel_replicate_degree == -1:
         data_parallel_replicate_degree = self.num_devices
-      config_args.append(
+      global_flags.append(
           f"--parallelism.data_parallel_replicate_degree={data_parallel_replicate_degree}"
       )
+
+    # Prepend flags collected in global_flags to config_args so they are
+    # not swallowed by positional subcommands introduced in the tyro upgrade.
+    # Namely, activation-checkpoint:none. This means global_flags should only
+    # contain global flags and not subcommands.
+    config_args[:] = global_flags + config_args
 
     config_manager = torchtitan.config.ConfigManager()
 
     config = config_manager.parse_args(config_args)
     config.dump_folder = tempfile.gettempdir()
 
-    utils.set_device_type(self.accelerator_device_type.value)
+    if self.accelerator_device_type == device_type.AcceleratorDeviceType.CPU:
+      # Workers are spawned and re-detect their device, so hide the accelerator
+      # in the environment they inherit rather than setting a global here.
+      os.environ.update(device_env.cpu_only_env())
     if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
       # Construct the environment before spawning workers.
       distributed_utils.maybe_init_distributed(self.num_devices)
+      start_trainer = _DistributedInitWrapper(start_trainer)
 
     gdist.torchrun(start_trainer, nproc_per_node=self.num_devices)(config)
 
@@ -759,6 +831,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
         test_utils.run_in_subprocess(
             module_name="torchtitan.experiments.tpu.base_distributed_device_test",
             function_name="_run_cpu_verification",
+            env=device_env.cpu_only_env(),
             args=[
                 temp_path,
                 config_args,
@@ -770,6 +843,8 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
                 param_rtol,
             ],
         )
+      except subprocess.CalledProcessError as e:
+        self.fail(f"Isolated subprocess failed with exit code {e.returncode}.\nstdout:\n{e.stdout}\nstderr:\n{e.stderr}")
       except Exception as e:
         self.fail(f"Isolated subprocess failed: {e}")
 

@@ -471,7 +471,7 @@ class MoE(nn.Module):
         selected_experts, torchax.tensor.Tensor
     ):
       j_experts = torchax.interop.jax_view(selected_experts)
-      j_counts = self._jax_count(j_experts)
+      j_counts = self._jax_count(j_experts)  # pyrefly: ignore[not-callable]
       return torchax.interop.torch_view(j_counts)
 
     # Fallback to one-hot implementation
@@ -497,7 +497,7 @@ class MoE(nn.Module):
           (x_flat, selected_experts, top_scores)
       )
 
-      j_routed, j_indices, j_scores_sorted = self._jax_permute(
+      j_routed, j_indices, j_scores_sorted = self._jax_permute(  # pyrefly: ignore[not-callable]
           j_x, j_experts, j_scores
       )
 
@@ -537,7 +537,7 @@ class MoE(nn.Module):
       j_routed, j_indices = torchax.interop.jax_view(
           (routed_output, sort_indices)
       )
-      j_out = self._jax_unpermute(j_routed, j_indices, j_routed)
+      j_out = self._jax_unpermute(j_routed, j_indices, j_routed)  # pyrefly: ignore[not-callable]
       return torchax.interop.torch_view(j_out)
 
     # Fallback to PyTorch implementation

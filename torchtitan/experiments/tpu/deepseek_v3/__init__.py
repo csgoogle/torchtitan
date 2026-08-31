@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.loss import ChunkedCELoss
+import torchtitan.components.loss as loss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
@@ -51,6 +51,16 @@ def _testmodel(
       attn_backend=attn_backend,
       moe_comm_backend="standard",
       non_blocking_capacity_factor=None,
+      rope=common_models.ComplexRoPE.Config(
+          dim=head_dim,
+          max_seq_len=128,
+          theta=10000.0,
+          scaling="yarn",
+          rope_factor=40.0,
+          beta_fast=32.0,
+          beta_slow=1.0,
+          original_seq_len=128,
+      ),
   )
   # pytype: enable=wrong-keyword-args
   return deepseek_v3_models.DeepSeekV3Model.Config(
@@ -68,17 +78,6 @@ def _testmodel(
           in_features=dim,
           out_features=vocab_size,
           param_init=deepseek_v3_models._output_linear_init(dim),
-      ),
-      rope=common_models.RoPE.Config(
-          dim=head_dim,
-          max_seq_len=128,
-          theta=10000.0,
-          backend="complex",
-          scaling="yarn",
-          rope_factor=40.0,
-          beta_fast=32.0,
-          beta_slow=1.0,
-          original_seq_len=128,
       ),
       layers=layers,
   )
@@ -112,6 +111,16 @@ def _testmodel_moe(
       attn_backend=attn_backend,
       moe_comm_backend="standard",
       non_blocking_capacity_factor=None,
+      rope=common_models.ComplexRoPE.Config(
+          dim=head_dim,
+          max_seq_len=128,
+          theta=10000.0,
+          scaling="yarn",
+          rope_factor=40.0,
+          beta_fast=32.0,
+          beta_slow=1.0,
+          original_seq_len=128,
+      ),
   )
   # pytype: enable=wrong-keyword-args
   return deepseek_v3_models.DeepSeekV3Model.Config(
@@ -129,17 +138,6 @@ def _testmodel_moe(
           in_features=dim,
           out_features=vocab_size,
           param_init=deepseek_v3_models._output_linear_init(dim),
-      ),
-      rope=common_models.RoPE.Config(
-          dim=head_dim,
-          max_seq_len=128,
-          theta=10000.0,
-          backend="complex",
-          scaling="yarn",
-          rope_factor=40.0,
-          beta_fast=32.0,
-          beta_slow=1.0,
-          original_seq_len=128,
       ),
       layers=layers,
   )
@@ -174,8 +172,8 @@ register_train_spec(
         model_args=deepseekv3_configs,
         parallelize_fn=parallelize_deepseekv3,
         pipelining_fn=pipeline_llm,
-        loss_config=ChunkedCELoss.Config(),
-        optimizer_config=OptimizersContainer.Config(lr=8e-4),
+        loss_config=loss.ChunkedLossWrapper.Config(),
+        optimizer_config=default_adamw(lr=8e-4),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
         dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         validator_config=Validator.Config(enable=True),

@@ -13,13 +13,12 @@ from typing import Any
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import Color, get_device_module, get_device_type, NoColor
+from torchtitan.tools.utils import Color, device_module, device_type, NoColor
 
 
 # named tuple for passing device memory stats for logging
@@ -38,19 +37,19 @@ DeviceMemStats = namedtuple(
 
 class DeviceMemoryMonitor:
     def __init__(self, device: str = None):
-        if device is None: device = get_device_type()
+        if device is None: device = device_type
 
         # pyrefly: ignore [read-only]
         self.device = torch.device(device)  # device object
-        self.device_name = get_device_module().get_device_name(self.device)
-        self.device_index = get_device_module().current_device()
-        self.device_capacity = get_device_module().get_device_properties(
+        self.device_name = device_module.get_device_name(self.device)
+        self.device_index = device_module.current_device()
+        self.device_capacity = device_module.get_device_properties(
             self.device
         ).total_memory
         self.device_capacity_gib = self._to_gib(self.device_capacity)
 
-        get_device_module().reset_peak_memory_stats()
-        get_device_module().empty_cache()
+        device_module.reset_peak_memory_stats()
+        device_module.empty_cache()
 
     def _to_gib(self, memory_in_bytes):
         # NOTE: GiB (gibibyte) is 1024, vs GB is 1000
@@ -62,7 +61,7 @@ class DeviceMemoryMonitor:
         return 100 * memory / self.device_capacity
 
     def get_peak_stats(self):
-        device_info = get_device_module().memory_stats(self.device)
+        device_info = device_module.memory_stats(self.device)
 
         max_active = device_info.get("active_bytes.all.peak", -1)
         max_active_gib = self._to_gib(max_active)
@@ -77,10 +76,10 @@ class DeviceMemoryMonitor:
 
         if num_retries > 0:
             logger.warning(
-                f"{num_retries} {get_device_type().upper()} memory allocation retries."
+                f"{num_retries} {device_type.upper()} memory allocation retries."
             )
         if num_ooms > 0:
-            logger.warning(f"{num_ooms} {get_device_type().upper()} OOM errors thrown.")
+            logger.warning(f"{num_ooms} {device_type.upper()} OOM errors thrown.")
 
         return DeviceMemStats(
             max_active_gib,
@@ -92,13 +91,13 @@ class DeviceMemoryMonitor:
         )
 
     def reset_peak_stats(self):
-        get_device_module().reset_peak_memory_stats()
+        device_module.reset_peak_memory_stats()
 
 
 def build_device_memory_monitor():
-    device_memory_monitor = DeviceMemoryMonitor(get_device_type())
+    device_memory_monitor = DeviceMemoryMonitor(device_type)
     logger.info(
-        f"{get_device_type().upper()} capacity: {device_memory_monitor.device_name} "
+        f"{device_type.upper()} capacity: {device_memory_monitor.device_name} "
         f"with {device_memory_monitor.device_capacity_gib:.2f}GiB memory"
     )
     return device_memory_monitor
@@ -125,7 +124,10 @@ class TensorBoardLogger(BaseLogger):
     def log(self, metrics: dict[str, Any], step: int) -> None:
         for k, v in metrics.items():
             tag = k if self.tag is None else f"{self.tag}/{k}"
-            self.writer.add_scalar(tag, v, step)
+            if isinstance(v, str):
+                self.writer.add_text(tag, v, step)
+            else:
+                self.writer.add_scalar(tag, v, step)
 
     def close(self) -> None:
         self.writer.close()
@@ -282,6 +284,9 @@ class MetricsProcessor(Configurable):
         log_freq: int = 10
         """How often to log metrics to TensorBoard, in iterations"""
 
+        enable_moe_routing: bool = False
+        """Whether to collect MoE routing counts and normalized auxiliary loss"""
+
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
 
@@ -316,7 +321,6 @@ class MetricsProcessor(Configurable):
     num_flops_per_token: int
     has_quantization: bool
     optimizers: OptimizersContainer | None
-    lr_schedulers: LRSchedulersContainer | None
     model_parts: list[torch.nn.Module] | None
 
     def __init__(
@@ -361,7 +365,6 @@ class MetricsProcessor(Configurable):
         # These variables have to be set later as they depend on other components or model.
         self.num_flops_per_token = -1
         self.optimizers = None
-        self.lr_schedulers = None
         self.model_parts = None
 
     def should_log(self, step: int) -> bool:

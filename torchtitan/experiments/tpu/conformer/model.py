@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import math
+import einops
 import torch
 import torch.nn as nn
 from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
@@ -40,10 +41,45 @@ class ConformerModelArgs(BaseModel.Config):
       self, model: nn.Module, seq_len: int
   ) -> tuple[int, int]:
     nparams = sum(p.numel() for p in model.parameters())
-    # Dummy flops for now to avoid crash in metrics processor
-    # redacted uses 6 * N * seq_len as rough estimate
-    flops_per_token = 6 * nparams
-    return nparams, flops_per_token
+
+    t = seq_len
+    d = self.hidden_dim
+    k = self.kernel_size
+    ffn_dim = 4 * d  # Based on ffn_dim=4*config.hidden_dim
+    l = self.num_layers
+
+    # 1. Feed Forward Networks (one in beginning, one at end of each layer)
+    # 2 linear layers per FFN (D -> FFN_dim, and FFN_dim -> D).
+    # MatMul FLOPs = 2 * T * in_dim * out_dim
+    ffn_flops = 2 * (2 * t * d * ffn_dim) * 2
+
+    # 2. Attention Module (PatchedMHA)
+    # QKV Projections + Output Projection: 4 * (2 * T * D^2)
+    # QK^T and AV Matrix Multiplications: 2 * (2 * T^2 * D)
+    attn_flops = (8 * t * (d**2)) + (4 * (t**2) * d)
+
+    # 3. Convolution Module
+    # Pointwise 1 (D -> 2D) + Pointwise 2 (D -> D) = 6 * T * D^2
+    # Depthwise Conv: 2 * T * D * K
+    conv_flops = (6 * t * (d**2)) + (2 * t * d * k)
+
+    # Total FLOPs for all Conformer layers
+    flops_per_layer = ffn_flops + attn_flops + conv_flops
+    total_layer_flops = l * flops_per_layer
+
+    # Final FC classifier layer
+    fc_flops = 2 * t * d * self.vocab_size
+
+    # Total Forward FLOPs
+    forward_flops = total_layer_flops + fc_flops
+
+    # Total Training FLOPs = Forward (1x) + Backward (2x) = 3x total
+    total_training_flops = forward_flops * 3
+
+    # Return FLOPs normalized per token to match downstream metric processor
+    flops_per_token = total_training_flops // t
+
+    return nparams, int(flops_per_token)
 
 
 # --- TPU-compatible GLU Fix ---
@@ -87,10 +123,27 @@ class PatchedMHA(nn.Module):
       average_attn_weights=True,
       is_causal=False,
   ):
-    bsz, tgt_len, hidden_dim = query.shape
-    w = self.in_proj.weight.view(3, self.num_heads, self.head_dim, hidden_dim)
-    qkv = torch.einsum("btd,nhkd->nbhtk", query, w)
-    q, k, v = qkv[0], qkv[1], qkv[2]
+    _, _, hidden_dim = query.shape
+    w_q, w_k, w_v = self.in_proj.weight.chunk(3, dim=0)
+    w_q_flat = w_q.reshape(self.embed_dim, hidden_dim)
+    w_k_flat = w_k.reshape(self.embed_dim, hidden_dim)
+    w_v_flat = w_v.reshape(self.embed_dim, hidden_dim)
+
+    q = einops.rearrange(
+        torch.matmul(query, w_q_flat.t()),
+        "b t (h d) -> b h t d",
+        h=self.num_heads,
+    ).contiguous()
+    k = einops.rearrange(
+        torch.matmul(query, w_k_flat.t()),
+        "b t (h d) -> b h t d",
+        h=self.num_heads,
+    ).contiguous()
+    v = einops.rearrange(
+        torch.matmul(query, w_v_flat.t()),
+        "b t (h d) -> b h t d",
+        h=self.num_heads,
+    ).contiguous()
 
     if self.use_splash:
       attn_output = splash_sdpa(q, k, v, is_causal=is_causal, use_vmap_bwd=self.use_vmap_bwd)
@@ -105,15 +158,11 @@ class PatchedMHA(nn.Module):
       )
 
     w = self.out_proj.weight.view(self.out_proj.out_features, self.num_heads, self.head_dim)
-    outputs = []
-    for i in range(self.num_heads):
-        x_i = attn_output[:, i, :, :]
-        w_i = w[:, i, :].t().unsqueeze(0).expand(bsz, -1, -1)
-        head_out = torch.bmm(x_i, w_i)
-        outputs.append(head_out)
-    attn_output = sum(outputs)
+
+    # Vectorized mh projection via einsum
+    attn_output = torch.einsum("bhtd,ohd->bto", attn_output, w)
     if self.out_proj.bias is not None:
-        attn_output = attn_output + self.out_proj.bias
+      attn_output = attn_output + self.out_proj.bias
     return attn_output, None
 
 

@@ -11,12 +11,17 @@ Hosts helpers for:
 """
 
 import logging
+import copy
 import os
 import re
 import time
+from typing import Dict, Any, List
+
 import torch
 import torch_tpu
 from torch.distributed.tensor import DTensor, Replicate
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
 logger = logging.getLogger(__name__)
 
@@ -113,11 +118,16 @@ def prepare_trainer_state_dict(model) -> dict:
     """
     t_start = time.perf_counter()
     
+    # Use named_parameters() to directly access wqkv.weight without triggering _split_qkv_on_save hooks
+    raw_params = dict(model.named_parameters())
+    if "lm_head.weight" not in raw_params and "tok_embeddings.weight" in raw_params:
+        raw_params["lm_head.weight"] = raw_params["tok_embeddings.weight"]
+
     if not SYNC_LAYER_BY_LAYER:
         # --- Whole-Model Synchronization (Baseline / Legacy) ---
         tpu_sd = {}
         with torch.no_grad():
-            for k, v in model.state_dict().items():
+            for k, v in raw_params.items():
                 val = v.data if isinstance(v, torch.nn.Parameter) else v
                 if isinstance(val, DTensor):
                     device_mesh = val.device_mesh
@@ -159,12 +169,11 @@ def prepare_trainer_state_dict(model) -> dict:
         t_total = time.perf_counter() - t_start
         
         if int(os.environ.get("RANK", "0")) == 0:
-            log_msg = (f"@@@ Trainer Rank 0 Profiling (Whole Model): "
+            log_msg = (f"Trainer Rank 0 Profiling (Whole Model): "
                        f"Queue redist = {t_redist_queue:.3f}s, "
                        f"Sync redist = {t_redist_sync:.3f}s, "
                        f"CPU offload = {t_copy:.3f}s, "
                        f"Total trainer time = {t_total:.3f}s")
-            print(log_msg, flush=True)
             logger.info(log_msg)
             
         torch_tpu._internal.sync.synchronize(wait=True)
@@ -172,7 +181,7 @@ def prepare_trainer_state_dict(model) -> dict:
 
     else:
         # --- Layer-by-Layer Synchronization (Scalable) ---
-        state_dict_keys = list(model.state_dict().keys())
+        state_dict_keys = list(raw_params.keys())
         sorted_groups = get_sorted_groups(state_dict_keys)
         
         cpu_sd = None
@@ -191,7 +200,7 @@ def prepare_trainer_state_dict(model) -> dict:
             group_tpu_sd = {}
             
             with torch.no_grad():
-                for k, v in model.state_dict().items():
+                for k, v in raw_params.items():
                     if get_layer_group(k) != group_name:
                         continue
                     val = v.data if isinstance(v, torch.nn.Parameter) else v
@@ -240,22 +249,64 @@ def prepare_trainer_state_dict(model) -> dict:
         t_total = time.perf_counter() - t_start
         
         if int(os.environ.get("RANK", "0")) == 0:
-            log_msg = (f"@@@ Trainer Rank 0 Profiling (Layer-by-Layer): "
+            log_msg = (f"Trainer Rank 0 Profiling (Layer-by-Layer): "
                        f"Num groups = {len(sorted_groups)}, "
                        f"Queue redist = {t_redist_queue_total:.3f}s, "
                        f"Sync redist = {t_redist_sync_total:.3f}s, "
                        f"CPU offload = {t_copy_total:.3f}s, "
                        f"Total trainer time = {t_total:.3f}s")
-            print(log_msg, flush=True)
             logger.info(log_msg)
             
         torch_tpu._internal.sync.synchronize(wait=True)
         return cpu_sd
 
 
-# =====================================================================
-# Generator/Worker Weight Injection & Slicing
-# =====================================================================
+def _prepare_local_tensors_for_loading(items_dict: dict, target_params: dict, rank: int):
+    """
+    Takes global CPU tensors (items_dict) transferred from Trainer,
+    handles untied lm_head if needed, and shards/slices them to match target_params on worker rank.
+    Returns list of tuples: (target_key, target_local_shape, param_cpu_local)
+    """
+    processed_globals = dict(items_dict)
+        
+    # If lm_head.weight is in target_params but not in processed_globals, replicate from tok_embeddings.weight
+    if "lm_head.weight" in target_params and "lm_head.weight" not in processed_globals and "tok_embeddings.weight" in processed_globals:
+        processed_globals["lm_head.weight"] = processed_globals["tok_embeddings.weight"]
+    elif "model.lm_head.weight" in target_params and "model.lm_head.weight" not in processed_globals and "tok_embeddings.weight" in processed_globals:
+        processed_globals["model.lm_head.weight"] = processed_globals["tok_embeddings.weight"]
+
+    # Slice each global tensor for the local worker
+    result = []
+    for k, global_t in processed_globals.items():
+        # Match parameter key against target (handling optional 'model.' prefix)
+        target_key = next((cand for cand in (k, k.removeprefix("model."), f"model.{k}") if cand in target_params), None)
+        if target_key is None:
+            continue
+            
+        target_v = target_params[target_key]
+            
+        target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
+        target_local_shape = target_local.shape
+        if global_t.shape == target_local_shape:
+            param_cpu_local = global_t
+        else:
+            sharded = False
+            for dim in range(len(global_t.shape)):
+                if global_t.shape[dim] != target_local_shape[dim]:
+                    shard_size = target_local_shape[dim]
+                    rank_offset = shard_size * rank
+                    indices = [slice(None)] * len(global_t.shape)
+                    indices[dim] = slice(rank_offset, rank_offset + shard_size)
+                    param_cpu_local = global_t[tuple(indices)].clone()
+                    sharded = True
+                    break
+            if not sharded:
+                param_cpu_local = global_t
+
+        result.append((target_key, target_local_shape, param_cpu_local))
+
+    return result
+
 
 def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     """
@@ -267,14 +318,6 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     """
     t_start = time.perf_counter()
     
-    # [TPU HACK / LOCAL RUN SUPPORT]: Convert plain state dict (e.g. from CPU Trainer runs) 
-    # to flat/metadata dict on-the-fly.
-    # Why: For local CPU trainer runs, the returned state dict is a plain un-flat {key: tensor} dict.
-    # We dynamically flatten it on-the-fly to reuse the highly optimized chunked loading pipeline.
-    # What didn't work: Writing a completely separate weight injection pathway for CPU trainer; 
-    # dynamically converting format on-the-fly preserves high PCIe throughput and 100% codebase compatibility.
-    # TODO: Remove HACK. In normal non-colocated RL runs, both trainer and generator run on TPU with 
-    # uniform distributed formats, eliminating format mismatch workarounds.
     if isinstance(state_dict, dict) and "flat_tensors" not in state_dict and "grouped" not in state_dict:
         flat_tensors = {}
         metadata = {}
@@ -302,18 +345,17 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
             
         t_total = time.perf_counter() - t_start
         if rank == 0:
-            log_msg = (f"@@@ Worker 0 Profiling (Layer-by-Layer): "
+            log_msg = (f"Worker 0 Profiling (Layer-by-Layer): "
                        f"Total groups loaded = {len(grouped_dict)}, "
                        f"Total keys loaded = {total_keys}, "
                        f"Total worker execution = {t_total:.3f}s")
-            print(log_msg, flush=True)
             logger.info(log_msg)
         return total_keys
 
     # Otherwise fallback to whole model sync logic
     flat_tensors = state_dict["flat_tensors"]
     metadata = state_dict["metadata"]
-    
+
     # 1. Pre-process metadata to support tied embeddings (lm_head)
     clean_metadata = {}
     num_keys = 0
@@ -324,115 +366,45 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
             clean_k = get_clean_name(k)
             clean_items.append((clean_k, shape, numel, offset))
             num_keys += 1
-            
-            # Replicate embedding weights pointing to the same flat segment offset
-            if "tok_embeddings.weight" in clean_k:
-                lm_k = clean_k.replace("tok_embeddings", "lm_head")
-                clean_items.append((lm_k, shape, numel, offset))
-                num_keys += 1
-                
             offset += numel
         clean_metadata[dtype] = clean_items
         
-    model_sd = vllm_model.model.state_dict()
-    
-    def resolve_key(k):
-        if k in model_sd:
-            return k
-        if k.startswith("model.") and k[6:] in model_sd:
-            return k[6:]
-        if f"model.{k}" in model_sd:
-            return f"model.{k}"
-        return k
+    target_params = dict(vllm_model.model.named_parameters())
+    target_params.update(dict(vllm_model.model.named_buffers()))
 
     t_format_start = time.perf_counter()
     
-    # 2. Slice and Chunk Parameters by Dtype
+    # 2. Slice and copy parameters directly to TPU
+    loaded_keys = 0
     for dtype, flat_data in flat_tensors.items():
         items = clean_metadata.get(dtype, [])
         if not items:
             continue
             
-        # Unpack NumPy array to PyTorch CPU tensor (zero-copy shared-memory view)
         flat_cpu = torch.from_numpy(flat_data) if not isinstance(flat_data, torch.Tensor) else flat_data
+        items_dict = {k: flat_cpu[offset : offset + numel].view(shape) for k, shape, numel, offset in items}
         
-        local_items = []
-        local_tensors_to_cat = []
-        local_offset = 0
-        
-        # 3. CPU-side slicing (reduces PCIe transfer payload across 8 workers by 8x!)
-        for k, shape, numel, offset in items:
-            target_key = resolve_key(k)
-            if target_key not in model_sd:
-                continue
-                
-            target_v = model_sd[target_key]
-            target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
-            
-            param_cpu_global = flat_cpu[offset : offset + numel].view(shape)
-            if target_local.shape == shape:
-                param_cpu_local = param_cpu_global
-            else:
-                sharded = False
-                for dim in range(len(shape)):
-                    if shape[dim] != target_local.shape[dim]:
-                        shard_size = target_local.shape[dim]
-                        rank_offset = shard_size * rank
-                        indices = [slice(None)] * len(shape)
-                        indices[dim] = slice(rank_offset, rank_offset + shard_size)
-                        param_cpu_local = param_cpu_global[tuple(indices)].clone()
-                        sharded = True
-                        break
-                if not sharded:
-                    param_cpu_local = param_cpu_global
-                    
-            local_tensors_to_cat.append(param_cpu_local.reshape(-1))
-            local_items.append((target_key, target_local.shape, target_local.numel(), local_offset))
-            local_offset += target_local.numel()
-            
-        if not local_tensors_to_cat:
-            continue
-            
-        # Concatenate rank-specific parameters on CPU
-        flat_local_cpu = torch.cat(local_tensors_to_cat)
-        
-        # 4. Grouped Flat Transfer to TPU (safety limits peak memory to exactly 15MB)
-        chunks = [local_items[i : i + TPU_COPY_CHUNK_SIZE_PARAMETERS] for i in range(0, len(local_items), TPU_COPY_CHUNK_SIZE_PARAMETERS)]
-        
-        for chunk in chunks:
-            chunk_start_offset = chunk[0][3]
-            chunk_end_offset = chunk[-1][3] + chunk[-1][2]
-            flat_chunk_cpu = flat_local_cpu[chunk_start_offset:chunk_end_offset]
-            
-            # Stream the 15MB chunk to TPU over PCIe in a single operation
-            flat_chunk_tpu = flat_chunk_cpu.to("tpu")
-            
-            # Slice and copy directly on TPU
-            for target_key, local_shape, local_numel, offset in chunk:
-                local_offset = offset - chunk_start_offset
-                slice_tpu = flat_chunk_tpu[local_offset : local_offset + local_numel].view(local_shape)
-                
-                target_v = model_sd[target_key]
-                target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
-                target_local.copy_(slice_tpu)
-                
-            # Free temporary flat chunk and sync immediately.
-            # This prevents XLA compilation footprint buildup and ensures absolute VMEM safety.
-            del flat_chunk_tpu
-            torch_tpu._internal.sync.synchronize(wait=True)
+        local_processed = _prepare_local_tensors_for_loading(items_dict, target_params, rank)
+        for target_key, target_local_shape, param_cpu_local in local_processed:
+            target_v = target_params[target_key]
+            target_local = target_v.to_local() if hasattr(target_v, "to_local") else target_v
+            with torch.no_grad():
+                target_local.copy_(param_cpu_local)
+            loaded_keys += 1
+
+    torch_tpu._internal.sync.synchronize(wait=True)
             
     t_copy_to_device = time.perf_counter() - t_format_start
     t_total = time.perf_counter() - t_start
     
     if rank == 0:
-        log_msg = (f"@@@ Worker 0 Profiling (Whole Model): "
+        log_msg = (f"Worker 0 Profiling (Whole Model): "
                    f"Copy & Format = {t_copy_to_device:.3f}s, "
-                   f"vLLM load = 0.000s, "
+                   f"Total keys loaded = {loaded_keys}, "
                    f"Total worker execution = {t_total:.3f}s")
-        print(log_msg, flush=True)
         logger.info(log_msg)
         
-    return num_keys
+    return loaded_keys
 
 
 def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int) -> int:
@@ -451,93 +423,40 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int) -> int:
             clean_k = get_clean_name(k)
             clean_items.append((clean_k, shape, numel, offset))
             num_keys += 1
-            
-            # Replicate embedding weights pointing to the same flat segment offset
-            if "tok_embeddings.weight" in clean_k:
-                lm_k = clean_k.replace("tok_embeddings", "lm_head")
-                clean_items.append((lm_k, shape, numel, offset))
-                num_keys += 1
-                
             offset += numel
         clean_metadata[dtype] = clean_items
         
-    model_sd = vllm_model.model.state_dict()
-    
-    def resolve_key(k):
-        if k in model_sd:
-            return k
-        if k.startswith("model.") and k[6:] in model_sd:
-            return k[6:]
-        if f"model.{k}" in model_sd:
-            return f"model.{k}"
-        return k
+    target_params = dict(vllm_model.model.named_parameters())
+    target_params.update(dict(vllm_model.model.named_buffers()))
 
+    loaded_keys = 0
     for dtype, flat_data in flat_tensors.items():
         items = clean_metadata.get(dtype, [])
         if not items:
             continue
             
         flat_cpu = torch.from_numpy(flat_data) if not isinstance(flat_data, torch.Tensor) else flat_data
+        items_dict = {k: flat_cpu[offset : offset + numel].view(shape) for k, shape, numel, offset in items}
         
-        local_items = []
-        local_tensors_to_cat = []
-        local_offset = 0
-        
-        for k, shape, numel, offset in items:
-            target_key = resolve_key(k)
-            if target_key not in model_sd:
-                continue
-                
-            target_v = model_sd[target_key]
-            target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
+        local_processed = _prepare_local_tensors_for_loading(items_dict, target_params, rank)
+        for target_key, target_local_shape, param_cpu_local in local_processed:
+            target_v = target_params[target_key]
+            target_local = target_v.to_local() if hasattr(target_v, "to_local") else target_v
+            try:
+                with torch.no_grad():
+                    target_local.copy_(param_cpu_local)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed copying key {target_key}: "
+                    f"param_cpu_local shape={param_cpu_local.shape}, "
+                    f"target_local shape={target_local.shape}, "
+                    f"target_local_shape={target_local_shape}. Error: {e}"
+                ) from e
+            loaded_keys += 1
+
+    torch_tpu._internal.sync.synchronize(wait=True)
             
-            param_cpu_global = flat_cpu[offset : offset + numel].view(shape)
-            if target_local.shape == shape:
-                param_cpu_local = param_cpu_global
-            else:
-                sharded = False
-                for dim in range(len(shape)):
-                    if shape[dim] != target_local.shape[dim]:
-                        shard_size = target_local.shape[dim]
-                        rank_offset = shard_size * rank
-                        indices = [slice(None)] * len(shape)
-                        indices[dim] = slice(rank_offset, rank_offset + shard_size)
-                        param_cpu_local = param_cpu_global[tuple(indices)].clone()
-                        sharded = True
-                        break
-                if not sharded:
-                    param_cpu_local = param_cpu_global
-                    
-            local_tensors_to_cat.append(param_cpu_local.reshape(-1))
-            local_items.append((target_key, target_local.shape, target_local.numel(), local_offset))
-            local_offset += target_local.numel()
-            
-        if not local_tensors_to_cat:
-            continue
-            
-        flat_local_cpu = torch.cat(local_tensors_to_cat)
-        
-        chunks = [local_items[i : i + TPU_COPY_CHUNK_SIZE_PARAMETERS] for i in range(0, len(local_items), TPU_COPY_CHUNK_SIZE_PARAMETERS)]
-        
-        for chunk in chunks:
-            chunk_start_offset = chunk[0][3]
-            chunk_end_offset = chunk[-1][3] + chunk[-1][2]
-            flat_chunk_cpu = flat_local_cpu[chunk_start_offset:chunk_end_offset]
-            
-            flat_chunk_tpu = flat_chunk_cpu.to("tpu")
-            
-            for target_key, local_shape, local_numel, offset in chunk:
-                local_offset = offset - chunk_start_offset
-                slice_tpu = flat_chunk_tpu[local_offset : local_offset + local_numel].view(local_shape)
-                
-                target_v = model_sd[target_key]
-                target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
-                target_local.copy_(slice_tpu)
-                
-            del flat_chunk_tpu
-            torch_tpu._internal.sync.synchronize(wait=True)
-            
-    return num_keys
+    return loaded_keys
 
 
 def load_weights_on_driver(vllm_model, state_dict_data: dict) -> None:
@@ -561,17 +480,31 @@ def load_weights_on_driver(vllm_model, state_dict_data: dict) -> None:
     else:
         state_dict = state_dict_data
         
+    # Clean keys to remove FSDP prefixes before merging or matching
+    state_dict = {get_clean_name(k): v for k, v in state_dict.items()}
+        
     # If weight tying is enabled, explicitly add lm_head for syncing
     tok_key = next((k for k in state_dict.keys() if "tok_embeddings.weight" in k), None)
     lm_key = next((k for k in state_dict.keys() if "lm_head.weight" in k), None)
     if tok_key and not lm_key:
         state_dict[tok_key.replace("tok_embeddings", "lm_head")] = state_dict[tok_key]
 
+    # Merge QKV weights for FusedQKVLinear modules
+    from torchtitan.models.common.attention import FusedQKVLinear
+    for name, module in vllm_model.model.named_modules():
+        if isinstance(module, FusedQKVLinear):
+            prefix = name + "." if name else ""
+            FusedQKVLinear._merge_qkv_on_load(module, state_dict, prefix)
+
     target_sd = dict(vllm_model.named_parameters())
+    
+    matched_keys = 0
+    missing_keys = []
+    
     with torch.no_grad():
         for name, source_p in state_dict.items():
-            clean_name = get_clean_name(name)
-            target_name = f"model.{clean_name}"
+            # name is already clean
+            target_name = f"model.{name}"
             
             if target_name in target_sd:
                 target_t = target_sd[target_name]
@@ -580,15 +513,23 @@ def load_weights_on_driver(vllm_model, state_dict_data: dict) -> None:
                     val = val.full_tensor()
                 if target_t.shape == val.shape:
                     target_t.copy_(val.to(target_t.device))
+                    matched_keys += 1
                 else:
                     logger.warning(f"Shape mismatch for {target_name}: {target_t.shape} != {val.shape}")
-            elif clean_name in target_sd:
-                target_name = clean_name
+            elif name in target_sd:
+                target_name = name
                 target_t = target_sd[target_name]
                 val = source_p
                 if hasattr(val, "full_tensor"):
                     val = val.full_tensor()
                 if target_t.shape == val.shape:
                     target_t.copy_(val.to(target_t.device))
+                    matched_keys += 1
                 else:
                     logger.warning(f"Shape mismatch for {target_name}: {target_t.shape} != {val.shape}")
+            else:
+                missing_keys.append(name)
+
+    if missing_keys:
+        logger.warning(f"Missing keys in target_sd: {len(missing_keys)}")
+

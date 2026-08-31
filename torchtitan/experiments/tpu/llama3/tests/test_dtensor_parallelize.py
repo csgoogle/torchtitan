@@ -10,7 +10,8 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 import torch.nn as nn
-from torchtitan.config.configs import ActivationCheckpointConfig, CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
@@ -19,7 +20,6 @@ from torchtitan.experiments.tpu.base_distributed_device_test import InputDistrib
 import torchtitan.experiments.tpu.llama3 as llama3_tpu
 from torchtitan.models.llama3 import parallelize as llama3_dtensor_parallelize
 from torchtitan.models.llama3.model import Llama3Model
-
 
 
 
@@ -63,7 +63,7 @@ def _verify_dtensor_llama3_tp_forward_worker(
     # pytype: disable=wrong-arg-types
     llama3_dtensor_parallelize.parallelize_llama(
         model,
-        ac_config=ActivationCheckpointConfig(),
+        ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -86,7 +86,7 @@ def _verify_dtensor_llama3_tp_forward_worker(
 
   runner.run_forward_parity(
       batch_size=TEST_BATCH_SIZE,
-      seq_len=config.rope.max_seq_len,
+      seq_len=config.layers[0].attention.rope.max_seq_len,
       atol=5e-2,
       rtol=5e-2,
   )
@@ -111,7 +111,7 @@ def _verify_dtensor_llama3_tp_backward_worker(
     # pytype: disable=wrong-arg-types
     llama3_dtensor_parallelize.parallelize_llama(
         model,
-        ac_config=ActivationCheckpointConfig(),
+        ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -136,7 +136,7 @@ def _verify_dtensor_llama3_tp_backward_worker(
   runner.run_backward_parity(
       num_steps=1,
       batch_size=TEST_BATCH_SIZE,
-      seq_len=config.rope.max_seq_len,
+      seq_len=config.layers[0].attention.rope.max_seq_len,
       atol_loss=3e-2,
       rtol_loss=3e-2,
       atol_grad=5e-3,
@@ -163,7 +163,7 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
     # pytype: disable=wrong-arg-types
     llama3_dtensor_parallelize.parallelize_llama(
         model,
-        ac_config=ActivationCheckpointConfig(),
+        ac_config=SelectiveAC.Config(),
         compile_config=CompileConfig(),
         dump_folder="",
         parallel_dims=parallel_dims,
@@ -188,7 +188,7 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
   runner.run_backward_parity(
       num_steps=TEST_TRAINING_STEPS,
       batch_size=TEST_BATCH_SIZE,
-      seq_len=config.rope.max_seq_len,
+      seq_len=config.layers[0].attention.rope.max_seq_len,
       atol_loss=3,  # TODO(tbajpai): investigate tolerance issues b/495494788
       rtol_loss=3,
       atol_grad=9e-1,
