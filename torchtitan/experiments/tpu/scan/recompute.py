@@ -6,12 +6,12 @@
 
 """Activation checkpointing for a scan body.
 
-Moving the FSDP all-gather into the scan body (see `fsdp.py`) is only half a
-fix. The min-cut partitioner then saves the *gathered* per-layer weight as a
-scan `ys` residual, so all 136.9 GB of LLaMA-3 70B weights come back -- stacked
-into one residual instead of N separate gathers, but just as resident. The
-gather has to be recomputed in backward, and so do the block's activations if
-the stack is to be fully checkpointed.
+Moving the FSDP all-gather into the scan body (see `layer_stack.py`) is only
+half a fix. The min-cut partitioner then saves the *gathered* per-layer weight
+as a scan `ys` residual, so all 136.9 GB of LLaMA-3 70B weights come back --
+stacked into one residual instead of N separate gathers, but just as resident.
+The gather has to be recomputed in backward, and so do the block's activations
+if the stack is to be fully checkpointed.
 
 `torch.utils.checkpoint` around the body does not do it: the scan HOP re-traces
 the body through `materialize_as_graph`, and the re-trace runs outside the

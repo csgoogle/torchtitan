@@ -47,7 +47,6 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
 )
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
-from torchtitan.experiments.tpu.scan import fsdp as scan_fsdp
 from torchtitan.experiments.tpu.scan import layer_stack
 from torchtitan.experiments.tpu.tests import scan_fixtures
 from torchtitan.experiments.tpu.tests.scan_fixtures import BATCH, DIM, N_LAYERS, SEQ
@@ -72,13 +71,12 @@ def _worker_placement(device, rank, world_size):
   """Dim 0 is the scan axis and must survive SimpleFSDP untouched."""
   del rank
   _, stack = scan_fixtures.stacked(device)
-  plan = scan_fixtures.shard(
+  specs = scan_fixtures.shard(
       stack, device, world_size, torch.bfloat16, torch.float32
   )
 
-  assert len(plan) == len(stack.param_fqns), (
-      f"planned {len(plan)} gathers for {len(stack.param_fqns)} stacked"
-      " parameters"
+  assert len(specs) == len(stack.param_fqns), (
+      f"{len(specs)} slice specs for {len(stack.param_fqns)} stacked parameters"
   )
   for fqn, param in zip(stack.param_fqns, stack.stacked_parameters()):
     assert isinstance(param, DTensor), f"{fqn} was not sharded at all"
@@ -89,14 +87,21 @@ def _worker_placement(device, rank, world_size):
     assert param.shape[0] == stack.n_layers, (
         f"{fqn} lost its layer axis: {tuple(param.shape)}"
     )
-    spec = plan[layer_stack._mangle(fqn)]  # pylint: disable=protected-access
-    assert spec.sharded and spec.group_name, f"{fqn} planned no gather: {spec}"
-    assert spec.param_dtype == torch.bfloat16, spec
-    assert spec.reduce_dtype == torch.float32, spec
+    # Dropping the layer axis turns the stack's Shard(1) into Shard(0) of the
+    # per-layer weight the body rebuilds.
+    mesh, placement = specs[layer_stack._mangle(fqn)]  # pylint: disable=protected-access
+    assert placement == Shard(0), f"{fqn}'s slice is {placement}, not Shard(0)"
+    assert mesh.size() == world_size, f"{fqn} gathers over {mesh}, not the world"
+
+  # The body calls SimpleFSDP's own parametrization, so the asymmetric dtypes
+  # are its to enforce -- assert on the object `forward` actually invokes.
+  gather = stack._simple_fsdp_parametrization_list[0]  # pylint: disable=protected-access
+  assert gather.param_dtype == torch.bfloat16, gather.param_dtype
+  assert gather.reduce_dtype == torch.float32, gather.reduce_dtype
 
 
 def _worker_plan_rejections(device, rank, world_size):
-  """`plan_gathers` must reject what the in-body path cannot express."""
+  """`slice_specs` must reject what the in-body path cannot express."""
   del rank
   policy = MixedPrecisionPolicy()
 
@@ -111,7 +116,7 @@ def _worker_plan_rejections(device, rank, world_size):
       shard_dim=0,
   )
   try:
-    scan_fsdp.plan_gathers(stack, policy)
+    stack.slice_specs()
   except ValueError as e:
     assert "sharded on dim 0" in str(e), e
   else:
@@ -125,7 +130,7 @@ def _worker_plan_rejections(device, rank, world_size):
         distribute_tensor(param.detach(), mesh, (Replicate(), Shard(1)))
     )
   try:
-    scan_fsdp.plan_gathers(stack, policy)
+    stack.slice_specs()
   except ValueError as e:
     assert "1-D dp mesh only" in str(e), e
   else:
@@ -164,9 +169,9 @@ def _worker_matches_unrolled(device, rank, world_size):
   """Sharded and scanned must equal the plain loop over full weights.
 
   The forward is the easy half. The gradient is the one that catches a bad
-  in-body collective: `gather_slice` differentiates to a reduce-scatter, so a
-  wrong group, axis, or dtype shows up as a per-layer weight gradient that is
-  off by a factor of the world size rather than as an error.
+  in-body collective: the body's `redistribute` differentiates to a
+  reduce-scatter, so a wrong group, axis, or dtype shows up as a per-layer
+  weight gradient off by a factor of the world size rather than as an error.
   """
   # Same seed as `scan_fixtures.stacked`, so the reference holds exactly the
   # weights the stack was built from -- no copy of a half-transformed module.
@@ -176,7 +181,7 @@ def _worker_matches_unrolled(device, rank, world_size):
   scan_fixtures.shard(stack, device, world_size)
 
   # Real data parallelism: one global batch, a different slice per rank. The
-  # reduce-scatter in `gather_slice`'s backward *sums* across ranks -- DTensor's
+  # reduce-scatter in the body's backward *sums* across ranks -- DTensor's
   # Partial -> Shard reduction -- so the reference must be the whole global
   # batch. Feeding every rank the same slice instead would leave the gradient
   # world_size times too large and the comparison would have to fudge it.

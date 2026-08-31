@@ -21,7 +21,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from torchtitan.experiments.graph_trainer.simple_fsdp import MixedPrecisionPolicy
-from torchtitan.experiments.tpu.scan import fsdp as scan_fsdp
 from torchtitan.experiments.tpu.scan import layer_stack
 
 
@@ -84,8 +83,8 @@ def stacked(device, n_layers: int = N_LAYERS, dim: int = DIM, **stack_kwargs):
 
 
 def shard(stack, device, world_size, param_dtype=None, reduce_dtype=None):
-  """Puts `stack` under SimpleFSDP on a 1-D mesh; returns the gather plan."""
-  return scan_fsdp.shard_stacked_layers(
+  """Puts `stack` under SimpleFSDP on a 1-D mesh; returns its slice specs."""
+  return layer_stack.shard_stacked_layers(
       stack,
       dp_mesh=init_device_mesh(device.type, (world_size,)),
       dp_mode="fully_shard",

@@ -29,8 +29,10 @@ One rule governs every read of a stacked parameter: go through
 `self._parameters[...]`, never `getattr`. SimpleFSDP installs its all-gather as
 a property on the parameter name, so a `getattr` gathers all N layers at once --
 136.9 GB of bf16 weights at 70B, against a 96 GB budget. `self._parameters`
-returns the sharded DTensor, which `forward` unwraps and the body gathers one
-layer at a time. See `fsdp.py`.
+returns the sharded DTensor, whose local shard `forward` hands to the body; the
+body all-gathers one layer's slice at a time, so the collective lands inside the
+`stablehlo.while` and only the layer in flight is ever gathered. That is 1.71 GB
+instead of 136.9 GB, and it is the whole reason to scan at 70B.
 """
 
 import contextlib
@@ -39,11 +41,16 @@ from typing import Any, Iterable
 import torch
 from torch import nn
 from torch._higher_order_ops.scan import scan
-from torch.distributed.tensor import DTensor
+import torch.distributed._functional_collectives as funcol
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Placement, Replicate, Shard
 from torch.func import functional_call
 import torch.utils.checkpoint
 
-from torchtitan.experiments.tpu.scan.fsdp import gather_slice, ScanFSDPSpec
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    data_parallel,
+    MixedPrecisionPolicy,
+)
 from torchtitan.experiments.tpu.scan.recompute import body_checkpointed
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
@@ -89,6 +96,57 @@ def _bound_to(module: nn.Module, values: dict[str, torch.Tensor]):
       owner._parameters[leaf] = param  # pylint: disable=protected-access
 
 
+class _AllGatherReduceScatter(torch.autograd.Function):
+  """`all_gather` forward / `reduce_scatter` backward with SimpleFSDP's dtypes.
+
+  SimpleFSDP's own `ReplicateComputation` would be the natural thing to call
+  here, and it is what the gather does above the loop. It cannot run *inside*
+  the body, for two reasons that are both HOP-contract limits rather than
+  anything about the collective:
+
+    * a closed-over `DeviceMesh` is lifted as an extra HOP operand, and `scan`'s
+      additional-inputs contract accepts only `Tensor | int | SymInt`, so the
+      mesh arrives as a `FakeScriptObject` and the call dies;
+    * `replicate_compute` reads `x._spec` to pick its branch, which Dynamo
+      cannot wrap while tracing the sourceless combine_fn ("SourcelessBuilder
+      .create does not know how to wrap DTensorSpec").
+
+  `torch.distributed._functional_collectives` takes the group as a plain `str`,
+  which bakes into the graph as a constant, so it is what the body uses. The
+  dtypes are still SimpleFSDP's -- a plain `funcol.all_gather_tensor` already
+  differentiates to a `reduce_scatter`, but it reduces in whatever dtype the
+  forward gathered in, and SimpleFSDP is deliberately asymmetric: gather in bf16
+  to halve comm volume, reduce in fp32 to keep the gradient accurate. No
+  composition of casts around a symmetric collective reproduces that.
+
+  Deleting this class needs upstream ask 4 in `README.md`.
+  """
+
+  @staticmethod
+  def forward(  # pylint: disable=arguments-differ
+      ctx: Any,
+      shard: torch.Tensor,
+      group_name: str,
+      param_dtype: torch.dtype | None,
+      reduce_dtype: torch.dtype | None,
+  ) -> torch.Tensor:
+    ctx.group_name = group_name
+    ctx.reduce_dtype = reduce_dtype
+    ctx.shard_dtype = shard.dtype
+    if param_dtype is not None:
+      shard = shard.to(param_dtype)
+    return funcol.all_gather_tensor(shard, gather_dim=0, group=group_name)
+
+  @staticmethod
+  def backward(ctx: Any, grad: torch.Tensor):  # pylint: disable=arguments-differ
+    if ctx.reduce_dtype is not None:
+      grad = grad.to(ctx.reduce_dtype)
+    out = funcol.reduce_scatter_tensor(
+        grad, reduceOp="sum", scatter_dim=0, group=ctx.group_name
+    )
+    return out.to(ctx.shard_dtype), None, None, None
+
+
 class ScannedLayerStack(Module):
   """A `ModuleDict`-compatible stand-in that runs its layers under `scan`.
 
@@ -118,28 +176,24 @@ class ScannedLayerStack(Module):
     self.n_layers = len(layers)
     self.peel_first_layer = peel_first_layer
     self.recompute_body = recompute_body
-    # Mangled name -> how to gather that parameter in the body. Empty until
-    # `shard_stacked_layers` runs; empty means "use the parameter as-is".
-    self._fsdp_plan: dict[str, ScanFSDPSpec] = {}
 
     per_layer = [dict(layer.named_parameters()) for layer in layers]
     self.param_fqns: list[str] = sorted(per_layer[0])
+    def signature(params: dict[str, nn.Parameter]) -> dict[str, tuple[int, ...]]:
+      return {fqn: tuple(p.shape) for fqn, p in params.items()}
+
     for i, params in enumerate(per_layer[1:], start=1):
-      if sorted(params) != self.param_fqns:
+      if signature(params) != signature(per_layer[0]):
         raise ValueError(
-            f"layer {i} has parameter FQNs {sorted(params)}, layer 0 has"
-            f" {self.param_fqns}; scan requires structurally identical layers."
+            f"layer {i} has parameters {signature(params)}, layer 0 has"
+            f" {signature(per_layer[0])}; scan requires structurally identical"
+            " layers. Dtypes are not checked -- no configuration this lane can"
+            " produce varies dtype across layers."
         )
-      for fqn in self.param_fqns:
-        if params[fqn].shape != per_layer[0][fqn].shape:
-          raise ValueError(
-              f"layer {i}.{fqn} has shape {tuple(params[fqn].shape)}, layer"
-              f" 0.{fqn} has {tuple(per_layer[0][fqn].shape)}."
-          )
 
     # Stack along dim 0, the scan axis. Dim 0 must never be sharded: slicing a
     # sharded axis inside the loop would force a dynamic collective per
-    # iteration. `fsdp.py` shards these on dim 1.
+    # iteration. `shard_stacked_layers` shards these on dim 1.
     for fqn in self.param_fqns:
       stacked = torch.stack([p[fqn].detach() for p in per_layer], dim=0)
       self.register_parameter(
@@ -177,9 +231,44 @@ class ScannedLayerStack(Module):
     """The `[n_layers, *shape]` parameters, in `param_fqns` order."""
     return [self._parameters[_mangle(fqn)] for fqn in self.param_fqns]  # pylint: disable=protected-access
 
-  def set_fsdp_plan(self, plan: dict[str, ScanFSDPSpec]) -> None:
-    """Installs the in-body gather plan; called by `shard_stacked_layers`."""
-    self._fsdp_plan = plan
+  def slice_specs(self) -> dict[str, tuple[DeviceMesh, Placement]]:
+    """`{mangled name: (mesh, placement)}` for the *per-layer* slice of each
+    stacked parameter, for the ones SimpleFSDP made DTensors.
+
+    The stack is sharded on dim 1 (dim 0 is the scan axis; slicing a sharded
+    axis inside the loop would need a dynamic collective per iteration), so
+    dropping the layer axis makes that dim 0 of the per-layer weight.
+
+    The placement is read back off each DTensor rather than assumed from the
+    mode, because `data_parallel` silently leaves a parameter `Replicate` when
+    its dim-1 extent does not divide the mesh. Wrapping such a slice as
+    `Shard(0)` would all-gather `mesh.size()` copies of a full weight -- wrong
+    numbers, no error, and no test at debugmodel scale would catch it.
+
+    Raises:
+      ValueError: on a mesh or placement the in-body gather cannot express.
+    """
+    specs: dict[str, tuple[DeviceMesh, Placement]] = {}
+    for name, param in self._parameters.items():  # pylint: disable=protected-access
+      if not isinstance(param, DTensor):
+        continue
+      mesh = param.device_mesh
+      if mesh.ndim != 1:
+        raise ValueError(
+            f"{name}: the in-body gather supports a 1-D dp mesh only (got"
+            f" {mesh.ndim}-D). SimpleFSDP's nD path collapses the mesh with a"
+            " to_local/from_local round-trip that has not been shown to trace"
+            " into a HOP body."
+        )
+      placement = param.placements[0]
+      if isinstance(placement, Shard) and placement.dim != 1:
+        raise ValueError(
+            f"{name} is sharded on dim {placement.dim}; the scan axis is dim 0"
+            " and the in-body gather assumes dim 1 (= dim 0 of the per-layer"
+            " weight)."
+        )
+      specs[name] = (mesh, Shard(0) if isinstance(placement, Shard) else Replicate())
+    return specs
 
   # -- device movement + initialization ----------------------------------------
 
@@ -252,17 +341,37 @@ class ScannedLayerStack(Module):
           " backward would silently zero every inter-layer gradient."
       )
 
-    template, fqns, plan = self.scan_template, self.param_fqns, self._fsdp_plan
+    template, fqns = self.scan_template, self.param_fqns
+    # The gather's dtypes come off SimpleFSDP's own parametrization -- the object
+    # behind the property that reading a parameter name would have triggered --
+    # so the bf16-gather / fp32-reduce asymmetry has one definition, not two.
+    # Its group is resolved to a plain `str` out here: see
+    # `_AllGatherReduceScatter` for why a `DeviceMesh` cannot cross into a body.
+    gather = getattr(self, "_simple_fsdp_parametrization_list", [None])[0]
+    groups = {
+        name: mesh.get_group().group_name if isinstance(placement, Shard) else None
+        for name, (mesh, placement) in self.slice_specs().items()
+    }
 
     def body(carry, params_slice):
       # One layer's slice of each stacked parameter. Under FSDP that slice is
-      # this rank's *shard* of the layer's weight and `gather_slice` issues the
-      # all-gather right here, inside the combine_fn, so it lowers into the
-      # `stablehlo.while` body and only the layer in flight is ever gathered.
-      params = {
-          fqn: gather_slice(params_slice[_mangle(fqn)], plan.get(_mangle(fqn)))
-          for fqn in fqns
-      }
+      # this rank's *shard* of the layer's weight, so the all-gather that turns
+      # it into the layer's full weight happens here, inside the combine_fn: it
+      # lowers into the `stablehlo.while` body and only the layer in flight is
+      # ever gathered.
+      params = {}
+      for fqn in fqns:
+        mangled = _mangle(fqn)
+        value = params_slice[mangled]
+        if mangled in groups:
+          group = groups[mangled]
+          if group is None:  # replicated by SimpleFSDP: cast, do not gather
+            value = value if gather.param_dtype is None else value.to(gather.param_dtype)
+          else:
+            value = _AllGatherReduceScatter.apply(
+                value, group, gather.param_dtype, gather.reduce_dtype
+            )
+        params[fqn] = value
       out = functional_call(template, params, (carry, *block_args))
       # `scan` requires a non-empty per-iteration output: returning `None` (or
       # any empty pytree) trips "all fw_gm output nodes must be torch.fx.Node
@@ -271,10 +380,11 @@ class ScannedLayerStack(Module):
       return out, out.new_zeros(())
 
     # `self._parameters`, NOT `getattr` -- see the module docstring. A DTensor
-    # cannot cross into the body either: the mesh it closes over is lifted as a
-    # `FakeScriptObject` HOP operand and `scan` takes only Tensor/int/SymInt. So
-    # hand it the local shard, whose `Shard(1)` gradient placement is exactly
-    # what `gather_slice`'s reduce-scatter backward produces.
+    # cannot cross into the body *as an operand* either: the mesh it closes over
+    # is lifted as a `FakeScriptObject` and `scan` takes only Tensor/int/SymInt.
+    # Rebuilding one inside the body from a plain-tensor operand is fine, which
+    # is what `body` does: `from_local` and `redistribute` are traced through,
+    # leaving only the functional collective behind.
     xs = {}
     for fqn in fqns:
       mangled = _mangle(fqn)
@@ -307,29 +417,6 @@ class ScannedLayerStack(Module):
       carry, _ = scan(body, h, xs)
     return carry
 
-  # -- state_dict adapter ------------------------------------------------------
-  # On disk we keep the *unrolled* FQNs, so a scanned run and an unrolled run
-  # share checkpoints in both directions.
-
-  def stacked_to_unrolled(self) -> dict[str, torch.Tensor]:
-    """Returns `{"<i>.<layer-relative fqn>": tensor}` -- the ModuleDict layout."""
-    return {
-        f"{i}.{fqn}": self._parameters[_mangle(fqn)][i]  # pylint: disable=protected-access
-        for fqn in self.param_fqns
-        for i in range(self.n_layers)
-    }
-
-  @torch.no_grad()
-  def load_unrolled(self, unrolled: dict[str, torch.Tensor]) -> None:
-    """Loads a `{"<i>.<layer-relative fqn>": tensor}` mapping into the stack."""
-    for fqn in self.param_fqns:
-      stacked = self._parameters[_mangle(fqn)]  # pylint: disable=protected-access
-      for i in range(self.n_layers):
-        key = f"{i}.{fqn}"
-        if key not in unrolled:
-          raise KeyError(f"missing {key} in unrolled state dict")
-        stacked[i].copy_(unrolled[key])
-
 
 def stack_layers(
     model: nn.Module,
@@ -358,4 +445,39 @@ def stack_layers(
   return model.layers
 
 
-__all__ = ["ScannedLayerStack", "stack_layers"]
+def shard_stacked_layers(
+    stack: ScannedLayerStack,
+    *,
+    dp_mesh: DeviceMesh,
+    dp_mode: str,
+    mp_policy: MixedPrecisionPolicy,
+) -> dict[str, tuple[DeviceMesh, Placement]]:
+  """Shards the stack on dim 1 so the body can gather one layer at a time.
+
+  Runs after SimpleFSDP has wrapped the rest of the model with the stacked
+  parameters ignored.
+
+  `data_parallel` is used here for its *sharding*: `distribute_tensor` plus
+  `OffsetBasedRNGTracker` is what keeps initialization bit-identical to a
+  single-device run. The all-gather it installs alongside is bypassed --
+  `forward` reads `self._parameters` and calls that same parametrization object
+  on one layer's slice inside the scan body instead.
+
+  Returns:
+    The per-layer slice specs, i.e. `stack.slice_specs()`, which is also called
+    here so an unsupported mesh or shard dim fails at wrap time rather than at
+    the first traced step.
+  """
+  data_parallel(stack, dp_mesh, mode=dp_mode, mp_policy=mp_policy, shard_dim=1)
+  specs = stack.slice_specs()
+  n_sharded = sum(isinstance(p, Shard) for _, p in specs.values())
+  logger.info(
+      "scan in-body FSDP: %d/%d stacked parameters gathered per layer inside"
+      " the scan body (the rest are replicated).",
+      n_sharded,
+      len(specs),
+  )
+  return specs
+
+
+__all__ = ["ScannedLayerStack", "stack_layers", "shard_stacked_layers"]

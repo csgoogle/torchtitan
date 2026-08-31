@@ -72,42 +72,14 @@ class ScanStructureTest(BaseAcceleratorDeviceTest):
   def test_rejects_layers_with_mismatched_shapes(self):
     model = scan_fixtures.ToyModel(2, DIM)
     model.layers["1"] = scan_fixtures.ToyBlock(DIM + 1)
-    with self.assertRaisesRegex(ValueError, "has shape"):
+    with self.assertRaisesRegex(ValueError, "structurally identical"):
       layer_stack.stack_layers(model)
 
   def test_rejects_layers_with_mismatched_fqns(self):
     model = scan_fixtures.ToyModel(2, DIM)
     model.layers["1"].extra = nn.Parameter(torch.zeros(1))
-    with self.assertRaisesRegex(ValueError, "parameter FQNs"):
+    with self.assertRaisesRegex(ValueError, "structurally identical"):
       layer_stack.stack_layers(model)
-
-  def test_stacked_to_unrolled_roundtrips(self):
-    """A scanned run and an unrolled run must share checkpoints both ways."""
-    before = {
-        f"{i}.{fqn}": p.detach().clone()
-        for i in range(N_LAYERS)
-        for fqn, p in self.model.layers[str(i)].named_parameters()
-    }
-    stack = layer_stack.stack_layers(self.model)
-
-    unrolled = stack.stacked_to_unrolled()
-    self.assertCountEqual(unrolled, before)
-    for key, want in before.items():
-      torch.testing.assert_close(unrolled[key].detach().cpu(), want.cpu())
-
-    perturbed = {k: v + 1.0 for k, v in before.items()}
-    stack.load_unrolled(perturbed)
-    for key, want in perturbed.items():
-      torch.testing.assert_close(
-          stack.stacked_to_unrolled()[key].detach().cpu(), want.cpu()
-      )
-
-  def test_load_unrolled_rejects_incomplete_state_dict(self):
-    stack = layer_stack.stack_layers(self.model)
-    unrolled = stack.stacked_to_unrolled()
-    unrolled.pop(next(iter(unrolled)))
-    with self.assertRaisesRegex(KeyError, "missing"):
-      stack.load_unrolled(unrolled)
 
 
 class ScanSemanticsTest(BaseAcceleratorDeviceTest):

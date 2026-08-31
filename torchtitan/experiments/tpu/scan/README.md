@@ -116,7 +116,7 @@ closures, so initialization binds layer *i*'s parameters to a view of
 Initialization is bit-identical to the unrolled model's, per layer, with no
 extra allocation.
 
-### FSDP inside the body -- `fsdp.py`
+### FSDP inside the body -- `layer_stack.py`
 
 This is the part that matters most at scale, and the easiest to break silently.
 
@@ -126,17 +126,30 @@ once* -- at 70B, 136.9 GB of bf16 weights against a 96 GB budget -- before the
 loop the gather was supposed to happen inside.
 
 So `ScannedLayerStack.forward` reads through `self._parameters[name]`, never
-`getattr`, and hands `scan` the local shard. A hand-rolled
-`_AllGatherReduceScatter` autograd function gathers one layer's slice inside
-the combine_fn, and peak gathered weight is one layer rather than eighty.
+`getattr`, and hands `scan` the local shard. `_AllGatherReduceScatter` gathers
+one layer's slice inside the combine_fn, so the collective lowers into the
+`stablehlo.while` body and peak gathered weight is one layer rather than eighty.
 
-It is hand-rolled rather than reusing SimpleFSDP's DTensor `redistribute`
-because **DTensor cannot run inside a scan body**: Dynamo lifts the closed-over
-`DeviceMesh` as an extra HOP operand, and the scan HOP's additional-inputs
-contract accepts only `Tensor | int | SymInt`, not the `FakeScriptObject` a mesh
-becomes. `torch.distributed._functional_collectives` is used instead -- its
-group is a plain `str`, which bakes into the graph. The all-gather is bf16 and
-the reduce-scatter fp32, matching SimpleFSDP's existing asymmetry.
+Calling SimpleFSDP's `ReplicateComputation` there instead -- which would delete
+the hand-rolled collective -- was tried and does not work. Two HOP-contract
+limits block it, both measured on 8 ranks:
+
+* a closed-over `DeviceMesh` is lifted as an extra HOP operand, and scan's
+  additional-inputs contract accepts only `Tensor | int | SymInt`, so the mesh
+  arrives as a `FakeScriptObject` and the call dies;
+* `replicate_compute` reads `x._spec` to choose its branch, which Dynamo cannot
+  wrap while tracing the sourceless combine_fn -- *"SourcelessBuilder.create
+  does not know how to wrap DTensorSpec"*.
+
+`torch.distributed._functional_collectives` is used instead: its group is a
+plain `str`, which bakes into the graph as a constant. The **dtypes** are still
+SimpleFSDP's, read off `module._simple_fsdp_parametrization_list[0]` rather than
+restated, so the deliberate bf16-gather / fp32-reduce asymmetry has one
+definition.
+
+`shard_stacked_layers` is the wrap-time half: `data_parallel(..., shard_dim=1)`
+for the sharding (dim 0 is the scan axis), then `slice_specs()` to reject any
+mesh or placement the in-body gather cannot express before the first step runs.
 
 ### Activation checkpointing -- `recompute.py`
 
@@ -224,16 +237,27 @@ optional, so there is none.
 
 ## Upstream asks
 
-Three changes would delete code here. None is required to use the feature.
+Four changes would delete code here. None is required to use the feature.
 
 1. **Preserve `node.meta["recompute"]` through the scan HOP's
    `materialize_as_graph`.** Deletes `recompute.py` and makes
    `torch.utils.checkpoint` around a scan body mean what it says.
-2. **A `reverse` argument on the scan HOP.** Deletes `reverse.py`, and fixes the
+2. **Let `HopGraphMinCutPartitioner.create_partitioned_graph` take a
+   `partition_fn`.** `HopJointGraph.partition` already accepts one
+   (`torch/_higher_order_ops/partitioner.py:281`); only the caller two frames
+   up hardcodes `min_cut_rematerialization_partition` (lines 356-380). Adding
+   the argument and forwarding it from `scan_autograd` is ~10 lines, and turns
+   `recompute.install()`'s process-global monkeypatch into a function argument.
+   The smaller companion: `must_recompute` at
+   `torch/_functorch/partitioners.py:162` should exclude `placeholder` nodes,
+   which is what the `NetworkXError` half of the strip works around.
+3. **A `reverse` argument on the scan HOP.** Deletes `reverse.py`, and fixes the
    `torch.flip` TODO upstream already carries.
-3. **Let the HOP's additional inputs carry a lifted `ScriptObject`.** A
+4. **Let the HOP's additional inputs carry a lifted `ScriptObject`.** A
    `DeviceMesh` would then survive into the body, and SimpleFSDP's own
-   `redistribute` path could replace most of `fsdp.py`.
+   `ReplicateComputation` could replace `_AllGatherReduceScatter`. Needs a
+   Dynamo fix alongside it: `SourcelessBuilder` cannot wrap a `DTensorSpec`, and
+   `replicate_compute` reads one to pick its branch.
 
 ## Tests
 

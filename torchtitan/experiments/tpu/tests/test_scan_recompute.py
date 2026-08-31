@@ -7,9 +7,9 @@
 """Moving the gather into the scan body only pays if it is recomputed.
 
 Without `scan/recompute.py` the min-cut partitioner saves the *gathered*
-per-layer weight as a scan `ys` residual and the memory win of `fsdp.py`
-evaporates -- the full weight set is resident again, stacked into one residual
-instead of N separate gathers.
+per-layer weight as a scan `ys` residual and the memory win of the in-body
+gather evaporates -- the full weight set is resident again, stacked into one
+residual instead of N separate gathers.
 
 `GatheredWeightIsNotSaved` is the measurement, on 8 real chips: it captures the
 partition of the real scan body and looks at what the forward hands the

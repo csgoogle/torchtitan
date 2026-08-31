@@ -6,8 +6,8 @@
 
 """One call to put a decoder's layers under a scan.
 
-The four pieces of this package have to run in one specific order, and two of
-the orderings are silent when you get them wrong:
+Three steps have to run in one specific order, and two of the orderings are
+silent when you get them wrong:
 
   1. Stack the layers, *before* anything walks `model.layers`. Activation
      checkpointing and FSDP both iterate the `ModuleDict`'s children, and the
@@ -57,7 +57,6 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from torchtitan.experiments.graph_trainer.simple_fsdp import MixedPrecisionPolicy
-from torchtitan.experiments.tpu.scan import fsdp as scan_fsdp
 from torchtitan.experiments.tpu.scan import layer_stack
 from torchtitan.experiments.tpu.scan import recompute as scan_recompute
 from torchtitan.experiments.tpu.scan import reverse as scan_reverse
@@ -158,7 +157,7 @@ def over_layers(
   yield stack
 
   if dp_mesh is not None:
-    scan_fsdp.shard_stacked_layers(
+    layer_stack.shard_stacked_layers(
         stack, dp_mesh=dp_mesh, dp_mode=dp_mode, mp_policy=mp_policy
     )
   logger.info(
