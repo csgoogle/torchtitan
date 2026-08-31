@@ -48,8 +48,8 @@ xpk workload create \
   --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
   --command="torchrun \
-    --nnodes=4 \
-    --nproc_per_node=64 \
+    --nnodes=64 \
+    --nproc_per_node=4 \
     --rdzv_backend=static \
     --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
     --node_rank=\$TPU_WORKER_ID \
