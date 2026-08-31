@@ -27,7 +27,7 @@ We are running with the following key optimizations built into the configuration
 - **Activation Checkpointing**: FullAC (`SelectiveAC` causes OOM on v6e due to XLA activation limits).
 - **Compile Mode**: Layer-by-layer compilation (`compile_mode="layer"`).
 - **Precision**: `float32` reduction precision.
-- **Loss Kernel & Splash Attention**: Both enabled.
+- **Loss Kernel & Splash Attention**: Both enabled (SA block sizes updated to 1024 for all blocks).
 
 ## Training Command
 ```bash
