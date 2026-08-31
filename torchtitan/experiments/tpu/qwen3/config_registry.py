@@ -327,6 +327,7 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
   cfg.training.local_batch_size = 6
   cfg.training.global_batch_size = 768
   cfg.training.seq_len = 2048
