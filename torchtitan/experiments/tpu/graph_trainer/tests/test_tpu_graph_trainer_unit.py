@@ -1,7 +1,9 @@
 """Unit tests for TpuGraphTrainer (tracing, loss override, and config wiring)."""
 
+from types import SimpleNamespace
 import typing
 import unittest
+from unittest import mock
 
 from absl.testing import absltest
 import torch
@@ -16,6 +18,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
+from torchtitan.experiments.tpu.graph_trainer import mfu_benchmark
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
 from torchtitan.experiments.tpu.graph_trainer import tpu_graph_trainer
 from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
@@ -48,6 +51,43 @@ def _make_dummy_fwd_bwd_step(loss_fn: nn.Module, model: nn.Module):
     return [loss] + list(grads)
 
   return fwd_bwd_fn
+
+
+class MfuBenchmarkTest(absltest.TestCase):
+
+  def test_mfu_benchmark_bracket(self) -> None:
+    metrics = SimpleNamespace(
+        parallel_dims=SimpleNamespace(non_data_parallel_size=1),
+        num_flops_per_token=2e9,
+        gpu_peak_flops=100e12,
+        should_log=lambda step: step in (5, 7),
+    )
+    messages: list[str] = []
+    with (
+        mock.patch.object(
+            mfu_benchmark.time,
+            "perf_counter",
+            side_effect=(10.0, 17.0),
+        ),
+        mock.patch.object(
+            mfu_benchmark.logger,
+            "info",
+            side_effect=lambda message, *args: messages.append(message % args),
+        ),
+    ):
+      benchmark = mfu_benchmark.MfuBenchmark(metrics, 5, 7)
+      benchmark.record(5, 100)
+      benchmark.record(6, 200)
+      benchmark.record(7, 300)
+
+    self.assertEqual(
+        messages,
+        [
+            "[mfu_benchmark] start_step=5 final_step=7 measured_steps=2 "
+            "wall=7.000000s mean_step_time=3.500000s tokens_per_rank=200 "
+            "tflops=0.057143 mfu=0.057143%"
+        ],
+    )
 
 
 class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
@@ -192,6 +232,7 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
         eps=1e-8,
         weight_decay=0.1,
         max_norm=1.0,
+        capturable=False,
     )
 
     inputs = torch.randint(0, 128, (2, 16), device=device)

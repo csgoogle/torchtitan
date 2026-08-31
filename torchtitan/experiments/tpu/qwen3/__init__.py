@@ -13,7 +13,10 @@ from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
 
+from .model import MaxTextQwen3Config
+
 __all__ = [
+    "MaxTextQwen3Config",
     "parallelize_qwen3",
     "qwen3_configs",
     "qwen3_debugmodel",
@@ -21,12 +24,12 @@ __all__ = [
     "model_registry",
 ]
 
-def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
+def _testmodel(attn_backend: str = "sdpa") -> MaxTextQwen3Config:
     dim = 128
     head_dim = 16
     n_layers = 3
     vocab_size = 2048
-    return qwen3_models.Qwen3Model.Config(
+    return MaxTextQwen3Config(
         vocab_size=vocab_size,
         dim=dim,
         norm=qwen3_models._qwen3_norm(dim),
@@ -64,12 +67,12 @@ def _testmodel(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
 def _testmodel_moe(
     attn_backend: str = "sdpa",
     moe_comm_backend: str = "standard",
-) -> qwen3_models.Qwen3Model.Config:
+) -> MaxTextQwen3Config:
     dim = 128
     head_dim = 16
     n_layers = 3
     vocab_size = 2048
-    return qwen3_models.Qwen3Model.Config(
+    return MaxTextQwen3Config(
         vocab_size=vocab_size,
         dim=dim,
         norm=qwen3_models._qwen3_norm(dim),
@@ -104,7 +107,7 @@ def _testmodel_moe(
     )
 
 
-def _8b_tpu(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
+def _8b_tpu(attn_backend: str = "sdpa") -> MaxTextQwen3Config:
     """TPU-specific Qwen3 8B model configuration.
 
     Differs from the baseline models/qwen3/_8b config by setting fuse_qkv=False
@@ -114,7 +117,7 @@ def _8b_tpu(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
     head_dim = 128
     n_layers = 36
     vocab_size = 151936
-    return qwen3_models.Qwen3Model.Config(
+    return MaxTextQwen3Config(
         vocab_size=vocab_size,
         dim=dim,
         norm=qwen3_models._qwen3_norm(dim),
@@ -151,14 +154,28 @@ def _8b_tpu(attn_backend: str = "sdpa") -> qwen3_models.Qwen3Model.Config:
 qwen3_configs = {
     "testmodel": _testmodel("sdpa"),
     "testmodel_moe": _testmodel_moe("sdpa"),
-    "debugmodel": qwen3_models.qwen3_configs["debugmodel"]("sdpa"),
-    "debugmodel_moe": qwen3_models.qwen3_configs["debugmodel_moe"]("sdpa"),
-    "0.6B": qwen3_models.qwen3_configs["0.6B"]("sdpa"),
-    "1.7B": qwen3_models.qwen3_configs["1.7B"]("sdpa"),
-    "4B": qwen3_models.qwen3_configs["4B"]("sdpa"),
+    "debugmodel": MaxTextQwen3Config.from_qwen3(
+        qwen3_models.qwen3_configs["debugmodel"]("sdpa")
+    ),
+    "debugmodel_moe": MaxTextQwen3Config.from_qwen3(
+        qwen3_models.qwen3_configs["debugmodel_moe"]("sdpa")
+    ),
+    "0.6B": MaxTextQwen3Config.from_qwen3(
+        qwen3_models.qwen3_configs["0.6B"]("sdpa")
+    ),
+    "1.7B": MaxTextQwen3Config.from_qwen3(
+        qwen3_models.qwen3_configs["1.7B"]("sdpa")
+    ),
+    "4B": MaxTextQwen3Config.from_qwen3(
+        qwen3_models.qwen3_configs["4B"]("sdpa")
+    ),
     "8B": _8b_tpu("sdpa"),
-    "32B": qwen3_models.qwen3_configs["32B"]("sdpa"),
-    "30B-A3B": qwen3_models.qwen3_configs["30B-A3B"]("sdpa"),
+    "32B": MaxTextQwen3Config.from_qwen3(
+        qwen3_models.qwen3_configs["32B"]("sdpa")
+    ),
+    "30B-A3B": MaxTextQwen3Config.from_qwen3(
+        qwen3_models.qwen3_configs["30B-A3B"]("sdpa")
+    ),
 }
 
 def qwen3_debugmodel():
@@ -208,10 +225,13 @@ def model_registry(
         post_optimizer_build_fn=qwen3_models.register_moe_load_balancing_hook,
         state_dict_adapter=Qwen3StateDictAdapter,
     )
-  # Other models do not have TPU specific changes, use upstream model_registry.
-  return qwen3_models.model_registry(
+  # Reuse the upstream model specification and change only its FLOP accounting.
+  model_spec = qwen3_models.model_registry(
       flavor,
       attn_backend=attn_backend,
       moe_comm_backend=moe_comm_backend,
       converters=converters,
   )
+  assert isinstance(model_spec.model, Qwen3Model.Config)
+  model_spec.model = MaxTextQwen3Config.from_qwen3(model_spec.model)
+  return model_spec

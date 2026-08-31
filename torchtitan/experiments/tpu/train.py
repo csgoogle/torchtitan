@@ -211,6 +211,9 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
         optimizer_in_graph=train_config.tpu_config.optimizer_in_graph,
         optimizer_compile=train_config.tpu_config.compile_optimizer,
         compile_mode=train_config.tpu_config.compile_mode,
+        enable_mfu_benchmark=train_config.tpu_config.enable_mfu_benchmark,
+        mfu_benchmark_start_step=train_config.tpu_config.mfu_benchmark_start_step,
+        mfu_benchmark_final_step=train_config.training.steps,
         job_config=train_config,
     )
 
