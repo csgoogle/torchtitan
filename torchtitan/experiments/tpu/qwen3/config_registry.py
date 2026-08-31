@@ -188,6 +188,82 @@ def qwen3_1_7b() -> TPUTrainerConfig:
   )
 
 
+def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
+  """Qwen3 8B model configuration for TPU (regular trainer)."""
+  model_spec = model_registry("8B", attn_backend="sdpa")
+  model_config = cast(Qwen3Model.Config, model_spec.model)
+  model_config.enable_weight_tying = False
+  model_config.tok_embeddings.param_init = {
+      "weight": partial(nn.init.normal_, std=1.0)
+  }
+  model_spec.parallelize_fn = tpu_parallelize_qwen3
+
+  return TPUTrainerConfig(
+      loss=CrossEntropyLoss.Config(),
+      hf_assets_path="./tests/assets/tokenizer",
+      model_spec=model_spec,
+      optimizer=default_adamw(lr=8e-4),
+      lr_scheduler=LRSchedulersContainer.Config(
+          warmup_steps=600,
+          decay_ratio=0.8,
+          decay_type="linear",
+          min_lr_factor=0.0,
+      ),
+      training=TrainingConfig(
+          max_norm=1.0,
+          local_batch_size=6,
+          seq_len=2048,
+          steps=15,
+          mixed_precision_reduce="float32",
+      ),
+      dataloader=HuggingFaceTextDataLoader.Config(
+          dataset="c4_test",
+      ),
+      metrics=MetricsProcessor.Config(log_freq=1),
+      parallelism=ParallelismConfig(
+          use_simple_fsdp=True,
+          enable_tpu_topo_mesh=True,
+      ),
+      checkpoint=CheckpointManager.Config(
+          enable=False,
+          interval=500,
+          last_save_model_only=False,
+      ),
+      activation_checkpoint=FullAC.Config(),
+      tpu_config=TPUConfig(
+          eager_mode="DEFER_AND_FUSE",
+          use_graph_split=True,
+          use_jax_profiler=True,
+          compile_mode="layer",
+      ),
+      compile=CompileConfig(
+          enable=True,
+          backend="tpu",
+          components=["model"],
+      ),
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          use_splash_attention_kernel=True,
+          sa_block_q=1024,
+          sa_block_kv=1024,
+          sa_block_dkv=1024,
+          sa_block_kv_compute=1024,
+          sa_block_q_dkv=1024,
+          sa_block_kv_dkv=1024,
+          sa_block_kv_dkv_compute=1024,
+          sa_block_q_dq=1024,
+          sa_block_kv_dq=1024,
+      ),
+      loss_kernel=LossKernelConfig(
+          use_loss_kernel=True,
+      ),
+      validator=Validator.Config(
+          enable=False,
+          freq=5,
+          steps=10,
+      ),
+  )
+
+
 def qwen3_8b() -> TPUTrainerConfig:
   """Qwen3 8B model configuration for TPU."""
   model_spec = model_registry("8B", attn_backend="sdpa")
@@ -396,77 +472,3 @@ def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
   model_config.layers = model_config.layers[:4]
   return cfg
 
-def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
-  """Qwen3 8B model configuration for TPU (regular trainer)."""
-  model_spec = model_registry("8B", attn_backend="sdpa")
-  model_config = cast(Qwen3Model.Config, model_spec.model)
-  model_config.enable_weight_tying = False
-  model_config.tok_embeddings.param_init = {
-      "weight": partial(nn.init.normal_, std=1.0)
-  }
-  model_spec.parallelize_fn = tpu_parallelize_qwen3
-
-  return TPUTrainerConfig(
-      loss=CrossEntropyLoss.Config(),
-      hf_assets_path="./tests/assets/tokenizer",
-      model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4),
-      lr_scheduler=LRSchedulersContainer.Config(
-          warmup_steps=600,
-          decay_ratio=0.8,
-          decay_type="linear",
-          min_lr_factor=0.0,
-      ),
-      training=TrainingConfig(
-          max_norm=1.0,
-          local_batch_size=6,
-          seq_len=2048,
-          steps=15,
-          mixed_precision_reduce="float32",
-      ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
-      metrics=MetricsProcessor.Config(log_freq=1),
-      parallelism=ParallelismConfig(
-          use_simple_fsdp=True,
-          enable_tpu_topo_mesh=True,
-      ),
-      checkpoint=CheckpointManager.Config(
-          enable=False,
-          interval=500,
-          last_save_model_only=False,
-      ),
-      activation_checkpoint=FullAC.Config(),
-      tpu_config=TPUConfig(
-          eager_mode="DEFER_AND_FUSE",
-          use_graph_split=True,
-          use_jax_profiler=True,
-          compile_mode="layer",
-      ),
-      compile=CompileConfig(
-          enable=True,
-          backend="tpu",
-          components=["model"],
-      ),
-      splash_attention_kernel=SplashAttentionKernelConfig(
-          use_splash_attention_kernel=True,
-          sa_block_q=1024,
-          sa_block_kv=1024,
-          sa_block_dkv=1024,
-          sa_block_kv_compute=1024,
-          sa_block_q_dkv=1024,
-          sa_block_kv_dkv=1024,
-          sa_block_kv_dkv_compute=1024,
-          sa_block_q_dq=1024,
-          sa_block_kv_dq=1024,
-      ),
-      loss_kernel=LossKernelConfig(
-          use_loss_kernel=True,
-      ),
-      validator=Validator.Config(
-          enable=False,
-          freq=5,
-          steps=10,
-      ),
-  )
