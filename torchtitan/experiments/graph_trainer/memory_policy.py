@@ -66,6 +66,19 @@ def _find_fsdp_unshard_save_nodes(gm: torch.fx.GraphModule) -> set[torch.fx.Node
     return save_nodes
 
 
+def _configured_fsdp_force_save_nodes(
+    gm: torch.fx.GraphModule,
+    config: "GraphTrainer.Config",
+) -> set[torch.fx.Node] | None:
+    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
+        config.parallelism.fsdp_reshard_after_forward,
+        pp_enabled=config.parallelism.pipeline_parallel_degree > 1,
+    )
+    if reshard_after_forward:
+        return None
+    return _find_fsdp_unshard_save_nodes(gm)
+
+
 def _make_full_memory_policy() -> Callable:
     """Full recompute policy: mark everything as MUST_RECOMPUTE.
 
@@ -276,17 +289,10 @@ def _default_memory_policy_pass(
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
     """SAC policy that saves compute-intensive ops and required FSDP unshards."""
-    fsdp_reshard_after_forward = get_fsdp_reshard_after_forward_policy(
-        config.parallelism.fsdp_reshard_after_forward,
-        pp_enabled=config.parallelism.pipeline_parallel_degree > 1,
-    )
-    force_save_nodes = (
-        _find_fsdp_unshard_save_nodes(gm) if not fsdp_reshard_after_forward else None
-    )
     tag_sac_policy(
         gm,
         policy_fn=_make_default_memory_policy(),
-        force_save_nodes=force_save_nodes,
+        force_save_nodes=_configured_fsdp_force_save_nodes(gm, config),
     )
     return gm
 
@@ -298,7 +304,11 @@ def _full_memory_policy_pass(
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
     """Full recompute: only layer outputs are saved."""
-    tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
+    tag_sac_policy(
+        gm,
+        policy_fn=_make_full_memory_policy(),
+        force_save_nodes=_configured_fsdp_force_save_nodes(gm, config),
+    )
     return gm
 
 
@@ -309,7 +319,11 @@ def _eager_memory_policy_pass(
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
     """SAC policy that alternates mm ops between save/recompute."""
-    tag_sac_policy(gm, policy_fn=_make_eager_memory_policy())
+    tag_sac_policy(
+        gm,
+        policy_fn=_make_eager_memory_policy(),
+        force_save_nodes=_configured_fsdp_force_save_nodes(gm, config),
+    )
     return gm
 
 

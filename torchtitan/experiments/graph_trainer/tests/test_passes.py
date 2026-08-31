@@ -92,6 +92,7 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     _make_default_memory_policy,
     _make_full_memory_policy,
     tag_sac_policy,
+    tag_with_memory_policy_pass,
 )
 from torchtitan.experiments.graph_trainer.passes import (
     compile_time_passes,
@@ -1450,7 +1451,35 @@ class TestApplySACPass(TestCase):
         self.assertEqual(rs_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
         self.assertEqual(wait_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
-    def test_default_policy_saves_fsdp_unshard_when_not_resharding(self):
+    def test_all_memory_policies_honor_fsdp_reshard_setting(self):
+        for memory_policy in ("default", "full", "eager"):
+            for reshard_after_forward, pp_degree, expect_save in (
+                ("never", 1, True),
+                ("default", 2, True),
+                ("always", 1, False),
+            ):
+                with self.subTest(
+                    memory_policy=memory_policy,
+                    reshard_after_forward=reshard_after_forward,
+                    pp_degree=pp_degree,
+                ):
+                    gm, _all_gather, wait, _view = self._fsdp_unshard_test_graph()
+                    config = SimpleNamespace(
+                        compile=SimpleNamespace(memory_policy=memory_policy),
+                        parallelism=SimpleNamespace(
+                            fsdp_reshard_after_forward=reshard_after_forward,
+                            pipeline_parallel_degree=pp_degree,
+                        ),
+                    )
+
+                    tag_with_memory_policy_pass(gm, config=config)
+
+                    self.assertEqual(
+                        wait.meta["recompute"] == CheckpointPolicy.MUST_SAVE,
+                        expect_save,
+                    )
+
+    def test_default_policy_resolves_fsdp_reshard_setting(self):
         """Saves the helper-selected FSDP unshard output only when needed."""
         cases = (
             ("never", 1, CheckpointPolicy.MUST_SAVE),
@@ -1472,13 +1501,14 @@ class TestApplySACPass(TestCase):
                     view,
                 ) = self._fsdp_unshard_test_graph()
                 config = SimpleNamespace(
+                    compile=SimpleNamespace(memory_policy="default"),
                     parallelism=SimpleNamespace(
                         fsdp_reshard_after_forward=reshard_after_forward,
                         pipeline_parallel_degree=pp_degree,
                     )
                 )
 
-                _default_memory_policy_pass(gm, config=config)
+                tag_with_memory_policy_pass(gm, config=config)
 
                 self.assertEqual(
                     all_gather.meta["recompute"],

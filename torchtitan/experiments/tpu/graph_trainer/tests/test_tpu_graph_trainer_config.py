@@ -31,6 +31,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
     qwen3_moe_30b,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
+    qwen3_moe_30b_fsdp_only_full_ac_profile,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
@@ -122,6 +123,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         config.tpu_config.graph_trainer_memory_policy,
         "default",
     )
+    self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "never")
 
     graph_config = to_tpu_graph_trainer_config(
         config,
@@ -146,6 +148,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_8b()
 
     self.assertFalse(config.tpu_config.enable_fused_optimizer)
+
+  def test_qwen3_30b_fsdp_profile_explicitly_uses_zero2(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_full_ac_profile()
+
+    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
+    self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "never")
 
   def test_remat_schedule_supports_optimizer_in_graph(self) -> None:
     config = qwen3_8b()
