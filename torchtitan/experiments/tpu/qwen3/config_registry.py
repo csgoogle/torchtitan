@@ -430,6 +430,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
+          enable_tpu_topo_mesh=True,
       ),
       checkpoint=CheckpointManager.Config(
           enable=False,
