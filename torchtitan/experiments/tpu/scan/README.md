@@ -274,15 +274,17 @@ two monkeypatches.
    reproducer is fifteen lines on CPU and needs no accelerator. Deletes
    `recompute.py`.
 
-   Worth testing before asking: the *selective* AC path
-   (`create_selective_checkpoint_contexts`) does not go through Dynamo. It tags
-   from a `TorchDispatchMode` that writes `fx_traceback.current_meta`
-   (`torch/utils/checkpoint.py:1345`), and `materialize_as_graph` calls
-   `_disable_current_modes()` *before* running the body, so a mode entered
-   inside the body should survive. Tagging by dispatch would also hit exactly
-   the body's `call_function` nodes -- no placeholders, no outer `scan` node,
-   so no strip. If that works, most of `recompute.py` goes away with no
-   upstream change at all.
+   The *selective* AC path is the obvious way around this, and it was tested
+   rather than assumed: `create_selective_checkpoint_contexts` does not go
+   through Dynamo, tagging instead from a `TorchDispatchMode` that writes
+   `fx_traceback.current_meta` (`torch/utils/checkpoint.py:1345`). It fails too,
+   for a second and unrelated reason -- node-meta preservation is off for the
+   body re-trace, so the writes go nowhere, and turning it on from inside the
+   body is rejected by the HOP as an unsafe side effect.
+   `tests/test_scan_body_checkpoint.py` is the measurement: on the real HOP
+   path, the ambient window tags 14 of 14 body nodes and SAC tags 0 of 19. So
+   this ask covers both flavours, and there is no way around it from the
+   caller's side.
 
 2. **Let `HopGraphMinCutPartitioner.create_partitioned_graph` take a
    `partition_fn`.** `HopJointGraph.partition` already accepts one
@@ -320,6 +322,8 @@ IMG=<image> TT=<repo root> NPROC=8 ./run_in_container.sh \
 IMG=<image> TT=<repo root> NPROC=8 ./run_in_container.sh \
     torchtitan.experiments.tpu.tests.test_scan_recompute    --device=tpu --num_devices=8
 IMG=<image> TT=<repo root> NPROC=1 ./run_in_container.sh \
+    torchtitan.experiments.tpu.tests.test_scan_body_checkpoint
+IMG=<image> TT=<repo root> NPROC=1 ./run_in_container.sh \
     torchtitan.experiments.tpu.tests.test_scan_reverse      --device=tpu
 IMG=<image> TT=<repo root> NPROC=1 ./run_in_container.sh \
     torchtitan.experiments.tpu.tests.test_scan_integration  --device=tpu
@@ -332,6 +336,7 @@ IMG=<image> TT=<repo root> NPROC=1 ./run_in_container.sh \
 | `test_scan_stack` | one copy of the body in the graph; stacked parameters; init parity; the `.values()` compatibility contract |
 | `test_scan_fsdp` | gathers inside the body and none above it; real 8-rank gradient parity against a global-batch reference |
 | `test_scan_recompute` | the gathered weights do not cross the forward/backward boundary; the ambient tag reaches the body and is stripped off the nodes that must not carry it |
+| `test_scan_body_checkpoint` | neither flavour of `torch.utils.checkpoint` tags a scan body -- the evidence for upstream ask 1, and the tripwire that tells us when it lands |
 | `test_scan_reverse` | reverse-scan semantics vs a Python loop; the TPU lowering agrees; the rewrite is gradient-neutral |
 | `test_scan_integration` | the adoption API's ordering and guards; `--tpu-config.use-scan` reaching both lanes |
 | `test_rope_real_arithmetic` | the real rewrite is bit-identical to the complex multiply |
