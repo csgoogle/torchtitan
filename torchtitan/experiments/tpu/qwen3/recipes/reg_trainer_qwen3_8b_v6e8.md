@@ -46,9 +46,9 @@ xpk workload create \
   --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
   --command="export PYTHONPATH=/app:\$PYTHONPATH && cd /app && WORKERS=(${TPU_WORKER_HOSTNAMES//,/ }) && MASTER_ADDR=\$WORKERS_0_HOSTNAME && torchrun \
-    --nnodes=1 \
-    --nproc_per_node=8 \
-    --rdzv_backend=c10d \
+    --nnodes=2 \
+    --nproc_per_node=4 \
+    --rdzv_backend=static \
     --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
@@ -60,7 +60,7 @@ xpk workload create \
 
 With this configuration, you should observe the following metrics at step 15:
 
-- **TPS (Tokens per second)**: ~5,381
-- **MFU**: ~28.74%
-- **Step Time**: ~2.28s
+- **TPS (Tokens per second)**: 5,253
+- **MFU**: 28.06%
+- **Step Time**: 2.34s
 - **HBM Peak**: ~32GB (Saturated)
