@@ -17,10 +17,15 @@ from typing import Any, Callable
 
 import torch
 
+from torchtitan.experiments.graph_trainer.fsdp_passes import (
+    schedule_fsdp_comms_to_dense_regions_pass,
+)
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+    apply_tpu_fsdp_rs_deadline_schedule,
+    apply_tpu_remat_fsdp_all_gather_schedule,
     apply_tpu_remat_schedule,
 )
 from torchtitan.tools.logging import logger
@@ -123,6 +128,15 @@ def construct_tpu_pass_pipeline(
     passes: list[Callable] = [remove_parameter_gradient_markers_pass]
 
     memory_policy = getattr(config.compile, "memory_policy", "none")
+    fsdp_schedule = config.tpu_config.graph_trainer_fsdp_schedule
+    if fsdp_schedule != "none" and (
+        memory_policy in (None, "none")
+        or not config.tpu_config.enable_graph_trainer_remat_schedule
+    ):
+        raise ValueError(
+            "graph_trainer_fsdp_schedule requires GraphTrainer rematerialization"
+        )
+
     if memory_policy and memory_policy != "none":
         from torchtitan.experiments.graph_trainer.passes import (
             selective_activation_remat_pass,
@@ -143,6 +157,16 @@ def construct_tpu_pass_pipeline(
                     num_static_inputs=traced_result.num_static_inputs,
                 )
             )
+            if fsdp_schedule != "none":
+                passes.append(
+                    functools.partial(
+                        apply_tpu_remat_fsdp_all_gather_schedule,
+                        num_static_inputs=traced_result.num_static_inputs,
+                        prefetch_distance=(
+                            config.tpu_config.graph_trainer_fsdp_prefetch_distance
+                        ),
+                    )
+                )
         logger.info(
             f"[tpu_backend_pass] activation checkpointing enabled "
             f"(memory_policy={memory_policy!r}); prepended "
@@ -153,6 +177,33 @@ def construct_tpu_pass_pipeline(
         apply_combine_barrier_pass,
     )
     passes.append(apply_combine_barrier_pass)
+
+    if fsdp_schedule != "none":
+        model_config = config.model_spec.model
+        n_layers = len(model_config.layers)
+        # TransformerBlock.Config exposes ``moe`` independently of the concrete
+        # expert implementation, including TPU-converted GroupedExperts.
+        moe_layer_ids = frozenset(
+            index
+            for index, layer in enumerate(model_config.layers)
+            if layer.moe is not None
+        )
+        passes.append(
+            functools.partial(
+                schedule_fsdp_comms_to_dense_regions_pass,
+                moe_layer_ids=moe_layer_ids,
+                n_layers=n_layers,
+                strict=False,
+            )
+        )
+        if fsdp_schedule == "interleave":
+            passes.append(
+                functools.partial(
+                    apply_tpu_fsdp_rs_deadline_schedule,
+                    n_layers=n_layers,
+                    strict=False,
+                )
+            )
 
     passes.append(tpu_backend_compile_pass)
     return passes
