@@ -162,10 +162,22 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
 
             self.__class__.load_weights_from_state_dict_on_worker = load_weights_from_state_dict_on_worker
             
-            if os.path.exists(vllm_args_path):
+            ms_args = None
+            if "VLLM_TORCHTITAN_MODEL_SPEC_B64" in os.environ:
+                try:
+                    import base64
+                    ms_args = pickle.loads(base64.b64decode(os.environ["VLLM_TORCHTITAN_MODEL_SPEC_B64"]))
+                except Exception as e:
+                    logger.error(f"Failed to load TorchTitan args from env var: {e}")
+            if ms_args is None and os.path.exists(vllm_args_path):
                 try:
                     with open(vllm_args_path, "rb") as f:
-                        ms_spec, c_config, gen_config = pickle.load(f)
+                        ms_args = pickle.load(f)
+                except Exception as e:
+                    logger.error(f"Failed to load TorchTitan args from file: {e}")
+            if ms_args is not None:
+                try:
+                    ms_spec, c_config, gen_config = ms_args
                     register_to_vllm(
                         ms_spec,
                         parallelism=gen_config.parallelism,
@@ -174,7 +186,7 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
                         override=gen_config.override,
                     )
                 except Exception as e:
-                    logger.error(f"Failed to load TorchTitan args: {e}")
+                    logger.error(f"Failed to register TorchTitan model on worker: {e}")
             
             # [TPU HACK]: Restore TPU Pallas attention backend in worker process after register_to_vllm imports attention.py
             try:
@@ -230,9 +242,17 @@ class RayVLLMGenerator:
         # Apply all TPU patches and hacks to vLLM & torchtpu-vllm
         patch_vllm_for_tpu(VLLM_ARGS_PATH)
 
-        # Teleport configs to Ray workers using VLLM_ARGS_PATH file
-        with open(VLLM_ARGS_PATH, "wb") as f:
-            pickle.dump((model_spec, compile_config, config), f)
+        # Teleport configs to Ray workers: in-memory env var first, with the
+        # VLLM_ARGS_PATH file as a shared-filesystem fallback.
+        import base64
+        os.environ["VLLM_TORCHTITAN_MODEL_SPEC_B64"] = base64.b64encode(
+            pickle.dumps((model_spec, compile_config, config))
+        ).decode("ascii")
+        try:
+            with open(VLLM_ARGS_PATH, "wb") as f:
+                pickle.dump((model_spec, compile_config, config), f)
+        except Exception as e:
+            logger.warning(f"Could not write fallback vllm args file: {e}")
 
         # [TPU HACK] Monkey patch VLLMGenerator to support Ray weight transfer in engine loop
         import torchtitan.experiments.rl.actors.generator as gen_mod

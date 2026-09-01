@@ -191,6 +191,16 @@ class RayController(Controller):
         generator_compile_config = copy.deepcopy(config.compile)
         generator_compile_config.enable = False
 
+        # In-memory model spec propagation: carry the same payload as the
+        # VLLM_ARGS_PATH pickle in the actor's runtime env, so workers do not
+        # depend on a filesystem path shared across hosts (and cannot pick up
+        # a stale file from a previous run with a different model).
+        import base64
+        import pickle
+        generator_env_vars["VLLM_TORCHTITAN_MODEL_SPEC_B64"] = base64.b64encode(
+            pickle.dumps((config.model_spec, generator_compile_config, config.generator))
+        ).decode("ascii")
+
         async_loop = config.async_loop
         max_active_rollout_groups = (
             async_loop.max_offpolicy_steps + 1
