@@ -30,6 +30,7 @@ from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
     qwen3_moe_30b,
+    qwen3_moe_30b_fsdp_only_full_ac_benchmark,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
@@ -128,6 +129,23 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         target_cls=TpuGraphTrainer.Config,
     )
     self.assertEqual(graph_config.compile.memory_policy, "default")
+
+  def test_fsdp_only_recipe_uses_fused_adamw(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+
+    self.assertEqual(config.optimizer.implementation, "fused")
+    self.assertTrue(config.tpu_config.enable_fused_optimizer)
+    self.assertEqual(config.splash_attention_kernel.sa_q_layout, "SEQ_MINOR")
+    self.assertEqual(config.splash_attention_kernel.sa_k_layout, "SEQ_MINOR")
+    self.assertEqual(
+        config.splash_attention_kernel.sa_v_layout,
+        "HEAD_DIM_MINOR",
+    )
+
+  def test_dense_recipe_does_not_enable_fused_adamw_on_tpu(self) -> None:
+    config = qwen3_8b()
+
+    self.assertFalse(config.tpu_config.enable_fused_optimizer)
 
   def test_remat_schedule_supports_optimizer_in_graph(self) -> None:
     config = qwen3_8b()

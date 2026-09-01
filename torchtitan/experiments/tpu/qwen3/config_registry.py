@@ -281,6 +281,8 @@ def qwen3_8b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
+      # Keep the established dense optimizer path until native fused AdamW has
+      # a dedicated long-convergence validation for this recipe.
       optimizer=default_adamw(lr=8e-4),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
@@ -414,9 +416,11 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
       compile_mode="aot_fx_trace",
       graph_trainer_memory_policy="full",
       enable_graph_trainer_remat_schedule=True,
+      enable_fused_optimizer=True,
       compile_optimizer=False,
       optimizer_in_graph=False,
   )
+  cfg.optimizer.implementation = "fused"
   cfg.compile = CompileConfig(
       enable=True,
       backend="tpu",
@@ -424,6 +428,8 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   )
   cfg.splash_attention_kernel = SplashAttentionKernelConfig(
       use_splash_attention_kernel=True,
+      sa_q_layout="SEQ_MINOR",
+      sa_k_layout="SEQ_MINOR",
       sa_block_q=1024,
       sa_block_kv=1024,
       sa_block_dkv=1024,
@@ -472,4 +478,3 @@ def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
   # Slice layers to only keep 4 layers to save memory and compile time
   model_config.layers = model_config.layers[:4]
   return cfg
-
