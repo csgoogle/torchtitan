@@ -1,4 +1,4 @@
-# Recipe for training Llama3-70B model on a 32 device TPU ironwood cluster (tpu7x-32)
+# Recipe for training Llama3-70B model on a 32 device (16 chip) TPU ironwood cluster (tpu7x-32)
 
 These are instructions for deploying Llama3-70B training to a 32 device (16 chip) tpu7x cluster using `xpk`.
 
@@ -50,7 +50,7 @@ export WORKLOAD_NAME="llama3-70b-tpu7x32-$(date +%Y%m%d-%H%M%S)"
 xpk workload create \
   --workload="$WORKLOAD_NAME" \
   --cluster="$CLUSTER_NAME" \
-  --tpu-type="tpu7x-32" \
+  --tpu-type="tpu7x-2x4x4" \
   --project="$PROJECT_ID" \
   --zone="$ZONE" \
   --no-use-parallel-containers \

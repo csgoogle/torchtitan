@@ -50,7 +50,7 @@ export WORKLOAD_NAME="llama3-70b-tpu7x64-$(date +%Y%m%d-%H%M%S)"
 xpk workload create \
   --workload="$WORKLOAD_NAME" \
   --cluster="$CLUSTER_NAME" \
-  --tpu-type="tpu7x-64" \
+  --tpu-type="tpu7x-2x4x4" \
   --project="$PROJECT_ID" \
   --zone="$ZONE" \
   --no-use-parallel-containers \
