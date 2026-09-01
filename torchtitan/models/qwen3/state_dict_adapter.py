@@ -27,6 +27,18 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
     def __init__(self, model_config: Qwen3Model.Config, hf_assets_path: str | None):
         super().__init__(model_config, hf_assets_path)
 
+        # Architectures without qk_norm (e.g. the TPU RL 1.7B variant) have no
+        # q_norm/k_norm modules, so only map those HF keys when the config has them.
+        has_qk_norm = model_config.layers[0].attention.qk_norm is not None
+        qk_norm_map: dict[str, str | None] = (
+            {
+                "model.layers.{}.self_attn.q_norm.weight": "layers.{}.attention.q_norm.weight",
+                "model.layers.{}.self_attn.k_norm.weight": "layers.{}.attention.k_norm.weight",
+            }
+            if has_qk_norm
+            else {}
+        )
+
         self.from_hf_map = {
             "model.embed_tokens.weight": "tok_embeddings.weight",
             # Attention module
@@ -34,8 +46,7 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
             "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.qkv_linear.wk.weight",
             "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.qkv_linear.wv.weight",
             "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
-            "model.layers.{}.self_attn.q_norm.weight": "layers.{}.attention.q_norm.weight",
-            "model.layers.{}.self_attn.k_norm.weight": "layers.{}.attention.k_norm.weight",
+            **qk_norm_map,
             "model.layers.{}.self_attn.rotary_emb.inv_freq": None,
             # MLP module for non-MoE
             "model.layers.{}.mlp.gate_proj.weight": "layers.{}.feed_forward.w1.weight",
@@ -191,6 +202,8 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
                 # pyrefly: ignore [missing-attribute]
                 layer_num = re.search(r"\d+", key).group(0)
 
+                if abstract_key not in self.from_hf_map:
+                    continue
                 new_key = self.from_hf_map[abstract_key]
                 if new_key is None:
                     continue
@@ -198,6 +211,8 @@ class Qwen3StateDictAdapter(MoEStateDictAdapter):
                 state_dict[new_key] = value
 
             else:
+                if key not in self.from_hf_map:
+                    continue
                 new_key = self.from_hf_map[key]
                 if new_key is None:
                     continue

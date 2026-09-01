@@ -97,6 +97,7 @@ def _build_qwen3_layers(
     head_dim: int,
     hidden_dim: int,
     fuse_qkv: bool = True,
+    qk_norm: bool = True,
     attn_backend: str,
     rope: RoPE.Config,
 ) -> list[TransformerBlock.Config]:
@@ -118,7 +119,7 @@ def _build_qwen3_layers(
                     inner_attention=inner_attention,
                     fuse_qkv=fuse_qkv,
                     rope=rope,
-                    qk_norm=_qwen3_norm(head_dim),
+                    qk_norm=_qwen3_norm(head_dim) if qk_norm else None,
                 ),
                 feed_forward=make_ffn_config(
                     dim=dim,
@@ -294,7 +295,7 @@ def _0_6b(attn_backend: str) -> Qwen3Model.Config:
 
 
 def _1_7b(attn_backend: str) -> Qwen3Model.Config:
-    dim = 2048
+    dim = 1536
     head_dim = 128
     n_layers = 28
     vocab_size = 151936
@@ -317,10 +318,11 @@ def _1_7b(attn_backend: str) -> Qwen3Model.Config:
             fuse_qkv=True,
             n_layers=n_layers,
             dim=dim,
-            n_heads=16,
-            n_kv_heads=8,
+            n_heads=12,
+            n_kv_heads=2,
             head_dim=head_dim,
-            hidden_dim=6144,
+            hidden_dim=8960,
+            qk_norm=False,
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,

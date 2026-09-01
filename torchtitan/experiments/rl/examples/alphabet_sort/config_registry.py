@@ -473,6 +473,66 @@ def rl_grpo_qwen3_1_7b() -> Controller.Config:
     )
 
 
+def rl_grpo_qwen3_1_7b_varlen() -> Controller.Config:
+    """Alias for ``rl_grpo_qwen3_1_7b`` (already varlen-backed); referenced by
+    the TPU GKE e2e recipe script."""
+    return rl_grpo_qwen3_1_7b()
+
+
+def rl_grpo_qwen3_4b_varlen() -> Controller.Config:
+    """GRPO training config for Qwen3-4B (varlen attention)."""
+    group_size = 8
+    return Controller.Config(
+        model_spec=_qwen3_rl_model_registry("4B", attn_backend="varlen"),
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-4B",
+        async_loop=AsyncLoopConfig(
+            num_training_steps=10,
+            num_groups_per_train_step=8,
+            group_size=group_size,
+            validation=ValidationConfig(num_samples=20),
+            batcher=Batcher.Config(
+                batch=BatchConfig(local_batch_size=2, seq_len=2048),
+            ),
+        ),
+        compile=CompileConfig(enable=True, backend="aot_eager"),
+        rollouter=AlphabetSortRollouter.Config(),
+        renderer=RendererConfig(name="qwen3", enable_thinking=False),
+        metrics=MetricsProcessor.Config(enable_wandb=True),
+        trainer=PolicyTrainer.Config(
+            optimizer=default_adamw(lr=2e-6),
+            lr_scheduler=LRSchedulersContainer.Config(
+                warmup_steps=2,
+                decay_type="linear",
+            ),
+            training=TrainingConfig(),
+            parallelism=ParallelismConfig(
+                data_parallel_shard_degree=1,
+                tensor_parallel_degree=2,
+            ),
+            checkpoint=CheckpointManager.Config(
+                enable=True,
+                initial_load_in_hf=True,
+                interval=10,
+                last_save_model_only=False,
+            ),
+            loss=ChunkedLossWrapper.Config(num_chunks=8, loss_fn=GRPOLoss.Config()),
+        ),
+        generator=VLLMGenerator.Config(
+            model_dtype="bfloat16",
+            parallelism=InferenceParallelismConfig(
+                data_parallel_degree=1,
+                tensor_parallel_degree=4,
+            ),
+            checkpoint=CheckpointManager.Config(enable=False),
+            sampling=SamplingConfig(
+                temperature=0.8,
+                top_p=0.95,
+                max_tokens=700,
+            ),
+        ),
+    )
+
+
 def rl_grpo_qwen3_14b() -> Controller.Config:
     """GRPO training config for Qwen3-14B (16 GPUs: 8 gen + 8 train)."""
     group_size = 8
