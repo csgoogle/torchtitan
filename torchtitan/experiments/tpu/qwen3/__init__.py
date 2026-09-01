@@ -216,6 +216,7 @@ def model_registry(
       qwen3_models.validate_converter_order(converters)
       for c in converters:
         config = c.build().convert(config)
+    config = MaxTextQwen3Config.from_qwen3(config)
     return ModelSpec(
         name="qwen3",
         flavor=flavor,
@@ -235,3 +236,5 @@ def model_registry(
   assert isinstance(model_spec.model, Qwen3Model.Config)
   model_spec.model = MaxTextQwen3Config.from_qwen3(model_spec.model)
   return model_spec
+
+from .config_registry import *
