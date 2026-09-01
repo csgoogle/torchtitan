@@ -308,6 +308,27 @@ def _prepare_local_tensors_for_loading(items_dict: dict, target_params: dict, ra
     return result
 
 
+def _copy_local_tensor_to_tpu(target_local, param_cpu_local) -> None:
+    """Copy a CPU shard into its TPU-resident target.
+
+    Large parameters (>5M elements, e.g. embedding tables) are copied row-by-row
+    in slices of <=8192 rows: a single giant H2D copy compiles a huge XLA copy
+    kernel and spikes device memory, which shows up as a multi-minute stall.
+    """
+    with torch.no_grad():
+        if param_cpu_local.numel() > 5_000_000 and len(param_cpu_local.shape) >= 2:
+            chunk_rows = 8192
+            num_rows = param_cpu_local.shape[0]
+            for r in range(0, num_rows, chunk_rows):
+                r_end = min(r + chunk_rows, num_rows)
+                slice_tpu = param_cpu_local[r:r_end].to("tpu")
+                target_local[r:r_end].copy_(slice_tpu)
+                del slice_tpu
+                torch_tpu._internal.sync.synchronize(wait=True)
+        else:
+            target_local.copy_(param_cpu_local)
+
+
 def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     """
     Worker-side weight loader. Performs host-side CPU sharding (slicing)
@@ -388,8 +409,7 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
         for target_key, target_local_shape, param_cpu_local in local_processed:
             target_v = target_params[target_key]
             target_local = target_v.to_local() if hasattr(target_v, "to_local") else target_v
-            with torch.no_grad():
-                target_local.copy_(param_cpu_local)
+            _copy_local_tensor_to_tpu(target_local, param_cpu_local)
             loaded_keys += 1
 
     torch_tpu._internal.sync.synchronize(wait=True)
@@ -443,8 +463,7 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int) -> int:
             target_v = target_params[target_key]
             target_local = target_v.to_local() if hasattr(target_v, "to_local") else target_v
             try:
-                with torch.no_grad():
-                    target_local.copy_(param_cpu_local)
+                _copy_local_tensor_to_tpu(target_local, param_cpu_local)
             except Exception as e:
                 raise RuntimeError(
                     f"Failed copying key {target_key}: "

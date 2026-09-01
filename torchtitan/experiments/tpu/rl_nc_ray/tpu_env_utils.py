@@ -5,6 +5,7 @@ TPU Cluster Topology, layout discovery, and multi-process environment generation
 for Ray-native non-colocated RL.
 """
 
+import math
 import os
 import ray
 
@@ -200,37 +201,46 @@ def build_generator_env_vars(layout: dict, worker_pythonpath: str, dump_folder: 
         for chip_idx in range(chips_per_host):
             generator_sb_addresses.append(f"127.0.0.1:{GENERATOR_BASE_PORT + chip_idx}")
 
-    # Determine correct topology for generator
-    # TODO: remove HACK once the generator/vLLM dynamically scales and handles the topology mapping natively.
+    # Determine correct topology and bounds for generator
+    # For single-host subslices (<= chips_per_host), host_bounds is 1,1,1 and the chip
+    # grid lives in TPU_CHIPS_PER_HOST_BOUNDS; for full/multi-host meshes the host grid
+    # lives in TPU_HOST_BOUNDS with one chip per process. This must not depend on
+    # LOCAL_VM_RUN: a 4-chip generator carved out of a v6e-8 host on GKE is still a
+    # single-host subslice.
     if tpu_type == "v6e-32" and generator_world_size == 32:
         topo = "4,8,1"
+        host_bounds = "4,8,1"
+        chips_bounds = "1,1,1"
     elif generator_world_size == 8:
         topo = "2,4,1"
+        host_bounds = "2,4,1"
+        chips_bounds = "1,1,1"
     elif generator_world_size == 4:
         topo = "2,2,1"
+        host_bounds = "1,1,1"
+        chips_bounds = "2,2,1"
+    elif generator_world_size == 2:
+        topo = "1,2,1"
+        host_bounds = "1,1,1"
+        chips_bounds = "1,2,1"
     else:
         topo = "1,1,1"
+        host_bounds = "1,1,1"
+        chips_bounds = "1,1,1"
 
-    is_local_run = os.environ.get("LOCAL_VM_RUN") == "1"
+    # Restrict slicebuilder addresses to the generator world size
+    generator_sb_addresses = generator_sb_addresses[:generator_world_size]
+    gen_chips_per_host = math.prod(int(x) for x in chips_bounds.split(","))
 
-    # =====================================================================
-    # TPU Mesh Bounds Semantics:
-    # 1. Single VM (is_local_run == True): All TPU chips reside on the same physical
-    #    machine. PJRT requires TPU_HOST_BOUNDS to be "1,1,1" (as only 1 host exists in the
-    #    torus) and expresses the full chip coordinate grid via TPU_CHIPS_PER_HOST_BOUNDS (e.g. "2,2,1").
-    # 2. Multi-Host Cluster (is_local_run == False): TPUs are distributed across multiple network
-    #    hosts. PJRT defines the mesh across host dimensions in TPU_HOST_BOUNDS (e.g. "2,4,1")
-    #    with TPU_CHIPS_PER_HOST_BOUNDS set to "1,1,1".
-    # =====================================================================
     generator_env_vars = {
         "TORCHTITAN_DEVICE_TYPE": generator_device_type,
         "SKIP_JAX_PRECOMPILE": "1",
         "VLLM_PLUGINS": "torchtpu,torchtpu_layers",
         "VLLM_ENABLE_V1_MULTIPROCESSING": VLLM_ENABLE_V1_MULTIPROCESSING,
         "TORCH_TPU_TOPOLOGY": topo,
-        "TPU_CHIPS_PER_HOST_BOUNDS": topo if is_local_run else "1,1,1",
-        "TPU_HOST_BOUNDS": "1,1,1" if is_local_run else topo,
-        "CHIPS_PER_HOST": str(chips_per_host),
+        "TPU_CHIPS_PER_HOST_BOUNDS": chips_bounds,
+        "TPU_HOST_BOUNDS": host_bounds,
+        "CHIPS_PER_HOST": str(gen_chips_per_host),
         "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(generator_sb_addresses),
         "TPU_PROCESS_ADDRESSES": ",".join(generator_sb_addresses),
         "JAX_MEM_FRACTION": JAX_MEM_FRACTION,
