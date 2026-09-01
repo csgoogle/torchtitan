@@ -124,10 +124,10 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   if (
       utils.device_type == "tpu"
       and train_config.optimizer.implementation == "fused"
+      and not train_config.tpu_config.enable_fused_optimizer
   ):
-    # TODO: b/45811390 - Remove this once fused optimizer is supported on TPU.
     logger.warning(
-        "Fused optimizer is not supported on TPU, changing to foreach."
+        "Fused optimizer is not enabled for this TPU recipe, changing to foreach."
     )
     train_config.optimizer.implementation = "foreach"
 

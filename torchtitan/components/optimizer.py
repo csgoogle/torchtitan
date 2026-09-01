@@ -131,7 +131,8 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         Per-param-group ``optimizer_kwargs`` can override this (e.g.
         ``"fused": False`` for optimizers that don't support fused).
 
-        - 'fused': Use fused implementation (CUDA only) for best performance.
+        - 'fused': Use the fused implementation when supported by the active
+          device backend.
         - 'foreach': Use some horizontal fusion of tensors for better performance.
         - 'for-loop': Use the default implementation for the optimizer (slowest).
         - 'fused_opt_states_bf16': Like 'fused', but initialize Adam/AdamW
