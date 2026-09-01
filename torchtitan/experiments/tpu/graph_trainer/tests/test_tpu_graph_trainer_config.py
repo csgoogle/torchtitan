@@ -11,8 +11,10 @@ from types import SimpleNamespace
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import torch
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.graph_trainer import qwen3 as qwen3_gt
+from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
 from torchtitan.experiments.tpu.graph_trainer.config import (
     to_tpu_graph_trainer_config,
 )
@@ -22,11 +24,34 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
-from torchtitan.experiments.tpu.qwen3.config_registry import qwen3_8b
+from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+    model_registry as tpu_qwen3_graph_registry,
+)
+from torchtitan.experiments.tpu.qwen3.config_registry import (
+    qwen3_8b,
+    qwen3_moe_30b,
+)
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
+
+  def test_qwen3_graph_config_preserves_maxtext_flops(self) -> None:
+    config = qwen3_moe_30b()
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        tpu_qwen3_graph_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    with torch.device("meta"):
+      model = graph_config.model_spec.model.build()
+
+    self.assertIsInstance(model, GraphTrainerQwen3Model)
+    self.assertEqual(
+        graph_config.model_spec.model.get_nparams_and_flops(model, seq_len=2048)[1],
+        20_665_860_096,
+    )
 
   @parameterized.parameters("default", "full", "eager")
   def test_cli_memory_policy_is_propagated(self, policy: str) -> None:

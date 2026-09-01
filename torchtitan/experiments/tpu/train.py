@@ -167,7 +167,9 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     from torchtitan.experiments.tpu.graph_trainer import TpuGraphTrainer, TpuGraphTrainerConfig
 
     if model_name == "qwen3":
-      from torchtitan.experiments.graph_trainer.qwen3 import model_registry as gt_registry
+      from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+          model_registry as gt_registry,
+      )
     elif model_name == "llama3":
       from torchtitan.experiments.graph_trainer.llama3 import model_registry as gt_registry
     elif model_name == "deepseek_v3":
