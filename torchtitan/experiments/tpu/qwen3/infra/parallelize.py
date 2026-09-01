@@ -37,8 +37,11 @@ def parallelize_qwen3(
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
   if effective_compile_config.enable and hasattr(model, "layers"):
+    from torchtitan.models.common.moe import MoE
     for layer in model.layers.values():
-      apply_spmd_safe(layer)
+      has_moe = any(isinstance(m, MoE) for m in layer.modules())
+      if not has_moe:
+        apply_spmd_safe(layer)
 
   if compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
     effective_compile_config = dataclasses.replace(compile_config, enable=False)
