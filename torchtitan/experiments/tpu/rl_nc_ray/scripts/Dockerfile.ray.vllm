@@ -1,7 +1,7 @@
 # Use the latest Ray master as base.
 FROM rayproject/ray:nightly.260501.1c7c90-py312-tpu
 
-RUN sudo apt-get update && sudo apt-get install -y build-essential g++ libopenblas-base libopenmpi-dev libomp-dev
+RUN sudo apt-get update && sudo apt-get install -y build-essential g++ gcc cmake ninja-build libopenblas-base libopenmpi-dev libomp-dev
 RUN pip uninstall -y torch torchvision
 
 RUN pip install keyrings.google-artifactregistry-auth
@@ -29,7 +29,7 @@ RUN pip install -r requirements.txt
 
 RUN pip install 'typeguard>=4.0.0'
 
-RUN pip install portpicker absl-py numpy gcsfs frozendict triton fairscale pygtrie "git+https://github.com/PrimeIntellect-ai/renderers.git@main"
+RUN pip install portpicker absl-py numpy gcsfs frozendict triton fairscale regex tpu-info pathwaysutils numba pygtrie "git+https://github.com/PrimeIntellect-ai/renderers.git@main"
 
 # --- Install vllm and vllm-torchtpu ---
 ARG GITHUB_USER
