@@ -129,8 +129,18 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
             
             import vllm_torchtpu.runner.tpu_runner
             vllm_torchtpu.runner.tpu_runner._get_padded_num_reqs_with_upper_limit = lambda x, upper_limit: upper_limit
+            # [TPU HACK 7]: vLLM's dummy-weight randomization runs eager Python loops over
+            # millions of parameters, triggering thousands of un-fused XLA compilations on
+            # TPU (20+ minute hang). Patch both weight_utils and dummy_loader: dummy_loader
+            # imports initialize_dummy_weights by value, so patching weight_utils alone is
+            # ineffective once the model_loader package has been imported.
             import vllm.model_executor.model_loader.weight_utils
             vllm.model_executor.model_loader.weight_utils.initialize_dummy_weights = lambda *args, **kwargs: None
+            try:
+                import vllm.model_executor.model_loader.dummy_loader
+                vllm.model_executor.model_loader.dummy_loader.initialize_dummy_weights = lambda *args, **kwargs: None
+            except Exception:
+                pass
 
             def load_weights_from_state_dict_on_worker(self, state_dict):
                 vllm_model = getattr(self, "model_runner", getattr(self, "worker", self)).model
@@ -178,7 +188,12 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
             torch._dynamo.config._config["recompile_limit"].default = 100
             torch._dynamo.config._config["cache_size_limit"].default = 100
             torch._dynamo.config._config["accumulated_cache_size_limit"].default = 100
-            
+
+            # Inference-only worker: pin grad mode off. AsyncCollectiveTensor timing can
+            # flip grad_mode between traces, and each flip is a Dynamo recompile (a full
+            # XLA compile on TPU that looks like a stall during generation).
+            torch.set_grad_enabled(False)
+
             res = original_initialize_worker(self, local_rank, env_vars, driver_env_vars, *args, **kwargs)
             if hasattr(self, "worker"):
                 setattr(self.worker, "load_weights_from_state_dict_on_worker", types.MethodType(load_weights_from_state_dict_on_worker, self.worker))

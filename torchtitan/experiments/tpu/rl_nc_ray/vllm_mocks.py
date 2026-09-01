@@ -9,9 +9,15 @@ logger = logging.getLogger(__name__)
 try:
     import vllm
     
-    # Try importing codegen first. If it works, we don't need to mock it.
+    # Try importing codegen first. If it works, we don't need to mock it — but make
+    # sure the attributes other code monkeypatches or calls unconditionally exist,
+    # without clobbering the real implementations (notably compile_execution_fn).
     try:
         import vllm.compilation.codegen
+        if not hasattr(vllm.compilation.codegen, "_node_ref"):
+            vllm.compilation.codegen._node_ref = lambda arg: arg
+        if not hasattr(vllm.compilation.codegen, "compile_execution_fn"):
+            vllm.compilation.codegen.compile_execution_fn = lambda *args, **kwargs: None
     except Exception as e:
         # Create a dummy module object to mock the missing vLLM compilation codegen layer.
         # Since we are inside the TPU experiments directory, we are sure that we want
@@ -20,7 +26,8 @@ try:
         # Define a dummy _node_ref attribute so that unconditional monkeypatching
         # in vllm_wrapper.py executes successfully without raising AttributeErrors.
         vllm_codegen._node_ref = lambda arg: arg
-        
+        vllm_codegen.compile_execution_fn = lambda *args, **kwargs: None
+
         # Try importing the real vllm.compilation package if it exists so we do not
         # break real package sub-imports (e.g. vllm.compilation.passes).
         try:
@@ -120,9 +127,15 @@ try:
 
         vllm_wrapper.create_torchtitan_config_from_vllm_config = patched_create_config
 
-        # Stub out _initial_load_weights since TPU weights will be initialized/loaded
-        # through alternative TPU-native paths or random initialization.
-        vllm_wrapper.TorchTitanVLLMModelWrapper._initial_load_weights = lambda self, *args, **kwargs: None
+        # Stub out the initial HF checkpoint load since TPU weights will be initialized/
+        # loaded through alternative TPU-native paths (Ray weight transfer from the
+        # trainer). Upstream renamed _initial_load_weights to _maybe_initial_load_weights
+        # (gated on checkpoint_config.enable); stub whichever exists so a config that
+        # enables checkpointing cannot reintroduce the redundant DCP load on TPU.
+        if hasattr(vllm_wrapper.TorchTitanVLLMModelWrapper, "_maybe_initial_load_weights"):
+            vllm_wrapper.TorchTitanVLLMModelWrapper._maybe_initial_load_weights = lambda self, *args, **kwargs: None
+        if hasattr(vllm_wrapper.TorchTitanVLLMModelWrapper, "_initial_load_weights"):
+            vllm_wrapper.TorchTitanVLLMModelWrapper._initial_load_weights = lambda self, *args, **kwargs: None
 
         # Patched __init__ of TorchTitanVLLMModelWrapper to support meta device initialization
         # and on-device materialization dynamically on TPU if TP > 1.
