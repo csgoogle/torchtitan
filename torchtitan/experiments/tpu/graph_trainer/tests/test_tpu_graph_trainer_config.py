@@ -8,6 +8,7 @@
 
 import typing
 from types import SimpleNamespace
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -30,7 +31,10 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as tpu_qwen3_graph_registry,
 )
-from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.loss import (
+    PallasCrossEntropyLoss,
+    pallas_cross_entropy_loss,
+)
 from torchtitan.experiments.tpu.overrides.bf16_rope import (
     TpuActivationDtypeCosSinRoPE,
 )
@@ -338,6 +342,37 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         torch.full_like(lm_head.weight, 0.25),
     )
     torch.testing.assert_close(output_weight, lm_head.weight.t())
+
+  def test_pallas_loss_slices_physical_vocab_to_logical_size(self) -> None:
+    hidden = torch.randn(4, 8)
+    weights = torch.randn(8, 12)
+    labels = torch.randint(0, 10, (4,))
+
+    kernel = mock.Mock(return_value=torch.tensor(0.0))
+    fake_kernel_module = SimpleNamespace(
+        linear_softmax_cross_entropy_loss=kernel
+    )
+    with mock.patch(
+        "torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss",
+        fake_kernel_module,
+        create=True,
+    ):
+      pallas_cross_entropy_loss(
+          (hidden, weights),
+          labels,
+          implementation="xla",
+          logical_vocab_size=10,
+      )
+
+    self.assertEqual(kernel.call_args.args[2].shape, (8, 10))
+
+    with self.assertRaisesRegex(ValueError, "logical_vocab_size"):
+      pallas_cross_entropy_loss(
+          (hidden, weights),
+          labels,
+          implementation="xla",
+          logical_vocab_size=13,
+      )
 
   def test_qwen3_moe_ep_keeps_plain_cross_entropy(self) -> None:
     config = qwen3_moe_30b()

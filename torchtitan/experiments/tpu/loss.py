@@ -23,6 +23,7 @@ def pallas_cross_entropy_loss(
     b_block_size: int = 1024,
     h_block_size: int = 512,
     v_block_size: int = 2048,
+    logical_vocab_size: int | None = None,
 ) -> torch.Tensor:
   """Compute sum-reduced linear cross entropy without materializing logits.
 
@@ -37,6 +38,14 @@ def pallas_cross_entropy_loss(
     raise ValueError("Pallas loss requires (x, weights) as input")
 
   x, weights = pred
+  if logical_vocab_size is not None:
+    if logical_vocab_size <= 0 or logical_vocab_size > weights.shape[-1]:
+      raise ValueError(
+          "Pallas loss logical_vocab_size must be positive and no larger "
+          f"than the physical vocabulary ({weights.shape[-1]}), got "
+          f"{logical_vocab_size}"
+      )
+    weights = weights[..., :logical_vocab_size]
   if x.ndim == 3:
     x = x.flatten(0, 1)
   if labels.ndim == 2:
@@ -106,6 +115,7 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
     b_block_size: int = 1024
     h_block_size: int = 512
     v_block_size: int = 2048
+    logical_vocab_size: int | None = None
 
   def __init__(
       self,
@@ -120,6 +130,7 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
         b_block_size=config.b_block_size,
         h_block_size=config.h_block_size,
         v_block_size=config.v_block_size,
+        logical_vocab_size=config.logical_vocab_size,
     )
     self.implementation = config.implementation
     self.b_block_size = config.b_block_size

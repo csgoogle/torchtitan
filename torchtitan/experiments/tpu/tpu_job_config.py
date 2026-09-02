@@ -94,6 +94,8 @@ class TPUConfig:
   # precision.
   enable_amp: bool = True
   log_freq: int = 10
+  # Recipe-owned flags merged with launcher flags before PJRT initialization.
+  libtpu_init_args: str = ""
   eager_mode: Literal[
       "",
       "DEFER_AND_FUSE",

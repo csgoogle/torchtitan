@@ -521,6 +521,78 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
+  """Qwen3 235B-A22B FSDP recipe for a 4x8x8 TPU7x slice."""
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  cfg.model_spec = model_registry(
+      "235B-A22B",
+      attn_backend="sdpa",
+      converters=[
+          TpuTokenDispatcherConverter.Config(),
+          TpuGroupedExpertsConverter.Config(),
+      ],
+  )
+  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  model_config.tok_embeddings.num_embeddings = 152064
+  model_config.lm_head.out_features = 152064
+  assert isinstance(cfg.loss, PallasCrossEntropyLoss.Config)
+  cfg.loss.logical_vocab_size = model_config.vocab_size
+  for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
+    experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 512)
+    experts.use_kernel_native_weight_layout = True
+  cfg.training.local_batch_size = 16
+  cfg.training.global_batch_size = 8192
+  cfg.training.seq_len = 4096
+  cfg.training.steps = 15
+  cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.tpu_config.use_graph_split = True
+  cfg.tpu_config.graph_split.forward_layers_per_executable = 1
+  cfg.tpu_config.graph_split.forward_isolate_prefix = True
+  cfg.tpu_config.graph_split.backward_partition_mode = "fsdp_pipeline"
+  cfg.tpu_config.graph_split.backward_layers_per_executable = 1
+  cfg.tpu_config.graph_split.donate_internal_buffers = False
+  cfg.tpu_config.enable_graph_trainer_remat_schedule = False
+  cfg.tpu_config.graph_trainer_fsdp_schedule = "none"
+  cfg.tpu_config.compile_optimizer = False
+  cfg.tpu_config.optimizer_in_graph = False
+  cfg.dataloader.dataset = "c4_test"
+  cfg.hf_assets_path = "./assets/hf/Qwen3-235B-A22B"
+  cfg.metrics.log_freq = 1
+  return cfg
+
+
+def qwen3_moe_235b_fsdp_smoke() -> TPUTrainerConfig:
+  """Four-layer FSDP512 smoke for the production 235B execution path."""
+  cfg = qwen3_moe_235b_fsdp_only()
+  assert cfg.model_spec is not None
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  model_config.layers = model_config.layers[:4]
+  cfg.training.local_batch_size = 1
+  cfg.training.seq_len = 128
+  cfg.training.steps = 2
+  cfg.tpu_config.enable_mfu_benchmark = False
+  return cfg
+
+
+def qwen3_moe_235b_fsdp_pipeline_b8_profile() -> TPUTrainerConfig:
+  """Batch-8 validation and rank-zero profile for the 235B pipeline."""
+  cfg = qwen3_moe_235b_fsdp_only()
+  cfg.training.local_batch_size = 8
+  cfg.training.global_batch_size = 4096
+  cfg.training.steps = 15
+  cfg.profiler = Profiler.Config(
+      enable_profiling=int(os.environ.get("RANK", "0")) == 0,
+      profile_freq=5,
+      profiler_warmup=2,
+      profiler_active=1,
+      profiler_repeat=1,
+  )
+  return cfg
+
+
 def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
   """Proxy model for Qwen3 30B MoE (4 layers instead of 48) for testing/iterations."""
   cfg = qwen3_moe_30b()
