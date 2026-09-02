@@ -441,6 +441,35 @@ xpk workload create \
 * You must limit `seq_len` to 512 at this time; support for the full context length is coming soon.
 * Memory and MFU metrics might be inaccurate in the current version.
 
+### Qwen3 235B FSDP on TPU7x
+
+The current TorchTPU `0.0.42.1` baseline needs the following launcher-owned
+flags for the Qwen3 235B FSDP recipes. The three fusion disables avoid a
+TPU v2 fusion-cost crash while compiling the attention executables.
+
+```bash
+export LIBTPU_INIT_ARGS="\
+--xla_tpu_enable_sparse_core_collective_aggregator=true \
+--xla_tpu_enable_latency_hiding_layer_scheduler=true \
+--xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false \
+--xla_tpu_dot_dot_fusion=false \
+--xla_tpu_nested_dot_fusion=false \
+--xla_tpu_rwb_fusion=false"
+
+torchrun \
+    --nnodes="$NNODES" \
+    --nproc_per_node=8 \
+    --rdzv_backend=static \
+    --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
+    --node_rank="$NODE_RANK" \
+    -m torchtitan.experiments.tpu.train \
+    --module=torchtitan.experiments.tpu.qwen3 \
+    --config=qwen3_moe_235b_fsdp_pipeline_b8_profile
+```
+
+This profile recipe uses local batch 8 and sequence length 4,096. The
+`qwen3_moe_235b_fsdp_only` recipe is the local-batch-16 MaxText target.
+
 ---
 
 ### Profile workloads using TensorBoard

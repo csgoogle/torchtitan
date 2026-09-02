@@ -436,6 +436,7 @@ def apply_cp_to_attention(
 
 
 def _select_expert_fsdp_shard_dim(num_experts: int, fsdp_degree: int) -> int:
+    """Use the hidden dimension when the FSDP mesh exceeds expert count."""
     return 1 if fsdp_degree > num_experts else 0
 
 
@@ -449,8 +450,8 @@ def apply_simple_fsdp(
 
     For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
     on the EDP mesh when expert parallelism is enabled. Without EP, expert
-    banks whose expert dimension is smaller than the FSDP degree are wrapped
-    on the DP mesh using hidden-dimension sharding.
+    banks whose expert dimension is smaller than the FSDP degree stay on the
+    same pure-FSDP DP mesh but shard their hidden dimension instead.
     """
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
