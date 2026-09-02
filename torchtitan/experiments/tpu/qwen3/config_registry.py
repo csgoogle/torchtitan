@@ -306,6 +306,9 @@ def qwen3_8b() -> TPUTrainerConfig:
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
+          # The current best-performing benchmark recipe uses Zero-2. Keep it
+          # explicit while Zero-3 memory/overlap policy is tuned separately.
+          fsdp_reshard_after_forward="never",
       ),
       checkpoint=CheckpointManager.Config(
           enable=False,
@@ -404,6 +407,9 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
       enable_tpu_topo_mesh=True,
       data_parallel_shard_degree=-1,
       expert_parallel_degree=1,
+      # The current best-performing benchmark recipe uses Zero-2. Keep it
+      # explicit while Zero-3 memory/overlap policy is tuned separately.
+      fsdp_reshard_after_forward="never",
   )
   assert cfg.model_spec is not None
   for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
