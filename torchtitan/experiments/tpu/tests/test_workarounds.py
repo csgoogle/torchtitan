@@ -3,8 +3,91 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
+from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.models.common import rope
+
+
+class FusedLossNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
+  """Numerical parity for the complete fused LM-head and loss path."""
+
+  def test_fused_loss_matches_unfused_cross_entropy(self):
+    if self.accelerator_device.type == "cpu":
+      self.skipTest("Pallas fused loss requires a TPU")
+
+    from torchtitan.components import loss as components_loss
+    from torchtitan.experiments.tpu.loss import pallas_cross_entropy_loss
+    from torchtitan.experiments.tpu.overrides.fused_loss import (
+        fused_loss_lm_head,
+    )
+    from torchtitan.models.common import Linear
+
+    hidden_size = 128
+    vocab_size = 192
+    linear_config = Linear.Config(
+        in_features=hidden_size,
+        out_features=vocab_size,
+        bias=False,
+    )
+    unfused_head = linear_config.build()
+    fused_head = fused_loss_lm_head(linear_config).build()
+    fused_head.load_state_dict(unfused_head.state_dict())
+    unfused_head = unfused_head.to(
+        device=self.accelerator_device,
+        dtype=torch.bfloat16,
+    )
+    fused_head = fused_head.to(
+        device=self.accelerator_device,
+        dtype=torch.bfloat16,
+    )
+
+    hidden = torch.randn(2, 64, hidden_size)
+    unfused_hidden = hidden.to(
+        device=self.accelerator_device,
+        dtype=torch.bfloat16,
+    ).requires_grad_(True)
+    fused_hidden = unfused_hidden.detach().clone().requires_grad_(True)
+    labels = torch.randint(0, vocab_size, (2, 64))
+    labels[0, 0] = components_loss.IGNORE_INDEX
+    labels = labels.to(self.accelerator_device)
+
+    expected_loss = components_loss.cross_entropy_loss(
+        unfused_head(unfused_hidden), labels
+    )
+    actual_loss = pallas_cross_entropy_loss(
+        fused_head(fused_hidden),
+        labels,
+        implementation="mosaic_tpu",
+        b_block_size=128,
+        h_block_size=128,
+        v_block_size=128,
+    )
+
+    torch.testing.assert_close(
+        actual_loss.cpu(),
+        expected_loss.cpu(),
+        rtol=1.6e-2,
+        atol=1e-5,
+    )
+
+    expected_loss.backward()
+    actual_loss.backward()
+
+    def relative_l2(actual, expected):
+      actual = actual.detach().float().cpu()
+      expected = expected.detach().float().cpu()
+      return torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(
+          expected
+      )
+
+    self.assertLess(
+        relative_l2(fused_hidden.grad, unfused_hidden.grad),
+        2e-2,
+    )
+    self.assertLess(
+        relative_l2(fused_head.weight.grad, unfused_head.weight.grad),
+        2e-2,
+    )
 
 
 class WorkaroundsTest(parameterized.TestCase):
@@ -295,90 +378,6 @@ class WorkaroundsTest(parameterized.TestCase):
     out, weight_t = model.lm_head(x)
     torch.testing.assert_close(out, x)
     self.assertEqual(tuple(weight_t.shape), (8, 16))
-
-  def test_fused_loss_matches_unfused_cross_entropy(self):
-    """The deferred LM-head path preserves loss and gradient numerics."""
-    import sys
-    import types
-    from unittest import mock
-
-    import torch.nn.functional as F
-    from torchtitan.components import loss as components_loss
-    from torchtitan.experiments.tpu import kernels
-    from torchtitan.experiments.tpu.loss import pallas_cross_entropy_loss
-    from torchtitan.experiments.tpu.overrides.fused_loss import (
-        fused_loss_lm_head,
-    )
-    from torchtitan.models.common import Linear
-
-    torch.manual_seed(0)
-    linear_config = Linear.Config(
-        in_features=8,
-        out_features=16,
-        bias=False,
-    )
-    unfused_head = linear_config.build()
-    fused_head = fused_loss_lm_head(linear_config).build()
-    fused_head.load_state_dict(unfused_head.state_dict())
-
-    unfused_hidden = torch.randn(2, 4, 8, requires_grad=True)
-    fused_hidden = unfused_hidden.detach().clone().requires_grad_(True)
-    labels = torch.tensor([
-        [1, 4, components_loss.IGNORE_INDEX, 2],
-        [5, 3, 0, 7],
-    ])
-
-    expected_loss = components_loss.cross_entropy_loss(
-        unfused_head(unfused_hidden), labels
-    )
-
-    # Kernel parity is covered by test_linear_softmax_cross_entropy_loss. Stub
-    # only its TPU-specific dispatch here so this CPU test covers the adapter,
-    # weight orientation, sum reduction, and ignored-label behavior together.
-    def reference_linear_loss(x, kernel_labels, weights, **unused_kwargs):
-      return F.cross_entropy(
-          x.float() @ weights.float(),
-          kernel_labels,
-          reduction="sum",
-      )
-
-    kernel_module_name = (
-        "torchtitan.experiments.tpu.kernels."
-        "linear_softmax_cross_entropy_loss"
-    )
-    fake_kernel_module = types.ModuleType(kernel_module_name)
-    fake_kernel_module.linear_softmax_cross_entropy_loss = reference_linear_loss
-    with (
-        mock.patch.dict(sys.modules, {kernel_module_name: fake_kernel_module}),
-        mock.patch.object(
-            kernels,
-            "linear_softmax_cross_entropy_loss",
-            fake_kernel_module,
-            create=True,
-        ),
-    ):
-      actual_loss = pallas_cross_entropy_loss(
-          fused_head(fused_hidden),
-          labels,
-          implementation="xla",
-      )
-
-    torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-5, atol=1e-5)
-
-    expected_loss.backward()
-    actual_loss.backward()
-    torch.testing.assert_close(
-        fused_hidden.grad,
-        unfused_hidden.grad,
-        rtol=1e-5,
-        atol=1e-5,
-    )
-    torch.testing.assert_close(
-        fused_head.weight.grad,
-        unfused_head.weight.grad,
-        rtol=1e-5,
-        atol=1e-5,
-    )
 
   def test_pallas_loss_linear_patches_output_and_output_transform(self):
     """Key preservation must also hold for `output` / `output_transform`."""

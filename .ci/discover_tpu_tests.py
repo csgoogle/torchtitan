@@ -69,8 +69,6 @@ DISABLED_TESTS = {
     "torchtitan.experiments.tpu.kernels.tests.test_kernel_name_determinism",
     # TODO: SyntaxError: invalid syntax (from jaxtyping)
     "torchtitan.experiments.tpu.redacted.tests.test_train_minimal_distributed",
-    # TODO: Unknown command line flag 'device'
-    "torchtitan.experiments.tpu.tests.test_workarounds",
     # TODO: AssertionError: test_deepseek_complete_model_training_steps_cpu_device_parity_MOE
     "torchtitan.experiments.tpu.deepseek_v3.tests.test_deepseek_v3",
     # TODO: imports torchtitan.scripts; this fork keeps scripts/ at the repo root.
