@@ -28,6 +28,7 @@ from typing import Any, Optional
 
 import torch
 
+from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer import (
     collect_moe_routing_metric_tensors,
     set_moe_routing_metric_tensors,
@@ -84,7 +85,7 @@ class TpuGraphTrainer(GraphTrainer):
     Core Extensions and Overrides over GraphTrainer:
     1. __init__:
        - Registers TPU pass pipeline (PASS_PIPELINE_REGISTRY["tpu"]).
-       - Overrides cross-entropy loss with PallasCrossEntropyLoss when enabled.
+       - Rejects chunked loss until it can preserve sequential chunk lifetimes.
        - Hooks TPU-specific metrics and profiling brackets.
        - Initializes compiled optimizer or optimizer-in-graph state.
     2. _make_fx_forward_backward_step (Overridden):
@@ -105,18 +106,16 @@ class TpuGraphTrainer(GraphTrainer):
 
     def __init__(self, config, *, tpu_extra: Optional[TpuGraphTrainerConfig] = None) -> None:
         """Override of GraphTrainer.__init__ adding TPU pipeline registration, Pallas loss, and opt-in-graph setup."""
+        if isinstance(config.loss, ChunkedLossWrapper.Config):
+            raise ValueError(
+                "TPU GraphTrainer does not support ChunkedLossWrapper because "
+                "FX unrolls its loop and defeats bounded-memory execution; use "
+                "CrossEntropyLoss or PallasCrossEntropyLoss"
+            )
         # Ensure the 'tpu' pass pipeline is registered before GraphTrainer traces/compiles
         register_tpu_pipeline()
 
         super().__init__(config)
-
-        if (
-            isinstance(config, TPUTrainerConfig)
-            and config.loss_kernel.use_loss_kernel
-        ):
-            from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
-
-            self.loss_fn = build_cross_entropy_loss(config)
 
         if _split_optimizers_by_mesh(self.optimizers):
             self.lr_schedulers = config.lr_scheduler.build(

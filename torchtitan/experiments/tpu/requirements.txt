@@ -1,7 +1,12 @@
 jax==0.11.0
 jaxlib==0.11.0
 libtpu==0.0.41
-tokamax @ git+https://github.com/openxla/tokamax.git@b33bdfa64a78cc16193f3c77dd223bb040aeebf4
+# Pin the first revision containing both fused-loss correctness fixes: padded
+# vocabulary columns are excluded from softmax and the loss cotangent is
+# applied before the BF16 gradient GEMMs. At Qwen3's production
+# [12,288, 2,048] x [2,048, 151,936] shape this produced relative errors of
+# 7.927e-8 for loss, 7.370e-5 for dW, and 1.412e-4 for dX.
+tokamax @ git+https://github.com/openxla/tokamax.git@f06bfa7bb6d241b7849a35039663c5f7fb37bbf1
 portpicker
 absl-py
 numpy
