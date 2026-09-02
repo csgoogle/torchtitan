@@ -152,7 +152,11 @@ def build_trainer_env_vars(rank: int, layout: dict, worker_pythonpath: str) -> t
         "XLA_PYTHON_CLIENT_PREALLOCATE": XLA_PYTHON_CLIENT_PREALLOCATE,
         "XLA_PYTHON_CLIENT_MEM_FRACTION": XLA_PYTHON_CLIENT_MEM_FRACTION,
         "LIBTPU_INIT_ARGS": f"--xla_tpu_use_enhanced_launch_barrier=false --deepsea_slice_builder_worker_port={TRAINER_BASE_PORT + local_chip_index}",
+        "TORCHDYNAMO_RECOMPILE_LIMIT": str(TORCH_DYNAMO_RECOMPILE_LIMIT),
         "TORCH_DYNAMO_RECOMPILE_LIMIT": str(TORCH_DYNAMO_RECOMPILE_LIMIT),
+        "TORCHDYNAMO_FAIL_ON_RECOMPILE_LIMIT_HIT": "0",
+        "TORCH_DYNAMO_FAIL_ON_RECOMPILE_LIMIT_HIT": "0",
+        "TORCHDYNAMO_CACHE_SIZE_LIMIT": str(TORCH_DYNAMO_RECOMPILE_LIMIT),
     })
 
     if tpu_type == "v6e-32":
@@ -248,7 +252,11 @@ def build_generator_env_vars(layout: dict, worker_pythonpath: str, dump_folder: 
         "XLA_PYTHON_CLIENT_PREALLOCATE": XLA_PYTHON_CLIENT_PREALLOCATE,
         "XLA_PYTHON_CLIENT_MEM_FRACTION": XLA_PYTHON_CLIENT_MEM_FRACTION,
         "LIBTPU_INIT_ARGS": "--xla_tpu_use_enhanced_launch_barrier=false",
+        "TORCHDYNAMO_RECOMPILE_LIMIT": str(TORCH_DYNAMO_RECOMPILE_LIMIT),
         "TORCH_DYNAMO_RECOMPILE_LIMIT": str(TORCH_DYNAMO_RECOMPILE_LIMIT),
+        "TORCHDYNAMO_FAIL_ON_RECOMPILE_LIMIT_HIT": "0",
+        "TORCH_DYNAMO_FAIL_ON_RECOMPILE_LIMIT_HIT": "0",
+        "TORCHDYNAMO_CACHE_SIZE_LIMIT": str(TORCH_DYNAMO_RECOMPILE_LIMIT),
         "PYTHONPATH": worker_pythonpath,
         "TORCH_LOGS": "recompiles,recompiles_verbose",
     }

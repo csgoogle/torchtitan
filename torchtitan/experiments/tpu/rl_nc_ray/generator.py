@@ -105,6 +105,56 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
                 return worker_obj.rank
             return int(os.environ.get("RANK", "0"))
 
+        def load_weights_from_state_dict_on_worker(self, state_dict):
+            worker_target = getattr(self, "worker", self)
+            vllm_model = getattr(worker_target, "model_runner", worker_target).model
+            from torchtitan.experiments.tpu.rl_nc_ray.weight_transfer_utils import load_weights_on_worker
+            rank = _get_worker_rank(self)
+            return load_weights_on_worker(vllm_model, state_dict, rank)
+
+        # Hook TPUWorker and WorkerBase directly at patch time: with TP=1 vLLM runs a
+        # single in-process worker and never creates RayWorkerProc, so the attachment
+        # inside patched_initialize_worker below never happens on that path.
+        try:
+            from vllm_torchtpu.worker.tpu_worker import TPUWorker
+            TPUWorker.load_weights_from_state_dict_on_worker = load_weights_from_state_dict_on_worker
+        except Exception as e:
+            logger.warning(f"Could not patch TPUWorker: {e}")
+        try:
+            from vllm.v1.worker.worker_base import WorkerBase
+            WorkerBase.load_weights_from_state_dict_on_worker = load_weights_from_state_dict_on_worker
+        except Exception:
+            pass
+
+        # Process-level tweaks applied here as well as in the RayWorkerProc hook,
+        # so the in-process TP=1 executor (which never runs that hook) gets them:
+        # shape padding to one bucket, dummy-weight mocks, Dynamo recompile limits,
+        # recursion limit, and inference-only grad mode.
+        sys.setrecursionlimit(50000)
+        try:
+            import vllm_torchtpu.runner.tpu_runner
+            vllm_torchtpu.runner.tpu_runner._get_padded_num_reqs_with_upper_limit = lambda x, upper_limit: upper_limit
+        except Exception as e:
+            logger.warning(f"Could not patch tpu_runner padding: {e}")
+        try:
+            import vllm.model_executor.model_loader.weight_utils
+            vllm.model_executor.model_loader.weight_utils.initialize_dummy_weights = lambda *args, **kwargs: None
+            import vllm.model_executor.model_loader.dummy_loader
+            vllm.model_executor.model_loader.dummy_loader.initialize_dummy_weights = lambda *args, **kwargs: None
+        except Exception:
+            pass
+        import torch
+        import torch._dynamo
+        torch._dynamo.config.recompile_limit = 100
+        torch._dynamo.config.cache_size_limit = 100
+        try:
+            torch._dynamo.config._config["recompile_limit"].default = 100
+            torch._dynamo.config._config["cache_size_limit"].default = 100
+            torch._dynamo.config._config["accumulated_cache_size_limit"].default = 100
+        except Exception:
+            pass
+        torch.set_grad_enabled(False)
+
         from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
         original_initialize_worker = RayWorkerProc.initialize_worker
         
@@ -197,9 +247,11 @@ def patch_vllm_for_tpu(vllm_args_path: str) -> None:
                 pass
 
             import torch._dynamo
-            torch._dynamo.config._config["recompile_limit"].default = 100
-            torch._dynamo.config._config["cache_size_limit"].default = 100
-            torch._dynamo.config._config["accumulated_cache_size_limit"].default = 100
+            torch._dynamo.config.recompile_limit = 100
+            torch._dynamo.config.cache_size_limit = 100
+            torch._dynamo.config.accumulated_cache_size_limit = 100
+            torch._dynamo.config.fail_on_recompile_limit_hit = False
+            torch._dynamo.config.suppress_errors = True
 
             # Inference-only worker: pin grad mode off. AsyncCollectiveTensor timing can
             # flip grad_mode between traces, and each flip is a Dynamo recompile (a full
@@ -222,6 +274,12 @@ class RayVLLMGenerator:
         import sys
         # Prevent RecursionError during TorchDynamo AOT tracing on driver/worker
         sys.setrecursionlimit(50000)
+        import torch._dynamo
+        torch._dynamo.config.recompile_limit = 100
+        torch._dynamo.config.cache_size_limit = 100
+        torch._dynamo.config.accumulated_cache_size_limit = 100
+        torch._dynamo.config.fail_on_recompile_limit_hit = False
+        torch._dynamo.config.suppress_errors = True
         os.environ.setdefault("LOCAL_RANK", "0")
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
