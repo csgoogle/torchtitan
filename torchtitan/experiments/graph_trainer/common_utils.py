@@ -470,7 +470,7 @@ def apply_simple_fsdp(
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
     )
 
-    expert_mesh = None
+    expert_fsdp_mesh = None
     expert_fsdp_degree = 1
     if parallel_dims.ep_enabled:
         expert_mesh_names = (
@@ -478,15 +478,19 @@ def apply_simple_fsdp(
             if parallel_dims.dp_replicate_enabled
             else ["efsdp"]
         )
-        expert_mesh = parallel_dims.get_optional_mesh(expert_mesh_names)
-        assert expert_mesh is not None
-        expert_fsdp_degree = expert_mesh["efsdp"].size() * parallel_dims.ep
+        expert_fsdp_mesh = parallel_dims.get_optional_mesh(expert_mesh_names)
+        assert expert_fsdp_mesh is not None
+        expert_fsdp_degree = (
+            expert_fsdp_mesh["efsdp"].size() * parallel_dims.ep
+        )
     elif parallel_dims.fsdp_enabled:
-        expert_mesh = dp_mesh
+        # Pure FSDP still uses the same DP mesh; only the expert tensor's shard
+        # dimension changes when the mesh is wider than its expert dimension.
+        expert_fsdp_mesh = dp_mesh
         expert_fsdp_degree = parallel_dims.dp_shard * parallel_dims.cp
 
     experts_sharded_on_dim_1 = 0
-    if expert_mesh is not None and isinstance(model, Decoder):
+    if expert_fsdp_mesh is not None and isinstance(model, Decoder):
         for _, transformer_block in model.layers.items():
             if not isinstance(transformer_block, TransformerBlock):
                 continue
@@ -502,7 +506,7 @@ def apply_simple_fsdp(
 
             moe.experts = data_parallel(
                 moe.experts,
-                expert_mesh,
+                expert_fsdp_mesh,
                 dp_mode,
                 mp_policy=mp_policy,
                 shard_dim=experts_shard_dim,
