@@ -4,7 +4,7 @@ This recipe runs the FSDP-only Qwen3-30B-A3B benchmark on 128 TPU cores.
 See the TPU [README](../../../../README.md) for XPK installation and cluster
 setup.
 
-The two `LIBTPU_INIT_ARGS` below must be set before PJRT initialization. The
+The `LIBTPU_INIT_ARGS` below must be set before PJRT initialization. The
 SparseCore collective aggregator is required by the latency-hiding layer
 scheduler for this workload, so keep the flags enabled or disabled together.
 
@@ -21,9 +21,12 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 # Zero-3 interleave in PR #328, which cannot overlap its all-gathers and
 # reduce-scatters. Re-evaluate this choice for Zero-3 prefetch or future
 # schedules that can make those collectives concurrent.
+# Request TPU7x performance state 7 for this throughput-oriented recipe. This
+# trades higher device power for faster compute rather than changing the graph.
 export LIBTPU_INIT_ARGS='--xla_tpu_enable_sparse_core_collective_aggregator=true \
     --xla_tpu_enable_latency_hiding_layer_scheduler=true \
-    --xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false'
+    --xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false \
+    --xla_tpu_dvfs_p_state=7'
 
 xpk workload create \
 --workload="$WORKLOAD_NAME" \
@@ -50,8 +53,10 @@ xpk workload create \
 The scheduler is opt-in: omit the aggregator and scheduler flags to run the
 same TorchTitan configuration without it. The dual-SparseCore reduce-scatter
 flag is an independent recipe choice and may need to be disabled for schedules
-that overlap all-gather and reduce-scatter. These flags are launcher-owned
-because libtpu reads them before the TorchTitan configuration is constructed.
+that overlap all-gather and reduce-scatter. The p-state flag is also independent
+and selects the throughput-oriented TPU7x operating point. These flags are
+launcher-owned because libtpu reads them before the TorchTitan configuration is
+constructed.
 
 In matched 30-step TPU7x runs, enabling the pair improved throughput by about
 5% at both GBS768/2K and GBS1024/2K. The runs retained FP32 FSDP reductions and
