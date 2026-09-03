@@ -9,6 +9,9 @@ from torchtitan.config import derive
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
     segment_matmul_pallas_2d,
 )
+from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
+    paired_segment_matmul_pallas_2d,
+)
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.model import ModelConfigConverter
@@ -68,7 +71,7 @@ def _native_weight_sharding(config: ShardingConfig) -> ShardingConfig:
 
 
 class TpuGroupedExperts(GroupedExperts):
-    """TPU expert kernels with an opt-in Pallas grouped path.
+    """TPU expert kernels with opt-in Pallas grouped paths.
 
     The optional kernel-native layout stores each expert weight in the exact
     ``(E, K, N)`` order consumed by Pallas, where ``K`` is the contracted input
@@ -78,11 +81,16 @@ class TpuGroupedExperts(GroupedExperts):
 
     Translation hooks register during construction. Later save hooks on this
     module see canonical keys; later load pre-hooks see native keys.
+
+    The paired path changes only W1/W3 execution: their parameters, FSDP
+    collectives, checkpoint keys, and the W2 projection remain independent.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(GroupedExperts.Config):
         use_pallas_grouped_mm: bool = False
+        # Share routed-token loads between the equal-shaped W1/W3 projections.
+        use_pallas_paired_grouped_mm: bool = False
         pallas_grouped_mm_tile_m: int = 1024
         pallas_grouped_mm_tile_k: int = 0
         pallas_grouped_mm_tile_n: int = 0
@@ -111,12 +119,21 @@ class TpuGroupedExperts(GroupedExperts):
             super().__init__(config)
 
         self.use_pallas_grouped_mm = config.use_pallas_grouped_mm
+        self.use_pallas_paired_grouped_mm = config.use_pallas_paired_grouped_mm
         self.pallas_grouped_mm_tile_m = config.pallas_grouped_mm_tile_m
         self.pallas_grouped_mm_tile_k = config.pallas_grouped_mm_tile_k
         self.pallas_grouped_mm_tile_n = config.pallas_grouped_mm_tile_n
         self.pallas_grouped_mm_tgmm_tiling = config.pallas_grouped_mm_tgmm_tiling
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
         self._native_sharding_applied = False
+
+        if self.use_pallas_paired_grouped_mm:
+            if not self.use_pallas_grouped_mm:
+                raise ValueError("Paired grouped matmul requires Pallas")
+            if self.pallas_grouped_mm_tgmm_tiling[1:] != (0, 0):
+                raise ValueError(
+                    "Paired grouped matmul requires full K/N TGMM tiles"
+                )
 
         if not self.use_kernel_native_weight_layout:
             return
@@ -148,6 +165,18 @@ class TpuGroupedExperts(GroupedExperts):
             self._sharding_config = _native_weight_sharding(self._sharding_config)
             self._native_sharding_applied = True
         super()._distribute_states(parallel_dims)
+
+    def parallelize(self, parallel_dims) -> None:
+        # The paired GEMM can consume expert-major rows after EP dispatch, but
+        # EP produces a ragged row count that is not generally tile-aligned.
+        # Supporting it requires masked or padded tail rows, removing any
+        # padding before combine, and validating the nested EP/FSDP sharding.
+        if (
+            self.use_pallas_paired_grouped_mm
+            and parallel_dims.get_optional_mesh("ep") is not None
+        ):
+            raise ValueError("Paired grouped matmul requires EP=1 exact-row dispatch")
+        super().parallelize(parallel_dims)
 
     @staticmethod
     def _canonical_weights_on_save(module, state_dict, prefix, local_metadata) -> None:
@@ -200,8 +229,17 @@ class TpuGroupedExperts(GroupedExperts):
         tile_k = self.pallas_grouped_mm_tile_k
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
-        hidden_RF = F.silu(
-            segment_matmul_pallas_2d(
+        if self.use_pallas_paired_grouped_mm:
+            gate_RF, up_RF = paired_segment_matmul_pallas_2d(
+                x_bf16,
+                w1_EKN.bfloat16(),
+                w3_EKN.bfloat16(),
+                num_tokens_per_expert_E,
+                tile_m=tile_m,
+                tgmm_tile_m=tgmm_tiling[0],
+            )
+        else:
+            gate_RF = segment_matmul_pallas_2d(
                 x_bf16,
                 w1_EKN.bfloat16(),
                 num_tokens_per_expert_E,
@@ -210,16 +248,16 @@ class TpuGroupedExperts(GroupedExperts):
                 tile_n=tile_n,
                 tgmm_tiling=tgmm_tiling,
             )
-        )
-        hidden_RF = hidden_RF * segment_matmul_pallas_2d(
-            x_bf16,
-            w3_EKN.bfloat16(),
-            num_tokens_per_expert_E,
-            tile_m=tile_m,
-            tile_k=tile_k,
-            tile_n=tile_n,
-            tgmm_tiling=tgmm_tiling,
-        )
+            up_RF = segment_matmul_pallas_2d(
+                x_bf16,
+                w3_EKN.bfloat16(),
+                num_tokens_per_expert_E,
+                tile_m=tile_m,
+                tile_k=tile_k,
+                tile_n=tile_n,
+                tgmm_tiling=tgmm_tiling,
+            )
+        hidden_RF = F.silu(gate_RF) * up_RF
         return segment_matmul_pallas_2d(
             hidden_RF,
             w2_EKN.bfloat16(),
