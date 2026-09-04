@@ -262,28 +262,33 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m):
             )
             loaded_lhs = lax.select(
                 lhs_mask[...],
-                lhs[...].astype(jnp.float32),
-                jnp.zeros_like(lhs, jnp.float32),
-            ).swapaxes(0, 1)
+                lhs[...],
+                jnp.zeros_like(lhs),
+            )
             loaded_dout1 = lax.select(
                 dout_mask[...],
-                dout1[...].astype(jnp.float32),
-                jnp.zeros_like(dout1, jnp.float32),
+                dout1[...],
+                jnp.zeros_like(dout1),
             )
             loaded_dout3 = lax.select(
                 dout_mask[...],
-                dout3[...].astype(jnp.float32),
-                jnp.zeros_like(dout3, jnp.float32),
+                dout3[...],
+                jnp.zeros_like(dout3),
             )
-            acc1[...] += lax.dot(
-                loaded_lhs.astype(jnp.bfloat16),
-                loaded_dout1.astype(jnp.bfloat16),
+            # All three inputs are already BF16. Mask them without a
+            # BF16->FP32->BF16 round trip, and contract the row dimensions
+            # directly instead of transposing lhs only to express X.T @ dY.
+            acc1[...] += lax.dot_general(
+                loaded_lhs,
+                loaded_dout1,
                 preferred_element_type=jnp.float32,
+                dimension_numbers=(((0,), (0,)), ((), ())),
             )
-            acc3[...] += lax.dot(
-                loaded_lhs.astype(jnp.bfloat16),
-                loaded_dout3.astype(jnp.bfloat16),
+            acc3[...] += lax.dot_general(
+                loaded_lhs,
+                loaded_dout3,
                 preferred_element_type=jnp.float32,
+                dimension_numbers=(((0,), (0,)), ((), ())),
             )
 
         is_last_grid_id = grid_id == pl.num_programs(2) - 1
