@@ -97,6 +97,21 @@ class TestConfigManager(unittest.TestCase):
         )
         assert config.training.steps == 5
 
+    def test_cli_override_bfloat16_reduce(self):
+        """FSDP reduction precision can be selected explicitly."""
+        config_manager = ConfigManager()
+        config = config_manager.parse_args(
+            [
+                "--module",
+                "llama3",
+                "--config",
+                "llama3_debugmodel",
+                "--training.mixed_precision_reduce",
+                "bfloat16",
+            ]
+        )
+        assert config.training.mixed_precision_reduce == "bfloat16"
+
     def test_cli_override_dump_folder(self):
         """CLI args override config defaults for nested fields."""
         config_manager = ConfigManager()
