@@ -187,6 +187,7 @@ def _make_splash_attention_fn(
         out_b,
         logsumexp_b,
         dkv_mask_info,
+        None,  # prng_key
     )
     # pylint: disable=protected-access
     all_grads = splash_attention_kernel._splash_attention_bwd(
