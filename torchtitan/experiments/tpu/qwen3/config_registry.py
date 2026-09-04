@@ -425,6 +425,7 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   assert cfg.model_spec is not None
   for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
+    experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
     experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
     experts.use_kernel_native_weight_layout = True

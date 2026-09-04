@@ -25,6 +25,7 @@ def _build_experts(
     num_experts=1,
     *,
     use_pallas_grouped_mm=False,
+    use_pallas_paired_grouped_mm=False,
     use_kernel_native_weight_layout=False,
     param_init=None,
 ):
@@ -33,6 +34,10 @@ def _build_experts(
         hidden_dim=24,
         num_experts=num_experts,
         use_pallas_grouped_mm=use_pallas_grouped_mm,
+        use_pallas_paired_grouped_mm=use_pallas_paired_grouped_mm,
+        pallas_grouped_mm_tgmm_tiling=(
+            (128, 0, 0) if use_pallas_paired_grouped_mm else (128, 128, 128)
+        ),
         use_kernel_native_weight_layout=use_kernel_native_weight_layout,
         param_init=param_init,
         token_dispatcher=LocalTokenDispatcher.Config(
@@ -75,6 +80,7 @@ def test_model_converter_preserves_config_fields():
     assert root.experts.hidden_dim == original.hidden_dim
     assert root.experts.num_experts == original.num_experts
     assert root.experts.token_dispatcher == original.token_dispatcher
+    assert not root.experts.use_pallas_paired_grouped_mm
     assert root.experts.pallas_grouped_mm_tile_k == 0
     assert root.experts.pallas_grouped_mm_tile_n == 0
     assert root.experts.pallas_grouped_mm_tgmm_tiling == (128, 128, 128)
@@ -93,6 +99,9 @@ def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
     experts = list(config.model_spec.model.traverse(TpuGroupedExperts.Config))
     assert len(experts) == 48
     assert all(expert.use_pallas_grouped_mm for _, expert, _, _ in experts)
+    assert all(
+        expert.use_pallas_paired_grouped_mm for _, expert, _, _ in experts
+    )
     assert all(expert.pallas_grouped_mm_tile_m == 256 for _, expert, _, _ in experts)
     assert all(
         expert.pallas_grouped_mm_tgmm_tiling == (256, 0, 0)
@@ -110,6 +119,35 @@ def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
 def test_kernel_native_layout_requires_pallas():
     with pytest.raises(ValueError, match="Kernel-native expert weights require Pallas"):
         _build_experts(use_kernel_native_weight_layout=True)
+
+
+def test_paired_grouped_mm_validates_supported_configuration():
+    with pytest.raises(ValueError, match="requires Pallas"):
+        _build_experts(use_pallas_paired_grouped_mm=True)
+
+    config = TpuGroupedExperts.Config(
+        dim=16,
+        hidden_dim=24,
+        num_experts=1,
+        use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=True,
+        token_dispatcher=LocalTokenDispatcher.Config(num_experts=1, top_k=1),
+    )
+    with pytest.raises(ValueError, match="requires full K/N TGMM tiles"):
+        config.build()
+
+    experts = _build_experts(
+        use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=True,
+    )
+
+    class ParallelDimsWithEp:
+        @staticmethod
+        def get_optional_mesh(name):
+            return object() if name == "ep" else None
+
+    with pytest.raises(ValueError, match="requires EP=1 exact-row dispatch"):
+        experts.parallelize(ParallelDimsWithEp())
 
 
 def test_kernel_native_layout_preserves_initialization_and_state_dict():
@@ -178,7 +216,8 @@ def test_kernel_native_layout_checkpoint_hook_order():
     assert not {"w1_EFD", "w2_EDF", "w3_EFD"} & load_keys
 
 
-def test_kernel_native_layout_pallas_forward_and_backward():
+@pytest.mark.parametrize("use_pair", [False, True])
+def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
     param_init = {
         name: lambda x: torch.nn.init.normal_(x, std=0.02)
         for name in ("w1_EFD", "w2_EDF", "w3_EFD")
@@ -189,6 +228,7 @@ def test_kernel_native_layout_pallas_forward_and_backward():
     native = _build_experts(
         num_experts=2,
         use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=use_pair,
         use_kernel_native_weight_layout=True,
         param_init=param_init,
     )
@@ -203,10 +243,16 @@ def test_kernel_native_layout_pallas_forward_and_backward():
         offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
         return torch._grouped_mm(x, weight, offs=offsets)
 
+    def paired_grouped_mm(x, w1, w3, counts, **kwargs):
+        return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
+
     expected = stock._experts_forward(x, counts)
     with patch(
         "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
         side_effect=grouped_mm,
+    ), patch(
+        "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
+        side_effect=paired_grouped_mm,
     ):
         actual = native._experts_forward(x_native, counts)
     torch.testing.assert_close(actual, expected)
