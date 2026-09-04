@@ -86,6 +86,11 @@ def _my_bwd(
     h_block_size,
     v_block_size,
 ):
+  # The Torch custom op exposes the reduced loss as a one-element tensor, but
+  # Tokamax's backward API consumes its cotangent as a scalar. Whole-graph XLA
+  # can fold that distinction away; an executable boundary preserves the
+  # one-element shape, so normalize it explicitly before entering Tokamax.
+  dout = jax.numpy.reshape(dout, ())
   if implementation == "xla":
     from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference  # pylint: disable=g-import-not-at-top
 
