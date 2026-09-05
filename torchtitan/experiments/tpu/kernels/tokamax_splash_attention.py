@@ -11,9 +11,33 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask
-import torch
+
+# Workaround for https://github.com/openxla/tokamax/issues/240 (same as
+# linear_softmax_cross_entropy_loss.py): tokamax applies @jaxtyping.jaxtyped
+# at import time, and typeguard's AST instrumentation cannot parse jaxtyping
+# shape-string annotations ("*B T H d"). Swap in a pass-through decorator for
+# the duration of the tokamax import.
+import jaxtyping
+
+_real_jaxtyped = jaxtyping.jaxtyped
+
+
+def _dummy_jaxtyped(*args, **kwargs):
+  def decorator(f):
+    return f
+
+  if len(args) == 1 and callable(args[0]):
+    return args[0]
+  return decorator
+
+
+jaxtyping.jaxtyped = _dummy_jaxtyped
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel  # noqa: E402  pylint: disable=g-import-not-at-top
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask  # noqa: E402  pylint: disable=g-import-not-at-top
+
+jaxtyping.jaxtyped = _real_jaxtyped
+
+import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
 
@@ -187,7 +211,7 @@ def _make_splash_attention_fn(
         out_b,
         logsumexp_b,
         dkv_mask_info,
-        None,  # prng_key
+        None,  # prng_key (added in upstream tokamax)
     )
     # pylint: disable=protected-access
     all_grads = splash_attention_kernel._splash_attention_bwd(
@@ -354,6 +378,12 @@ def jax_attention_bwd(
     q_tr = q_tr * (scale / default_scale)
 
   dq_tr, dk_tr, dv_tr = splash_bwd_fn(q_tr, k_tr, v_tr, out_tr, logsumexp, grad_out_tr)
+
+  # Chain rule for the q pre-scaling above: splash_bwd_fn returns the
+  # gradient wrt the SCALED q, so a non-default scale needs the same
+  # ratio applied to dq (without it, dq is off by default_scale/scale).
+  if abs(scale - default_scale) > 1e-6:
+    dq_tr = dq_tr * (scale / default_scale)
 
   # Transpose/Expand back to original PyTorch layouts
   dq = jnp.transpose(dq_tr, (0, 2, 1, 3))
