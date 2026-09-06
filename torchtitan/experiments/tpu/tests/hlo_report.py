@@ -360,6 +360,112 @@ def layer_axis_buffers(
   )
 
 
+_SHAPE_RE = re.compile(r"^([a-z0-9]+)\[([\d,]+)\]")
+
+
+def _shape(alloc: Allocation) -> tuple[str, tuple[int, ...]] | None:
+  """`f32[6,192,512]` -> `("f32", (6, 192, 512))`, or None if unparseable."""
+  match = _SHAPE_RE.match(alloc.shape)
+  if match is None:
+    return None
+  return match.group(1), tuple(int(d) for d in match.group(2).split(","))
+
+
+def gathered_stacks(
+    layer_buffers: list[Allocation], dp_degree: int
+) -> list[tuple[Allocation, Allocation]]:
+  """Layer-axis buffers that look like a whole-weight copy of a sharded one.
+
+  This is verification step 8 -- "what crosses the forward/backward cut?" --
+  made decidable. The scan is supposed to carry only each rank's *shard* of the
+  stacked weights across the cut and redo the gather in the backward. If the
+  partitioner saves the gather instead, the gathered weight is materialised with
+  the layer axis still on it, and the only thing separating it from the shard it
+  came from is that it is ``dp_degree`` times as wide on dim 1.
+
+  So: same element type, same trailing dims, dim 1 exactly ``dp_degree`` times
+  another buffer's. Returns ``(gathered, its shard)`` pairs.
+
+  ``dp_degree`` is required rather than guessed, and the exact multiple is the
+  point. A plain "is a multiple" test flags fused QKV against ``wo`` -- 3x on
+  dim 1, and entirely correct. Two unrelated weights that happen to differ by
+  exactly the world size would still be a false positive; this is a heuristic
+  over shapes, and it says so.
+  """
+  by_tail: dict[tuple, dict[int, Allocation]] = collections.defaultdict(dict)
+  for alloc in layer_buffers:
+    parsed = _shape(alloc)
+    if parsed is None or len(parsed[1]) < 2:
+      continue
+    dtype, dims = parsed
+    by_tail[(dtype, dims[2:])][dims[1]] = alloc
+
+  found = []
+  for widths in by_tail.values():
+    for width, alloc in widths.items():
+      if width % dp_degree == 0 and width // dp_degree in widths:
+        found.append((alloc, widths[width // dp_degree]))
+  return found
+
+
+def unrolled_violations(report: dict) -> list[str]:
+  """Why this dump is *not* the unrolled baseline, or an empty list.
+
+  The negative control. Every row in this report reads better under scan, so a
+  report that looks right proves nothing unless the arm that is supposed to look
+  wrong actually does. Run it against the unrolled dump of the same config: if
+  it comes back clean, the scan report is measuring a difference rather than a
+  quirk of the reader.
+
+  Note what is *not* asserted: ``while == 0`` over the whole module. Once the
+  TPU kernels are on, the unrolled arm has a dozen `while`s, all of them inside
+  Pallas kernels. ``regions`` already excludes those -- see ``top_level_loops``
+  -- so the check is on the regions, which is the only place the distinction
+  survives.
+  """
+  problems = []
+  loops = [r for r in report["regions"] if r != "outside"]
+  if loops:
+    problems.append(f"has a layer loop ({', '.join(loops)})")
+  if report["layer_axis_buffers"]:
+    shapes = ", ".join(b["shape"] for b in report["layer_axis_buffers"])
+    problems.append(f"has stacked layer-axis buffers ({shapes})")
+  return problems
+
+
+def depth_invariance(shallow: dict, deep: dict) -> str | None:
+  """A diff of two reports at different depths, or None if the program is the same.
+
+  The claim scan exists to make about compile time: the program stops growing
+  with ``n_layers``. Two dumps, four layers and sixteen, and the structural
+  table has to be identical -- same regions, same op counts in each. The
+  instruction count is reported but not asserted: the loop body is depth-free,
+  the entry around it is not quite, and pinning it would fail on a bound
+  computed from the trip count.
+  """
+  lines = []
+  if stable_table(shallow) != stable_table(deep):
+    lines += list(
+        difflib.unified_diff(
+            stable_table(shallow).splitlines(keepends=True),
+            stable_table(deep).splitlines(keepends=True),
+            fromfile="shallow",
+            tofile="deep",
+        )
+    )
+  ratio = deep["instruction_count"] / max(shallow["instruction_count"], 1)
+  # 1.5x is not a tuned threshold, it is the gap between the two outcomes: a
+  # scanned program grows by a constant handful of instructions, an unrolled one
+  # grows with the layer count, and at 4 -> 16 that is 4x.
+  if ratio > 1.5:
+    lines.append(
+        f"instruction count grew {ratio:.1f}x with depth "
+        f"({shallow['instruction_count']} -> {deep['instruction_count']}), so "
+        "the program still scales with n_layers\n"
+    )
+  return "".join(lines) or None
+
+
 def load_dump(dump_dir: str) -> tuple[list[Module], dict[str, list[Allocation]]]:
   """Read every compiled module in a dump directory.
 
@@ -579,6 +685,30 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
       "--expect", help="golden table to compare against; exit 1 on any diff"
   )
   parser.add_argument("--write-expected", help="(re)write a golden table")
+  parser.add_argument(
+      "--saved-set",
+      type=int,
+      metavar="DP_DEGREE",
+      help="check that no gathered weight stack crosses the fwd/bwd cut, "
+      "given the data-parallel degree the run used",
+  )
+  parser.add_argument(
+      "--expect-unrolled",
+      action="store_true",
+      help="negative control: assert this dump has NO layer loop and no "
+      "stacked buffers",
+  )
+  parser.add_argument(
+      "--depth-invariance",
+      metavar="DEEPER_DUMP",
+      help="a second dump of the same config at more layers; assert the "
+      "compiled program is the same",
+  )
+  parser.add_argument(
+      "--deeper-n-layers",
+      type=int,
+      help="layer count of --depth-invariance's dump (default: 4x --n-layers)",
+  )
   return parser.parse_args(argv)
 
 
@@ -590,13 +720,61 @@ def main(argv: list[str]) -> int:
   if args.write_expected:
     with open(args.write_expected, "w") as handle:
       handle.write(stable_table(report))
+
+  # Every check below prints and sets a flag rather than returning, so one run
+  # reports everything that is wrong instead of the first thing.
+  failed = False
   if args.expect:
     diff = compare(report, args.expect)
     if diff:
       print(f"\nthe compiled program is not the one recorded in {args.expect}:")
       print(diff)
-      return 1
-  return 0
+      failed = True
+
+  if args.saved_set:
+    allocations = buffers.get(report["module"], [])
+    pairs = gathered_stacks(
+        layer_axis_buffers(allocations, args.n_layers), args.saved_set
+    )
+    if pairs:
+      print(
+          f"\n{len(pairs)} gathered weight stack(s) cross the forward/backward"
+          " cut, so the in-body gather is being saved rather than recomputed:"
+      )
+      for gathered, shard in pairs:
+        print(f"  {gathered.shape} ({_mib(gathered.size)}) <- {shard.shape}")
+      failed = True
+    else:
+      print("\nsaved set: no gathered weight stack, only sharded xs")
+
+  if args.expect_unrolled:
+    problems = unrolled_violations(report)
+    if problems:
+      print("\nthis dump is not an unrolled baseline: " + "; ".join(problems))
+      failed = True
+    else:
+      print("\nnegative control: no layer loop, no stacked buffers")
+
+  if args.depth_invariance:
+    deeper_modules, deeper_buffers = load_dump(args.depth_invariance)
+    deeper = build_report(
+        deeper_modules,
+        deeper_buffers,
+        args.deeper_n_layers or args.n_layers * 4,
+    )
+    diff = depth_invariance(report, deeper)
+    if diff:
+      print("\nthe compiled program changed with depth:")
+      print(diff)
+      failed = True
+    else:
+      print(
+          "\ndepth invariance: same program at "
+          f"{args.n_layers} and "
+          f"{args.deeper_n_layers or args.n_layers * 4} layers"
+      )
+
+  return 1 if failed else 0
 
 
 if __name__ == "__main__":
