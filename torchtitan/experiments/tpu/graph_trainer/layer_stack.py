@@ -286,6 +286,15 @@ class LayerStack:
                 mp_policy.param_dtype if mp_policy else None,
                 mp_policy.reduce_dtype if mp_policy else None,
             )
+            # Logged because a recipe would otherwise believe its own setting:
+            # `graph_trainer_memory_policy` tags joint-graph nodes, and the
+            # body's are not in it. Only `scan_loop`'s budget reaches them, and
+            # it must be 0.0 or the in-body gather is saved instead of
+            # recomputed.
+            logger.info(
+                "Decoder layers run as a scan: the body is fully "
+                "activation-checkpointed, whatever the memory policy asks for"
+            )
         model.layers = StackedLayers(model.layers, self, use_scan=use_scan)
         self.layers = model.layers
 
