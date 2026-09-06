@@ -6,18 +6,13 @@
 
 """Test-only recipes for the scan work.
 
-Reachable the same way as any shipped recipe, by fully qualified module path::
+Reached like any shipped recipe -- `--module=` takes a module path, so::
 
     --module=torchtitan.experiments.tpu.tests.scan_configs \
     --config=llama3_debugmodel_kernels
 
-These live here rather than in `experiments/tpu/llama3/config_registry.py`
-because nothing outside the tests runs them yet. Almost everything below *is*
-expressible as a command-line flag -- all 22 non-model differences from
-`llama3_debugmodel` parse fine -- so the only reason this is Python at all is
-the model: `model_spec` is excluded from the tyro surface (see the comment in
-`protocols/model_spec.py`), and both `--model_spec.flavor=...` and
-`--model_spec.model.dim=...` are rejected.
+Here rather than in `experiments/tpu/llama3/config_registry.py` because
+nothing outside the tests runs them yet.
 """
 
 from torchtitan.components.checkpoint import CheckpointManager
@@ -63,8 +58,10 @@ def llama3_debugmodel_kernels() -> TPUTrainerConfig:
   and at world size 1 there is nothing to gather.
   """
   config = llama3_debugmodel()
-  # The one thing no flag can reach. `debugmodel` is head_dim=16 and splash
-  # attention needs 128, so the flavour has to be selected in Python.
+  # The one thing no flag can reach: `model_spec` is excluded from the tyro
+  # surface, so `--model_spec.flavor=` and `--model_spec.model.dim=` are both
+  # rejected. Everything else below is a flag, and is here only so the recipe
+  # runs as one name. `debugmodel` is head_dim=16; splash needs 128.
   config.model_spec = model_registry("debugmodel_kernels", attn_backend="sdpa")
   config.model_spec.parallelize_fn = tpu_parallelize_llama
 
