@@ -16,6 +16,7 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
@@ -326,6 +327,39 @@ def llama3_405b() -> TPUTrainerConfig:
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
   return config
+
+
+def _on_graph_trainer(config: TPUTrainerConfig) -> TPUTrainerConfig:
+  """Move a stock recipe onto the graph trainer, changing nothing else.
+
+  Scan lives in the joint-graph tracer, so an A/B has to start from the stock
+  recipe already on that trainer -- otherwise the two arms differ in a trainer
+  as well as in scan. Two things must move with it: the loss, because the
+  tracer folds the lm_head into it and hands plain cross entropy a tuple, and
+  `compile_mode`.
+
+  A transform rather than a second copy of each recipe, so an arm cannot drift
+  from the recipe it claims to measure.
+  """
+  config.loss = PallasCrossEntropyLoss.Config()
+  config.tpu_config.use_graph_trainer = True
+  config.tpu_config.compile_mode = "aot_fx_trace"
+  return config
+
+
+def llama3_8b_gt() -> TPUTrainerConfig:
+  """`llama3_8b` on the graph trainer. Scan is `--tpu-config.use-scan-layers`."""
+  return _on_graph_trainer(llama3_8b())
+
+
+def llama3_70b_gt() -> TPUTrainerConfig:
+  """`llama3_70b` on the graph trainer. Scan is `--tpu-config.use-scan-layers`."""
+  return _on_graph_trainer(llama3_70b())
+
+
+def llama3_405b_gt() -> TPUTrainerConfig:
+  """`llama3_405b` on the graph trainer. Scan is `--tpu-config.use-scan-layers`."""
+  return _on_graph_trainer(llama3_405b())
 
 
 def sft_llama3_8b_metamath() -> TPUTrainerConfig:
