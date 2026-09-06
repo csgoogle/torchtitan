@@ -33,19 +33,27 @@ starts, whatever launcher you use:
 --xla_dump_hlo_pass_re=NOTHING" \
         torchrun --nproc_per_node=8 -m torchtitan.experiments.tpu.train \
             --module=torchtitan.experiments.tpu.llama3 \
-            --config=llama3_debugmodel_kernels --training.steps=3
+            --config=llama3_debugmodel --training.steps=3 \
+            --parallelism.use_simple_fsdp --compile.enable \
+            --compile.backend=tpu --tpu_config.use_graph_trainer \
+            --tpu_config.compile_mode=aot_fx_trace \
+            --tpu_config.eager_mode=DEFER_AND_FUSE
 
 then read it:
 
     python -m torchtitan.experiments.tpu.tests.hlo_report --dump-dir=DIR
     python -m torchtitan.experiments.tpu.tests.hlo_report --dump-dir=DIR \
         --expect=torchtitan/experiments/tpu/tests/testdata/\
-llama3_debugmodel_kernels_unrolled.txt
+llama3_debugmodel_unrolled.txt
 
-`testdata/llama3_debugmodel_kernels_unrolled.txt` is that golden: the unrolled
-`llama3_debugmodel_kernels` recipe on 8 v6e chips, written with
+`testdata/llama3_debugmodel_unrolled.txt` is that golden: the unrolled
+`llama3_debugmodel` recipe on 8 v6e chips at `seq_len=2048`, written with
 `--write-expected`. It is the "before" the scan work is measured against -- no
 layer loop, every all-gather outside one, no stacked layer-axis buffer.
+
+It is SDPA, not splash: `debugmodel` is `head_dim=16` and splash attention
+needs 128. A baseline against the kernels 8B actually trains with needs a debug
+flavour shaped like 8B, which lands with the scan work that requires it.
 """
 
 from __future__ import annotations
@@ -375,10 +383,10 @@ def training_modules(modules: list[Module]) -> list[Module]:
   """The modules that do matmuls, which is the model and nothing else.
 
   A step does not compile one program. Measured on a `DEFER_AND_FUSE` run of
-  `llama3_debugmodel_kernels`: 92 programs, of which 91 are the optimizer
+  `llama3_debugmodel`: 76 programs, of which 75 are the optimizer
   (`foreach_pow`, `foreach_div_`, ...), the RNG, and collectives issued outside
   the graph. Those are elementwise, and several are *larger* than the model --
-  the biggest is a `foreach_pow` at 8631 instructions against the model's 7805 --
+  the biggest is a `foreach_pow` at 8665 instructions against the model's 8549 --
   so picking the largest program picks the optimizer.
 
   Matmuls are the discriminator that survives that: only the model has any.
