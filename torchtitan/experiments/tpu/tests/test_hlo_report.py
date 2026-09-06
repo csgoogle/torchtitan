@@ -283,6 +283,21 @@ class BufferTest(absltest.TestCase):
         hlo_report.layer_axis_buffers(self.allocations, n_layers=99), []
     )
 
+  def test_an_integer_buffer_is_not_a_stacked_weight(self):
+    """Token ids in a run whose batch size equals its layer count.
+
+    `s64[6,2048]` is a batch of sequences, not six stacked layers, and reading
+    it as one made a genuinely unrolled dump fail the unrolled negative
+    control. Weights are floats; this is what tells the two apart without the
+    tool knowing the batch size.
+    """
+    allocations = hlo_report.parse_buffer_assignment(
+        "allocation 0: size 98304, shape |s64[6,2048]|:\n"
+        "allocation 1: size 6144, shape |f32[6,32,8]|:\n"
+    )
+    found = hlo_report.layer_axis_buffers(allocations, n_layers=6)
+    self.assertEqual([a.shape for a in found], ["f32[6,32,8]"])
+
 
 class SavedSetTest(absltest.TestCase):
   """Did the in-body gather get saved across the cut instead of recomputed?

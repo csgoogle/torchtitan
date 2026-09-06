@@ -331,6 +331,17 @@ def parse_buffer_assignment(text: str) -> list[Allocation]:
   return out
 
 
+_SHAPE_RE = re.compile(r"^([a-z0-9]+)\[([\d,]+)\]")
+
+
+def _shape(alloc: Allocation) -> tuple[str, tuple[int, ...]] | None:
+  """`f32[6,192,512]` -> `("f32", (6, 192, 512))`, or None if unparseable."""
+  match = _SHAPE_RE.match(alloc.shape)
+  if match is None:
+    return None
+  return match.group(1), tuple(int(d) for d in match.group(2).split(","))
+
+
 def layer_axis_buffers(
     allocations: list[Allocation], n_layers: int
 ) -> list[Allocation]:
@@ -350,25 +361,26 @@ def layer_axis_buffers(
   decide on its own, having no world size and no model dims -- into a diff a
   reviewer can read.
 
-  It is still a heuristic and says so: any tensor that happens to have
+  **Floating-point only.** The property is about *weights*, and a weight is a
+  float. Without that filter the check reads any leading dimension equal to
+  `n_layers` as a layer axis, so a run whose batch size happens to equal its
+  layer count reports its token ids (`s64[6,2048]`), its positions and its RNG
+  counter as stacked weights -- which made a genuinely unrolled dump fail the
+  unrolled negative control. The element type separates them with no knowledge
+  of the batch size, which this tool does not have.
+
+  It is still a heuristic and says so: any float tensor that happens to have
   `n_layers` as its leading dimension matches.
   """
+  def is_float(alloc: Allocation) -> bool:
+    shape = _shape(alloc)
+    return shape is not None and shape[0].startswith(("f", "bf"))
+
   return sorted(
-      (a for a in allocations if a.leading_dim == n_layers),
+      (a for a in allocations if a.leading_dim == n_layers and is_float(a)),
       key=lambda a: a.size,
       reverse=True,
   )
-
-
-_SHAPE_RE = re.compile(r"^([a-z0-9]+)\[([\d,]+)\]")
-
-
-def _shape(alloc: Allocation) -> tuple[str, tuple[int, ...]] | None:
-  """`f32[6,192,512]` -> `("f32", (6, 192, 512))`, or None if unparseable."""
-  match = _SHAPE_RE.match(alloc.shape)
-  if match is None:
-    return None
-  return match.group(1), tuple(int(d) for d in match.group(2).split(","))
 
 
 def gathered_stacks(
