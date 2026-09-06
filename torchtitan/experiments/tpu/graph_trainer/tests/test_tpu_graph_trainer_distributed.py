@@ -106,19 +106,18 @@ class TpuGraphTrainerDistributedTest(
       dict(
           # The scan work is developed against llama3, so the graph-trainer
           # path it depends on needs coverage there and not only on Qwen3.
-          # `debugmodel_kernels` rather than `debugmodel` because the harness
-          # turns splash attention on, which needs head_dim 128.
           testcase_name="llama3_simple_fsdp",
-          module="torchtitan.experiments.tpu.tests.scan_configs",
-          config="llama3_debugmodel_kernels",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=[
               "--tpu_config.use_simple_fsdp",
-              # The recipe's fused loss tiles 1024 tokens at a time, and this
-              # harness trains on 4 x 128 = 512. The kernel must cover the token
-              # dimension exactly, so retile rather than fall back to XLA.
-              "--loss.b_block_size=512",
+              # `debugmodel` is head_dim=16 and splash attention needs 128, so
+              # this arm runs SDPA. Covering llama3 against the kernels 8B
+              # actually trains with needs a debug flavour shaped like 8B; that
+              # lands with the scan work that requires it.
+              "--splash_attention_kernel.no-use-splash-attention-kernel",
           ],
       ),
   ])

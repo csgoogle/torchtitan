@@ -107,8 +107,9 @@ def _build_llama3_layers(
     return layers
 
 
-def _debug(attn_backend: str, *, dim: int, n_heads: int) -> Llama3Model.Config:
-    """A 6-layer, 2048-vocabulary llama3, parameterised by the attention shape."""
+def _debugmodel(attn_backend: str) -> Llama3Model.Config:
+    dim = 256
+    n_heads = 16
     n_layers = 6
     return Llama3Model.Config(
         dim=dim,
@@ -135,21 +136,6 @@ def _debug(attn_backend: str, *, dim: int, n_heads: int) -> Llama3Model.Config:
             attn_backend=attn_backend,
         ),
     )
-
-
-def _debugmodel(attn_backend: str) -> Llama3Model.Config:
-    return _debug(attn_backend, dim=256, n_heads=16)
-
-
-def _debugmodel_kernels(attn_backend: str) -> Llama3Model.Config:
-    """`debugmodel` at a head dimension the real kernels accept.
-
-    `debugmodel` is `head_dim=16`, and splash attention needs 128 -- so anything
-    validated only on `debugmodel` is never once run against the attention the
-    8B/70B/405B recipes train with. Depth and vocabulary are unchanged: it is
-    the *shape* that is realistic here, not the size.
-    """
-    return _debug(attn_backend, dim=1024, n_heads=8)
 
 
 def _1b(attn_backend: str) -> Llama3Model.Config:
@@ -350,7 +336,6 @@ def _405b(attn_backend: str) -> Llama3Model.Config:
 
 llama3_configs = {
     "debugmodel": _debugmodel,
-    "debugmodel_kernels": _debugmodel_kernels,
     "1B": _1b,
     "3B": _3b,
     "8B": _8b,
