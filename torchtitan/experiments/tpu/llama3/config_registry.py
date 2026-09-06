@@ -22,6 +22,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
     LossKernelConfig,
 )
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.hf_datasets.text_datasets import (
     ChatDataLoader,
     HuggingFaceTextDataLoader,
@@ -74,6 +75,97 @@ def llama3_debugmodel() -> TPUTrainerConfig:
       ),
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  return config
+
+
+def llama3_debugmodel_kernels() -> TPUTrainerConfig:
+  """A debug model that exercises what 8B/70B/405B actually run.
+
+  `llama3_debugmodel` and `llama3_1b` use plain SDPA with `SelectiveAC` and no
+  kernels; `8B`, `70B` and `405B` use `FullAC`, splash attention and the Pallas
+  loss kernel. Anything validated only on `llama3_debugmodel` is therefore never
+  once run against the code path it will ship into -- it passes, and then fails
+  at 8B on a kernel the debug config does not contain.
+
+  This recipe closes that gap at debug cost: the 8B feature set, at
+  `debugmodel_kernels` size (`dim=1024 / n_heads=8`, six layers). It is also the
+  first llama3 recipe on the graph-trainer lane, whose coverage is otherwise
+  Qwen3-only.
+
+  It is sized for **all 8 chips of a v6e-8**, not one. FSDP is the thing under
+  test and at world size 1 there is nothing to gather, so a single-chip run of
+  this config proves nothing it is meant to prove.
+  """
+  model_spec = model_registry("debugmodel_kernels", attn_backend="sdpa")
+  model_spec.parallelize_fn = tpu_parallelize_llama
+  config = TPUTrainerConfig(
+      # The fused loss is selected the new way -- `PallasCrossEntropyLoss.Config`
+      # plus the LM-head override below -- not by `loss_kernel.use_loss_kernel`.
+      # The legacy flag is applied inside `build_tpu_loss`, which the graph
+      # trainer never calls: `compute_annotated_loss` reads `job_config.loss`
+      # directly, so the flag would patch the LM head into returning
+      # `(hidden, weight.T)` while the loss stayed ordinary cross entropy, and
+      # the run dies in `pred.flatten` on a tuple.
+      loss=PallasCrossEntropyLoss.Config(),
+      hf_assets_path="./tests/assets/tokenizer",
+      model_spec=model_spec,
+      optimizer=default_adamw(lr=8e-4),
+      lr_scheduler=LRSchedulersContainer.Config(
+          warmup_steps=2,
+          decay_ratio=0.8,
+          decay_type="linear",
+          min_lr_factor=0.0,
+      ),
+      training=TrainingConfig(
+          local_batch_size=1,
+          seq_len=2048,
+          steps=10,
+      ),
+      dataloader=HuggingFaceTextDataLoader.Config(
+          dataset="c4_test",
+      ),
+      metrics=MetricsProcessor.Config(log_freq=1),
+      parallelism=ParallelismConfig(use_simple_fsdp=True),
+      checkpoint=CheckpointManager.Config(
+          enable=False,
+          interval=500,
+          last_save_model_only=True,
+      ),
+      activation_checkpoint=FullAC.Config(),
+      validator=Validator.Config(enable=False, freq=500, steps=10),
+      tpu_config=TPUConfig(
+          eager_mode="DEFER_AND_FUSE",
+          use_graph_split=False,
+          use_graph_trainer=True,
+          compile_mode="aot_fx_trace",
+      ),
+      compile=CompileConfig(
+          enable=True,
+          backend="tpu",
+          components=["model"],
+      ),
+      # Block sizes are the sequence length quartered, as in the 8B recipe --
+      # scaled down with `seq_len` rather than copied from it, since a block
+      # larger than the sequence is not a valid splash configuration.
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          use_splash_attention_kernel=True,
+          sa_block_q=512,
+          sa_block_kv=512,
+          sa_block_dkv=512,
+          sa_block_kv_compute=512,
+          sa_block_q_dkv=512,
+          sa_block_kv_dkv=512,
+          sa_block_kv_dkv_compute=512,
+          sa_block_q_dq=512,
+          sa_block_kv_dq=512,
+      ),
+  )
+  # Pairs with `PallasCrossEntropyLoss` above: the override swaps the LM head
+  # for one whose forward returns `(hidden, weight.T)` for the fused kernel to
+  # consume, and it has to be registered before the model is constructed.
+  config.override.imports.append(
+      "torchtitan.experiments.tpu.overrides.fused_loss"
+  )
   return config
 
 

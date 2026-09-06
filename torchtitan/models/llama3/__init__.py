@@ -138,6 +138,48 @@ def _debugmodel(attn_backend: str) -> Llama3Model.Config:
     )
 
 
+def _debugmodel_kernels(attn_backend: str) -> Llama3Model.Config:
+    """`debugmodel`, but with a head dimension the real kernels accept.
+
+    `debugmodel` is `dim=256 / n_heads=16`, i.e. `head_dim=16`. Splash attention
+    needs a head dimension of 128, so any change that only ever runs against
+    `debugmodel` is never once exercised against the kernel the 8B/70B/405B
+    recipes actually train with -- it looks finished and then fails at 8B.
+
+    `dim=1024 / n_heads=8` is the smallest shape that gives `head_dim=128`.
+    Depth stays at 6 and the vocabulary stays tiny, so this is still a debug
+    model: it is the *shape* that is realistic, not the size.
+    """
+    dim = 1024
+    n_heads = 8
+    n_layers = 6
+    return Llama3Model.Config(
+        dim=dim,
+        vocab_size=2048,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=2048, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        lm_head=Linear.Config(
+            in_features=dim, out_features=2048, param_init=_output_linear_init(dim)
+        ),
+        layers=_build_llama3_layers(
+            fuse_qkv=True,
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=n_heads,
+            hidden_dim=compute_ffn_hidden_dim(dim, multiple_of=256),
+            rope=ComplexRoPE.Config(
+                dim=dim // n_heads,
+                max_seq_len=131072,
+                theta=500000,
+                scaling="llama",
+            ),
+            attn_backend=attn_backend,
+        ),
+    )
+
+
 def _1b(attn_backend: str) -> Llama3Model.Config:
     dim = 2048
     n_heads = 32
@@ -336,6 +378,7 @@ def _405b(attn_backend: str) -> Llama3Model.Config:
 
 llama3_configs = {
     "debugmodel": _debugmodel,
+    "debugmodel_kernels": _debugmodel_kernels,
     "1B": _1b,
     "3B": _3b,
     "8B": _8b,
