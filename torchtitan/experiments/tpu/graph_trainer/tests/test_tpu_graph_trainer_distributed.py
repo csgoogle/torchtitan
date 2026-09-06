@@ -109,7 +109,7 @@ class TpuGraphTrainerDistributedTest(
           # `debugmodel_kernels` rather than `debugmodel` because the harness
           # turns splash attention on, which needs head_dim 128.
           testcase_name="llama3_simple_fsdp",
-          module="torchtitan.experiments.tpu.llama3",
+          module="torchtitan.experiments.tpu.tests.scan_configs",
           config="llama3_debugmodel_kernels",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
