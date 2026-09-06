@@ -331,21 +331,33 @@ def parse_buffer_assignment(text: str) -> list[Allocation]:
   return out
 
 
-def largest_layer_axis_buffer(
+def layer_axis_buffers(
     allocations: list[Allocation], n_layers: int
-) -> Allocation | None:
-  """The biggest buffer whose leading dimension is the layer count.
+) -> list[Allocation]:
+  """Every buffer whose leading dimension is the layer count, biggest first.
 
   This is the P1 check stated as a number. A stacked `[n_layers, ...]` weight
   that reaches the device materialised -- rather than being sliced inside the
   loop -- shows up here, and nowhere else, because it is numerically correct.
 
-  It is a heuristic and says so: any tensor that happens to have `n_layers` as
-  its leading dimension matches. That is acceptable for a report whose job is to
-  make a reviewer look, and the shape is printed so they can.
+  **Why the whole list and not just the largest.** The property being tested is
+  that no *gathered, unsharded* weight carries a layer axis. A scan must
+  materialise layer-axis buffers for its `xs` and stacked `ys`, so the presence
+  of one proves nothing; what separates `f32[6,96,256]` (the sharded `xs`, 96 =
+  768/8) from `f32[6,768,256]` (a gathered stack) is the shape, and reporting
+  only the biggest hides every other one. Listing them all and pinning the list
+  in the golden turns "is this sharded or gathered?" -- which the tool cannot
+  decide on its own, having no world size and no model dims -- into a diff a
+  reviewer can read.
+
+  It is still a heuristic and says so: any tensor that happens to have
+  `n_layers` as its leading dimension matches.
   """
-  candidates = [a for a in allocations if a.leading_dim == n_layers]
-  return max(candidates, key=lambda a: a.size, default=None)
+  return sorted(
+      (a for a in allocations if a.leading_dim == n_layers),
+      key=lambda a: a.size,
+      reverse=True,
+  )
 
 
 def load_dump(dump_dir: str) -> tuple[list[Module], dict[str, list[Allocation]]]:
@@ -395,10 +407,22 @@ def training_modules(modules: list[Module]) -> list[Module]:
 
 
 def main_module(modules: list[Module]) -> Module:
-  """The one training program.
+  """The whole training step, picked out of the matmul-bearing programs.
 
-  More than one means the model recompiled, which invalidates every number
-  below -- the report would describe whichever copy happened to be biggest.
+  An earlier version of this docstring claimed more than one training program
+  "means the model recompiled, which invalidates every number below". That is
+  false for a scan arm and it was never enforced -- the function raised only on
+  *zero* and then silently described whichever copy was biggest. Measured on
+  `llama3_debugmodel` under scan: **three** matmul-bearing programs, at
+  576 instructions / 7 matmuls, 1176 / 20, and 2525 / 30. The 7-matmul one is a
+  single llama3 layer, so the loop body is compiled standalone as well as
+  nested. That is expected, not a recompile.
+
+  So the largest is the right answer -- it is the one that contains the others'
+  work -- but it is a choice, and a report that makes a choice has to say so.
+  `training_programs` is in the golden and `render` names every candidate, so a
+  run that really did recompile shows up as a diff instead of as a silent
+  substitution.
   """
   found = training_modules(modules)
   if not found:
@@ -427,21 +451,28 @@ def build_report(
       for label, opcodes in _OP_ROWS
   }
   allocations = buffers.get(module.name, [])
-  layer_buffer = largest_layer_axis_buffer(allocations, n_layers)
+  layer_buffers = layer_axis_buffers(allocations, n_layers)
+  training = training_modules(modules)
   return {
       "module": module.name,
       "programs_compiled": len(modules),
-      # >1 means the model recompiled. Most of `programs_compiled` is the
-      # optimizer under `DEFER_AND_FUSE` and its count is noise; this one is not.
-      "training_programs": len(training_modules(modules)),
+      # Most of `programs_compiled` is the optimizer under `DEFER_AND_FUSE` and
+      # its count is noise. This one is not: it says how many programs the
+      # report had to choose between. Under scan it is legitimately >1 -- see
+      # `main_module` -- so it is pinned rather than asserted.
+      "training_programs": len(training),
+      # Named so a reader can tell "the body got compiled standalone too" from
+      # "the model recompiled at a second shape", which have the same count.
+      "training_program_sizes": sorted(
+          ((m.instruction_count, m.matmul_count) for m in training),
+          reverse=True,
+      ),
       "regions": list(regions),
       "rows": rows,
       "instruction_count": module.instruction_count,
-      "largest_layer_axis_buffer": (
-          None
-          if layer_buffer is None
-          else {"size": layer_buffer.size, "shape": layer_buffer.shape}
-      ),
+      "layer_axis_buffers": [
+          {"size": a.size, "shape": a.shape} for a in layer_buffers
+      ],
       "largest_buffer": (
           max(a.size for a in allocations) if allocations else None
       ),
@@ -468,12 +499,16 @@ def stable_table(report: dict) -> str:
         label.ljust(20)
         + "".join(str(counts[r]).rjust(width + 2) for r in regions)
     )
-  buf = report["largest_layer_axis_buffer"]
-  lines += [
-      "",
-      "layer-axis buffer:  " + ("none" if buf is None else buf["shape"]),
-      f"training programs:  {report['training_programs']}",
-  ]
+  bufs = report["layer_axis_buffers"]
+  lines += [""]
+  if not bufs:
+    lines.append("layer-axis buffers: none")
+  else:
+    # Every one, not just the biggest: the shapes are the only thing that tells
+    # a sharded `xs` from a gathered weight stack. See `layer_axis_buffers`.
+    lines.append("layer-axis buffers: " + bufs[0]["shape"])
+    lines += ["                    " + b["shape"] for b in bufs[1:]]
+  lines.append(f"training programs:  {report['training_programs']}")
   return "\n".join(lines) + "\n"
 
 
@@ -485,13 +520,28 @@ def render(report: dict) -> str:
       stable_table(report).rstrip("\n"),
       "",
   ]
-  buf = report["largest_layer_axis_buffer"]
-  if buf is not None:
-    lines.append(f"layer-axis buffer size:     {_mib(buf['size'])}")
+  bufs = report["layer_axis_buffers"]
+  if bufs:
+    # The shapes are already in the stable table above; what this adds is the
+    # byte total, which is the number the memory claim actually rests on.
+    total = sum(b["size"] for b in bufs)
+    lines.append(
+        f"layer-axis buffers:         {len(bufs)}, {_mib(total)} total"
+        f" (largest {_mib(bufs[0]['size'])})"
+    )
   if report["largest_buffer"] is not None:
     lines.append(f"largest buffer:             {_mib(report['largest_buffer'])}")
     lines.append(f"total allocated:            {_mib(report['total_allocated'])}")
   lines.append(f"programs compiled:          {report['programs_compiled']}")
+  sizes = report["training_program_sizes"]
+  if len(sizes) > 1:
+    # Say which one the table describes. Without this the reader cannot tell a
+    # standalone-compiled scan body from a genuine recompile at a second shape.
+    described = ", ".join(
+        f"{n} instrs/{m} matmuls" + (" <- described here" if i == 0 else "")
+        for i, (n, m) in enumerate(sizes)
+    )
+    lines.append(f"training programs:          {described}")
   return "\n".join(lines)
 
 

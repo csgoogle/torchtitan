@@ -8,5 +8,5 @@ dot/convolution            135
 custom-call                 95
 reverse                      0
 
-layer-axis buffer:  none
+layer-axis buffers: none
 training programs:  1

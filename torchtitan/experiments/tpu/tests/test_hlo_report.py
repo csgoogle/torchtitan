@@ -223,15 +223,30 @@ class BufferTest(absltest.TestCase):
     """`preallocated-temp` headers carry no `shape |...|`."""
     self.assertEqual(self.allocations[2].shape, "f32[6,8,8]")
 
-  def test_largest_layer_axis_buffer_ignores_larger_non_layer_buffers(self):
+  def test_layer_axis_buffers_ignore_larger_non_layer_buffers(self):
     """The 64 KiB output is bigger, and is not what P1 is about."""
-    found = hlo_report.largest_layer_axis_buffer(self.allocations, n_layers=6)
-    self.assertEqual(found.shape, "f32[6,32,8]")
+    found = hlo_report.layer_axis_buffers(self.allocations, n_layers=6)
+    self.assertEqual([a.shape for a in found], ["f32[6,32,8]", "f32[6,8,8]"])
 
-  def test_no_layer_axis_buffer_is_reported_as_none(self):
+  def test_layer_axis_buffers_are_biggest_first(self):
+    """The list is the golden, so its order has to be deterministic."""
+    found = hlo_report.layer_axis_buffers(self.allocations, n_layers=6)
+    self.assertEqual([a.size for a in found], sorted([a.size for a in found],
+                                                     reverse=True))
+
+  def test_every_layer_axis_buffer_is_reported_not_just_the_biggest(self):
+    """A sharded `xs` and a gathered weight stack can coexist.
+
+    Reporting only the largest would let a gathered stack hide behind a bigger
+    activation buffer, which is the regression P1 is about.
+    """
+    found = hlo_report.layer_axis_buffers(self.allocations, n_layers=6)
+    self.assertLen(found, 2)
+
+  def test_no_layer_axis_buffer_is_an_empty_list(self):
     """The passing state, and it has to be distinguishable from a parse miss."""
-    self.assertIsNone(
-        hlo_report.largest_layer_axis_buffer(self.allocations, n_layers=99)
+    self.assertEqual(
+        hlo_report.layer_axis_buffers(self.allocations, n_layers=99), []
     )
 
 
@@ -283,6 +298,28 @@ class VacuousPassTest(absltest.TestCase):
       self.assertEqual(report["programs_compiled"], 3)
       self.assertEqual(report["training_programs"], 2)
 
+  def test_the_unreported_training_programs_are_named(self):
+    """Choosing the biggest is fine; choosing it silently is not.
+
+    A scan arm legitimately compiles the loop body standalone as well as nested
+    -- measured, three matmul-bearing programs on `llama3_debugmodel` -- so the
+    count alone cannot separate that from a real recompile. `render` has to say
+    what it passed over, or the reader has no way to tell which case they are
+    looking at.
+    """
+    with tempfile.TemporaryDirectory() as dump:
+      _write(dump, "module_0001.step.after_optimizations.txt", _HLO)
+      _write(dump, "module_0002.body.after_optimizations.txt", _SMALL_MATMUL)
+      modules, buffers = hlo_report.load_dump(dump)
+      report = hlo_report.build_report(modules, buffers, n_layers=6)
+      text = hlo_report.render(report)
+      self.assertIn("<- described here", text)
+      self.assertEqual(len(report["training_program_sizes"]), 2)
+      # Biggest first, and that is the one the table describes.
+      self.assertEqual(
+          report["training_program_sizes"][0][0], report["instruction_count"]
+      )
+
 
 # Bigger than `_HLO` and entirely elementwise, like the optimizer's programs.
 _BIG_ELEMENTWISE = "".join(
@@ -296,6 +333,18 @@ _BIG_ELEMENTWISE = "".join(
         "  ROOT %constant.2 = f32[] constant(1)\n}\n",
     ]
 )
+
+
+# A matmul-bearing program smaller than `_HLO`: the scan body compiled on its
+# own, which is what makes `training_programs > 1` ambiguous.
+_SMALL_MATMUL = """\
+HloModule tt_jit_body, is_scheduled=true
+
+ENTRY %main.3 () -> f32[8,8] {
+  %p0 = f32[8,8]{1,0} parameter(0)
+  ROOT %dot.1 = f32[8,8]{1,0} dot(%p0, %p0)
+}
+"""
 
 
 def _write(directory: str, name: str, text: str) -> None:
