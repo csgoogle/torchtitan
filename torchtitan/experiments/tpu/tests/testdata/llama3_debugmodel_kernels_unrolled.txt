@@ -1,0 +1,12 @@
+                       outside
+while                        1
+all-gather                  99
+reduce-scatter              32
+all-reduce                   1
+dynamic-slice               15
+dot/convolution             90
+custom-call                153
+reverse                      0
+
+layer-axis buffer:  none
+training programs:  1
