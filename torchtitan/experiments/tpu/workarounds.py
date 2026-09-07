@@ -628,7 +628,7 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   # scan's autograd backward reverses its stacks with torch.flip, which is the
   # 70B OOM. Only installed when something is actually going to scan.
   if getattr(
-      getattr(job_config, "parallelism", None), "use_scan_layers", False
+      getattr(job_config, "tpu_config", None), "use_scan_layers", False
   ):
     from torchtitan.experiments.tpu.scan_backward_patch import (  # pylint: disable=g-import-not-at-top
         apply_scan_reverse_backward_patch,
@@ -639,7 +639,7 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
     # learn that a torch bump moved the copied source out from under us.
     if not apply_scan_reverse_backward_patch():
       raise RuntimeError(
-          "--parallelism.use-scan-layers needs the scan backward patch and it"
+          "--tpu-config.use-scan-layers needs the scan backward patch and it"
           " did not install; the warning above says which case this is."
       )
 
