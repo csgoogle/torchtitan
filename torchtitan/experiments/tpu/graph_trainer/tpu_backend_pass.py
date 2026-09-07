@@ -138,6 +138,9 @@ def construct_tpu_pass_pipeline(
         )
 
     if memory_policy and memory_policy != "none":
+        from torchtitan.experiments.graph_trainer.cpu_offload import (
+            apply_cpu_offload_pass,
+        )
         from torchtitan.experiments.graph_trainer.passes import (
             selective_activation_remat_pass,
             tag_with_memory_policy_pass,
@@ -145,6 +148,18 @@ def construct_tpu_pass_pipeline(
 
         passes.append(
             functools.partial(tag_with_memory_policy_pass, config=config)
+        )
+        # Same order as the CUDA pipeline in ``graph_trainer/passes.py``: tag,
+        # then inject, then remat. A no-op unless the policy tagged something
+        # MUST_CPU_OFFLOAD, but without it the offloading policies set their
+        # tags and this pipeline drops them -- the run is correct and uses
+        # exactly the memory it would have used with offloading off.
+        passes.append(
+            functools.partial(
+                apply_cpu_offload_pass,
+                prefetch_lookahead=config.compile.cpu_offload_prefetch_n_layers,
+                defer_n_layers=config.compile.cpu_offload_defer_n_layers,
+            )
         )
         passes.append(selective_activation_remat_pass)
         # This pass pipeline is constructed only by TpuGraphTrainer. Do not
