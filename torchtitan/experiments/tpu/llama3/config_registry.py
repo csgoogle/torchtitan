@@ -168,6 +168,8 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          sa_q_layout="SEQ_MINOR",
+          sa_k_layout="SEQ_MINOR",
           sa_block_q=2048,
           sa_block_kv=2048,
           sa_block_dkv=2048,
@@ -236,6 +238,8 @@ def llama3_70b() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          sa_q_layout="SEQ_MINOR",
+          sa_k_layout="SEQ_MINOR",
           sa_block_q=2048,
           sa_block_kv=2048,
           sa_block_dkv=2048,
@@ -304,6 +308,8 @@ def llama3_405b() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          sa_q_layout="SEQ_MINOR",
+          sa_k_layout="SEQ_MINOR",
           sa_block_q=2048,
           sa_block_kv=2048,
           sa_block_dkv=2048,
@@ -385,6 +391,8 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          sa_q_layout="SEQ_MINOR",
+          sa_k_layout="SEQ_MINOR",
           sa_block_q=2048,
           sa_block_kv=2048,
           sa_block_dkv=2048,
