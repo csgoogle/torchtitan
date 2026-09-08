@@ -61,3 +61,11 @@ constructed.
 In matched 30-step TPU7x runs, enabling the pair improved throughput by about
 5% at both GBS768/2K and GBS1024/2K. The runs retained FP32 FSDP reductions and
 completed with finite loss and gradient norms on all 16 hosts.
+
+## Benchmark Results
+Run Date: 9/8/2026
+* **MFU:** 12.76%
+* **TPS (Tokens Per Second):** 7,121
+* **TFLOPS:** 147.16
+* **Memory Usage:** 65.33 GiB (68.05%)
+* **Step Time (end-to-end):** 1.73s
