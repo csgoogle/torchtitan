@@ -58,6 +58,7 @@ xpk workload create \
     --config=qwen3_8b \
     --training.local_batch_size=6 \
     --training.seq_len=2048 \
+    --training.steps=30 \
     --training.mixed_precision_reduce=float32 \
     --parallelism.use_simple_fsdp \
     --parallelism.enable_tpu_topo_mesh \
@@ -79,7 +80,7 @@ xpk workload create \
 
 ## Expected Metrics
 
-With this configuration, you should observe the following metrics around step 15:
+With this configuration, you should observe the following metrics around step 30:
 
 - **TPS (Tokens per second)**: ~11,044
 - **TFLOPS**: ~521.49
