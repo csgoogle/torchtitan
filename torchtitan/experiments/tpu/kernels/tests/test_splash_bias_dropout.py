@@ -10,6 +10,7 @@ test reuses the full-rank test's shape on purpose to lock that in.
 """
 
 import functools
+import unittest
 
 from absl.testing import absltest
 import torch
@@ -174,6 +175,10 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
           ga.cpu(), gb.cpu(), rtol=0.0, atol=0.0, msg=f"{name}:{gname}"
       )
 
+  # TODO(jeremiahhsu): Update tokamax pin. This test requires tokamax pin
+  # 8eadbf6cfdd9 otherwise fails with ValueError: too many values to unpack
+  # (expected 8)
+  @unittest.skip("Requires tokamax pin 8eadbf6cfdd9")
   def test_matches_tokamax(self):
     """The no-regression contract: forward and backward parity with the
     stock tokamax wrapper across its full user surface."""

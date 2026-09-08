@@ -8,8 +8,12 @@ import copy
 import unittest
 from unittest.mock import patch
 
+# With torch_tpu, torch must be imported before spmd_types to avoid a circular
+# import error. Import of torch autoloads torch_tpu which imports
+# torch.distributed.fsdp which imports spmd_types still initializing.
+import torch  # isort: skip
+
 import spmd_types as spmd
-import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard

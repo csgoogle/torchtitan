@@ -10,6 +10,29 @@ import torch
 from torchtitan.tools.utils import get_local_device
 
 
+def _tpu_device_type_registered() -> bool:
+    try:
+        torch.device("tpu")
+    except RuntimeError:
+        return False
+    return True
+
+
+# TODO(jeremiahhsu): We skip running on tpu as this pytest test runs on cpu runner.
+# (This is the only test in tests/unit_tests that parameterizes over cpu and tpu).
+# We cannot move to the single-chip TPU shard as it expects tests in absltest
+# format. Either enable the TPU shards to dispatch both absltest and pytest tests
+# and route this specific test there, or move all TPU specific testing under
+# experiments/tpu for consistency
+_TPU = pytest.param(
+    "tpu",
+    marks=pytest.mark.skipif(
+        not _tpu_device_type_registered(),
+        reason="torch has no tpu device type registered",
+    ),
+)
+
+
 class _FakeDeviceModule:
     def __init__(self, num_devices: int):
         self.num_devices = num_devices
@@ -45,7 +68,7 @@ def test_get_local_device_uses_zero_when_one_device_visible(
     assert get_local_device() == torch.device("cuda:0")
 
 
-@pytest.mark.parametrize("device_type", ["cuda", "cpu", "tpu"])
+@pytest.mark.parametrize("device_type", ["cuda", "cpu", _TPU])
 def test_get_local_device_ignores_local_rank_for_a_single_device(
     monkeypatch: pytest.MonkeyPatch, device_type: str
 ) -> None:
@@ -80,7 +103,7 @@ def test_get_local_device_requires_local_rank(
         get_local_device()
 
 
-@pytest.mark.parametrize("device_type", ["cpu", "tpu"])
+@pytest.mark.parametrize("device_type", ["cpu", _TPU])
 def test_get_local_device_is_index_free_for_single_device_lanes(
     monkeypatch: pytest.MonkeyPatch, device_type: str
 ) -> None:

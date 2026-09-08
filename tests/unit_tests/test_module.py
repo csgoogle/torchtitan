@@ -8,8 +8,12 @@ import unittest
 from dataclasses import dataclass
 from unittest.mock import patch
 
+# With torch_tpu, torch must be imported before spmd_types to avoid a circular
+# import error. Import of torch autoloads torch_tpu which imports
+# torch.distributed.fsdp which imports spmd_types still initializing.
+import torch  # isort: skip
+
 import spmd_types as spmd
-import torch
 import torch.nn as nn
 from expecttest import assert_expected_inline
 from torch.distributed.tensor import distribute_tensor, Shard

@@ -18,6 +18,10 @@ RUN pip install -r requirements.txt
 COPY .ci/docker/requirements-flux.txt .
 RUN pip install -r requirements-flux.txt
 
+# Install test utilities (CI runs with this image)
+COPY requirements-dev.txt .
+RUN pip install -r requirements-dev.txt
+
 COPY torchtitan /torchtitan/torchtitan
 COPY assets /torchtitan/assets
 COPY tests /torchtitan/tests
