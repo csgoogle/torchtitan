@@ -80,7 +80,7 @@ xpk workload create \
 
 ## Expected Metrics
 
-With this configuration, you should observe the following metrics around step 30 (as of September 8, 2026):
+With this configuration, you should observe the following metrics around step 30 (as of 9/8/2026):
 
 - **TPS (Tokens per second)**: ~11,044
 - **TFLOPS**: ~521.49
