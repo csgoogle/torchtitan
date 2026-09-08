@@ -12,6 +12,9 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
     data_parallel as simple_fsdp_data_parallel,
 )
+from torchtitan.experiments.tpu.grouped_experts import (
+    configure_expert_dweight_output_dtype,
+)
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
@@ -36,6 +39,12 @@ def parallelize_qwen3(
   """
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
+  reduce_dtype = torchtitan.config.TORCH_DTYPE_MAP[
+      training.mixed_precision_reduce
+  ]
+  # Match unpaired expert dWeight stores to the final, post-CLI FSDP reduction
+  # dtype before tracing or FSDP wrapping.
+  configure_expert_dweight_output_dtype(model, reduce_dtype)
   if effective_compile_config.enable and hasattr(model, "layers"):
     from torchtitan.models.common.moe import MoE
     for layer in model.layers.values():
@@ -67,7 +76,7 @@ def parallelize_qwen3(
     dp_mode = "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
     mp_policy = SimpleFSDPMixedPrecisionPolicy(
           param_dtype=torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_param],
-          reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+          reduce_dtype=reduce_dtype,
       )
     model = simple_fsdp_data_parallel(
           model,
