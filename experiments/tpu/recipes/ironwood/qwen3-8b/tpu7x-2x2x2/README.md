@@ -82,8 +82,8 @@ xpk workload create \
 
 With this configuration, you should observe the following metrics around step 30 (as of 9/8/2026):
 
-- **TPS (Tokens per second)**: ~11,044
-- **TFLOPS**: ~521.49
-- **MFU**: ~45.21%
+- **TPS (Tokens per second)**: ~10,971
+- **TFLOPS**: ~518.07
+- **MFU**: ~44.91%
 - **Step Time (time_end_to_end)**: ~1.11s
 - **Memory**: 78.47GiB (81.74%)
