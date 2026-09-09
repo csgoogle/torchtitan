@@ -38,6 +38,7 @@ from collections.abc import Iterator
 
 import torch
 from torch import nn
+from torch._higher_order_ops.scan import scan
 from torch.func import functional_call
 
 from torchtitan.config import derive
@@ -106,7 +107,7 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
                 "per-layer buffers cannot be shared across layers. Stacking "
                 "does not support MoE load balancing "
                 "(https://github.com/google-pytorch/torchtitan/issues/391); "
-                "drop --tpu-config.use-stacked-layers, or set "
+                "drop --tpu-config.use-scan-layers, or set "
                 "load_balance_coeff to None."
             )
         got = spec(layer)
@@ -157,17 +158,19 @@ class StackedLayers(TpuLayerLoop):
     """``model.layers``, running its layers out of the stacks.
 
     A ``TpuLayerLoop`` runs its own layers, so swapping the container is all it
-    takes to change how they run. The layer modules inside are the same objects
-    as before, so their parameters, FQNs and SimpleFSDP parametrizations are
-    untouched.
+    takes to change how they run: as ``n_layers`` ``functional_call``s, or as
+    one ``scan`` over the stacks. Either way the layer modules inside are the
+    same objects as before, so their parameters, FQNs and SimpleFSDP
+    parametrizations are untouched.
     """
 
-    def __init__(self, layers: nn.ModuleDict, stack: "LayerStack"):
+    def __init__(self, layers: nn.ModuleDict, stack: "LayerStack", *, use_scan: bool):
         super().__init__(layers)
         self.stack = stack
+        self.use_scan = use_scan
 
     def forward(self, h: torch.Tensor, *args) -> torch.Tensor:
-        return self.stack.python_loop(h, *args)
+        return self.stack.run(h, *args, use_scan=self.use_scan)
 
 
 class LayerStack:
@@ -324,7 +327,7 @@ class LayerStack:
 
     # -- installation ------------------------------------------------------
 
-    def install(self, model: nn.Module) -> None:
+    def install(self, model: nn.Module, *, use_scan: bool) -> None:
         """Attach the stack to the model, at the end of its ``__init__``.
 
         Three attachments, and the model isn't stacked until all three are on:
@@ -383,21 +386,27 @@ class LayerStack:
             )
         # The container holds the same layer modules, so `self.layers` keeps
         # working and is deliberately not repointed at it.
-        model.layers = StackedLayers(model.layers, self)
+        model.layers = StackedLayers(model.layers, self, use_scan=use_scan)
 
     # -- running the layers ------------------------------------------------
 
-    def python_loop(self, h: torch.Tensor, *args):
-        """Run the layers one at a time, reading their weights from the stacks.
+    def run(self, h: torch.Tensor, *args, use_scan: bool):
+        """Run the layers out of the stacks, one at a time or as one ``scan``.
 
-        Layer 0 acts as the template: ``functional_call`` runs its ``forward``
-        with another layer's weights. The layers' own buffers (the RoPE cache)
-        are identical across layers, so the template's are correct on every
-        iteration.
+        Both paths run the same ``body``. Layer 0 acts as the template:
+        ``functional_call`` runs its ``forward`` with another layer's weights.
+        The layers' own buffers (the RoPE cache) are identical across layers, so
+        the template's are correct on every iteration.
 
-        ``getattr`` here is deliberate, unlike everywhere else in this file. It
-        goes through SimpleFSDP's parametrization, which is what all-gathers the
-        stack.
+        They differ only in who slices the stacks. The loop indexes them itself;
+        ``scan`` takes them as its ``xs``, slicing along their leading layer
+        axis with the hidden state as the carry. That collapses ``n_layers``
+        copies of the block into a single ``stablehlo.while`` body, so compile
+        time and program size stop growing with depth.
+
+        Neither changes where the all-gather happens. ``getattr`` here is
+        deliberate, unlike everywhere else in this file. It goes through
+        SimpleFSDP's parametrization, which is what all-gathers the stack.
 
         That gather is once per *stack*, not once per layer, and its result
         stays live until the backward is done -- so peak memory here is the
@@ -409,16 +418,57 @@ class LayerStack:
         """
         assert self._unregistered and not self._views_attached
         template = self.layers["0"]
-        stacks = {name: getattr(self.holder, _mangle(name)) for name in self.names}
-        for i in range(self.n_layers):
-            h = functional_call(
-                template, {name: s[i] for name, s in stacks.items()}, (h, *args)
-            )
-        return h
+
+        def body(carry, params):
+            # Layer 0's module stands in for every layer, one row at a time.
+            # That is what makes the scan body a single traced graph instead of
+            # n_layers of them. It has no parameters of its own to collide with,
+            # because they were unregistered when the stacks were allocated.
+            return functional_call(template, params, (carry, *args))
+
+        # One whole [n_layers, *shape] stack per parameter, keyed by its mangled
+        # name. For llama3-70B that is
+        #
+        #     {"attention__wq__weight":     [80, 8192, 8192],
+        #      "attention__wk__weight":     [80, 1024, 8192],
+        #      ...
+        #      "feed_forward__w1__weight":  [80, 28672, 8192]}
+        stacks = {_mangle(n): getattr(self.holder, _mangle(n)) for n in self.names}
+
+        if use_scan:
+            if template.training and not h.requires_grad:
+                # When the init carry doesn't require grad, `scan`'s backward
+                # returns `zeros_like(carry)`. That cuts the gradient chain
+                # between layers while leaving the loss bit-exact, so nothing
+                # looks wrong. Fail loudly instead.
+                raise RuntimeError(
+                    "the scan init carry does not require grad, so every layer's "
+                    "weight gradient would reflect only itself -- with a correct "
+                    "loss and no error"
+                )
+
+            def scan_body(carry, slices):
+                # `scan` hands the body row i of every stack, under the same keys.
+                out = body(carry, {n: slices[_mangle(n)] for n in self.names})
+                # A `scan` body returns (next_carry, y), and `scan` stacks the y
+                # of every iteration into one `[n_layers, ...]` output. We only
+                # want the last hidden state, which is the carry. Returning `out`
+                # as y as well would stack all n_layers of them -- for llama3-70B
+                # that is 80 x the full activation -- and then throw the whole
+                # thing away. `scan` does not accept a body with no y, so return
+                # a scalar and drop it.
+                return out, out.new_zeros(())
+
+            carry, _ = scan(scan_body, h, stacks)
+            return carry
+        else:
+            for i in range(self.n_layers):
+                h = body(h, {n: stacks[_mangle(n)][i] for n in self.names})
+            return h
 
 
-def _apply_stacked_layers(model: nn.Module) -> None:
-    """Store each decoder layer's weights as a row of one stacked tensor.
+def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
+    """Stack the decoder layers' weights, and with ``use_scan`` run them as one.
 
     Called from the model's own ``__init__`` (see
     :func:`with_tpu_stacked_layers`), so the model is stacked from the moment it
@@ -440,6 +490,15 @@ def _apply_stacked_layers(model: nn.Module) -> None:
     * ``model.init_states`` exists and is where the weights are initialized. It
       gets wrapped so the per-layer views are up while it runs.
 
+    Two more requirements apply with ``use_scan``, and they come from ``scan``
+    rather than from the stack:
+
+    * The layer must not mutate its inputs. ``scan`` is a higher-order op, and a
+      body that writes to what it was handed raises
+      ``UncapturedHigherOrderOpError`` at trace time.
+    * The step has to be traced: ``--tpu-config.compile-mode=aot_fx_trace``.
+      Eager ``scan`` doesn't materialize on TPU.
+
     What does and does not change:
 
     * ``state_dict()``, ``load_state_dict()`` and the on-disk model checkpoint
@@ -450,39 +509,47 @@ def _apply_stacked_layers(model: nn.Module) -> None:
       ``layer_stacks.<mangled>``, and the per-layer attributes no longer exist.
       Anything keyed off live parameter names sees the difference; see the
       module docstring.
+
+    With ``use_scan=False`` the layers still run one at a time, just out of the
+    stacks. That's the storage change without the loop change, which is what the
+    reshard and checkpoint tests compare against.
     """
     holder = LayerStackHolder()
     setattr(model, STACK_ATTR, holder)
     stack = LayerStack(model.layers, holder)
     stack.unregister_and_allocate()
-    stack.install(model)
+    stack.install(model, use_scan=use_scan)
     logger.info(
-        "Stacked %d weights across %d layers", len(stack.names), stack.n_layers
+        "Stacked %d weights across %d layers, run as a %s",
+        len(stack.names),
+        stack.n_layers,
+        "scan" if use_scan else "loop",
     )
 
 
 @functools.cache
-def _stacked_model_class(config_cls: type) -> type:
+def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
     """Build the ``Stacked<Model>`` subclass that stacks itself on construction.
 
     It subclasses whatever layer-loop class ``tpu_model_class`` builds, because
     the model has to run its layers through its layers container for stacking to
     do anything. Its ``__init__`` builds the model as usual and then stacks it.
 
-    One class per config class, cached.
+    One class per (config class, ``use_scan``), cached.
     """
     base = tpu_model_class(config_cls)
 
     def __init__(self, *args, **kwargs):
         base.__init__(self, *args, **kwargs)
-        _apply_stacked_layers(self)
+        _apply_stacked_layers(self, use_scan=use_scan)
 
-    return model_subclass(
-        base, base.Config, f"Stacked{base.__name__}", __init__=__init__
-    )
+    name = f"{'Scanned' if use_scan else 'Stacked'}{base.__name__}"
+    return model_subclass(base, base.Config, name, __init__=__init__)
 
 
-def with_tpu_stacked_layers(model_config: Decoder.Config) -> Decoder.Config:
+def with_tpu_stacked_layers(
+    model_config: Decoder.Config, *, use_scan: bool
+) -> Decoder.Config:
     """Put ``model_config`` on a model that arrives already stacked.
 
     Stacking is a property of the model, not of how it gets parallelized. The
@@ -490,7 +557,13 @@ def with_tpu_stacked_layers(model_config: Decoder.Config) -> Decoder.Config:
     finds like any other parameter, on the axis ``_fsdp_shard_dim`` names above.
     Nothing in the parallelize path has to know that stacking exists.
 
+    ``use_scan`` additionally runs the layers as one ``scan`` rather than one
+    at a time; it is fixed at construction because it decides which container
+    ``model.layers`` becomes.
+
     Builds on :func:`tpu_model_class`, and has to be applied in the same place
     and for the same reasons; see its docstring.
     """
-    return derive(model_config, _stacked_model_class(type(model_config)).Config)
+    return derive(
+        model_config, _stacked_model_class(type(model_config), use_scan).Config
+    )

@@ -87,17 +87,17 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
   @parameterized.parameters(False, True)
-  def test_stacking_converts_the_model_and_nothing_else_does(
-      self, stacked: bool
+  def test_scanning_converts_the_model_and_nothing_else_does(
+      self, scanned: bool
   ) -> None:
-    """Stacking needs a model that runs its layers container.
+    """Scanning needs a model that runs its layers container.
 
     The conversion has to happen here and not on the recipe: the graph-trainer
     registry rebuilds the model config from a fixed class, so a converter the
     recipe applied is already gone by this point.
     """
     config = qwen3_8b()
-    config.tpu_config.use_stacked_layers = stacked
+    config.tpu_config.use_scan_layers = scanned
     graph_config = self._qwen3_graph_config(config)
 
     plain = self._qwen3_graph_config(qwen3_8b()).model_spec.model
@@ -105,15 +105,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       model = graph_config.model_spec.model.build()
       plain_model = plain.build()
 
-    self.assertEqual(runs_layer_loop(model), stacked)
+    self.assertEqual(runs_layer_loop(model), scanned)
     # The MaxText FLOP accounting the registry installed must survive it.
     self.assertEqual(
         graph_config.model_spec.model.get_nparams_and_flops(model, seq_len=2048),
         plain.get_nparams_and_flops(plain_model, seq_len=2048),
     )
 
-  def test_stacking_allows_the_moe_recipe(self) -> None:
-    """Stacking refuses MoE load balancing, which this recipe does not use.
+  def test_scanning_allows_the_moe_recipe(self) -> None:
+    """Scanning refuses MoE load balancing, which this recipe does not use.
 
     The only MoE recipe on this lane is the global-aux one, so it sets no
     `load_balance_coeff`: there is no `expert_bias_E` and nothing reads
@@ -123,7 +123,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     aux-loss mutual exclusion first.
     """
     config = qwen3_moe_30b()
-    config.tpu_config.use_stacked_layers = True
+    config.tpu_config.use_scan_layers = True
     # The recipe runs expert parallel, which is refused on its own; turn it off
     # so this reaches the MoE check.
     config.parallelism.expert_parallel_degree = 1
@@ -131,20 +131,20 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     with torch.device("meta"):
       self._qwen3_graph_config(config).model_spec.model.build()
 
-  def test_stacking_refuses_expert_parallelism(self) -> None:
+  def test_scanning_refuses_expert_parallelism(self) -> None:
     config = qwen3_8b()
-    config.tpu_config.use_stacked_layers = True
+    config.tpu_config.use_scan_layers = True
     config.parallelism.expert_parallel_degree = 2
 
     with self.assertRaisesRegex(ValueError, "expert-parallel-degree"):
       self._qwen3_graph_config(config)
 
-  def test_stacking_needs_the_graph_trainer(self) -> None:
+  def test_scanning_needs_the_graph_trainer(self) -> None:
     """Off the graph-trainer lane nothing applies the flag, so it must not be
     silently accepted."""
     with self.assertRaisesRegex(ValueError, "use-graph-trainer"):
       TPUTrainerConfig(
-          tpu_config=TPUConfig(use_stacked_layers=True, use_graph_trainer=False)
+          tpu_config=TPUConfig(use_scan_layers=True, use_graph_trainer=False)
       )
 
   @parameterized.parameters("default", "full", "eager")
