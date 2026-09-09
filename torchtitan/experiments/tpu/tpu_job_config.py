@@ -112,6 +112,9 @@ class SplashAttentionKernelConfig:
   use_splash_attention_kernel: bool = False
   use_tokamax_splash_attention_kernel: bool = False
   use_vmap_bwd: bool = False
+  # When False, retain segment-ID masking but avoid per-example block-metadata
+  # specialization so Splash can lower a batch-native kernel.
+  sa_use_document_aware_block_skipping: bool = True
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512

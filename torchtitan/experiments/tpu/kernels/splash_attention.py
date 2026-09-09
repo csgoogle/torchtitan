@@ -75,6 +75,37 @@ def _document_aware_mask_info(mask_info, segment_ids_b, block_q, block_kv, is_dk
   return mask_info._replace(block_mask=block_mask, data_next=data_next)
 
 
+def _maybe_document_aware_mask_info(
+    mask_info,
+    segment_ids_b,
+    block_q,
+    block_kv,
+    is_dkv,
+    use_document_aware_block_skipping,
+):
+  """Choose between sparse per-example metadata and batch-native lowering.
+
+  Both modes pass ``segment_ids_b`` to Splash, so they enforce the same causal
+  and packed-document attention mask. The document-aware mode additionally
+  removes whole query/key blocks that cannot contain same-document tokens.
+  That is useful for packs with many short documents, but making this metadata
+  depend on each example causes JAX/XLA to lower the surrounding ``vmap`` as a
+  serial batch loop on TPU today. Returning the shared causal metadata avoids
+  that loop and is faster for the measured Qwen3-30B C4 training workload.
+
+  Disabling block skipping is therefore safe for real packed training, not a
+  benchmark-only relaxation of the mask. It is not universally faster: the
+  extra block work can outweigh batch-native lowering for sufficiently sparse
+  document packs. Keep the conservative document-aware behavior as the
+  default and opt out only for a profiled input distribution and shape.
+  """
+  if not use_document_aware_block_skipping:
+    return mask_info
+  return _document_aware_mask_info(
+      mask_info, segment_ids_b, block_q, block_kv, is_dkv
+  )
+
+
 def _make_splash_attention_fn(
     seq_len: int,
     n_heads: int,
@@ -94,6 +125,7 @@ def _make_splash_attention_fn(
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
     use_vmap_bwd: bool = False,
+    use_document_aware_block_skipping: bool = True,
 ):
   """Create JAX splash attention forward and backward functions.
 
@@ -192,12 +224,13 @@ def _make_splash_attention_fn(
       seg_ids = splash_attention_kernel.SegmentIds(
           q=segment_ids_b, kv=segment_ids_b
       )
-      fwd_mask_info_b = _document_aware_mask_info(
+      fwd_mask_info_b = _maybe_document_aware_mask_info(
           fwd_mask_info,
           segment_ids_b,
           block_sizes.block_q,
           block_sizes.block_kv,
           is_dkv=False,
+          use_document_aware_block_skipping=use_document_aware_block_skipping,
       )
 
     out_b, (logsumexp_b,) = splash_attention_kernel._splash_attention_forward(
@@ -255,20 +288,22 @@ def _make_splash_attention_fn(
       seg_ids = splash_attention_kernel.SegmentIds(
           q=segment_ids_b, kv=segment_ids_b
       )
-      dkv_mask_info_b = _document_aware_mask_info(
+      dkv_mask_info_b = _maybe_document_aware_mask_info(
           dkv_mask_info,
           segment_ids_b,
           block_sizes.block_q_dkv,
           block_sizes.block_kv_dkv,
           is_dkv=True,
+          use_document_aware_block_skipping=use_document_aware_block_skipping,
       )
       if dq_mask_info is not None:
-        dq_mask_info_b = _document_aware_mask_info(
+        dq_mask_info_b = _maybe_document_aware_mask_info(
             dq_mask_info,
             segment_ids_b,
             block_sizes.block_q_dq,
             block_sizes.block_kv_dq,
             is_dkv=False,
+            use_document_aware_block_skipping=use_document_aware_block_skipping,
         )
 
     res = (
@@ -459,6 +494,7 @@ def splash_sdpa(
     block_kv_dq: Optional[int] = None,
     use_fused_bwd_kernel: bool = True,
     use_vmap_bwd: bool = False,
+    use_document_aware_block_skipping: bool = True,
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
@@ -491,6 +527,9 @@ def splash_sdpa(
     use_fused_bwd_kernel: Whether to use fused backward kernel.
     use_vmap_bwd: Whether to use vmap in backward pass. Default False (uses scan
       for memory safety).
+    use_document_aware_block_skipping: Whether to specialize Splash block
+      metadata for each packed example. Segment-ID masking remains active when
+      disabled; only whole-block pruning is skipped.
     q_layout: Layout for Q.
     k_layout: Layout for K.
     v_layout: Layout for V.
@@ -525,6 +564,7 @@ def splash_sdpa(
       block_kv_dq=block_kv_dq,
       use_fused_bwd_kernel=use_fused_bwd_kernel,
       use_vmap_bwd=use_vmap_bwd,
+      use_document_aware_block_skipping=use_document_aware_block_skipping,
       q_layout=q_layout,
       k_layout=k_layout,
       v_layout=v_layout,
