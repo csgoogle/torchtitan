@@ -39,9 +39,15 @@ from collections.abc import Iterator
 import torch
 from torch import nn
 from torch._higher_order_ops.scan import scan
+from torch.distributed.tensor import DTensor
 from torch.func import functional_call
 
 from torchtitan.config import derive
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
+    gather_slice,
+    plan_stacked_gathers,
+    ScanFSDPSpec,
+)
 from torchtitan.experiments.tpu.layer_loop import (
     model_subclass,
     tpu_model_class,
@@ -196,6 +202,10 @@ class LayerStack:
         # `unrolled()`, and the views themselves, to check nothing swapped them.
         self._hidden: dict[str, nn.Parameter] = {}
         self._views: dict[tuple[int, str], nn.Parameter] = {}
+        # The DTensor attributes each stack is sharded with, saved because the
+        # scan body only ever sees plain tensors. Filled on the first scan, not
+        # here; see `scan_fsdp`.
+        self.fsdp_plan: dict[str, ScanFSDPSpec] = {}
 
     def _slots(self) -> Iterator[tuple[int, str, nn.Module, str]]:
         """Every per-layer parameter, as (row, FQN, owning module, attribute).
@@ -281,8 +291,8 @@ class LayerStack:
         assert self._unregistered and not self._views_attached
         for i, name, mod, attr in self._slots():
             # Read out of `_parameters`, not with `getattr`: after SimpleFSDP
-            # the attribute is a property returning the *gathered* tensor, and
-            # a view of that would alias a temporary, not this rank's shard.
+            # the attribute returns the *gathered* tensor, and a view of that
+            # would alias a temporary, not this rank's shard.
             stack = self.holder._parameters[_mangle(name)]
             # `stack[i]` is basic indexing -- a plain integer, no mask, no index
             # tensor -- which in torch always returns a view, never a copy. So
@@ -398,23 +408,19 @@ class LayerStack:
         The layers' own buffers (the RoPE cache) are identical across layers, so
         the template's are correct on every iteration.
 
-        They differ only in who slices the stacks. The loop indexes them itself;
+        One difference is who slices the stacks. The loop indexes them itself;
         ``scan`` takes them as its ``xs``, slicing along their leading layer
         axis with the hidden state as the carry. That collapses ``n_layers``
         copies of the block into a single ``stablehlo.while`` body, so compile
         time and program size stop growing with depth.
 
-        Neither changes where the all-gather happens. ``getattr`` here is
-        deliberate, unlike everywhere else in this file. It goes through
-        SimpleFSDP's parametrization, which is what all-gathers the stack.
-
-        That gather is once per *stack*, not once per layer, and its result
-        stays live until the backward is done -- so peak memory here is the
-        whole unsharded model, not one layer of it. At llama3-70b that is around
-        137 GiB per chip, which does not fit. Stacking is only useful at that
-        size once the gather moves inside the body, one layer at a time; that is
-        the in-body gather PR. Everywhere the result is *kept*, read
-        `_parameters` instead.
+        The other is where the all-gather happens. The loop reads each stack
+        with ``getattr``, which runs SimpleFSDP's parametrization and gathers
+        the whole ``[n_layers, ...]`` tensor. Every layer's weights are then
+        resident until the backward is done: about 137 GiB per chip at
+        llama3-70b, which does not fit. ``scan`` instead passes this rank's
+        *shard* of each stack and gathers one layer inside the body, so only
+        one layer is ever whole. See ``scan_fsdp``.
         """
         assert self._unregistered and not self._views_attached
         template = self.layers["0"]
@@ -426,16 +432,23 @@ class LayerStack:
             # because they were unregistered when the stacks were allocated.
             return functional_call(template, params, (carry, *args))
 
-        # One whole [n_layers, *shape] stack per parameter, keyed by its mangled
-        # name. For llama3-70B that is
+        # One [n_layers, *shape] stack per parameter, keyed by its mangled
+        # name. For llama3-70B, unsharded, that is
         #
         #     {"attention__wq__weight":     [80, 8192, 8192],
         #      "attention__wk__weight":     [80, 1024, 8192],
         #      ...
         #      "feed_forward__w1__weight":  [80, 28672, 8192]}
-        stacks = {_mangle(n): getattr(self.holder, _mangle(n)) for n in self.names}
-
+        #
+        # `scan` slices each one along its leading axis, so iteration i gets a
+        # dict with the same keys holding row i: [8192, 8192], [1024, 8192], ...
         if use_scan:
+            # On the first forward, not at install time: the stacks are sharded
+            # after `__init__`, so a plan built there would see meta tensors,
+            # find nothing sharded, and silently run every layer on this rank's
+            # shard of it.
+            if not self.fsdp_plan:
+                self.fsdp_plan = plan_stacked_gathers(self.holder)
             if template.training and not h.requires_grad:
                 # When the init carry doesn't require grad, `scan`'s backward
                 # returns `zeros_like(carry)`. That cuts the gradient chain
@@ -446,10 +459,29 @@ class LayerStack:
                     "weight gradient would reflect only itself -- with a correct "
                     "loss and no error"
                 )
+            # `xs` is the body's input, one layer per step. `getattr` would
+            # fire SimpleFSDP's parametrization and gather the whole stack
+            # here, outside the loop. `_parameters` passes this rank's shard
+            # instead, and the body gathers one layer.
+            xs = {}
+            for name in self.names:
+                param = self.holder._parameters[_mangle(name)]
+                xs[_mangle(name)] = (
+                    param.to_local() if isinstance(param, DTensor) else param
+                )
 
             def scan_body(carry, slices):
-                # `scan` hands the body row i of every stack, under the same keys.
-                out = body(carry, {n: slices[_mangle(n)] for n in self.names})
+                # `scan` hands the body row i of every stack, under the same
+                # keys, and `gather_slice` makes each row whole.
+                out = body(
+                    carry,
+                    {
+                        name: gather_slice(
+                            slices[_mangle(name)], self.fsdp_plan.get(_mangle(name))
+                        )
+                        for name in self.names
+                    },
+                )
                 # A `scan` body returns (next_carry, y), and `scan` stacks the y
                 # of every iteration into one `[n_layers, ...]` output. We only
                 # want the last hidden state, which is the carry. Returning `out`
@@ -459,12 +491,26 @@ class LayerStack:
                 # a scalar and drop it.
                 return out, out.new_zeros(())
 
-            carry, _ = scan(scan_body, h, stacks)
+            # Budget 0.0 forces the gathered weight to be recomputed in the
+            # backward. Left alone, the partitioner saves it -- a collective
+            # looks expensive to redo -- and the saved copy is carried out of
+            # the loop, which is the whole memory win gone.
+            #
+            # It costs a full recompute of the body. Tagging just the gather
+            # would be cheaper, but that tag lives in `node.meta["custom"]`,
+            # which the body's re-trace drops before it reaches any node inside
+            # the scan.
+            #
+            # The patch is process-global, so it has to be a window; it closes
+            # when this call returns. `test_layer_stack.py` checks both halves.
+            with torch._functorch.config.patch(activation_memory_budget=0.0):
+                carry, _ = scan(scan_body, h, xs)
             return carry
-        else:
-            for i in range(self.n_layers):
-                h = body(h, {n: stacks[_mangle(n)][i] for n in self.names})
-            return h
+
+        stacks = {_mangle(n): getattr(self.holder, _mangle(n)) for n in self.names}
+        for i in range(self.n_layers):
+            h = body(h, {n: stacks[_mangle(n)][i] for n in self.names})
+        return h
 
 
 def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
