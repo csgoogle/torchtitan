@@ -5,10 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import operator
+from types import SimpleNamespace
 import unittest
 
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 from torch import nn
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
@@ -22,6 +26,7 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     run_traced,
 )
 from torchtitan.experiments.graph_trainer.memory_policy import (
+    _full_memory_policy_pass,
     _make_default_memory_policy,
     _make_full_memory_policy,
     tag_sac_policy,
@@ -29,15 +34,23 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
-from torchtitan.experiments.graph_trainer.fsdp_passes import _FSDP_BUCKET_META
+from torchtitan.experiments.graph_trainer.fsdp_passes import (
+    _collect_bucketed_fsdp_comms,
+    schedule_fsdp_comms_to_dense_regions_pass,
+)
 from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
+)
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    data_parallel,
+    MixedPrecisionPolicy,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     _TPU_FSDP_RS_DEADLINE_META,
     _TPU_REMAT_BARRIER_KIND_META,
     _TPU_REMAT_LAYER_ENTRY_ANCHOR_META,
     _TPU_REMAT_REGION_ID_META,
+    _collect_fsdp_all_gather_barriers,
     _optimization_barrier,
     apply_tpu_fsdp_rs_deadline_schedule,
     apply_tpu_remat_fsdp_all_gather_schedule,
@@ -62,125 +75,88 @@ def _set_tensor_meta(
     return node
 
 
-def _make_fsdp_remat_graph() -> tuple[
-    torch.fx.GraphModule,
-    list[torch.fx.Node],
-    list[torch.fx.Node],
-    torch.fx.Node,
-    dict[int, torch.fx.Node],
-    dict[int, torch.fx.Node],
-]:
-    graph = torch.fx.Graph()
-    weights = [_set_tensor_meta(graph.placeholder(f"weight_{i}")) for i in range(3)]
-    saved = [_set_tensor_meta(graph.placeholder(f"saved_{i}")) for i in range(3)]
-    top_cotangent = _set_tensor_meta(
-        graph.placeholder("top_cotangent"), backward=True
+class _Projection(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.weight.to(torch.bfloat16)
+
+
+class _Block(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.moe = nn.Module()
+        self.moe.experts = _Projection(dim)
+        self.attention = _Projection(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(self.moe.experts(x)) + self.attention(x)
+
+
+class _Epilogue(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.square()
+
+
+class _ToyModel(nn.Module):
+    def __init__(self, dim: int = 4, n_layers: int = 2) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(_Block(dim) for _ in range(n_layers))
+        self.norm = _Epilogue()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
+
+
+def _trace_simple_fsdp_remat_graph(n_layers: int = 3):
+    """Trace a real SimpleFSDP graph and add its layer-entry barriers."""
+    assert not dist.is_initialized()
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
+    try:
+        mesh = DeviceMesh("cpu", [0, 1])
+        with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
+            model = _ToyModel(dim=8, n_layers=n_layers)
+            annotate_module_fqns(model)
+            model = data_parallel(
+                model,
+                device_mesh=mesh,
+                mode="fully_shard",
+                mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+            )
+            inputs = torch.randn(
+                2, 8, dtype=torch.bfloat16, requires_grad=True
+            )
+
+            def step(inputs: torch.Tensor) -> list[torch.Tensor]:
+                loss = model(inputs).float().sum()
+                named_params = list(model.named_parameters())
+                gradients = compute_parameter_gradients(loss, named_params)
+                return [loss, *gradients]
+
+            traced = minimal_fx_tracer(step, module=model)(inputs)
+    finally:
+        dist.destroy_process_group()
+
+    _full_memory_policy_pass(
+        traced.gm,
+        config=SimpleNamespace(
+            parallelism=SimpleNamespace(
+                fsdp_reshard_after_forward="always",
+                pipeline_parallel_degree=1,
+            )
+        ),
     )
-
-    forward_casts = []
-    forward = saved[0]
-    for layer_id in range(3):
-        cast = _set_tensor_meta(
-            graph.call_function(
-                torch.ops.aten._to_copy.default,
-                args=(weights[layer_id],),
-                kwargs={"dtype": torch.bfloat16},
-            ),
-            layer_id=layer_id,
-        )
-        forward_casts.append(cast)
-        all_gather = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.all_gather_into_tensor.default,
-                args=(cast, 1, "fsdp"),
-            ),
-            layer_id=layer_id,
-        )
-        wait = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.wait_tensor.default,
-                args=(all_gather,),
-            ),
-            layer_id=layer_id,
-        )
-        forward = _set_tensor_meta(
-            graph.call_function(torch.ops.aten.mm.default, args=(forward, wait)),
-            layer_id=layer_id,
-        )
-    loss = graph.call_function(torch.ops.aten.sum.default, args=(forward,))
-    loss.meta["val"] = torch.empty((), dtype=torch.float32)
-
-    recompute_casts = {}
-    layer_entry_anchors = {}
-    incoming_cotangent = top_cotangent
-    for layer_id in reversed(range(3)):
-        entry_barrier = graph.call_function(
-            _optimization_barrier,
-            args=(saved[layer_id], incoming_cotangent),
-        )
-        entry_barrier.meta["val"] = (
-            saved[layer_id].meta["val"],
-            incoming_cotangent.meta["val"],
-        )
-        saved_entry = _set_tensor_meta(
-            graph.call_function(operator.getitem, args=(entry_barrier, 0)),
-            backward=True,
-        )
-        cotangent_entry = _set_tensor_meta(
-            graph.call_function(operator.getitem, args=(entry_barrier, 1)),
-            backward=True,
-        )
-        cotangent_entry.meta[_TPU_REMAT_LAYER_ENTRY_ANCHOR_META] = layer_id
-        layer_entry_anchors[layer_id] = cotangent_entry
-        cast = _set_tensor_meta(
-            graph.call_function(
-                torch.ops.aten._to_copy.default,
-                args=(weights[layer_id],),
-                kwargs={"dtype": torch.bfloat16},
-            ),
-            layer_id=layer_id,
-            backward=True,
-            recomputed=True,
-        )
-        recompute_casts[layer_id] = cast
-        all_gather = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.all_gather_into_tensor.default,
-                args=(cast, 1, "fsdp"),
-            ),
-            layer_id=layer_id,
-            backward=True,
-            recomputed=True,
-        )
-        wait = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.wait_tensor.default,
-                args=(all_gather,),
-            ),
-            layer_id=layer_id,
-            backward=True,
-            recomputed=True,
-        )
-        recompute = _set_tensor_meta(
-            graph.call_function(torch.ops.aten.mm.default, args=(saved_entry, wait)),
-            layer_id=layer_id,
-            backward=True,
-            recomputed=True,
-        )
-        incoming_cotangent = _set_tensor_meta(
-            graph.call_function(
-                torch.ops.aten.mm.default,
-                args=(recompute, cotangent_entry),
-            ),
-            layer_id=layer_id,
-            backward=True,
-        )
-
-    graph.output((loss, incoming_cotangent))
-    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    gm.graph.lint()
-    gm.recompile()
-    return gm, weights, forward_casts, loss, recompute_casts, layer_entry_anchors
+    selective_activation_remat_pass(traced.gm)
+    apply_tpu_remat_schedule(
+        traced.gm,
+        traced.example_inputs,
+        num_static_inputs=traced.num_static_inputs,
+    )
+    return traced
 
 
 class TestTpuFsdpRematSchedule(unittest.TestCase):
@@ -190,65 +166,71 @@ class TestTpuFsdpRematSchedule(unittest.TestCase):
             (2, (2, None, None)),
         ):
             with self.subTest(distance=distance):
-                (
-                    gm,
-                    weights,
-                    forward_casts,
-                    loss,
-                    recompute_casts,
-                    layer_entry_anchors,
-                ) = _make_fsdp_remat_graph()
+                traced = _trace_simple_fsdp_remat_graph()
+                gm = traced.gm
+                layer_entry_anchors = {
+                    node.meta[_TPU_REMAT_LAYER_ENTRY_ANCHOR_META]: node
+                    for node in gm.graph.nodes
+                    if _TPU_REMAT_LAYER_ENTRY_ANCHOR_META in node.meta
+                }
+                output = next(node for node in gm.graph.nodes if node.op == "output")
+                loss = output.args[0][0]
 
                 apply_tpu_remat_fsdp_all_gather_schedule(
                     gm,
-                    (),
-                    num_static_inputs=3,
+                    traced.example_inputs,
+                    num_static_inputs=traced.num_static_inputs,
                     prefetch_distance=distance,
                 )
 
-                barriers = [
-                    node
-                    for node in gm.graph.nodes
-                    if node.meta.get(_TPU_REMAT_BARRIER_KIND_META)
-                    == "fsdp_all_gather"
-                    and node.target is _optimization_barrier
-                ]
-                self.assertEqual(len(barriers), 3)
-                barrier_by_weight = {barrier.args[0]: barrier for barrier in barriers}
-                for layer_id, weight in enumerate(weights):
+                barriers = _collect_fsdp_all_gather_barriers(gm)
+                self.assertEqual(set(barriers), {0, 1, 2})
+                for layer_id, barrier in barriers.items():
                     expected_anchor_id = expected_anchor_ids[layer_id]
                     expected_anchor = (
                         loss
                         if expected_anchor_id is None
                         else layer_entry_anchors[expected_anchor_id]
                     )
-                    barrier = barrier_by_weight[weight]
-                    self.assertIs(barrier.args[1], expected_anchor)
-                    barrier_output = next(
-                        user
-                        for user in barrier.users
-                        if user.target is operator.getitem and user.args[1] == 0
-                    )
-                    self.assertIs(recompute_casts[layer_id].args[0], barrier_output)
-                    self.assertIs(forward_casts[layer_id].args[0], weight)
+                    *parameters, anchor = barrier.args
+                    self.assertTrue(parameters)
+                    self.assertIs(anchor, expected_anchor)
+                    for index, parameter in enumerate(parameters):
+                        barrier_output = next(
+                            user
+                            for user in barrier.users
+                            if user.target is operator.getitem
+                            and user.args[1] == index
+                        )
+                        self.assertTrue(barrier_output.users)
+                        self.assertTrue(
+                            all(
+                                user.name.endswith("_recomputed")
+                                for user in barrier_output.users
+                            )
+                        )
+                        self.assertIn(barrier, parameter.users)
+                        self.assertTrue(
+                            any(user is not barrier for user in parameter.users)
+                        )
 
                 graph_after_first_application = str(gm.graph)
                 apply_tpu_remat_fsdp_all_gather_schedule(
                     gm,
-                    (),
-                    num_static_inputs=3,
+                    traced.example_inputs,
+                    num_static_inputs=traced.num_static_inputs,
                     prefetch_distance=distance,
                 )
                 self.assertEqual(str(gm.graph), graph_after_first_application)
 
     def test_all_gather_barrier_requires_positive_prefetch_distance(self) -> None:
-        gm, *_ = _make_fsdp_remat_graph()
+        traced = _trace_simple_fsdp_remat_graph()
 
         with self.assertRaisesRegex(ValueError, "must be positive"):
             apply_tpu_remat_fsdp_all_gather_schedule(
-                gm,
-                (),
-                num_static_inputs=3,
+                traced.gm,
+                traced.example_inputs,
+                num_static_inputs=traced.num_static_inputs,
                 prefetch_distance=0,
             )
 
@@ -278,199 +260,82 @@ class TestTpuFsdpRematSchedule(unittest.TestCase):
         )
         self.assertIs(all_gather.args[0], activation)
 
-    def test_rs_deadline_reuses_all_gather_barrier(self) -> None:
-        graph = torch.fx.Graph()
-        shard_2 = _set_tensor_meta(graph.placeholder("shard_2"))
-        shard_1 = _set_tensor_meta(graph.placeholder("shard_1"))
-        activation = _set_tensor_meta(graph.placeholder("activation"))
-
-        barrier_2 = graph.call_function(
-            _optimization_barrier,
-            args=(shard_2, activation),
+    def test_rs_deadline_reuses_all_gather_barriers(self) -> None:
+        traced = _trace_simple_fsdp_remat_graph()
+        gm = traced.gm
+        apply_tpu_remat_fsdp_all_gather_schedule(
+            gm,
+            traced.example_inputs,
+            num_static_inputs=traced.num_static_inputs,
         )
-        barrier_2.meta["val"] = (shard_2.meta["val"], activation.meta["val"])
-        barrier_2.meta[_TPU_REMAT_BARRIER_KIND_META] = "fsdp_all_gather"
-        barrier_2.meta[_TPU_REMAT_REGION_ID_META] = 2
-        shard_2_ready = _set_tensor_meta(
-            graph.call_function(operator.getitem, args=(barrier_2, 0)),
-            backward=True,
-        )
-        _set_tensor_meta(
-            graph.call_function(operator.getitem, args=(barrier_2, 1)),
-            backward=True,
-        )
-        ag_2 = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.all_gather_into_tensor.default,
-                args=(shard_2_ready, 1, "fsdp"),
-            ),
-            layer_id=2,
-            backward=True,
-        )
-        ag_2.meta[_FSDP_BUCKET_META] = {
-            "plan_fqns": ("layers.2",),
-            "direction": "bwd",
-        }
-        ag_2_wait = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.wait_tensor.default,
-                args=(ag_2,),
-            ),
-            backward=True,
-        )
-        dense_2 = _set_tensor_meta(
-            graph.call_function(torch.ops.aten.relu.default, args=(ag_2_wait,)),
-            layer_id=2,
-            backward=True,
-        )
-        early_rs_2 = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.reduce_scatter_tensor.default,
-                args=(dense_2, "sum", 0, "fsdp"),
-            ),
-            layer_id=2,
-            backward=True,
-        )
-        early_rs_2.meta[_FSDP_BUCKET_META] = {
-            "plan_fqns": ("layers.2",),
-            "direction": "bwd",
-        }
-        early_rs_2_wait = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.wait_tensor.default,
-                args=(early_rs_2,),
-            ),
-            backward=True,
-        )
-        early_rs_2_user = _set_tensor_meta(
-            graph.call_function(
-                torch.ops.aten.alias.default,
-                args=(early_rs_2_wait,),
-            ),
-            backward=True,
+        schedule_fsdp_comms_to_dense_regions_pass(
+            gm,
+            traced.example_inputs,
+            moe_layer_ids=frozenset(),
+            n_layers=3,
+            strict=False,
         )
 
-        barrier_1 = graph.call_function(
-            _optimization_barrier,
-            args=(shard_1, dense_2),
-        )
-        barrier_1.meta["val"] = (shard_1.meta["val"], dense_2.meta["val"])
-        barrier_1.meta[_TPU_REMAT_BARRIER_KIND_META] = "fsdp_all_gather"
-        barrier_1.meta[_TPU_REMAT_REGION_ID_META] = 1
-        shard_1_ready = _set_tensor_meta(
-            graph.call_function(operator.getitem, args=(barrier_1, 0)),
-            backward=True,
-        )
-        _set_tensor_meta(
-            graph.call_function(operator.getitem, args=(barrier_1, 1)),
-            backward=True,
-        )
-
-        rs_2 = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.reduce_scatter_tensor.default,
-                args=(dense_2, "sum", 0, "fsdp"),
-            ),
-            layer_id=2,
-            backward=True,
-        )
-        rs_2.meta[_FSDP_BUCKET_META] = {
-            "plan_fqns": ("layers.2",),
-            "direction": "bwd",
-        }
-        ag_1 = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.all_gather_into_tensor.default,
-                args=(shard_1_ready, 1, "fsdp"),
-            ),
-            layer_id=1,
-            backward=True,
-        )
-        ag_1.meta[_FSDP_BUCKET_META] = {
-            "plan_fqns": ("layers.1",),
-            "direction": "bwd",
-        }
-        ag_1_wait = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.wait_tensor.default,
-                args=(ag_1,),
-            ),
-            backward=True,
-        )
-        dense_1 = _set_tensor_meta(
-            graph.call_function(torch.ops.aten.relu.default, args=(ag_1_wait,)),
-            layer_id=1,
-            backward=True,
-        )
-        rs_2_wait = _set_tensor_meta(
-            graph.call_function(
-                torch.ops._c10d_functional.wait_tensor.default,
-                args=(rs_2,),
-            ),
-            backward=True,
-        )
-        graph.output((dense_1, early_rs_2_user, rs_2_wait))
-        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-
-        barrier_count = sum(
-            node.target is _optimization_barrier for node in gm.graph.nodes
-        )
-        apply_tpu_fsdp_rs_deadline_schedule(gm, (), n_layers=3, strict=True)
-
-        self.assertEqual(
-            sum(node.target is _optimization_barrier for node in gm.graph.nodes),
-            barrier_count,
-        )
-        self.assertIn(early_rs_2_wait, barrier_1.args)
-        self.assertIn(rs_2_wait, barrier_1.args)
-        self.assertEqual(
-            barrier_1.meta[_TPU_FSDP_RS_DEADLINE_META],
-            (early_rs_2_wait.name, rs_2_wait.name),
-        )
-        self.assertNotIn(_TPU_FSDP_RS_DEADLINE_META, barrier_2.meta)
+        barriers = _collect_fsdp_all_gather_barriers(gm)
+        _, comms = _collect_bucketed_fsdp_comms(gm, n_layers=3)
         order = {node: index for index, node in enumerate(gm.graph.nodes)}
-        self.assertLess(order[early_rs_2_wait], order[early_rs_2_user])
-        self.assertLess(order[early_rs_2_user], order[barrier_1])
-        self.assertLess(order[rs_2], order[rs_2_wait])
-        self.assertLess(order[rs_2_wait], order[barrier_1])
-        self.assertLess(order[barrier_1], order[ag_1])
+        # Each region's first backward AG consumes every RS wait launched since
+        # the preceding region's first AG.
+        pending_rs_waits: list[torch.fx.Node] = []
+        seen_regions: set[int] = set()
+        expected_deadlines: dict[int, tuple[torch.fx.Node, ...]] = {}
+        for comm in sorted(
+            (comm for comm in comms if comm.direction == "bwd"),
+            key=lambda comm: order[comm.launch],
+        ):
+            if comm.kind == "rs":
+                pending_rs_waits.append(comm.wait)
+            elif (
+                comm.kind == "ag"
+                and comm.logical_index is not None
+                and comm.logical_index not in seen_regions
+            ):
+                seen_regions.add(comm.logical_index)
+                if pending_rs_waits:
+                    expected_deadlines[comm.logical_index] = tuple(
+                        pending_rs_waits
+                    )
+                    pending_rs_waits.clear()
 
+        self.assertEqual(set(expected_deadlines), {0, 1})
+        early_wait = expected_deadlines[1][0]
+        with gm.graph.inserting_after(early_wait):
+            early_user = gm.graph.call_function(
+                torch.ops.aten.alias.default, args=(early_wait,)
+            )
+        early_user.meta = early_wait.meta.copy()
+        gm.graph.lint()
+        gm.recompile()
 
-class _Projection(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(dim, dim))
+        apply_tpu_fsdp_rs_deadline_schedule(
+            gm,
+            traced.example_inputs,
+            n_layers=3,
+            strict=True,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.weight.to(torch.bfloat16)
+        self.assertEqual(_collect_fsdp_all_gather_barriers(gm), barriers)
+        for region_id, waits in expected_deadlines.items():
+            barrier = barriers[region_id]
+            self.assertEqual(
+                barrier.meta[_TPU_FSDP_RS_DEADLINE_META],
+                tuple(wait.name for wait in waits),
+            )
+            for wait in waits:
+                self.assertIn(wait, barrier.args)
+        self.assertNotIn(_TPU_FSDP_RS_DEADLINE_META, barriers[2].meta)
 
-
-class _Block(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.moe = nn.Module()
-        self.moe.experts = _Projection(dim)
-        self.attention = _Projection(dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.relu(self.moe.experts(x)) + self.attention(x)
-
-
-class _Epilogue(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x.square()
-
-
-class _ToyModel(nn.Module):
-    def __init__(self, dim: int = 4) -> None:
-        super().__init__()
-        self.layers = nn.ModuleList([_Block(dim), _Block(dim)])
-        self.norm = _Epilogue()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(x)
-        return self.norm(x)
+        order = {node: index for index, node in enumerate(gm.graph.nodes)}
+        for region_id, waits in expected_deadlines.items():
+            for wait in waits:
+                self.assertLess(order[wait], order[barriers[region_id]])
+        self.assertLess(order[early_wait], order[early_user])
+        self.assertLess(order[early_user], order[barriers[1]])
 
 
 def _nearest_parameter_fqns(node: torch.fx.Node) -> tuple[str, ...]:
