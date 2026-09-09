@@ -9,6 +9,43 @@ import torchtitan.trainer
 
 
 GraphTrainerFSDPSchedule = Literal["none", "prefetch", "interleave"]
+BackwardPartitionMode = Literal[
+    "none",
+    "sequential",
+    "fsdp_pipeline",
+    "fsdp_region_local",
+]
+
+
+@dataclasses.dataclass
+class GraphSplitterConfig:
+  # Maximum number of complete transformer layers assigned to one forward
+  # executable. -1 keeps forward as one executable.
+  forward_layers_per_executable: int = -1
+  # Assign non-layer work before the first transformer layer to its own partition.
+  forward_isolate_prefix: bool = False
+  # Backward subdivision applied after the top-level forward/backward split.
+  # ``sequential`` groups adjacent rematerialization regions in their existing
+  # graph order; it keeps each collective launch/getitem/wait chain intact but
+  # does not move AG or RS work to match a layer's compute. ``fsdp_pipeline``
+  # explicitly moves each layer's AG earlier and RS later to form staggered
+  # stages. ``fsdp_region_local`` instead explicitly assigns each layer's AG,
+  # compute, and RS to the same executable.
+  backward_partition_mode: BackwardPartitionMode = "none"
+  # Maximum number of complete one-layer rematerialization regions assigned to
+  # one backward executable. Grouping regions widens the compiler scheduling
+  # window without changing activation-checkpoint boundaries: every layer keeps
+  # its saved input and can be recomputed immediately before its own backward.
+  # Multi-layer rematerialization is a separate memory-policy tradeoff that can
+  # reduce saved/offloaded boundaries only by extending intermediate lifetimes
+  # or repeating recompute, so it is intentionally outside this splitter.
+  backward_regions_per_executable: int = 1
+  # Reuse dead internal split-boundary buffers through XLA input donation.
+  # This should default to True: last-use donation is preferable and is safe
+  # unless reusable-buffer identification is wrong. It remains False until
+  # TorchTPU includes donation in its compilation cache key (torch_tpu#3614).
+  # Original graph inputs and forward-saved tensors are never candidates.
+  donate_internal_buffers: bool = False
 
 
 @dataclasses.dataclass
@@ -17,10 +54,17 @@ class TPUConfig:
   compile_mode: str = "layer"
   apply_rope_complex_workaround: bool = False
   use_jax_profiler: bool = False
-  # Insert a graph-split synchronization point between the forward+loss pass
-  # and the backward pass. This compiles two smaller XLA graphs instead of one
-  # monolithic graph, significantly reducing first-step compilation time.
+  # For GraphTrainer, partition the transformed joint FX graph into separately
+  # compiled forward and backward modules. All finer splitting is nested under
+  # this boundary. Other TPU trainers still use this flag for their older eager
+  # forward/backward synchronization path; this PR does not replace those paths.
+  # GraphTrainer splitting requires graph_trainer_fsdp_schedule="none",
+  # optimizer_in_graph=False, and no serialized precompiled FX artifact;
+  # TorchTPU's normal XLA/Tier-2 cache remains supported.
   use_graph_split: bool = False
+  graph_split: GraphSplitterConfig = dataclasses.field(
+      default_factory=GraphSplitterConfig
+  )
   # Compile AdamW step into its own separate FX graph.
   compile_optimizer: bool = False
   # Run via TpuGraphTrainer (joint fwd+loss+bwd aot_fx_trace and FX-graph SAC passes).
