@@ -70,6 +70,7 @@ def main() -> None:
     else:
         trainer.close()
         if torch.distributed.is_initialized():
+            torch.distributed.barrier()
             with sl.log_trace_span("torch_distributed_teardown"):
                 torch.distributed.destroy_process_group()
         logger.info("Process group destroyed")

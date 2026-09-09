@@ -313,7 +313,9 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     raise
   else:
     trainer.close()
-    torch.distributed.destroy_process_group()
+    if torch.distributed.is_initialized():
+      torch.distributed.barrier()
+      torch.distributed.destroy_process_group()
     logger.info("Process group destroyed")
 
 

@@ -398,6 +398,7 @@ def start_trainer(config: JobConfig):
     trainer.train()
   finally:
     if torch.distributed.is_initialized():
+      torch.distributed.barrier()
       torch.distributed.destroy_process_group()
     logger.info("Process group destroyed")
 
