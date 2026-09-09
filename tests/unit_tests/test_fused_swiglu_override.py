@@ -6,8 +6,12 @@
 
 import unittest
 
+# With torch_tpu, torch must be imported before spmd_types to avoid a circular
+# import error. Import of torch autoloads torch_tpu which imports
+# torch.distributed.fsdp which imports spmd_types still initializing.
+import torch  # isort: skip
+
 import spmd_types as spmd
-import torch
 
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.moe import GroupedExperts
