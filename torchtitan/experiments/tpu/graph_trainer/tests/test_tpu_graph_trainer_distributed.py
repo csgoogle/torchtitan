@@ -18,7 +18,10 @@ class TpuGraphTrainerDistributedTest(
 ):
   """Tests the distributed training setup under TpuGraphTrainer."""
 
-  # Tests only for Qwen3 Dense model for now
+  # Each model appears twice, with stacking off and on, so a failure in the
+  # stacked case is the stack and nothing else. Both models rather than one:
+  # the flag reaches them through a config rewrite with no model-specific code,
+  # and running it end to end on two models is what holds that true.
   @parameterized.named_parameters([
       dict(
           testcase_name="qwen3_simple_fsdp",
@@ -28,6 +31,38 @@ class TpuGraphTrainerDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--tpu_config.use_simple_fsdp",
+          ],
+      ),
+      dict(
+          testcase_name="qwen3_simple_fsdp_stacked_layers",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--tpu_config.use_simple_fsdp",
+              "--tpu_config.use_stacked_layers",
+          ],
+      ),
+      dict(
+          testcase_name="llama3_simple_fsdp",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--tpu_config.use_simple_fsdp",
+          ],
+      ),
+      dict(
+          testcase_name="llama3_simple_fsdp_stacked_layers",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--tpu_config.use_simple_fsdp",
+              "--tpu_config.use_stacked_layers",
           ],
       ),
   ])

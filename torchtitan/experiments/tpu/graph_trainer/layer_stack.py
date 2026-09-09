@@ -1,0 +1,496 @@
+"""Store sibling decoder layers' weights in one stacked tensor per parameter.
+
+Each layer used to own its weights. Now there is one tensor per *kind* of
+weight, with one row per layer:
+
+    before:  layers.0.attention.wq.weight ... layers.n-1.attention.wq.weight
+             n separate [d, d] tensors, one per layer
+    after:   layer_stacks.attention__wq__weight
+             one [n, d, d] tensor, row i belonging to layer i
+
+A later PR runs the layers as a single ``scan``. That leading axis is the reason
+to stack them at all.
+
+What changes for a reader:
+
+* The layer modules are still there, and still run one at a time in a Python
+  ``for``. They just have no parameters of their own.
+  ``layers.7.attention.wq.weight`` does not resolve, and ``named_parameters()``
+  reports the stack instead.
+* The per-layer names come back, as views onto their rows, in exactly three
+  windows: ``init_weights``, ``state_dict()`` and ``load_state_dict()``. So
+  weights initialize as they did unstacked, and checkpoints keep their
+  ``layers.i....`` keys -- a checkpoint moves freely between a stacked and an
+  unstacked run. Everywhere else the views are down, the forward and backward
+  included: those read rows out of the stack and never restore the names.
+* Anything keyed off *live* parameter names sees the difference: the optimizer
+  state dict and DCP's ``get_model_state_dict`` both do.
+  https://github.com/google-pytorch/torchtitan/issues/389
+  https://github.com/google-pytorch/torchtitan/issues/392
+
+Stacking happens in the model's ``__init__`` (:func:`with_tpu_stacked_layers`),
+which is always before FSDP shards anything.
+"""
+
+import contextlib
+import functools
+from collections.abc import Iterator
+
+import torch
+from torch import nn
+from torch.func import functional_call
+
+from torchtitan.config import derive
+from torchtitan.experiments.tpu.layer_loop import (
+    model_subclass,
+    tpu_model_class,
+    runs_layer_loop,
+    TpuLayerLoop,
+)
+from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.moe import MoE
+from torchtitan.protocols.module import Module
+from torchtitan.tools.logging import logger
+
+
+__all__ = [
+    "check_layers_are_stackable",
+    "LayerStack",
+    "StackedLayers",
+    "STACK_ATTR",
+    "with_tpu_stacked_layers",
+]
+
+
+# Where the stacks' own module hangs off the model -- see `LayerStackHolder`.
+STACK_ATTR = "layer_stacks"
+
+# `register_parameter` rejects names with a dot in them, so a per-layer FQN like
+# `attention.wq.weight` can't be used as a stack's name as-is. The mangled name
+# never leaves this module: the state-dict hooks below emit the real FQNs.
+def _mangle(name: str) -> str:
+    return name.replace(".", "__")
+
+
+def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
+    """Every layer must match layer 0, or they cannot share a stack.
+
+    Parameters become rows of one tensor, so they have to agree on name, shape,
+    dtype and ``requires_grad``. Dtype matters because the stack is allocated
+    from layer 0, so a layer with a different dtype would be silently cast into
+    it.
+
+    Buffers aren't stacked at all -- every layer runs with layer 0's -- so they
+    have to agree on *value* too, not just shape.
+
+    Raises:
+        ValueError: if any layer differs from layer 0.
+    """
+
+    def spec(layer: nn.Module) -> dict[str, tuple]:
+        named = [*layer.named_parameters(), *layer.named_buffers()]
+        return {n: (tuple(t.shape), t.dtype, t.requires_grad) for n, t in named}
+
+    template, zero_buffers = spec(layers["0"]), dict(layers["0"].named_buffers())
+    for i, layer in enumerate(layers.values()):
+        # Load balancing keeps its state in buffers, and buffers aren't stacked,
+        # so every layer would route off layer 0's. The value check above misses
+        # it: the buffers start equal and only diverge during training. With no
+        # `load_balance_coeff` nothing reads them, so sharing is harmless.
+        if any(
+            isinstance(m, MoE) and m.load_balance_coeff is not None
+            for m in layer.modules()
+        ):
+            raise ValueError(
+                f"layer {i} holds an MoE with load balancing on, and its "
+                "per-layer buffers cannot be shared across layers. Stacking "
+                "does not support MoE load balancing "
+                "(https://github.com/google-pytorch/torchtitan/issues/391); "
+                "drop --tpu-config.use-stacked-layers, or set "
+                "load_balance_coeff to None."
+            )
+        got = spec(layer)
+        if got != template:
+            # key=str: torch.dtype is not orderable.
+            differences = sorted(set(template.items()) ^ set(got.items()), key=str)
+        else:
+            # Skip meta: nothing to compare, and refusing there would reject
+            # every real model.
+            differences = [
+                f"buffer {n} holds different values"
+                for n, b in layer.named_buffers()
+                if not (b.is_meta or zero_buffers[n].is_meta)
+                and not torch.equal(zero_buffers[n], b)
+            ]
+        if differences:
+            raise ValueError(
+                f"layer {i} does not match layer 0, so their weights cannot "
+                f"share a stack: {differences}. Stacking needs identical "
+                "layers "
+                "(https://github.com/google-pytorch/torchtitan/issues/393)."
+            )
+
+
+class LayerStackHolder(Module):
+    """``model.layer_stacks``: the stacks, and nothing else.
+
+    The stacks live in the model tree so they count as ordinary parameters:
+    found by ``model.parameters()``, sharded by FSDP, seen by the optimizer,
+    written to the checkpoint.
+
+    A ``Module`` rather than a bare ``nn.Module``, because the model stacks
+    itself in its own ``__init__`` and so the holder is already in the tree when
+    ``verify_module_protocol`` walks it.
+
+    Put nothing else in here: SimpleFSDP skips a module once it has sharded it,
+    so anything else parked here would silently go unsharded.
+    """
+
+    # Dim 0 is the layer axis, so FSDP shards dim 1. Sharding dim 0 would split
+    # one layer's weight across ranks, and with `n_layers` below the mesh size
+    # it would quietly fall back to `Replicate`. `apply_simple_fsdp` reads this
+    # off the module; it is the whole interface between stacking and sharding.
+    _fsdp_shard_dim = 1
+
+
+class StackedLayers(TpuLayerLoop):
+    """``model.layers``, running its layers out of the stacks.
+
+    A ``TpuLayerLoop`` runs its own layers, so swapping the container is all it
+    takes to change how they run. The layer modules inside are the same objects
+    as before, so their parameters, FQNs and SimpleFSDP parametrizations are
+    untouched.
+    """
+
+    def __init__(self, layers: nn.ModuleDict, stack: "LayerStack"):
+        super().__init__(layers)
+        self.stack = stack
+
+    def forward(self, h: torch.Tensor, *args) -> torch.Tensor:
+        return self.stack.python_loop(h, *args)
+
+
+class LayerStack:
+    """Owns the stacks, and switches the model between the two layouts.
+
+    ``unrolled`` is the only method called from outside, by ``init_states`` and
+    the state-dict hooks. ``_apply_stacked_layers`` below drives the rest, in the
+    one order that works. Each step asserts what has already run, so getting the
+    order wrong fails loudly.
+    """
+
+    def __init__(self, layers: nn.ModuleDict, holder: LayerStackHolder):
+        self.layers = layers
+        # The `LayerStackHolder` the stacks are registered on.
+        self.holder = holder
+        self.n_layers = len(layers)
+        # Per-layer parameter FQNs relative to a layer, e.g. "attention.wq.weight".
+        self.names: list[str] = []
+        # What has already run, so a caller can't reorder the steps.
+        self._unregistered = False
+        self._views_attached = False
+        # Where the stacks wait while the views stand in for them, inside
+        # `unrolled()`, and the views themselves, to check nothing swapped them.
+        self._hidden: dict[str, nn.Parameter] = {}
+        self._views: dict[tuple[int, str], nn.Parameter] = {}
+
+    def _slots(self) -> Iterator[tuple[int, str, nn.Module, str]]:
+        """Every per-layer parameter, as (row, FQN, owning module, attribute).
+
+        `_parameters` is keyed by the last part of the name alone, so adding or
+        deleting an entry needs the owning module as well as the name. Attaching
+        and dropping views are inverses of each other, so both walk this.
+        """
+        for i, layer in enumerate(self.layers.values()):
+            for name in self.names:
+                # "attention.wq.weight" splits into path ["attention", "wq"] and
+                # attr "weight". Walking that path from a layer lands on the `wq`
+                # Linear, and its _parameters["weight"] is the slot to swap.
+                *path, attr = name.split(".")
+                mod = layer
+                for part in path:
+                    mod = getattr(mod, part)
+                yield i, name, mod, attr
+
+    # -- construction ------------------------------------------------------
+
+    def unregister_and_allocate(self) -> None:
+        """Replace each *kind* of per-layer weight with one stacked tensor.
+
+        Every layer holds the same kinds of weight: ``n_layers`` separate
+        ``attention.wq.weight``, ``n_layers`` separate ``feed_forward.w1.weight``
+        and so on. Each of those groups becomes one ``[n_layers, *shape]``
+        tensor, which is why the first loop below is over kinds and not over
+        layers. The second loop deletes the originals, leaving the layer modules
+        with no parameters of their own.
+
+        The originals have to go. A stack and its rows are the same memory, so if
+        FSDP found both it would shard both, and one weight would collect two
+        sets of gradients.
+
+        Nothing is really allocated here. The model is still on meta, so these
+        are shape-and-dtype placeholders that ``to_empty`` will materialize.
+        """
+        assert not self._unregistered, "unregister_and_allocate() ran twice"
+        check_layers_are_stackable(self.layers)
+        for name, p in self.layers["0"].named_parameters():
+            self.names.append(name)
+            self.holder.register_parameter(
+                _mangle(name),
+                nn.Parameter(
+                    torch.empty(
+                        self.n_layers, *p.shape, dtype=p.dtype, device=p.device
+                    ),
+                    requires_grad=p.requires_grad,
+                ),
+            )
+        # Row i of the stack is now the only copy. `layers.i.attention.wq.weight`
+        # no longer resolves to a parameter, and nothing walking the tree finds
+        # it.
+        for _, _, mod, attr in self._slots():
+            del mod._parameters[attr]
+        self._unregistered = True
+
+    # -- the two layouts ---------------------------------------------------
+
+    @contextlib.contextmanager
+    def unrolled(self):
+        """Make the model look unstacked for the duration of a block.
+
+        Inside the block the model is indistinguishable from the unrolled one:
+        same parameters, same names, same ``state_dict``, and writes land in the
+        stack. It's a scope rather than two calls so the views still come down
+        if the block raises.
+        """
+        self._attach_views()
+        try:
+            yield
+        finally:
+            self._drop_views()
+
+    def _attach_views(self) -> None:
+        """Put the per-layer names back, each aliasing its row of a stack.
+
+        Only ever after ``to_empty``, which reallocates storage without
+        preserving aliasing: a view taken while the model is still on meta
+        would point at nothing, and every write to it would be lost.
+        """
+        assert self._unregistered and not self._views_attached
+        for i, name, mod, attr in self._slots():
+            # Read out of `_parameters`, not with `getattr`: after SimpleFSDP
+            # the attribute is a property returning the *gathered* tensor, and
+            # a view of that would alias a temporary, not this rank's shard.
+            stack = self.holder._parameters[_mangle(name)]
+            # `stack[i]` is basic indexing -- a plain integer, no mask, no index
+            # tensor -- which in torch always returns a view, never a copy. So
+            # this parameter shares storage with row i, and writing the "layer"
+            # writes the stack. That is what makes `init_weights` land in the
+            # stack rather than in a temporary; `test_init_differs_per_row`
+            # checks it.
+            #
+            # Registered by hand, because `setattr` would go through SimpleFSDP's
+            # parametrization instead of the raw slot.
+            view = nn.Parameter(stack[i], requires_grad=stack.requires_grad)
+            mod._parameters[attr] = view
+            self._views[(i, name)] = view
+        # Move the stacks aside while the views stand in for them. Both would
+        # otherwise be registered parameters of the same model pointing at the
+        # same memory, so `model.parameters()` would yield every weight twice and
+        # the optimizer would step it twice. `_drop_views` puts them back.
+        self._hidden = dict(self.holder._parameters)
+        self.holder._parameters.clear()
+        self._views_attached = True
+
+    def _drop_views(self) -> None:
+        """Exact inverse of ``_attach_views``."""
+        assert self._views_attached
+        for i, name, mod, attr in self._slots():
+            # `load_state_dict(assign=True)` puts the checkpoint's tensor in the
+            # slot instead of copying into the view. The stack would keep its old
+            # values and the loaded weights would be deleted on the next line --
+            # wrong weights, no error. Nothing in torchtitan passes `assign`, so
+            # this only has to be loud.
+            if mod._parameters[attr] is not self._views[(i, name)]:
+                raise RuntimeError(
+                    f"layers.{i}.{name} was replaced rather than written to, so "
+                    "the stack never saw the new value. `assign=True` is not "
+                    "supported on a stacked model."
+                )
+            del mod._parameters[attr]
+        self.holder._parameters.update(self._hidden)
+        self._hidden = {}
+        self._views = {}
+        self._views_attached = False
+
+    # -- installation ------------------------------------------------------
+
+    def install(self, model: nn.Module) -> None:
+        """Attach the stack to the model, at the end of its ``__init__``.
+
+        Three attachments, and the model isn't stacked until all three are on:
+        initialization runs with the views up, checkpoints keep the unrolled
+        keys, and ``model.layers`` runs its layers out of the stacks.
+
+        The state-dict hooks call the two halves of ``unrolled`` instead of the
+        context manager, because torch's API is a pre-hook and a post-hook with
+        the caller's own ``state_dict`` call in between, so there is no block to
+        wrap. They are plain closures and not bound methods, because registering
+        a hook sets an attribute on whatever it is given and a bound method
+        rejects that.
+        """
+        assert self._unregistered, "install() before unregister_and_allocate()"
+        # `init_states` (torchtitan/protocols/module.py) is torchtitan's weight
+        # initializer. The trainer builds the model on meta, calls `to_empty` to
+        # give it real but uninitialized storage, then calls `init_states` once.
+        # That walks the tree and has each module fill in its own parameters and
+        # buffers. It is the only thing that writes initial weights, so it is
+        # the only place the per-layer views need to be up. Wrap it, and every
+        # write lands in the right row of the stack.
+        inner = model.init_states
+
+        def init_states(**kwargs):
+            with self.unrolled():
+                inner(**kwargs)
+
+        def attach(*args):
+            self._attach_views()
+
+        def drop(*args):
+            self._drop_views()
+
+        model.init_states = init_states
+        # Save and load in the unrolled format, so a run with the flag on can
+        # load a checkpoint written with it off and vice versa. Stacking is an
+        # execution detail, not a change to the model.
+        #
+        # This puts the views up and lets the model produce its own state dict,
+        # rather than translating keys afterwards, which is what keeps every
+        # other hook in the tree working. The fused-QKV split is the one that
+        # matters: it emits wq/wk/wv from a single wqkv parameter, and anything
+        # rewriting keys from outside would bypass it.
+        model.register_state_dict_pre_hook(attach)
+        model.register_state_dict_post_hook(drop)
+        model.register_load_state_dict_pre_hook(attach)
+        model.register_load_state_dict_post_hook(drop)
+        # Only a rewritten model calls its layers container. A stock `Decoder`
+        # loops over the layers directly, so it would ignore the stacks and
+        # quietly train nothing.
+        if not runs_layer_loop(model):
+            raise TypeError(
+                f"{type(model).__name__} does not run its layers through its "
+                "layers container, so stacking them would have no effect; the "
+                "model config has to go through `tpu_model_class` first."
+            )
+        # The container holds the same layer modules, so `self.layers` keeps
+        # working and is deliberately not repointed at it.
+        model.layers = StackedLayers(model.layers, self)
+
+    # -- running the layers ------------------------------------------------
+
+    def python_loop(self, h: torch.Tensor, *args):
+        """Run the layers one at a time, reading their weights from the stacks.
+
+        Layer 0 acts as the template: ``functional_call`` runs its ``forward``
+        with another layer's weights. The layers' own buffers (the RoPE cache)
+        are identical across layers, so the template's are correct on every
+        iteration.
+
+        ``getattr`` here is deliberate, unlike everywhere else in this file. It
+        goes through SimpleFSDP's parametrization, which is what all-gathers the
+        stack.
+
+        That gather is once per *stack*, not once per layer, and its result
+        stays live until the backward is done -- so peak memory here is the
+        whole unsharded model, not one layer of it. At llama3-70b that is around
+        137 GiB per chip, which does not fit. Stacking is only useful at that
+        size once the gather moves inside the body, one layer at a time; that is
+        the in-body gather PR. Everywhere the result is *kept*, read
+        `_parameters` instead.
+        """
+        assert self._unregistered and not self._views_attached
+        template = self.layers["0"]
+        stacks = {name: getattr(self.holder, _mangle(name)) for name in self.names}
+        for i in range(self.n_layers):
+            h = functional_call(
+                template, {name: s[i] for name, s in stacks.items()}, (h, *args)
+            )
+        return h
+
+
+def _apply_stacked_layers(model: nn.Module) -> None:
+    """Store each decoder layer's weights as a row of one stacked tensor.
+
+    Called from the model's own ``__init__`` (see
+    :func:`with_tpu_stacked_layers`), so the model is stacked from the moment it
+    exists. Everything downstream, sharding included, just sees a model whose
+    layer weights happen to have a leading axis. Mutates ``model``.
+
+    What the model has to provide, i.e. the checklist for porting a new one:
+
+    * It runs its layers through its layers container instead of looping over
+      them itself, which means its config went through ``tpu_model_class``.
+      Stacking works by swapping that container for one that runs the layers out
+      of the stacks.
+    * The layers are homogeneous, and no layer is an MoE with load balancing
+      on. Both checked, by :func:`check_layers_are_stackable`.
+    * The layer signature is ``(h, *args)``, where ``h`` is the hidden state and
+      layer ``i`` takes layer ``i-1``'s output. ``h`` is the only argument that
+      changes between layers; ``*args`` (RoPE cache, attention masks) has to be
+      the same for all of them.
+    * ``model.init_states`` exists and is where the weights are initialized. It
+      gets wrapped so the per-layer views are up while it runs.
+
+    What does and does not change:
+
+    * ``state_dict()``, ``load_state_dict()`` and the on-disk model checkpoint
+      keep the unrolled ``layers.i.<p>`` keys, so a checkpoint moves freely
+      between a stacked and an unstacked run. ``assign=True`` is the exception,
+      and is refused.
+    * ``named_parameters()`` does *not*. It reports the stacks, under
+      ``layer_stacks.<mangled>``, and the per-layer attributes no longer exist.
+      Anything keyed off live parameter names sees the difference; see the
+      module docstring.
+    """
+    holder = LayerStackHolder()
+    setattr(model, STACK_ATTR, holder)
+    stack = LayerStack(model.layers, holder)
+    stack.unregister_and_allocate()
+    stack.install(model)
+    logger.info(
+        "Stacked %d weights across %d layers", len(stack.names), stack.n_layers
+    )
+
+
+@functools.cache
+def _stacked_model_class(config_cls: type) -> type:
+    """Build the ``Stacked<Model>`` subclass that stacks itself on construction.
+
+    It subclasses whatever layer-loop class ``tpu_model_class`` builds, because
+    the model has to run its layers through its layers container for stacking to
+    do anything. Its ``__init__`` builds the model as usual and then stacks it.
+
+    One class per config class, cached.
+    """
+    base = tpu_model_class(config_cls)
+
+    def __init__(self, *args, **kwargs):
+        base.__init__(self, *args, **kwargs)
+        _apply_stacked_layers(self)
+
+    return model_subclass(
+        base, base.Config, f"Stacked{base.__name__}", __init__=__init__
+    )
+
+
+def with_tpu_stacked_layers(model_config: Decoder.Config) -> Decoder.Config:
+    """Put ``model_config`` on a model that arrives already stacked.
+
+    Stacking is a property of the model, not of how it gets parallelized. The
+    model is built stacked, and ``apply_simple_fsdp`` then shards the stacks it
+    finds like any other parameter, on the axis ``_fsdp_shard_dim`` names above.
+    Nothing in the parallelize path has to know that stacking exists.
+
+    Builds on :func:`tpu_model_class`, and has to be applied in the same place
+    and for the same reasons; see its docstring.
+    """
+    return derive(model_config, _stacked_model_class(type(model_config)).Config)

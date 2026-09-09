@@ -70,6 +70,15 @@ class TPUConfig:
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  # Store each decoder layer's weights as a row of one stacked tensor instead
+  # of n_layers separate tensors. Storage only -- the layers still run one at a
+  # time. Groundwork for running them as a single scan.
+  #
+  # Model checkpoints are unaffected: they keep the per-layer keys either way.
+  # Optimizer checkpoints are not, because the parameter names change, so a run
+  # cannot resume across a flip of this flag.
+  # https://github.com/google-pytorch/torchtitan/issues/389
+  use_stacked_layers: bool = False
   # Keep rematerialized layer workspaces local in the XLA schedule.
   enable_graph_trainer_remat_schedule: bool = False
   # TPU SimpleFSDP scheduling for GraphTrainer rematerialization. ``prefetch``
@@ -262,6 +271,14 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()
+    # Only the graph trainer builds its model through
+    # `to_tpu_graph_trainer_config`, which is what applies the stacking rewrite.
+    # Anywhere else the flag would be accepted and then do nothing.
+    if self.tpu_config.use_stacked_layers and not self.tpu_config.use_graph_trainer:
+      raise ValueError(
+          "--tpu-config.use-stacked-layers needs "
+          "--tpu-config.use-graph-trainer; no other lane applies it."
+      )
     # Set the default location of dump_folder. Allow the runtime CLI
     # configuration (i.e. --job.dump_folder=...) to override this parameter.
     if not self.dump_folder:
