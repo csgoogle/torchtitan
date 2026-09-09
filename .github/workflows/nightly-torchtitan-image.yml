@@ -96,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
-      candidate_tag: ${{ steps.meta.outputs.candidate_tag }}
+      candidate_ref: ${{ steps.ref.outputs.image_ref }}
       promote_latest: ${{ steps.meta.outputs.promote_latest }}
     defaults:
       run:
@@ -227,6 +227,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Downstream jobs should reference the image by digest. Candidate tags are
+      # mutable if this workflow is used to build two runs on the same day, and
+      # runners referencing candidate tags may fail to re-pull.
+      - name: Compute immutable image reference
+        id: ref
+        run: |
+          set -euo pipefail
+          echo "image_ref=${IMAGE_REPO}@${DIGEST}" >> "${GITHUB_OUTPUT}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
       - name: Print published tags
         run: |
           echo "Published tags (':latest' is added later, by promote-latest):"
@@ -247,7 +258,7 @@ jobs:
     if: ${{ github.event.inputs.push_image != 'false' }}
     uses: ./.github/workflows/tpu-test.yml
     with:
-      image: ${{ needs.build-and-push-image.outputs.candidate_tag }}
+      image: ${{ needs.build-and-push-image.outputs.candidate_ref }}
     secrets:
       GAR_JSON_KEY: ${{ secrets.GAR_JSON_KEY }}
 
@@ -275,7 +286,9 @@ jobs:
       - name: Add :latest tag to the validated image
         run: |
           set -euo pipefail
-          gcloud artifacts docker tags add "${CANDIDATE_TAG}" "${IMAGE_REPO}:latest" --quiet
-          echo "Promoted ${CANDIDATE_TAG} to ${IMAGE_REPO}:latest"
+          gcloud artifacts docker tags add "${CANDIDATE_REF}" "${IMAGE_REPO}:latest" --quiet
+          echo "Promoted ${CANDIDATE_REF} to ${IMAGE_REPO}:latest"
         env:
-          CANDIDATE_TAG: ${{ needs.build-and-push-image.outputs.candidate_tag }}
+          # Promote by digest so we tag the image validate-image actually ran,
+          # not whatever the mutable date tag resolves to by now.
+          CANDIDATE_REF: ${{ needs.build-and-push-image.outputs.candidate_ref }}
