@@ -8,6 +8,9 @@ from torchtitan.experiments.graph_trainer.configs import GraphTrainerMemoryPolic
 import torchtitan.trainer
 
 
+GraphTrainerFSDPSchedule = Literal["none", "prefetch", "interleave"]
+
+
 @dataclasses.dataclass
 class TPUConfig:
   use_simple_fsdp: bool = False
@@ -32,6 +35,17 @@ class TPUConfig:
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
   # Keep rematerialized layer workspaces local in the XLA schedule.
   enable_graph_trainer_remat_schedule: bool = False
+  # TPU SimpleFSDP scheduling for GraphTrainer rematerialization. ``prefetch``
+  # preserves recomputed all-gathers and places them in preceding dense compute;
+  # ``interleave`` also fences each next all-gather on prior reduce-scatter
+  # completion, bounding memory more tightly at the cost of AG/RS concurrency.
+  # TODO: Move this and the other graph_trainer_* options into a dedicated
+  # GraphTrainer TPU config once that nested config exists.
+  graph_trainer_fsdp_schedule: GraphTrainerFSDPSchedule = "none"
+  # Release layer L's recomputed parameters at backward layer L+N. N=1 is the
+  # lowest-memory useful prefetch and the best measured real-model policy;
+  # larger values expose more AGs for overlap but increase parameter lifetime.
+  graph_trainer_fsdp_prefetch_distance: int = 1
   # Emit one aggregate MFU measurement after the configured start log step
   # through the end of training. Both boundaries must be metric log steps.
   enable_mfu_benchmark: bool = False

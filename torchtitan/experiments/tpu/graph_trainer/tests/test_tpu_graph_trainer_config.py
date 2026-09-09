@@ -124,6 +124,48 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         graph_config.tpu_config.enable_graph_trainer_remat_schedule
     )
 
+  def test_cli_fsdp_schedule_is_propagated(self) -> None:
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_debugmodel",
+            "--tpu_config.graph_trainer_fsdp_schedule=interleave",
+        ]),
+    )
+
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_fsdp_schedule,
+        "interleave",
+    )
+
+  def test_cli_fsdp_prefetch_distance_is_propagated(self) -> None:
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_debugmodel",
+            "--tpu_config.graph_trainer_fsdp_prefetch_distance=2",
+        ]),
+    )
+
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_fsdp_prefetch_distance,
+        2,
+    )
+
   def test_qwen3_8b_explicitly_uses_default_graph_policy(self) -> None:
     config = qwen3_8b()
 
@@ -260,6 +302,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_remat_schedule_supports_optimizer_in_graph(self) -> None:
     config = qwen3_8b()
     config.tpu_config.enable_graph_trainer_remat_schedule = True
+    config.tpu_config.graph_trainer_fsdp_schedule = "interleave"
+    config.tpu_config.graph_trainer_fsdp_prefetch_distance = 2
     config.tpu_config.optimizer_in_graph = True
     graph_config = to_tpu_graph_trainer_config(
         config,
@@ -277,6 +321,75 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     self.assertIn("apply_tpu_remat_schedule", pass_names)
     self.assertEqual(pass_names[0], "remove_parameter_gradient_markers_pass")
+    self.assertLess(
+        pass_names.index("apply_tpu_remat_schedule"),
+        pass_names.index("apply_tpu_remat_fsdp_all_gather_schedule"),
+    )
+    self.assertLess(
+        pass_names.index("schedule_fsdp_comms_to_dense_regions_pass"),
+        pass_names.index("apply_tpu_fsdp_rs_deadline_schedule"),
+    )
+    fsdp_schedule = next(
+        graph_pass
+        for graph_pass in passes
+        if getattr(graph_pass, "func", graph_pass).__name__
+        == "apply_tpu_remat_fsdp_all_gather_schedule"
+    )
+    self.assertEqual(fsdp_schedule.keywords["prefetch_distance"], 2)
+
+  @parameterized.parameters(
+      ("none", False, False),
+      ("prefetch", True, False),
+      ("interleave", True, True),
+  )
+  def test_fsdp_schedule_selects_passes(
+      self,
+      schedule: str,
+      has_prefetch: bool,
+      has_interleave: bool,
+  ) -> None:
+    config = qwen3_8b()
+    config.tpu_config.enable_graph_trainer_remat_schedule = True
+    config.tpu_config.graph_trainer_fsdp_schedule = schedule
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    passes = construct_tpu_pass_pipeline(
+        typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
+        graph_config,
+    )
+    pass_names = {
+        getattr(graph_pass, "func", graph_pass).__name__ for graph_pass in passes
+    }
+
+    self.assertEqual(
+        "apply_tpu_remat_fsdp_all_gather_schedule" in pass_names,
+        has_prefetch,
+    )
+    self.assertEqual(
+        "schedule_fsdp_comms_to_dense_regions_pass" in pass_names,
+        has_prefetch,
+    )
+    self.assertEqual(
+        "apply_tpu_fsdp_rs_deadline_schedule" in pass_names,
+        has_interleave,
+    )
+
+  def test_fsdp_schedule_requires_rematerialization(self) -> None:
+    config = qwen3_8b()
+    config.tpu_config.graph_trainer_fsdp_schedule = "interleave"
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    with self.assertRaisesRegex(ValueError, "rematerialization"):
+      construct_tpu_pass_pipeline(
+          typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
+          graph_config,
+      )
 
 
 if __name__ == "__main__":
