@@ -170,6 +170,33 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         2,
     )
 
+  def test_fsdp_pipeline_split_is_propagated(self) -> None:
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_debugmodel",
+            "--tpu_config.use_graph_split",
+            "--tpu_config.graph_split.backward_partition_mode=fsdp_region_local",
+            "--tpu_config.graph_split.backward_regions_per_executable=2",
+        ]),
+    )
+
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    self.assertEqual(
+        graph_config.tpu_config.graph_split.backward_partition_mode,
+        "fsdp_region_local",
+    )
+    self.assertEqual(
+        graph_config.tpu_config.graph_split.backward_regions_per_executable,
+        2,
+    )
+
   def test_qwen3_8b_explicitly_uses_default_graph_policy(self) -> None:
     config = qwen3_8b()
 
