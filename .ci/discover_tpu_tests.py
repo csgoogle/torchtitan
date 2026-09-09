@@ -10,8 +10,6 @@ NUM_CPU_SHARDS = 1
 
 # Tests that are temporarily disabled
 DISABLED_TESTS = {
-    "torchtitan.experiments.tpu.kernels.tests.test_splash_attention",
-    "torchtitan.experiments.tpu.kernels.tests.test_tokamax_splash_attention",
     "torchtitan.experiments.tpu.kernels.tests.test_linear_softmax_cross_entropy_loss",
     "torchtitan.experiments.tpu.kernels.tests.test_gmm",
     "torchtitan.experiments.tpu.kernels.tests.test_fill_indices",
