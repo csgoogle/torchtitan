@@ -38,6 +38,7 @@ from torchtitan.experiments.tpu.overrides.fused_loss import (
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
     qwen3_moe_30b,
+    qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
 )
@@ -154,6 +155,18 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         "HEAD_DIM_MINOR",
     )
 
+  def test_attention_parity_recipe_uses_batch_native_maxtext_tiles(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
+    splash = config.splash_attention_kernel
+
+    self.assertTrue(splash.use_vmap_bwd)
+    self.assertFalse(splash.sa_use_document_aware_block_skipping)
+    self.assertEqual(splash.sa_block_q, 1024)
+    self.assertEqual(splash.sa_block_kv, 1024)
+    self.assertEqual(splash.sa_block_kv_compute, 512)
+    self.assertEqual(splash.sa_block_q_dkv, 2048)
+    self.assertEqual(splash.sa_block_kv_dkv, 2048)
+    self.assertEqual(splash.sa_block_kv_dkv_compute, 1024)
   def test_dense_recipe_does_not_enable_fused_adamw_on_tpu(self) -> None:
     config = qwen3_8b()
 

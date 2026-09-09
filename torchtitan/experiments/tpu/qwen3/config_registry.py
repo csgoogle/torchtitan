@@ -492,6 +492,28 @@ def qwen3_moe_30b_fsdp_only_full_ac_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
+  """Q30 benchmark with the validated MaxText-parity attention recipe.
+
+  Segment IDs still enforce packed-document boundaries. Turning off dynamic
+  whole-block pruning makes the metadata identical across examples, allowing
+  forward and backward to lower as batch-native Splash calls. The larger tile
+  choices improve the surrounding compiled schedule on TPU7x even though the
+  isolated dKV custom call is slightly slower.
+  """
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  splash = cfg.splash_attention_kernel
+  splash.use_vmap_bwd = True
+  splash.sa_use_document_aware_block_skipping = False
+  splash.sa_block_q = 1024
+  splash.sa_block_kv = 1024
+  splash.sa_block_kv_compute = 512
+  splash.sa_block_q_dkv = 2048
+  splash.sa_block_kv_dkv = 2048
+  splash.sa_block_kv_dkv_compute = 1024
+  return cfg
+
+
 def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
   """Proxy model for Qwen3 30B MoE (4 layers instead of 48) for testing/iterations."""
   cfg = qwen3_moe_30b()
