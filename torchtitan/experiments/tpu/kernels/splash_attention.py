@@ -83,21 +83,22 @@ def _maybe_document_aware_mask_info(
     is_dkv,
     use_document_aware_block_skipping,
 ):
-  """Choose between sparse per-example metadata and batch-native lowering.
+  """Choose document-aware block skipping or batch-native masking.
 
-  Both modes pass ``segment_ids_b`` to Splash, so they enforce the same causal
-  and packed-document attention mask. The document-aware mode additionally
-  removes whole query/key blocks that cannot contain same-document tokens.
-  That is useful for packs with many short documents, but making this metadata
-  depend on each example causes JAX/XLA to lower the surrounding ``vmap`` as a
-  serial batch loop on TPU today. Returning the shared causal metadata avoids
-  that loop and is faster for the measured Qwen3-30B C4 training workload.
+  Document-aware block skipping: specialize block metadata for each packed
+  example and omit blocks that cannot contain same-document token pairs.
+  Batch-native masking: reuse the static causal block metadata for every
+  example and rely on runtime segment IDs for document boundaries. Both modes
+  pass ``segment_ids_b`` to Splash and enforce the same token-level causal and
+  packed-document mask.
 
-  Disabling block skipping is therefore safe for real packed training, not a
-  benchmark-only relaxation of the mask. It is not universally faster: the
-  extra block work can outweigh batch-native lowering for sufficiently sparse
-  document packs. Keep the conservative document-aware behavior as the
-  default and opt out only for a profiled input distribution and shape.
+  Document-aware block skipping can save work for packs with many short
+  documents, but its example-dependent metadata makes JAX/XLA lower the
+  surrounding ``vmap`` as a serial batch loop on TPU today. Batch-native
+  masking avoids that loop and is faster for the measured Qwen3-30B C4
+  training distribution, but its extra block work may lose on sparser packs.
+  Keep document-aware block skipping as the kernel API default; recipes should
+  select batch-native masking only for a validated distribution and shape.
   """
   if not use_document_aware_block_skipping:
     return mask_info
@@ -525,11 +526,16 @@ def splash_sdpa(
     block_q_dq: Block size for Q in DQ.
     block_kv_dq: Block size for KV in DQ.
     use_fused_bwd_kernel: Whether to use fused backward kernel.
-    use_vmap_bwd: Whether to use vmap in backward pass. Default False (uses scan
-      for memory safety).
-    use_document_aware_block_skipping: Whether to specialize Splash block
-      metadata for each packed example. Segment-ID masking remains active when
-      disabled; only whole-block pruning is skipped.
+    use_vmap_bwd: Whether to vectorize backward over the batch. When false,
+      backward uses a memory-safe sequential scan. When true, batch-native
+      masking also permits XLA to lower backward as a batched custom call.
+    use_document_aware_block_skipping: Select document-aware block skipping
+      when true or batch-native masking when false. Both modes retain exact
+      segment-ID masking. This option is independent of ``use_vmap_bwd``:
+      batch-native masking still benefits the always-vmapped forward when
+      backward uses scan; enabling both makes backward batch-native as well.
+      Only document-aware block skipping prunes whole blocks using per-example
+      metadata.
     q_layout: Layout for Q.
     k_layout: Layout for K.
     v_layout: Layout for V.

@@ -146,11 +146,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertIsInstance(graph_config.loss, PallasCrossEntropyLoss.Config)
     self.assertEqual(graph_config.compile.memory_policy, "default")
 
-  def test_fsdp_only_recipe_uses_fused_adamw(self) -> None:
+  def test_fsdp_only_recipe_uses_fused_adamw_and_attention_tuning(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
 
     self.assertEqual(config.optimizer.implementation, "fused")
     self.assertTrue(config.tpu_config.enable_fused_optimizer)
+    self.assertTrue(config.splash_attention_kernel.use_vmap_bwd)
+    self.assertFalse(
+        config.splash_attention_kernel.sa_use_document_aware_block_skipping
+    )
     self.assertEqual(config.splash_attention_kernel.sa_q_layout, "SEQ_MINOR")
     self.assertEqual(config.splash_attention_kernel.sa_k_layout, "SEQ_MINOR")
     self.assertEqual(
@@ -158,18 +162,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         "HEAD_DIM_MINOR",
     )
 
-  def test_attention_parity_recipe_uses_batch_native_maxtext_tiles(self) -> None:
-    config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
-    splash = config.splash_attention_kernel
+    self.assertEqual(config.splash_attention_kernel.sa_block_kv_compute, 512)
+    self.assertEqual(config.splash_attention_kernel.sa_block_q_dkv, 2048)
+    self.assertEqual(config.splash_attention_kernel.sa_block_kv_dkv, 2048)
+    self.assertEqual(config.splash_attention_kernel.sa_block_kv_dkv_compute, 1024)
 
-    self.assertTrue(splash.use_vmap_bwd)
-    self.assertFalse(splash.sa_use_document_aware_block_skipping)
-    self.assertEqual(splash.sa_block_q, 1024)
-    self.assertEqual(splash.sa_block_kv, 1024)
-    self.assertEqual(splash.sa_block_kv_compute, 512)
-    self.assertEqual(splash.sa_block_q_dkv, 2048)
-    self.assertEqual(splash.sa_block_kv_dkv, 2048)
-    self.assertEqual(splash.sa_block_kv_dkv_compute, 1024)
+  def test_attention_parity_recipe_adds_bf16_rope(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
     self.assertIn(
         "torchtitan.experiments.tpu.overrides.bf16_rope",
         config.override.imports,
