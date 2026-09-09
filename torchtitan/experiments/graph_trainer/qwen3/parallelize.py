@@ -48,6 +48,7 @@ def parallelize_qwen3(
     compile_config: GraphTrainerCompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    stack_layers: bool = False,
 ):
     """
     Apply annotation, parallelization, activation checkpointing, and full graph
@@ -79,7 +80,12 @@ def parallelize_qwen3(
     # Apply simple_fsdp unconditionally. The `fsdp` mesh always exists with a
     # real backend (see ParallelDims._mesh_exist), even at degree 1, so that
     # MixedPrecisionPolicy's param_dtype cast still applies in single-GPU runs.
-    model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
+    model = apply_simple_fsdp(
+        model,
+        parallel_dims=parallel_dims,
+        training=training,
+        stack_layers=stack_layers,
+    )
     maybe_apply_ep_overlap_eager_chunking(model, compile_config)
 
     # Apply compilation based on mode

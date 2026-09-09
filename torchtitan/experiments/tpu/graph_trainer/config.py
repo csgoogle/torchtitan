@@ -6,6 +6,8 @@
 
 """TPU GraphTrainer config conversion."""
 
+import dataclasses
+import functools
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -22,7 +24,7 @@ def to_tpu_graph_trainer_config(
     model_registry: Callable[[str], ModelSpec],
     target_cls: type[ConfigT],
 ) -> ConfigT:
-  """Convert a TPU recipe and propagate its GraphTrainer memory policy."""
+  """Convert a TPU recipe and propagate its TPU-only GraphTrainer settings."""
   memory_policy = train_config.tpu_config.graph_trainer_memory_policy
   if memory_policy == "sac_and_offload":
     raise ValueError(
@@ -32,6 +34,17 @@ def to_tpu_graph_trainer_config(
       train_config, model_registry, target_cls=target_cls
   )
   graph_config.compile.memory_policy = memory_policy
+  if train_config.tpu_config.use_stacked_layers:
+    # Layer stacking is TPU-only, so the flag lives on tpu_config. The code
+    # that acts on it is inside the shared `apply_simple_fsdp`, which only
+    # takes a bool -- bind it here rather than teach shared code about
+    # tpu_config.
+    graph_config.model_spec = dataclasses.replace(
+        graph_config.model_spec,
+        parallelize_fn=functools.partial(
+            graph_config.model_spec.parallelize_fn, stack_layers=True
+        ),
+    )
   return graph_config
 
 

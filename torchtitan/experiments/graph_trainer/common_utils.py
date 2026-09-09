@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import fnmatch
+import functools
 import time
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
@@ -16,7 +17,7 @@ from torch.distributed.tensor import DTensor, Replicate
 from torch.fx.traceback import annotate, annotate_fn
 from torch.utils._pytree import register_constant, register_pytree_node, tree_map
 
-from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config import TORCH_DTYPE_MAP, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.context_parallel import apply_cp_to_forward
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
@@ -440,11 +441,17 @@ def apply_simple_fsdp(
     *,
     parallel_dims: ParallelDims,
     training: TrainingConfig,
+    stack_layers: bool = False,
 ) -> nn.Module:
     """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
 
     For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
     on the EDP mesh when expert parallelism is enabled.
+
+    ``stack_layers`` stores the decoder layers' weights as one stacked tensor
+    per parameter instead of one per layer; see
+    ``experiments/tpu/graph_trainer/layer_stack.py``. Default off is the
+    unchanged behaviour: plain per-parameter FSDP.
     """
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
@@ -490,12 +497,33 @@ def apply_simple_fsdp(
                 shard_dim=experts_shard_dim,
             )
 
-    model = data_parallel(
-        model,
-        dp_mesh,
-        dp_mode,
-        mp_policy=mp_policy,
-    )
+    if stack_layers:
+        # Imported here so this module does not depend on the TPU package,
+        # which imports it back.
+        from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
+            apply_stacked_layers,
+        )
+
+        # `apply_stacked_layers` gets the sharding as a callable rather than a
+        # sharded model: it has to build the stack first and shard *that*, so it
+        # makes the call itself, once, after rearranging the parameters. Same
+        # arguments as the branch below.
+        model = apply_stacked_layers(
+            model,
+            shard_fn=functools.partial(
+                data_parallel,
+                device_mesh=dp_mesh,
+                mode=dp_mode,
+                mp_policy=mp_policy,
+            ),
+        )
+    else:
+        model = data_parallel(
+            model,
+            dp_mesh,
+            dp_mode,
+            mp_policy=mp_policy,
+        )
     logger.info(
         "Applied Data Parallel (simple_fsdp) (dp mode=%s) to the model", dp_mode
     )

@@ -33,6 +33,10 @@ class TPUConfig:
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  # Store each decoder layer's weights as a row of one stacked tensor instead
+  # of n_layers separate tensors. Storage only -- the layers still run one at a
+  # time. Groundwork for running them as a single scan.
+  use_stacked_layers: bool = False
   # Keep rematerialized layer workspaces local in the XLA schedule.
   enable_graph_trainer_remat_schedule: bool = False
   # TPU SimpleFSDP scheduling for GraphTrainer rematerialization. ``prefetch``

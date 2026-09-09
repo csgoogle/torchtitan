@@ -36,6 +36,7 @@ def parallelize_llama(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    stack_layers: bool = False,
 ):
     """
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
@@ -63,7 +64,12 @@ def parallelize_llama(
     # Apply simple_fsdp unconditionally. The `fsdp` mesh always exists with a
     # real backend (see ParallelDims._mesh_exist), even at degree 1, so that
     # MixedPrecisionPolicy's param_dtype cast still applies in single-GPU runs.
-    model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
+    model = apply_simple_fsdp(
+        model,
+        parallel_dims=parallel_dims,
+        training=training,
+        stack_layers=stack_layers,
+    )
 
     # Apply compilation based on mode
     model = apply_compile(
