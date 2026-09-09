@@ -62,6 +62,11 @@ from torch import nn
 from torch._higher_order_ops.scan import scan
 from torch.func import functional_call
 
+from torchtitan.distributed import ParallelDims
+from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
+    check_layers_are_stackable,
+    check_scan_parallelism,
+)
 from torchtitan.models.common.decoder import LayerDict
 from torchtitan.tools.logging import logger
 
@@ -106,7 +111,7 @@ class LayerStack:
     """Owns the stacks and the transitions between the two layouts.
 
     Only ``unrolled`` is called from outside, by ``init_states`` and the
-    state-dict hooks. ``apply_scan`` below drives the rest, in the one
+    state-dict hooks. ``apply_stacked_layers`` below drives the rest, in the one
     order that works; each step asserts what has already run, so the order
     cannot silently go wrong.
     """
@@ -157,15 +162,9 @@ class LayerStack:
         shape-and-dtype placeholders that ``to_empty`` will materialize.
         """
         assert not self._unregistered, "unregister_and_allocate() ran twice"
-        # Layer 0 defines the kinds; every other layer must match it exactly or
-        # its weights cannot share a stack.
-        def spec(layer):
-            return {n: p.shape for n, p in layer.named_parameters()}
-
-        want = spec(self.layers["0"])
-        for i, layer in enumerate(self.layers.values()):
-            assert spec(layer) == want, f"layer {i} does not match layer 0"
-
+        # Layer 0 defines the kinds; every other layer must match it, or its
+        # weights cannot share a stack.
+        check_layers_are_stackable(self.layers)
         for name, p in self.layers["0"].named_parameters():
             self.names.append(name)
             self.holder.register_parameter(
@@ -347,6 +346,7 @@ def apply_scan(
     model: nn.Module,
     *,
     shard_fn: Callable[..., nn.Module],
+    parallel_dims: ParallelDims,
     use_scan: bool = True,
 ) -> nn.Module:
     """Stack the decoder layers' weights and run them as one ``scan``.
@@ -356,7 +356,11 @@ def apply_scan(
 
     The whole opt-in, on a model still on meta::
 
-        model = apply_scan(model, shard_fn=partial(data_parallel, ...))
+        model = apply_scan(
+            model,
+            shard_fn=partial(data_parallel, device_mesh=..., mode=...),
+            parallel_dims=parallel_dims,
+        )
 
     Requirements on the model -- the porting checklist for a new one:
 
@@ -397,6 +401,8 @@ def apply_scan(
     stacks -- the storage change without the loop change, which is what the
     reshard and checkpoint tests compare against.
     """
+    if use_scan:
+        check_scan_parallelism(parallel_dims)
     holder = nn.Module()
     setattr(model, STACK_ATTR, holder)
     stack = LayerStack(model.layers, holder)
