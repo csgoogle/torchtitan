@@ -20,7 +20,7 @@ from torchtitan.trainer import Trainer
 EpOverlapChunkDim = Literal["batch", "seq"]
 EpOverlapChunkStrategy = Literal["eager", "graph"]
 GraphTrainerMemoryPolicy = Literal[
-    "default", "full", "eager", "sac_and_offload"
+    "default", "full", "eager", "sac_and_offload", "full_and_scan_offload"
 ]
 
 TRANSFORMER_BLOCK_FQN = "layers.*"
@@ -108,6 +108,12 @@ class GraphTrainerCompileConfig(CompileConfig):
         sac_and_offload: SAC + CPU offload — apply default SAC first,
             then offload surviving MUST_SAVE activations to CPU within
             the cpu_offload_budget_gb budget.
+        full_and_scan_offload: full recompute, then offload the single
+            largest saved activation. Under --tpu-config.use-scan-layers
+            that is the stacked [n_layers, batch, seq, dim] layer input the
+            backward scan reads, which is the whole sequence-length
+            dependence of the run. The transfers are placed inside the loop
+            bodies, so the device holds one slice rather than the stack.
     """
 
     pass_pipeline: str = "default"

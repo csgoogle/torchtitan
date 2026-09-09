@@ -43,6 +43,9 @@ from torchtitan.experiments.graph_trainer.registry import (
     MEMORY_POLICY_REGISTRY,
     register_memory_policy,
 )
+from torchtitan.experiments.graph_trainer.tpu_cpu_offload import (
+    offload_scan_activations,
+)
 from torchtitan.tools.logging import logger
 
 
@@ -363,6 +366,24 @@ def _sac_and_offload_memory_policy_pass(
     return gm
 
 
+@register_memory_policy("full_and_scan_offload")
+def _full_and_scan_offload_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """FullAC, then keep the largest saved activation on the host.
+
+    FullAC first because it decides *what* that activation is: with anything
+    less, the forward saves more per layer and no single tensor dominates.
+    Under scan it is the stacked layer input, and the offload/reload go inside
+    the two loop bodies rather than around them -- see ``tpu_cpu_offload``.
+    """
+    _full_memory_policy_pass(gm, config=config)
+    offload_scan_activations(gm)
+    return gm
+
+
 def tag_with_memory_policy_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple | None = None,
@@ -376,6 +397,8 @@ def tag_with_memory_policy_pass(
         full: full recompute — only layer outputs are saved.
         eager: SAC alternating mm ops between save/recompute.
         sac_and_offload: SAC + CPU offload within budget.
+        full_and_scan_offload: full recompute + offload the single largest
+            saved activation, which under scan is the stacked layer input.
 
     Other memory policies combining SAC and CPU offload can be added
     via ``register_memory_policy`` without modifying this function.
