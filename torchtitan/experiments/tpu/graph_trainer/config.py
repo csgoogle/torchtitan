@@ -34,15 +34,19 @@ def to_tpu_graph_trainer_config(
       train_config, model_registry, target_cls=target_cls
   )
   graph_config.compile.memory_policy = memory_policy
-  if train_config.tpu_config.use_stacked_layers:
-    # Layer stacking is TPU-only, so the flag lives on tpu_config. The code
-    # that acts on it is inside the shared `apply_simple_fsdp`, which only
-    # takes a bool -- bind it here rather than teach shared code about
+  scan_layers = train_config.tpu_config.use_scan_layers
+  stack_layers = train_config.tpu_config.use_stacked_layers or scan_layers
+  if stack_layers:
+    # Layer stacking is TPU-only, so the flags live on tpu_config. The code
+    # that acts on them is inside the shared `apply_simple_fsdp`, which only
+    # takes bools -- bind them here rather than teach shared code about
     # tpu_config.
     graph_config.model_spec = dataclasses.replace(
         graph_config.model_spec,
         parallelize_fn=functools.partial(
-            graph_config.model_spec.parallelize_fn, stack_layers=True
+            graph_config.model_spec.parallelize_fn,
+            stack_layers=True,
+            scan_layers=scan_layers,
         ),
     )
   return graph_config

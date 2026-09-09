@@ -37,6 +37,10 @@ class TPUConfig:
   # of n_layers separate tensors. Storage only -- the layers still run one at a
   # time. Groundwork for running them as a single scan.
   use_stacked_layers: bool = False
+  # Run the decoder layers as a single scan over the stacked weights instead of
+  # a Python loop, so the compiler sees one loop body rather than n_layers
+  # copies of it. Implies use_stacked_layers.
+  use_scan_layers: bool = False
   # Keep rematerialized layer workspaces local in the XLA schedule.
   enable_graph_trainer_remat_schedule: bool = False
   # TPU SimpleFSDP scheduling for GraphTrainer rematerialization. ``prefetch``

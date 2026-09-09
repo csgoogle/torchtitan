@@ -49,6 +49,7 @@ def parallelize_qwen3(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     stack_layers: bool = False,
+    scan_layers: bool = False,
 ):
     """
     Apply annotation, parallelization, activation checkpointing, and full graph
@@ -85,6 +86,7 @@ def parallelize_qwen3(
         parallel_dims=parallel_dims,
         training=training,
         stack_layers=stack_layers,
+        scan_layers=scan_layers,
     )
     maybe_apply_ep_overlap_eager_chunking(model, compile_config)
 

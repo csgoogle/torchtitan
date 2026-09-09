@@ -442,6 +442,7 @@ def apply_simple_fsdp(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
     stack_layers: bool = False,
+    scan_layers: bool = False,
 ) -> nn.Module:
     """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
 
@@ -449,9 +450,10 @@ def apply_simple_fsdp(
     on the EDP mesh when expert parallelism is enabled.
 
     ``stack_layers`` stores the decoder layers' weights as one stacked tensor
-    per parameter instead of one per layer; see
-    ``experiments/tpu/graph_trainer/layer_stack.py``. Default off is the
-    unchanged behaviour: plain per-parameter FSDP.
+    per parameter instead of one per layer, and ``scan_layers`` additionally
+    runs them as a single ``scan`` over that stack (it implies the former); see
+    ``experiments/tpu/graph_trainer/layer_stack.py``. Both off is the unchanged
+    behaviour: plain per-parameter FSDP.
     """
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
@@ -497,18 +499,18 @@ def apply_simple_fsdp(
                 shard_dim=experts_shard_dim,
             )
 
-    if stack_layers:
+    if stack_layers or scan_layers:
         # Imported here so this module does not depend on the TPU package,
         # which imports it back.
         from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
-            apply_stacked_layers,
+            apply_scan,
         )
 
-        # `apply_stacked_layers` gets the sharding as a callable rather than a
+        # `apply_scan` gets the sharding as a callable rather than a
         # sharded model: it has to build the stack first and shard *that*, so it
         # makes the call itself, once, after rearranging the parameters. Same
         # arguments as the branch below.
-        model = apply_stacked_layers(
+        model = apply_scan(
             model,
             shard_fn=functools.partial(
                 data_parallel,
@@ -516,6 +518,7 @@ def apply_simple_fsdp(
                 mode=dp_mode,
                 mp_policy=mp_policy,
             ),
+            use_scan=scan_layers,
         )
     else:
         model = data_parallel(

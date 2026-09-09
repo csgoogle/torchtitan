@@ -45,6 +45,19 @@ class TpuGraphTrainerDistributedTest(
               "--tpu_config.use_stacked_layers",
           ],
       ),
+      # And the same again as a scan, so the pair isolates "runs as one loop"
+      # from "stored as one tensor".
+      dict(
+          testcase_name="qwen3_simple_fsdp_scan_layers",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--tpu_config.use_simple_fsdp",
+              "--tpu_config.use_scan_layers",
+          ],
+      ),
   ])
   def test_graph_trainer_distributed(
       self,

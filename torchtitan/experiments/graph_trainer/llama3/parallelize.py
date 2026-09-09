@@ -37,6 +37,7 @@ def parallelize_llama(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     stack_layers: bool = False,
+    scan_layers: bool = False,
 ):
     """
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
@@ -69,6 +70,7 @@ def parallelize_llama(
         parallel_dims=parallel_dims,
         training=training,
         stack_layers=stack_layers,
+        scan_layers=scan_layers,
     )
 
     # Apply compilation based on mode

@@ -39,8 +39,8 @@ than at each use:
 3.  **Reach the stacks through ``_parameters``, not ``getattr``, anywhere the
     result is stored.** After SimpleFSDP the attribute is a property returning
     the *gathered* tensor, so a view of it would alias a temporary rather than
-    this rank's shard. ``layer_loop`` is the deliberate exception: it wants the
-    gather.
+    this rank's shard. The two loops are the deliberate exception: they want
+    the gather.
 
 Because the views *are* the parameters while ``init_states`` runs,
 initialization is bit-identical to the unrolled model by construction, depth
@@ -59,13 +59,14 @@ from collections.abc import Callable, Iterator
 
 import torch
 from torch import nn
+from torch._higher_order_ops.scan import scan
 from torch.func import functional_call
 
 from torchtitan.models.common.decoder import LayerDict
 from torchtitan.tools.logging import logger
 
 
-__all__ = ["apply_stacked_layers", "LayerStack", "StackedLayers", "STACK_ATTR"]
+__all__ = ["apply_scan", "LayerStack", "StackedLayers", "STACK_ATTR"]
 
 
 # The stacks live on their own module, registered on the model under this name.
@@ -85,24 +86,27 @@ class StackedLayers(LayerDict):
     """``model.layers``, running its layers out of the stacks.
 
     ``Decoder.forward`` calls its layers container instead of looping over it,
-    so replacing the container is all it takes to change how the layers are
-    run. The layer modules inside are the same objects, so their parameters,
-    FQNs and SimpleFSDP parametrizations are untouched.
+    so replacing the container is all it takes to change how the layers are run
+    -- as ``n_layers`` ``functional_call``s, or as one ``scan`` over the stacks.
+    The layer modules inside are the same objects either way, so their
+    parameters, FQNs and SimpleFSDP parametrizations are untouched.
     """
 
-    def __init__(self, layers: LayerDict, stack: "LayerStack"):
+    def __init__(self, layers: LayerDict, stack: "LayerStack", *, use_scan: bool):
         super().__init__(layers)
         self.stack = stack
+        self.use_scan = use_scan
 
     def forward(self, h: torch.Tensor, *args) -> torch.Tensor:
-        return self.stack.layer_loop(h, *args)
+        loop = self.stack.scan_loop if self.use_scan else self.stack.layer_loop
+        return loop(h, *args)
 
 
 class LayerStack:
     """Owns the stacks and the transitions between the two layouts.
 
     Only ``unrolled`` is called from outside, by ``init_states`` and the
-    state-dict hooks. ``apply_stacked_layers`` below drives the rest, in the one
+    state-dict hooks. ``apply_scan`` below drives the rest, in the one
     order that works; each step asserts what has already run, so the order
     cannot silently go wrong.
     """
@@ -223,7 +227,7 @@ class LayerStack:
 
     # -- installation ------------------------------------------------------
 
-    def install(self, model: nn.Module) -> None:
+    def install(self, model: nn.Module, *, use_scan: bool = False) -> None:
         """Attach the stack to the model, after ``data_parallel`` has sharded it.
 
         Three attachments, and the model is not stacked until all three are on:
@@ -262,7 +266,7 @@ class LayerStack:
         model.register_state_dict_post_hook(drop)
         model.register_load_state_dict_pre_hook(attach)
         model.register_load_state_dict_post_hook(drop)
-        model.layers = StackedLayers(model.layers, self)
+        model.layers = StackedLayers(model.layers, self, use_scan=use_scan)
         self.layers = model.layers
 
     # -- running the layers ------------------------------------------------
@@ -287,17 +291,72 @@ class LayerStack:
             )
         return h
 
+    def scan_loop(self, h: torch.Tensor, *args):
+        """The same loop as ``layer_loop``, run as one ``scan``.
 
-def apply_stacked_layers(
+        The stacks are the ``xs``, sliced along their leading layer axis, and
+        the hidden state is the carry. ``n_layers`` copies of the block collapse
+        into a single ``stablehlo.while`` body, so compile time and program size
+        stop growing with depth.
+
+        This does *not* yet change where the all-gather happens: ``getattr``
+        still gathers the whole ``[n_layers, ...]`` stack before the loop, the
+        same as ``layer_loop`` does. Moving it into the body is a separate
+        change.
+        """
+        assert self._unregistered and not self._views_attached
+        template = self.layers["0"]
+        if template.training and not h.requires_grad:
+            # `scan`'s backward returns `zeros_like(carry)` when the init carry
+            # does not require grad, which severs the inter-layer gradient chain
+            # while keeping the loss bit-exact. Fail loudly instead.
+            raise RuntimeError(
+                "the scan init carry does not require grad, so every layer's "
+                "weight gradient would reflect only itself -- with a correct "
+                "loss and no error"
+            )
+
+        # One whole [n_layers, *shape] stack per parameter, keyed by its mangled
+        # name. For llama3-70B that is
+        #
+        #     {"attention__wq__weight":     [80, 8192, 8192],
+        #      "attention__wk__weight":     [80, 1024, 8192],
+        #      ...
+        #      "feed_forward__w1__weight":  [80, 28672, 8192]}
+        #
+        # `scan` slices each along its leading axis, so iteration i gets a dict
+        # of the same keys holding row i -- [8192, 8192], [1024, 8192], ...
+        xs = {_mangle(name): getattr(self.holder, _mangle(name)) for name in self.names}
+
+        def body(carry, slices):
+            # Layer 0's module stands in for every layer, one row at a time,
+            # which is what makes the body a single traced graph rather than
+            # n_layers of them. It has no parameters of its own to conflict
+            # with -- they were unregistered when the stacks were allocated.
+            params = {name: slices[_mangle(name)] for name in self.names}
+            out = functional_call(template, params, (carry, *args))
+            # `scan` rejects a body that returns no per-iteration output, so
+            # emit the cheapest possible one and drop it; only the carry is used.
+            return out, out.new_zeros(())
+
+        carry, _ = scan(body, h, xs)
+        return carry
+
+
+def apply_scan(
     model: nn.Module,
     *,
     shard_fn: Callable[..., nn.Module],
+    use_scan: bool = True,
 ) -> nn.Module:
-    """Store each decoder layer's weights as a row of one stacked tensor.
+    """Stack the decoder layers' weights and run them as one ``scan``.
+
+    Renamed from ``apply_stacked_layers``: with ``use_scan`` the stack is no
+    longer only a storage layout, and the loop is the point of it.
 
     The whole opt-in, on a model still on meta::
 
-        model = apply_stacked_layers(model, shard_fn=partial(data_parallel, ...))
+        model = apply_scan(model, shard_fn=partial(data_parallel, ...))
 
     Requirements on the model -- the porting checklist for a new one:
 
@@ -313,6 +372,14 @@ def apply_stacked_layers(
     * ``model.init_states`` exists and is where the weights are initialized. It
       is wrapped, so that the per-layer views are up while it runs.
 
+    And on the run, with ``use_scan``:
+
+    * The layer must not mutate its inputs. ``scan`` is a higher-order op, and
+      a body that writes to what it was handed raises
+      ``UncapturedHigherOrderOpError`` at trace time.
+    * The step has to be traced -- ``--tpu-config.compile-mode=aot_fx_trace``.
+      Eager ``scan`` does not materialize on TPU.
+
     Nothing else changes: FQNs, ``state_dict``, the optimizer and the
     checkpoint format are all as they were unstacked.
 
@@ -325,6 +392,10 @@ def apply_stacked_layers(
     2. the rest of the model, on its default axis, second: the stacks must
        exist before the model is walked, and ``shard_fn`` skips a module it has
        already sharded.
+
+    With ``use_scan=False`` the layers still run one at a time, just out of the
+    stacks -- the storage change without the loop change, which is what the
+    reshard and checkpoint tests compare against.
     """
     holder = nn.Module()
     setattr(model, STACK_ATTR, holder)
@@ -332,8 +403,11 @@ def apply_stacked_layers(
     stack.unregister_and_allocate()
     shard_fn(stack.holder, shard_dim=1)
     model = shard_fn(model)
-    stack.install(model)
+    stack.install(model, use_scan=use_scan)
     logger.info(
-        "Stacked %d weights across %d layers", len(stack.names), stack.n_layers
+        "Stacked %d weights across %d layers, run as a %s",
+        len(stack.names),
+        stack.n_layers,
+        "scan" if use_scan else "loop",
     )
     return model

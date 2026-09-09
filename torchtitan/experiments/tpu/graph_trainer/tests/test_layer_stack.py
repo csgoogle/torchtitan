@@ -26,6 +26,8 @@ from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
+from torchtitan.experiments.tpu.workarounds import use_real_rope_arithmetic_patch
+from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.llama3 import model_registry
 from torchtitan.models.qwen3 import model_registry as qwen3_registry
 
@@ -44,7 +46,13 @@ def _config(registry=model_registry):
     return config
 
 
-def _build(*, stacked: bool, param_dtype: str = "float32", config=None):
+def _build(
+    *,
+    stacked: bool,
+    scan: bool = False,
+    param_dtype: str = "float32",
+    config=None,
+):
     """Build a model the way the trainer does: parallelize, to_empty, init."""
     parallel_dims = ParallelDims(
         dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1
@@ -59,6 +67,7 @@ def _build(*, stacked: bool, param_dtype: str = "float32", config=None):
         parallel_dims=parallel_dims,
         training=training,
         stack_layers=stacked,
+        scan_layers=scan,
     )
     model.to_empty(device="cpu")
     torch.manual_seed(SEED)
@@ -76,6 +85,12 @@ class TestLayerStack(unittest.TestCase):
                 world_size=1,
                 rank=0,
             )
+        # `scan` re-traces its body through functionalization, which has no
+        # derivative for `view_as_complex_copy`. On a real run the TPU lane
+        # installs this before the first forward; see `workarounds`.
+        unpatched = ComplexRoPE.__dict__["apply_rotary_emb"]
+        use_real_rope_arithmetic_patch()
+        self.addCleanup(setattr, ComplexRoPE, "apply_rotary_emb", unpatched)
 
     def tearDown(self):
         if dist.is_initialized():
@@ -169,6 +184,41 @@ class TestLayerStack(unittest.TestCase):
             stacked(tokens), model(tokens), rtol=0, atol=0
         )
 
+    def test_scan_forward_matches_the_loop(self):
+        plain = _build(stacked=False)
+        scanned = _build(stacked=True, scan=True)
+        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+
+        torch.testing.assert_close(scanned(tokens), plain(tokens), rtol=1e-6, atol=1e-6)
+
+    def test_scan_gradients_match_the_loop(self):
+        """Per layer, because a severed carry chain keeps the loss exact.
+
+        If the scan's init carry does not carry a gradient, the inter-layer
+        chain is cut: the loss is unchanged, no error is raised, and only the
+        layer at one end of the stack is visibly wrong.
+        """
+        plain = _build(stacked=False)
+        scanned = _build(stacked=True, scan=True)
+        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+
+        for model in (plain, scanned):
+            model(tokens).sum().backward()
+
+        # `_parameters`, not `get_parameter`: SimpleFSDP shadows each name with a
+        # property returning the gathered tensor, which has no `.grad`.
+        stacks = getattr(scanned, STACK_ATTR)._parameters
+        for i, layer in enumerate(plain.layers.values()):
+            for name, param in layer.named_parameters():
+                stack = stacks[name.replace(".", "__")]
+                torch.testing.assert_close(
+                    stack.grad[i].to_local(),
+                    param.grad.to_local(),
+                    rtol=1e-5,
+                    atol=1e-6,
+                    msg=f"layers.{i}.{name}",
+                )
+
     def test_the_optimizer_sees_each_stack_once(self):
         """Param groups are built from ``named_parameters``, which the stacks change.
 
@@ -213,7 +263,7 @@ class TestLayerStack(unittest.TestCase):
 
 @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
 class TestQwen3(unittest.TestCase):
-    """The same properties on a second model, to pin that none of this is llama3.
+    """The same two properties on a second model, to pin that none of this is llama3.
 
     Stacking reads the layers' own parameters and never their names, so a model
     with a different attention shape, a different norm placement and its own
@@ -223,6 +273,11 @@ class TestQwen3(unittest.TestCase):
     """
 
     def setUp(self):
+        # `scan` traces its body through dynamo. Tracing a *differently shaped*
+        # body in the same process reuses the cached shape environment and
+        # fails on an unbacked symbol; llama3's scan tests run first, so
+        # without this the qwen3 ones fail only in a full-file run.
+        torch._dynamo.reset()
         if not dist.is_initialized():
             dist.init_process_group(
                 backend="gloo",
@@ -251,6 +306,13 @@ class TestQwen3(unittest.TestCase):
         )
         return _build(config=config, **kwargs)
 
+    def _pair(self, **kwargs):
+        """A plain model and a stacked one holding exactly its weights."""
+        plain = self._build(stacked=False)
+        other = self._build(**kwargs)
+        other.load_state_dict(copy.deepcopy(plain.state_dict()))
+        return plain, other
+
     def test_layer_weights_are_identical(self):
         plain = self._build(stacked=False).state_dict()
         stacked = self._build(stacked=True).state_dict()
@@ -266,6 +328,13 @@ class TestQwen3(unittest.TestCase):
                 atol=0,
                 msg=key,
             )
+
+    def test_scan_forward_matches_the_loop(self):
+        plain, scanned = self._pair(stacked=True, scan=True)
+        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+
+        torch.testing.assert_close(scanned(tokens), plain(tokens), rtol=1e-6, atol=1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()
