@@ -1,20 +1,31 @@
 """Stacking must not change what the model computes, on the real device.
 
-The structural claims -- FQNs, views, placements, checkpoints -- hold wherever
-the tensors live, so ``test_layer_stack`` asserts them on CPU. Numerics do not:
-the stacked layers run as one batched matmul per op instead of ``n_layers``
-separate ones, which is a different kernel and a different accumulation order.
-So the parity check is repeated here on ``--device``, across ``--num_devices``
-ranks, with the stacks actually sharded.
+Structural claims -- FQNs, views, placements, checkpoints -- hold wherever the
+tensors live, so ``test_layer_stack`` asserts them on CPU. Numerics do not. The
+stacked layers run as one batched matmul per op instead of ``n_layers`` separate
+ones: a different kernel, a different accumulation order. So the parity check is
+repeated here on ``--device``, across ``--num_devices`` ranks, with the stacks
+actually sharded.
 """
 
 from absl.testing import absltest
 import torch
-from torch.distributed.tensor import Shard
+import torch.distributed._functional_collectives as funcol
+from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    data_parallel,
+    MixedPrecisionPolicy,
+)
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
+    gather_slice,
+    plan_stacked_gathers,
+)
 from torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack import (
     _build,
     SEQ_LEN,
@@ -54,13 +65,132 @@ def stacks_are_sharded_off_the_layer_axis(device, rank, world_size):
         assert stack.placements == (Shard(1),), f"{name} is {stack.placements}"
 
 
+def a_replicated_stack_still_sums_its_gradient(device, rank, world_size):
+    """A stack too narrow to shard must still have its gradient summed.
+
+    ``data_parallel`` downgrades ``Shard`` to ``Replicate`` when dim 1 is below
+    the mesh size -- a norm weight on a wide mesh. There is then no gather for
+    the body to differentiate through. Unrolled, the sum comes from
+    ``to_local(grad_placements=Partial)``; the body reads the local tensor
+    directly, so it has to ask for the sum itself. Skip it and every rank steps
+    on its own microbatch's gradient, silently.
+    """
+    if world_size == 1:
+        return  # Nothing to downgrade, and nothing to sum.
+    mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
+    holder = nn.Module()
+    # Dim 1 is 1, so there is no way to split it across the ranks.
+    holder.register_parameter(
+        "narrow", nn.Parameter(torch.zeros(2, 1, 4, device=device))
+    )
+    data_parallel(holder, mesh, "fully_shard", shard_dim=1)
+
+    param = holder._parameters["narrow"]
+    assert param.placements == (Replicate(),), param.placements
+    replica = param.to_local().detach().clone().requires_grad_(True)
+
+    # Scaling by the rank makes an unsummed gradient visibly this rank's own.
+    weight = gather_slice(replica[0], plan_stacked_gathers(holder)["narrow"])
+    (weight.sum() * (rank + 1)).backward()
+
+    summed = float(world_size * (world_size + 1) // 2)
+    torch.testing.assert_close(
+        replica.grad[0], torch.full_like(replica.grad[0], summed)
+    )
+
+
+def a_sharded_stack_gathers_and_reduces_like_unrolled(device, rank, world_size):
+    """The body's gather must compute what SimpleFSDP's does unrolled.
+
+    ``_AllGatherReduceScatter`` hand-writes the pair ``redistribute`` gives the
+    unrolled path, so the two can drift apart: a gather on the wrong axis, a
+    reduce that never runs, a reduce in the wrong dtype. On one rank both
+    collectives are the identity and every version passes, so this only means
+    anything on a real mesh.
+    """
+    if world_size == 1:
+        return  # Both collectives are the identity.
+    mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
+    holder = nn.Module()
+    # Two layers, and a dim 1 the mesh splits evenly.
+    holder.register_parameter(
+        "stack", nn.Parameter(torch.randn(2, 4 * world_size, 8, device=device))
+    )
+    data_parallel(
+        holder,
+        mesh,
+        "fully_shard",
+        shard_dim=1,
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        ),
+    )
+    param = holder._parameters["stack"]
+    assert param.placements == (Shard(1),), param.placements
+
+    # Unrolled: the weight SimpleFSDP hands layer 0, straight off the DTensor.
+    want_shard = param.to_local().detach().clone().requires_grad_(True)
+    want = (
+        DTensor.from_local(want_shard, mesh, (Shard(1),))
+        .redistribute(
+            placements=[Replicate()],
+            forward_dtype=torch.bfloat16,
+            backward_dtype=torch.float32,
+        )
+        .to_local(grad_placements=[Partial()])[0]
+    )
+
+    # Scanned: what the body computes for the same row.
+    got_shard = param.to_local().detach().clone().requires_grad_(True)
+    got = funcol.wait_tensor(
+        gather_slice(got_shard[0], plan_stacked_gathers(holder)["stack"])
+    )
+
+    assert got.dtype == torch.bfloat16, got.dtype
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    # Scaling by the rank makes an unsummed gradient visibly this rank's own.
+    for gathered in (want, got):
+        (gathered.float().sum() * (rank + 1)).backward()
+    torch.testing.assert_close(got_shard.grad, want_shard.grad, rtol=0, atol=0)
+
+
+def an_unevenly_sharded_stack_is_refused(device, rank, world_size):
+    """A stack the mesh cannot split evenly must fail while the plan is built.
+
+    ``distribute_tensor`` leaves the last rank a short shard, and the body's
+    ``all_gather`` needs equal ones. Unrolled it still trains, because
+    ``redistribute`` pads around its gather. So only the scan path has to
+    refuse, and it should do that here rather than at a collective in the loop.
+    """
+    del rank
+    if world_size == 1:
+        return  # Every size divides by one.
+    mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
+    holder = nn.Module()
+    # Above the mesh size, so it is sharded rather than downgraded, and one row
+    # too many to split.
+    holder.register_parameter(
+        "uneven", nn.Parameter(torch.zeros(2, world_size + 1, 4, device=device))
+    )
+    data_parallel(holder, mesh, "fully_shard", shard_dim=1)
+
+    assert holder._parameters["uneven"].placements == (Shard(1),)
+    try:
+        plan_stacked_gathers(holder)
+    except ValueError as err:
+        assert "uneven" in str(err), err
+    else:
+        raise AssertionError("an unevenly sharded stack was planned")
+
+
 class TestLayerStackDistributed(
     base_distributed_device_test.BaseDistributedDeviceTest
 ):
     """Each check runs inside the spawned workers, so it asserts there too.
 
     The launcher returns nothing, so a failure arrives as the child's re-raised
-    exception rather than as a diff printed here.
+    exception, not as a diff printed here.
     """
 
     def _on_devices(self, worker):
@@ -73,6 +203,15 @@ class TestLayerStackDistributed(
 
     def test_stacks_are_sharded_off_the_layer_axis(self):
         self._on_devices(stacks_are_sharded_off_the_layer_axis)
+
+    def test_a_replicated_stack_still_sums_its_gradient(self):
+        self._on_devices(a_replicated_stack_still_sums_its_gradient)
+
+    def test_a_sharded_stack_gathers_and_reduces_like_unrolled(self):
+        self._on_devices(a_sharded_stack_gathers_and_reduces_like_unrolled)
+
+    def test_an_unevenly_sharded_stack_is_refused(self):
+        self._on_devices(an_unevenly_sharded_stack_is_refused)
 
 
 if __name__ == "__main__":
