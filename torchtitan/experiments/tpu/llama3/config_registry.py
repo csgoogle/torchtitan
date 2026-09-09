@@ -31,11 +31,17 @@ from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llam
 from torchtitan.models.llama3.config_registry import model_registry
 
 
+# Llama3's `ComplexRoPE` calls `view_as_complex`, which cannot be traced inside
+# a higher-order op such as `scan`; see `overrides/real_rope.py`. The rewrite is
+# bit-identical and perf-neutral, so every recipe carries it.
+_REAL_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.real_rope"
+
+
 def llama3_debugmodel() -> TPUTrainerConfig:
   """Llama3 debug model configuration for TPU."""
   model_spec = model_registry("debugmodel", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_llama
-  return TPUTrainerConfig(
+  config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
@@ -68,13 +74,15 @@ def llama3_debugmodel() -> TPUTrainerConfig:
           steps=10,
       ),
   )
+  config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  return config
 
 
 def llama3_1b() -> TPUTrainerConfig:
   """Llama3 1B model configuration for TPU."""
   model_spec = model_registry("1B", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_llama
-  return TPUTrainerConfig(
+  config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
@@ -107,6 +115,8 @@ def llama3_1b() -> TPUTrainerConfig:
           steps=10,
       ),
   )
+  config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  return config
 
 
 def llama3_8b() -> TPUTrainerConfig:
@@ -174,6 +184,7 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
   )
   config.optimizer.implementation = "foreach"
+  config.override.imports.append(_REAL_ROPE_OVERRIDE)
   return config
 
 
@@ -181,7 +192,7 @@ def llama3_70b() -> TPUTrainerConfig:
   """Llama3 70B model configuration for TPU."""
   model_spec = model_registry("70B", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_llama
-  return TPUTrainerConfig(
+  config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
@@ -241,13 +252,15 @@ def llama3_70b() -> TPUTrainerConfig:
           use_loss_kernel=True,
       ),
   )
+  config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  return config
 
 
 def llama3_405b() -> TPUTrainerConfig:
   """Llama3 405B model configuration for TPU."""
   model_spec = model_registry("405B", attn_backend="sdpa")
   model_spec.parallelize_fn = tpu_parallelize_llama
-  return TPUTrainerConfig(
+  config = TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
@@ -307,6 +320,8 @@ def llama3_405b() -> TPUTrainerConfig:
           use_loss_kernel=True,
       ),
   )
+  config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  return config
 
 
 def sft_llama3_8b_metamath() -> TPUTrainerConfig:
@@ -387,4 +402,5 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
       ),
   )
   config.optimizer.implementation = "foreach"
+  config.override.imports.append(_REAL_ROPE_OVERRIDE)
   return config
