@@ -84,6 +84,8 @@ class TpuGroupedExperts(GroupedExperts):
 
     The paired path changes only W1/W3 execution: their parameters, FSDP
     collectives, checkpoint keys, and the W2 projection remain independent.
+    The unpaired dWeight kernel retains FP32 accumulation and stores in the
+    final FSDP reduction dtype selected by the parallelizer.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -124,6 +126,10 @@ class TpuGroupedExperts(GroupedExperts):
         self.pallas_grouped_mm_tile_k = config.pallas_grouped_mm_tile_k
         self.pallas_grouped_mm_tile_n = config.pallas_grouped_mm_tile_n
         self.pallas_grouped_mm_tgmm_tiling = config.pallas_grouped_mm_tgmm_tiling
+        # Standalone modules preserve the historical FP32 result. Qwen's
+        # parallelizer replaces this with the final, post-CLI FSDP reduction
+        # dtype before tracing or sharding.
+        self._unpaired_dweight_output_dtype = torch.float32
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
         self._native_sharding_applied = False
 
@@ -139,6 +145,15 @@ class TpuGroupedExperts(GroupedExperts):
             return
         self.register_state_dict_post_hook(self._canonical_weights_on_save)
         self.register_load_state_dict_pre_hook(self._native_weights_on_load)
+
+    def configure_dweight_output_dtype(self, reduce_dtype: torch.dtype) -> None:
+        """Match unpaired expert dWeight stores to the FSDP reduction dtype."""
+        if reduce_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                "Expert dWeight output supports only "
+                f"float32 or bfloat16 reductions, got {reduce_dtype}"
+            )
+        self._unpaired_dweight_output_dtype = reduce_dtype
 
     def _init_param(self, name: str, param: torch.nn.Parameter) -> None:
         """Initialize native storage through a canonical contiguous tensor."""
@@ -209,7 +224,6 @@ class TpuGroupedExperts(GroupedExperts):
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
         if not self.use_pallas_grouped_mm:
             return super()._experts_forward(x_RD, num_tokens_per_expert_E)
-
         def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
@@ -230,6 +244,9 @@ class TpuGroupedExperts(GroupedExperts):
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
         if self.use_pallas_paired_grouped_mm:
+            # Paired W1/W3 always return BF16 dWeights: two full FP32 output
+            # tiles exceed TPU scoped VMEM. FP32 FSDP reductions widen those
+            # gradients after the kernel; BF16 reductions consume them as-is.
             gate_RF, up_RF = paired_segment_matmul_pallas_2d(
                 x_bf16,
                 w1_EKN.bfloat16(),
@@ -247,6 +264,7 @@ class TpuGroupedExperts(GroupedExperts):
                 tile_k=tile_k,
                 tile_n=tile_n,
                 tgmm_tiling=tgmm_tiling,
+                dweight_output_dtype=self._unpaired_dweight_output_dtype,
             )
             up_RF = segment_matmul_pallas_2d(
                 x_bf16,
@@ -256,6 +274,7 @@ class TpuGroupedExperts(GroupedExperts):
                 tile_k=tile_k,
                 tile_n=tile_n,
                 tgmm_tiling=tgmm_tiling,
+                dweight_output_dtype=self._unpaired_dweight_output_dtype,
             )
         hidden_RF = F.silu(gate_RF) * up_RF
         return segment_matmul_pallas_2d(
@@ -266,7 +285,17 @@ class TpuGroupedExperts(GroupedExperts):
             tile_k=tile_k,
             tile_n=tile_n,
             tgmm_tiling=tgmm_tiling,
+            dweight_output_dtype=self._unpaired_dweight_output_dtype,
         ).type_as(x_RD)
+
+
+def configure_expert_dweight_output_dtype(
+    model: torch.nn.Module, reduce_dtype: torch.dtype
+) -> None:
+    """Resolve unpaired dWeight stores before FSDP and graph tracing."""
+    for module in model.modules():
+        if isinstance(module, TpuGroupedExperts):
+            module.configure_dweight_output_dtype(reduce_dtype)
 
 
 class TpuGroupedExpertsConverter(ModelConfigConverter):

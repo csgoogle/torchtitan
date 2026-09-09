@@ -1,8 +1,11 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import jax
+import jax.numpy as jnp
 import pytest
-import torch
 import spmd_types as spmd
+import torch
 
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.experiments.tpu.grouped_experts import (
@@ -11,6 +14,8 @@ from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
+from torchtitan.experiments.tpu.graph_trainer import qwen3 as graph_trainer_qwen3
+from torchtitan.experiments.tpu.kernels import expert_segment_matmul
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
@@ -95,6 +100,7 @@ def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
     assert config.model_spec is not None
     assert config.model_spec.flavor == "30B-A3B-global-aux"
     assert config.metrics.enable_moe_routing
+    assert config.training.mixed_precision_reduce == "float32"
     assert config.optimizer.param_groups[0].optimizer_kwargs["lr"] == 3e-4
     experts = list(config.model_spec.model.traverse(TpuGroupedExperts.Config))
     assert len(experts) == 48
@@ -114,6 +120,87 @@ def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
     assert not benchmark.profiler.enable_profiling
     assert benchmark.tpu_config.enable_mfu_benchmark
     assert benchmark.tpu_config.mfu_benchmark_start_step == 10
+
+
+@pytest.mark.parametrize(
+    ("weight_dtype", "output_is_bfloat16", "expected_dweight_dtype"),
+    [
+        (jnp.bfloat16, False, jnp.float32),
+        (jnp.bfloat16, True, jnp.bfloat16),
+    ],
+)
+def test_pallas_dweight_output_dtype_contract(
+    weight_dtype, output_is_bfloat16, expected_dweight_dtype
+):
+    backward = expert_segment_matmul._grouped_mm_bwd._init_fn.jit_fn
+    grad_lhs, grad_rhs = jax.eval_shape(
+        backward,
+        jax.ShapeDtypeStruct((128, 64), jnp.bfloat16),
+        jax.ShapeDtypeStruct((128, 32), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2, 32, 64), weight_dtype),
+        jax.ShapeDtypeStruct((2,), jnp.int32),
+        128,
+        0,
+        0,
+        128,
+        32,
+        64,
+        output_is_bfloat16,
+    )
+
+    assert grad_lhs.shape == (128, 32)
+    assert grad_lhs.dtype == jnp.bfloat16
+    assert grad_rhs.shape == (2, 32, 64)
+    assert grad_rhs.dtype == expected_dweight_dtype
+
+
+@pytest.mark.parametrize(
+    ("reduce_dtype", "expected_dtype"),
+    [
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_unpaired_dweight_output_matches_fsdp_dtype(reduce_dtype, expected_dtype):
+    experts = _build_experts(use_pallas_grouped_mm=True)
+
+    experts.configure_dweight_output_dtype(reduce_dtype)
+
+    assert experts._unpaired_dweight_output_dtype == expected_dtype
+
+
+def test_expert_dweight_output_rejects_unsupported_dtype():
+    experts = _build_experts(use_pallas_grouped_mm=True)
+
+    with pytest.raises(ValueError, match="supports only float32 or bfloat16"):
+        experts.configure_dweight_output_dtype(torch.float16)
+
+
+def test_graph_trainer_parallelize_configures_dweight_output_dtype():
+    experts = _build_experts(
+        use_pallas_grouped_mm=True,
+    )
+    model = torch.nn.Sequential(experts)
+    training = SimpleNamespace(mixed_precision_reduce="bfloat16")
+
+    with patch.object(
+        graph_trainer_qwen3,
+        "graph_trainer_parallelize_qwen3",
+        return_value=model,
+    ) as delegate:
+        result = graph_trainer_qwen3.parallelize_qwen3(
+            model,
+            training=training,
+            marker="forwarded",
+        )
+
+    assert result is model
+    assert experts._unpaired_dweight_output_dtype == torch.bfloat16
+    delegate.assert_called_once_with(
+        model,
+        training=training,
+        marker="forwarded",
+    )
 
 
 def test_kernel_native_layout_requires_pallas():

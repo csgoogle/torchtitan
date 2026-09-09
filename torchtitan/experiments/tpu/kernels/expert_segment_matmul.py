@@ -3,8 +3,9 @@
 For expert ``e``, forward computes ``Y_e = X_e @ W_e``. Backward computes
 ``dX_e = dY_e @ W_e.T`` with another GMM and ``dW_e = X_e.T @ dY_e`` with
 TGMM. dInput uses MegaBlox's logical rhs transpose so kernel-native weights do
-not require a physical layout conversion. dWeight accumulates in FP32 across
-token tiles.
+not require a physical layout conversion. dWeight always accumulates in FP32
+across token tiles. It can either store FP32, or round once to the weight dtype
+when the caller's gradient-reduction policy requires that dtype.
 
 The module-level custom operators are stable Dynamo/AOTAutograd boundaries.
 Tiling arguments are compile-time constants, while ``group_sizes`` remains a
@@ -47,8 +48,9 @@ def _grouped_mm_fwd(
     tgmm_tile_m: int,
     tgmm_tile_k: int,
     tgmm_tile_n: int,
+    dweight_output_is_bfloat16: bool,
 ) -> jax.Array:
-    del tgmm_tile_m, tgmm_tile_k, tgmm_tile_n
+    del tgmm_tile_m, tgmm_tile_k, tgmm_tile_n, dweight_output_is_bfloat16
     _, k_dim, n_dim = rhs.shape
     return megablox_gmm(
         lhs,
@@ -57,6 +59,8 @@ def _grouped_mm_fwd(
         preferred_element_type=lhs.dtype,
         tiling=_tiling(tile_m, tile_k, tile_n, k_dim, n_dim),
     )
+
+
 @pallas.jax_op("tt_experts::grouped_mm_bwd")
 def _grouped_mm_bwd(
     dout: jax.Array,
@@ -69,6 +73,7 @@ def _grouped_mm_bwd(
     tgmm_tile_m: int,
     tgmm_tile_k: int,
     tgmm_tile_n: int,
+    dweight_output_is_bfloat16: bool,
 ) -> tuple[jax.Array, jax.Array]:
     _, k_dim, n_dim = rhs.shape
     grad_lhs = megablox_gmm(
@@ -89,7 +94,13 @@ def _grouped_mm_bwd(
         jnp.swapaxes(lhs, 0, 1),
         dout,
         group_sizes=group_sizes,
-        preferred_element_type=jnp.float32,
+        # MegaBlox still accumulates each tile with an FP32 dot into FP32 VMEM.
+        # This option changes only the final HBM store. For BF16 FSDP
+        # reductions it folds the otherwise separate FP32-to-BF16 cast into
+        # that store, without changing the reduce-scatter payload.
+        preferred_element_type=(
+            jnp.bfloat16 if dweight_output_is_bfloat16 else jnp.float32
+        ),
         tiling=_tiling(
             tgmm_tile_m,
             tgmm_tile_k,
@@ -114,7 +125,7 @@ def _backward(ctx, grad_output):
     grad_lhs, grad_rhs = _grouped_mm_bwd(
         grad_output, lhs, rhs, group_sizes, *ctx.static_args
     )
-    return grad_lhs, grad_rhs, None, None, None, None, None, None, None
+    return grad_lhs, grad_rhs, None, None, None, None, None, None, None, None
 
 
 _grouped_mm_fwd.register_autograd(_backward, setup_context=_setup_context)
@@ -129,12 +140,20 @@ def segment_matmul_pallas_2d(
     tile_k: int = 0,
     tile_n: int = 0,
     tgmm_tiling: tuple[int, int, int] = (128, 128, 128),
+    dweight_output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Compute per-expert matmuls without moving group sizes to the host.
 
     Zero-valued K/N tile dimensions select the corresponding full matrix
-    dimension. Distinct tiling values produce distinct compiled specializations.
+    dimension. Distinct tiling values and dWeight output dtypes produce
+    distinct compiled specializations. dWeight accumulation remains FP32;
+    ``dweight_output_dtype`` controls only its final store.
     """
+    if dweight_output_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            "dweight_output_dtype must be torch.float32 or torch.bfloat16, "
+            f"got {dweight_output_dtype}"
+        )
     if group_sizes.dtype != torch.int32:
         group_sizes = group_sizes.to(torch.int32)
     return _grouped_mm_fwd(
@@ -145,6 +164,7 @@ def segment_matmul_pallas_2d(
         tile_k,
         tile_n,
         *tgmm_tiling,
+        dweight_output_dtype == torch.bfloat16,
     )
 
 
