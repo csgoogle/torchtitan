@@ -519,6 +519,7 @@ def apply_simple_fsdp(
                 mp_policy=mp_policy,
             ),
             parallel_dims=parallel_dims,
+            mp_policy=mp_policy,
             use_scan=scan_layers,
         )
     else:

@@ -19,13 +19,15 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import Shard
+from torch._functorch import config as functorch_config, partitioners
+from torch.distributed.tensor import DTensor, Shard
 
 from torchtitan.components.optimizer import default_adamw, OptimizersContainer
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
 from torchtitan.experiments.tpu.workarounds import use_real_rope_arithmetic_patch
 from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.llama3 import model_registry
@@ -191,6 +193,41 @@ class TestLayerStack(unittest.TestCase):
 
         torch.testing.assert_close(scanned(tokens), plain(tokens), rtol=1e-6, atol=1e-6)
 
+    def test_the_body_recomputes_its_gather_in_backward(self):
+        """The in-body gather is worth nothing unless backward redoes it.
+
+        Left at the default budget the partitioner prices a collective as
+        expensive to redo and saves the gathered per-layer weight across the
+        cut, so the gather is inside the loop but its result is carried out of
+        it. ``scan_loop`` opens an ``activation_memory_budget=0.0`` window to
+        stop that; this pins both that the window reaches the body's partition
+        and that it closes again -- the config is process-global.
+        """
+        captured = []
+        partition = partitioners.min_cut_rematerialization_partition
+
+        def capture(joint, inputs, **kwargs):
+            forward, backward = partition(joint, inputs, **kwargs)
+            captured.append((functorch_config.activation_memory_budget, backward))
+            return forward, backward
+
+        model = _build(stacked=True, scan=True)
+        tokens = torch.randint(0, model.config.vocab_size, (2, SEQ_LEN))
+        default = functorch_config.activation_memory_budget
+        with patch.object(
+            partitioners, "min_cut_rematerialization_partition", capture
+        ):
+            model(tokens).sum().backward()
+
+        self.assertTrue(captured, "the scan body was never partitioned")
+        budget, backward = captured[0]
+        self.assertEqual(budget, 0.0)
+        self.assertTrue(
+            any("all_gather" in str(n.target) for n in backward.graph.nodes),
+            "the body's backward reuses a saved gather instead of redoing it",
+        )
+        self.assertEqual(functorch_config.activation_memory_budget, default)
+
     def test_scan_gradients_match_the_loop(self):
         """Per layer, because a severed carry chain keeps the loss exact.
 
@@ -218,6 +255,32 @@ class TestLayerStack(unittest.TestCase):
                     atol=1e-6,
                     msg=f"layers.{i}.{name}",
                 )
+
+    def test_the_body_gathers_in_the_compute_dtype(self):
+        """The gather is also the cast, exactly as SimpleFSDP's is.
+
+        The stacks are stored in fp32 and the layers run in bf16; unrolled,
+        SimpleFSDP's parametrization casts as it gathers. If the in-body gather
+        skipped that, the scanned model would run its layers in fp32 -- slower,
+        more memory, and numerically *closer* to the reference, so a loss
+        comparison would not catch it.
+        """
+        model = _build(stacked=True, scan=True, param_dtype="bfloat16")
+        # Through the installed container, so this is the plan the body will
+        # use -- the body itself cannot be instrumented, as dynamo rejects any
+        # side effect inside a HOP.
+        stack = model.layers.stack
+        self.assertTrue(stack.fsdp_plan, "no gather plan was installed")
+
+        holder = getattr(model, STACK_ATTR)
+        for name, spec in stack.fsdp_plan.items():
+            param = holder._parameters[name]
+            local = param.to_local() if isinstance(param, DTensor) else param
+            gathered = gather_slice(local[0], spec)
+            self.assertEqual(gathered.dtype, torch.bfloat16, name)
+            # ... and the stored weight is untouched, so the optimizer still
+            # steps in fp32.
+            self.assertEqual(param.dtype, torch.float32, name)
 
     def test_the_optimizer_sees_each_stack_once(self):
         """Param groups are built from ``named_parameters``, which the stacks change.

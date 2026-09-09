@@ -60,9 +60,16 @@ from collections.abc import Callable, Iterator
 import torch
 from torch import nn
 from torch._higher_order_ops.scan import scan
+from torch.distributed.tensor import DTensor
 from torch.func import functional_call
 
 from torchtitan.distributed import ParallelDims
+from torchtitan.experiments.graph_trainer.simple_fsdp import MixedPrecisionPolicy
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
+    gather_slice,
+    plan_stacked_gathers,
+    ScanFSDPSpec,
+)
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_layers_are_stackable,
     check_scan_parallelism,
@@ -129,6 +136,8 @@ class LayerStack:
         # Stacks parked here while the views stand in for them, inside
         # `unrolled()`.
         self._hidden: dict[str, nn.Parameter] = {}
+        # Set by `install` when the layers are run as a scan; see `scan_fsdp`.
+        self.fsdp_plan: dict[str, ScanFSDPSpec] = {}
 
     def _slots(self) -> Iterator[tuple[int, str, nn.Module, str]]:
         """Every per-layer parameter, as (row, FQN, owning module, attribute).
@@ -226,7 +235,13 @@ class LayerStack:
 
     # -- installation ------------------------------------------------------
 
-    def install(self, model: nn.Module, *, use_scan: bool = False) -> None:
+    def install(
+        self,
+        model: nn.Module,
+        *,
+        use_scan: bool = False,
+        mp_policy: MixedPrecisionPolicy | None = None,
+    ) -> None:
         """Attach the stack to the model, after ``data_parallel`` has sharded it.
 
         Three attachments, and the model is not stacked until all three are on:
@@ -265,6 +280,12 @@ class LayerStack:
         model.register_state_dict_post_hook(drop)
         model.register_load_state_dict_pre_hook(attach)
         model.register_load_state_dict_post_hook(drop)
+        if use_scan:
+            self.fsdp_plan = plan_stacked_gathers(
+                self.holder,
+                mp_policy.param_dtype if mp_policy else None,
+                mp_policy.reduce_dtype if mp_policy else None,
+            )
         model.layers = StackedLayers(model.layers, self, use_scan=use_scan)
         self.layers = model.layers
 
@@ -298,10 +319,8 @@ class LayerStack:
         into a single ``stablehlo.while`` body, so compile time and program size
         stop growing with depth.
 
-        This does *not* yet change where the all-gather happens: ``getattr``
-        still gathers the whole ``[n_layers, ...]`` stack before the loop, the
-        same as ``layer_loop`` does. Moving it into the body is a separate
-        change.
+        Each iteration all-gathers the one layer it is about to run, so only
+        that layer is ever whole. See ``scan_fsdp``.
         """
         assert self._unregistered and not self._views_attached
         template = self.layers["0"]
@@ -315,8 +334,8 @@ class LayerStack:
                 "loss and no error"
             )
 
-        # One whole [n_layers, *shape] stack per parameter, keyed by its mangled
-        # name. For llama3-70B that is
+        # One [n_layers, *shape] stack per parameter, keyed by its mangled
+        # name. For llama3-70B, unsharded, that is
         #
         #     {"attention__wq__weight":     [80, 8192, 8192],
         #      "attention__wk__weight":     [80, 1024, 8192],
@@ -324,21 +343,59 @@ class LayerStack:
         #      "feed_forward__w1__weight":  [80, 28672, 8192]}
         #
         # `scan` slices each along its leading axis, so iteration i gets a dict
-        # of the same keys holding row i -- [8192, 8192], [1024, 8192], ...
-        xs = {_mangle(name): getattr(self.holder, _mangle(name)) for name in self.names}
+        # of the same keys holding row i.
+        #
+        # Fact 3 above bites hardest here: `getattr` would gather the whole
+        # `[n_layers, ...]` stack right here, before the loop the gather is
+        # supposed to happen inside. So what goes in is this rank's *shard* of
+        # each stack, dim 1 divided by the mesh, and the body gathers one layer.
+        xs = {}
+        for name in self.names:
+            param = self.holder._parameters[_mangle(name)]
+            xs[_mangle(name)] = param.to_local() if isinstance(param, DTensor) else param
 
         def body(carry, slices):
-            # Layer 0's module stands in for every layer, one row at a time,
-            # which is what makes the body a single traced graph rather than
-            # n_layers of them. It has no parameters of its own to conflict
-            # with -- they were unregistered when the stacks were allocated.
-            params = {name: slices[_mangle(name)] for name in self.names}
+            # `slices` holds one layer's shard of each stack; `gather_slice`
+            # makes it whole. Layer 0's module then stands in for every layer,
+            # one row at a time, which is what makes the body a single traced
+            # graph rather than n_layers of them. It has no parameters of its
+            # own to conflict with -- they were unregistered when the stacks
+            # were allocated.
+            params = {
+                name: gather_slice(
+                    slices[_mangle(name)], self.fsdp_plan.get(_mangle(name))
+                )
+                for name in self.names
+            }
             out = functional_call(template, params, (carry, *args))
             # `scan` rejects a body that returns no per-iteration output, so
             # emit the cheapest possible one and drop it; only the carry is used.
             return out, out.new_zeros(())
 
-        carry, _ = scan(body, h, xs)
+        # Without this the min-cut partitioner prices the collective as
+        # expensive to redo and saves the *gathered* per-layer weight across the
+        # forward/backward cut: the gather is inside the loop but its result is
+        # carried out of it, and the memory saving evaporates. At budget 0.0 the
+        # only weights crossing the cut are the sharded `xs` -- which cost
+        # nothing extra, because the HOP drops a saved intermediate that *is* an
+        # `xs` placeholder and re-reads the original instead of stacking a
+        # second `[n_layers, ...]` copy of it.
+        #
+        # The budget is region-wide, so this is also full activation
+        # checkpointing of the body. It is a process-global config, and the
+        # only thing keeping it off the rest of the model is that the window
+        # closes when this call returns -- `test_layer_stack.py` pins both
+        # halves. In this lane nothing else is at risk anyway: the graph
+        # trainer hands its joint graph to the backend whole, so the body's is
+        # the only partition a functorch partitioner ever runs.
+        #
+        # `torch.autograd.graph.region_activation_memory_budget` is the public
+        # spelling and claims to cover HOP bodies, but it reads the budget from
+        # `node.meta["custom"]`, which the body's functionalize re-trace has
+        # already dropped -- and it refuses to run outside `torch.compile`.
+        # Switch to it once that meta survives.
+        with torch._functorch.config.patch(activation_memory_budget=0.0):
+            carry, _ = scan(body, h, xs)
         return carry
 
 
@@ -347,6 +404,7 @@ def apply_scan(
     *,
     shard_fn: Callable[..., nn.Module],
     parallel_dims: ParallelDims,
+    mp_policy: MixedPrecisionPolicy | None = None,
     use_scan: bool = True,
 ) -> nn.Module:
     """Stack the decoder layers' weights and run them as one ``scan``.
@@ -397,6 +455,9 @@ def apply_scan(
        exist before the model is walked, and ``shard_fn`` skips a module it has
        already sharded.
 
+    ``mp_policy`` is the same policy ``shard_fn`` was built with: the scan body
+    issues its own collectives and has to cast exactly as SimpleFSDP would.
+
     With ``use_scan=False`` the layers still run one at a time, just out of the
     stacks -- the storage change without the loop change, which is what the
     reshard and checkpoint tests compare against.
@@ -409,7 +470,7 @@ def apply_scan(
     stack.unregister_and_allocate()
     shard_fn(stack.holder, shard_dim=1)
     model = shard_fn(model)
-    stack.install(model, use_scan=use_scan)
+    stack.install(model, use_scan=use_scan, mp_policy=mp_policy)
     logger.info(
         "Stacked %d weights across %d layers, run as a %s",
         len(stack.names),
