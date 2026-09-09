@@ -31,6 +31,9 @@ from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as tpu_qwen3_graph_registry,
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.overrides.bf16_rope import (
+    TpuActivationDtypeCosSinRoPE,
+)
 from torchtitan.experiments.tpu.overrides.fused_loss import (
     FusedLossLinearWrapper,
     fused_loss_lm_head,
@@ -38,6 +41,7 @@ from torchtitan.experiments.tpu.overrides.fused_loss import (
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
     qwen3_moe_30b,
+    qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
 )
@@ -184,16 +188,50 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertIsInstance(graph_config.loss, PallasCrossEntropyLoss.Config)
     self.assertEqual(graph_config.compile.memory_policy, "default")
 
-  def test_fsdp_only_recipe_uses_fused_adamw(self) -> None:
+  def test_fsdp_only_recipe_uses_fused_adamw_and_attention_tuning(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
 
     self.assertEqual(config.optimizer.implementation, "fused")
     self.assertTrue(config.tpu_config.enable_fused_optimizer)
+    self.assertTrue(config.splash_attention_kernel.use_vmap_bwd)
+    self.assertFalse(
+        config.splash_attention_kernel.sa_use_document_aware_block_skipping
+    )
     self.assertEqual(config.splash_attention_kernel.sa_q_layout, "SEQ_MINOR")
     self.assertEqual(config.splash_attention_kernel.sa_k_layout, "SEQ_MINOR")
     self.assertEqual(
         config.splash_attention_kernel.sa_v_layout,
         "HEAD_DIM_MINOR",
+    )
+
+    self.assertEqual(config.splash_attention_kernel.sa_block_kv_compute, 512)
+    self.assertEqual(config.splash_attention_kernel.sa_block_q_dkv, 2048)
+    self.assertEqual(config.splash_attention_kernel.sa_block_kv_dkv, 2048)
+    self.assertEqual(config.splash_attention_kernel.sa_block_kv_dkv_compute, 1024)
+
+  def test_attention_parity_recipe_adds_bf16_rope(self) -> None:
+    config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
+    self.assertIn(
+        "torchtitan.experiments.tpu.overrides.bf16_rope",
+        config.override.imports,
+    )
+
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    apply_overrides(graph_config.override, graph_config)
+    assert graph_config.model_spec is not None
+    rope_configs = [
+        layer.attention.rope for layer in graph_config.model_spec.model.layers
+    ]
+    self.assertTrue(rope_configs)
+    self.assertTrue(
+        all(
+            isinstance(rope, TpuActivationDtypeCosSinRoPE.Config)
+            for rope in rope_configs
+        )
     )
 
   def test_dense_recipe_does_not_enable_fused_adamw_on_tpu(self) -> None:

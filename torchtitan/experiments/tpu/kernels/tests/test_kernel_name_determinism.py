@@ -91,6 +91,7 @@ class KernelNameDeterminismTest(absltest.TestCase):
         block_kv_dq=None,
         use_fused_bwd_kernel=True,
         use_vmap_bwd=False,
+        use_document_aware_block_skipping=True,
         q_layout="HEAD_DIM_MINOR",
         k_layout="HEAD_DIM_MINOR",
         v_layout="HEAD_DIM_MINOR",
@@ -104,6 +105,14 @@ class KernelNameDeterminismTest(absltest.TestCase):
 
     self.assertEqual(fwd1, fwd2)
     self.assertEqual(bwd1, bwd2)
+
+    no_block_skipping_args = dict(splash_args)
+    no_block_skipping_args["use_document_aware_block_skipping"] = False
+    fwd3, bwd3 = self._get_kernel_names_in_subprocess(
+        fn, **no_block_skipping_args
+    )
+    self.assertNotEqual(fwd1, fwd3)
+    self.assertNotEqual(bwd1, bwd3)
 
 
 if __name__ == "__main__":

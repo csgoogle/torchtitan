@@ -46,6 +46,7 @@ from torchtitan.tools.profiler import Profiler
 
 
 _FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
+_BF16_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.bf16_rope"
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
@@ -450,14 +451,25 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   )
   cfg.splash_attention_kernel = SplashAttentionKernelConfig(
       use_splash_attention_kernel=True,
+      # Batch-native masking lets the always-vmapped forward avoid a serial
+      # batch loop; use_vmap_bwd applies the same optimization to backward.
+      # Runtime segment IDs still preserve exact packed-document boundaries.
+      # At local batch 6, the combined change reduced XProf peak HBM from
+      # 14.924 to 14.575 GiB (-0.349 GiB); no vmap memory penalty was observed.
+      use_vmap_bwd=True,
+      sa_use_document_aware_block_skipping=False,
       sa_q_layout="SEQ_MINOR",
       sa_k_layout="SEQ_MINOR",
       sa_block_q=1024,
       sa_block_kv=1024,
       sa_block_dkv=1024,
-      sa_block_kv_compute=1024,
-      sa_block_q_dkv=1024,
-      sa_block_kv_dkv=1024,
+      # Matched Qwen3-30B/TPU7x profiling showed a 26.3-ms (1.60%) step win and
+      # 0.199-GiB lower peak HBM. The attention calls themselves took 2.5 ms
+      # longer, but module span fell 24.6 ms and exposed collectives fell
+      # 7.4 ms: this is a whole-program resource/scheduling improvement.
+      sa_block_kv_compute=512,
+      sa_block_q_dkv=2048,
+      sa_block_kv_dkv=2048,
       sa_block_kv_dkv_compute=1024,
       sa_block_q_dq=1024,
       sa_block_kv_dq=1024,
@@ -489,6 +501,23 @@ def qwen3_moe_30b_fsdp_only_full_ac_benchmark() -> TPUTrainerConfig:
   cfg.metrics.log_freq = 5
   cfg.tpu_config.enable_mfu_benchmark = True
   cfg.tpu_config.mfu_benchmark_start_step = 10
+  return cfg
+
+
+def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
+  """Q30 benchmark adding MaxText's BF16 RoPE numerical policy.
+
+  The base FSDP recipe already enables the correctness-preserving batch-native
+  masking and Qwen3-30B/TPU7x tile choices. This separate recipe changes only
+  RoPE arithmetic to BF16 for MaxText parity. That change is not numerically
+  equivalent to TorchTitan's FP32 RoPE and must remain opt-in unless longer
+  convergence validation justifies promoting it.
+  """
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  # Match MaxText's BF16 rotary arithmetic. This is an explicit numerical
+  # policy choice, not a numerics-preserving optimization; keep it out of the
+  # default recipe pending a longer convergence comparison.
+  cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
   return cfg
 
 

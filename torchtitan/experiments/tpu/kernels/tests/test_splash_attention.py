@@ -1,15 +1,52 @@
 """Tests for splash attention on TPU."""
 
+from collections import namedtuple
 import functools
 from typing import Callable
 
 from absl import logging
 from absl.testing import absltest
+import jax.numpy as jnp
 import torch
 from torch.nn import attention
 import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
+from torchtitan.experiments.tpu.kernels.splash_attention import (
+    _maybe_document_aware_mask_info,
+    splash_sdpa,
+)
+
+
+class SplashMaskInfoTest(absltest.TestCase):
+
+  def test_document_aware_block_skipping_is_optional(self):
+    mask_info_type = namedtuple("MaskInfo", ("block_mask", "data_next"))
+    mask_info = mask_info_type(
+        block_mask=jnp.array([[[1, 0], [1, 1]]], dtype=jnp.int32),
+        data_next=jnp.array([[[0, 0], [0, 1]]], dtype=jnp.int32),
+    )
+    segment_ids = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
+
+    disabled = _maybe_document_aware_mask_info(
+        mask_info,
+        segment_ids,
+        block_q=2,
+        block_kv=2,
+        is_dkv=False,
+        use_document_aware_block_skipping=False,
+    )
+    self.assertIs(disabled, mask_info)
+
+    enabled = _maybe_document_aware_mask_info(
+        mask_info,
+        segment_ids,
+        block_q=2,
+        block_kv=2,
+        is_dkv=False,
+        use_document_aware_block_skipping=True,
+    )
+    self.assertEqual(enabled.block_mask.tolist(), [[[1, 0], [0, 1]]])
+    self.assertEqual(enabled.data_next.tolist(), [[[0, 0], [0, 1]]])
 
 
 class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
@@ -109,10 +146,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     return q, k, v, segment_ids, attn_mask.unsqueeze(1).cpu()
 
   def test_segment_ids_parity(self):
-    """Verifies SplashAttention with segment_ids matches SDPA MATH backend with
-
-    custom attn_mask.
-    """
+    """Batch-native Splash with segment IDs matches the SDPA reference."""
     q, k, v, segment_ids, attn_mask_cpu = self.make_packed_inputs()
     q_cpu, k_cpu, v_cpu = q.cpu(), k.cpu(), v.cpu()
 
@@ -128,7 +162,14 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     # the final mask by passing both `segment_ids` and `is_causal=True`, and the
     # mask construction is handled in the kernel.
     actual_out = splash_sdpa(
-        q, k, v, segment_ids=segment_ids, is_causal=True, enable_gqa=False
+        q,
+        k,
+        v,
+        segment_ids=segment_ids,
+        is_causal=True,
+        enable_gqa=False,
+        use_vmap_bwd=True,
+        use_document_aware_block_skipping=False,
     )
 
     torch.testing.assert_close(
@@ -136,9 +177,7 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_segment_ids_backward_parity(self):
-    """Gradients from SplashAttention backward with segment_ids match SDPA MATH
-
-    backend with custom attn_mask."""
+    """Batch-native packed-document gradients match the SDPA reference."""
     q, k, v, segment_ids, attn_mask_cpu = self.make_packed_inputs()
 
     # Reference backward via math SDPA on CPU
@@ -163,6 +202,8 @@ class SplashAttentionTest(base_device_test.BaseAcceleratorDeviceTest):
         segment_ids=segment_ids,
         is_causal=True,
         enable_gqa=False,
+        use_vmap_bwd=True,
+        use_document_aware_block_skipping=False,
     )
     out_test.sum().backward()
 

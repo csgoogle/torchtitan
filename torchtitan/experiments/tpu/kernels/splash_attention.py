@@ -75,6 +75,38 @@ def _document_aware_mask_info(mask_info, segment_ids_b, block_q, block_kv, is_dk
   return mask_info._replace(block_mask=block_mask, data_next=data_next)
 
 
+def _maybe_document_aware_mask_info(
+    mask_info,
+    segment_ids_b,
+    block_q,
+    block_kv,
+    is_dkv,
+    use_document_aware_block_skipping,
+):
+  """Choose document-aware block skipping or batch-native masking.
+
+  Document-aware block skipping: specialize block metadata for each packed
+  example and omit blocks that cannot contain same-document token pairs.
+  Batch-native masking: reuse the static causal block metadata for every
+  example and rely on runtime segment IDs for document boundaries. Both modes
+  pass ``segment_ids_b`` to Splash and enforce the same token-level causal and
+  packed-document mask.
+
+  Document-aware block skipping can save work for packs with many short
+  documents, but its example-dependent metadata makes JAX/XLA lower the
+  surrounding ``vmap`` as a serial batch loop on TPU today. Batch-native
+  masking avoids that loop and is faster for the measured Qwen3-30B C4
+  training distribution, but its extra block work may lose on sparser packs.
+  Keep document-aware block skipping as the kernel API default; recipes should
+  select batch-native masking only for a validated distribution and shape.
+  """
+  if not use_document_aware_block_skipping:
+    return mask_info
+  return _document_aware_mask_info(
+      mask_info, segment_ids_b, block_q, block_kv, is_dkv
+  )
+
+
 def _make_splash_attention_fn(
     seq_len: int,
     n_heads: int,
@@ -94,6 +126,7 @@ def _make_splash_attention_fn(
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
     use_vmap_bwd: bool = False,
+    use_document_aware_block_skipping: bool = True,
 ):
   """Create JAX splash attention forward and backward functions.
 
@@ -192,12 +225,13 @@ def _make_splash_attention_fn(
       seg_ids = splash_attention_kernel.SegmentIds(
           q=segment_ids_b, kv=segment_ids_b
       )
-      fwd_mask_info_b = _document_aware_mask_info(
+      fwd_mask_info_b = _maybe_document_aware_mask_info(
           fwd_mask_info,
           segment_ids_b,
           block_sizes.block_q,
           block_sizes.block_kv,
           is_dkv=False,
+          use_document_aware_block_skipping=use_document_aware_block_skipping,
       )
 
     out_b, (logsumexp_b,) = splash_attention_kernel._splash_attention_forward(
@@ -255,20 +289,22 @@ def _make_splash_attention_fn(
       seg_ids = splash_attention_kernel.SegmentIds(
           q=segment_ids_b, kv=segment_ids_b
       )
-      dkv_mask_info_b = _document_aware_mask_info(
+      dkv_mask_info_b = _maybe_document_aware_mask_info(
           dkv_mask_info,
           segment_ids_b,
           block_sizes.block_q_dkv,
           block_sizes.block_kv_dkv,
           is_dkv=True,
+          use_document_aware_block_skipping=use_document_aware_block_skipping,
       )
       if dq_mask_info is not None:
-        dq_mask_info_b = _document_aware_mask_info(
+        dq_mask_info_b = _maybe_document_aware_mask_info(
             dq_mask_info,
             segment_ids_b,
             block_sizes.block_q_dq,
             block_sizes.block_kv_dq,
             is_dkv=False,
+            use_document_aware_block_skipping=use_document_aware_block_skipping,
         )
 
     res = (
@@ -459,6 +495,7 @@ def splash_sdpa(
     block_kv_dq: Optional[int] = None,
     use_fused_bwd_kernel: bool = True,
     use_vmap_bwd: bool = False,
+    use_document_aware_block_skipping: bool = True,
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
@@ -489,8 +526,16 @@ def splash_sdpa(
     block_q_dq: Block size for Q in DQ.
     block_kv_dq: Block size for KV in DQ.
     use_fused_bwd_kernel: Whether to use fused backward kernel.
-    use_vmap_bwd: Whether to use vmap in backward pass. Default False (uses scan
-      for memory safety).
+    use_vmap_bwd: Whether to vectorize backward over the batch. When false,
+      backward uses a memory-safe sequential scan. When true, batch-native
+      masking also permits XLA to lower backward as a batched custom call.
+    use_document_aware_block_skipping: Select document-aware block skipping
+      when true or batch-native masking when false. Both modes retain exact
+      segment-ID masking. This option is independent of ``use_vmap_bwd``:
+      batch-native masking still benefits the always-vmapped forward when
+      backward uses scan; enabling both makes backward batch-native as well.
+      Only document-aware block skipping prunes whole blocks using per-example
+      metadata.
     q_layout: Layout for Q.
     k_layout: Layout for K.
     v_layout: Layout for V.
@@ -525,6 +570,7 @@ def splash_sdpa(
       block_kv_dq=block_kv_dq,
       use_fused_bwd_kernel=use_fused_bwd_kernel,
       use_vmap_bwd=use_vmap_bwd,
+      use_document_aware_block_skipping=use_document_aware_block_skipping,
       q_layout=q_layout,
       k_layout=k_layout,
       v_layout=v_layout,

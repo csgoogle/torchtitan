@@ -125,7 +125,16 @@ class LoRAConfig:
 class SplashAttentionKernelConfig:
   use_splash_attention_kernel: bool = False
   use_tokamax_splash_attention_kernel: bool = False
+  # Forward is always vmapped. Enabling this also vectorizes backward instead
+  # of using its memory-safe sequential scan. With batch-native masking below,
+  # this permits a batched backward custom call. Vectorized intermediates can
+  # scale with local batch size, so recipes should validate peak memory.
   use_vmap_bwd: bool = False
+  # Independently select document-aware block skipping when True or
+  # batch-native masking when False. Both retain exact segment-ID masking.
+  # False remains useful with a scanned backward because forward still benefits;
+  # combine False with use_vmap_bwd=True to make backward batch-native too.
+  sa_use_document_aware_block_skipping: bool = True
   # Splash attention block sizes for performance optimization.
   sa_block_q: int = 512
   sa_block_kv: int = 512
