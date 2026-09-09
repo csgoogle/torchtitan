@@ -570,6 +570,56 @@ def use_rope_tpu_optimization_patch() -> None:
   )
 
 
+def use_real_rope_arithmetic_patch() -> None:
+  """Monkey patches ComplexRoPE.apply_rotary_emb to avoid a complex view.
+
+  The complex form calls `view_as_complex` on `query`, which requires grad.
+  A higher-order op such as `scan` re-traces its body through
+  functionalization, which rewrites that to `view_as_complex_copy` -- and only
+  the non-copy variant has a derivative:
+
+    NotImplementedError: view_as_complex_copy does not support automatic
+    differentiation for outputs with complex dtype
+
+  Writing the multiply out as (a + bi)(c + di) = (ac - bd) + (ad + bc)i is the
+  same expression with no differentiable complex view. Same pairing, same
+  interleaved output, bit-identical in fp32. The cache is a buffer, never
+  requires grad, and stays complex.
+
+  Remove this once `view_as_complex_copy` has an autograd formula upstream.
+  """
+  try:
+    from torchtitan.models.common.rope import ComplexRoPE  # pylint: disable=g-import-not-at-top
+  except ImportError:
+    return
+
+  def _apply_rotary_emb_real(
+      query: torch.Tensor,
+      key: torch.Tensor,
+      rope_cache: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    cache = torch.view_as_real(rope_cache)
+    cos, sin = cache[..., 0], cache[..., 1]
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+      pairs = x.float().reshape(*x.shape[:-1], -1, 2)
+      real, imag = pairs[..., 0], pairs[..., 1]
+      rotated = torch.stack(
+          [real * cos - imag * sin, real * sin + imag * cos], dim=-1
+      )
+      return rotated.flatten(3).type_as(x)
+
+    return rotate(query), rotate(key)
+
+  # `staticmethod`, matching what it replaces: the model calls this on an
+  # instance but passes query itself as the first argument.
+  ComplexRoPE.apply_rotary_emb = staticmethod(_apply_rotary_emb_real)
+  logger.info(
+      "Monkey-patched ComplexRoPE.apply_rotary_emb with real arithmetic, so "
+      "that it can be traced inside a higher-order op"
+  )
+
+
 def apply_patches(model: nn.Module, job_config: Any) -> None:
   """Applies all TPU-specific patches and workarounds to the model."""
   # Enable CPU safe histc workaround.
@@ -598,3 +648,4 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
 
   # Apply RoPE TPU Optimization Patch
   use_rope_tpu_optimization_patch()
+  use_real_rope_arithmetic_patch()
