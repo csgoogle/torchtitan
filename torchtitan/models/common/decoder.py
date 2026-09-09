@@ -37,7 +37,21 @@ from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
 
 
-__all__ = ["Decoder", "TransformerBlock"]
+__all__ = ["Decoder", "LayerDict", "TransformerBlock"]
+
+
+class LayerDict(ModuleDict):
+    """A ``ModuleDict`` that runs its layers in order, like ``nn.Sequential``.
+
+    ``Decoder.forward`` calls this once instead of looping over the layers
+    itself. Subclass it to run the same layers a different way; ``Decoder``
+    needs no change.
+    """
+
+    def forward(self, h: torch.Tensor, *args) -> torch.Tensor:
+        for layer in self.values():
+            h = layer(h, *args)
+        return h
 
 
 # TODO: we can unify the TransformerBlock impl across all models when
@@ -236,7 +250,8 @@ class Decoder(BaseModel):
 
         self.tok_embeddings = config.tok_embeddings.build()
 
-        self.layers = ModuleDict()
+        # `LayerDict` runs the layers itself, so a subclass can change how.
+        self.layers = LayerDict()
         for i, layer_config in enumerate(config.layers):
             self.layers[str(i)] = layer_config.build()
 
@@ -282,8 +297,7 @@ class Decoder(BaseModel):
             segment_ids_from_positions(positions) if positions is not None else None
         )
 
-        for layer in self.layers.values():
-            h = layer(h, attention_masks, positions, segment_ids)
+        h = self.layers(h, attention_masks, positions, segment_ids)
 
         h = self.norm(h) if self.norm is not None else h
 
