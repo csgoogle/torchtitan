@@ -46,6 +46,7 @@ from torchtitan.tools.profiler import Profiler
 
 
 _FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
+_BF16_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.bf16_rope"
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
@@ -493,13 +494,23 @@ def qwen3_moe_30b_fsdp_only_full_ac_benchmark() -> TPUTrainerConfig:
 
 
 def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
-  """Q30 benchmark with the validated MaxText-parity attention recipe.
+  """Q30 benchmark with self-contained MaxText-derived attention choices.
 
   Segment IDs still enforce packed-document boundaries. Turning off dynamic
   whole-block pruning makes the metadata identical across examples, allowing
   forward and backward to lower as batch-native Splash calls. The larger tile
   choices improve the surrounding compiled schedule on TPU7x even though the
   isolated dKV custom call is slightly slower.
+
+  Keep this as a separate MaxText-parity recipe while its three policies have
+  different promotion bars. Batch-native lowering preserves the exact mask
+  and is a candidate for the main FSDP recipe after validation across packing
+  distributions. The tile sizes are Qwen3-30B/TPU7x tuning and should move to
+  that main recipe only if its supported shapes stay faster. BF16 RoPE changes
+  arithmetic and remains explicitly opt-in until longer convergence evidence
+  justifies making it the normal training policy. Bundling them here provides
+  a stable end-to-end MaxText comparison without silently changing existing
+  recipes; each choice can still be promoted independently later.
   """
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
   splash = cfg.splash_attention_kernel
@@ -511,6 +522,9 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   splash.sa_block_q_dkv = 2048
   splash.sa_block_kv_dkv = 2048
   splash.sa_block_kv_dkv_compute = 1024
+  # Match MaxText's BF16 rotary arithmetic. This is an explicit numerical
+  # policy choice rather than a change to the default CosSinRoPE behavior.
+  cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
   return cfg
 
 

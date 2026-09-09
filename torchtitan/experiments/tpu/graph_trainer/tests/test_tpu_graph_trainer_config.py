@@ -31,6 +31,9 @@ from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as tpu_qwen3_graph_registry,
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.overrides.bf16_rope import (
+    TpuActivationDtypeCosSinRoPE,
+)
 from torchtitan.experiments.tpu.overrides.fused_loss import (
     FusedLossLinearWrapper,
     fused_loss_lm_head,
@@ -167,6 +170,29 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(splash.sa_block_q_dkv, 2048)
     self.assertEqual(splash.sa_block_kv_dkv, 2048)
     self.assertEqual(splash.sa_block_kv_dkv_compute, 1024)
+    self.assertIn(
+        "torchtitan.experiments.tpu.overrides.bf16_rope",
+        config.override.imports,
+    )
+
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    apply_overrides(graph_config.override, graph_config)
+    assert graph_config.model_spec is not None
+    rope_configs = [
+        layer.attention.rope for layer in graph_config.model_spec.model.layers
+    ]
+    self.assertTrue(rope_configs)
+    self.assertTrue(
+        all(
+            isinstance(rope, TpuActivationDtypeCosSinRoPE.Config)
+            for rope in rope_configs
+        )
+    )
+
   def test_dense_recipe_does_not_enable_fused_adamw_on_tpu(self) -> None:
     config = qwen3_8b()
 
