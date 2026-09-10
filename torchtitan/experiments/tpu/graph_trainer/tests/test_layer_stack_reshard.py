@@ -22,6 +22,10 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 
+from torchtitan.components.checkpoint_utils import (
+    get_flat_optim_state_dict,
+    init_optim_state,
+)
 from torchtitan.config import derive
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
@@ -158,6 +162,52 @@ class ReshardTest(unittest.TestCase):
     def test_unrolled_to_stacked(self):
         """The migration this work exists to make safe: an old checkpoint in."""
         self._round_trip(saved_stacked=False, loaded_stacked=True)
+
+
+class OptimizerStateTest(unittest.TestCase):
+    """The weights above reshard across layouts. The optimizer state does not.
+
+    TODO: make this pass. The model's state dict is written in the unrolled
+    format because ``state_dict`` and ``load_state_dict`` run inside
+    ``unrolled()``, which re-registers ``layers.i.<p>`` as views onto the rows.
+    The optimizer state never goes through those hooks -- it is keyed off
+    ``named_parameters()``, which stacking rewrites to
+    ``layer_stacks.attention__wq__weight`` -- so the two layouts write disjoint
+    key sets, which is what this test asserts against.
+
+    The consequence is silent rather than loud:
+    ``_unflatten_optim_state_dict`` treats an FQN that is absent from the
+    checkpoint as "this parameter has no state" rather than as an error. So
+    flipping ``--tpu-config.use-stacked-layers`` between a save and a resume
+    restores every weight correctly and restarts Adam from zero for every
+    layer parameter, with nothing in the logs to say so. Parameters outside
+    the layers (embeddings, output, the final norm) keep their moments,
+    because their names never changed.
+
+    The fix is to re-key the flat optimizer state dict the way ``unrolled()``
+    re-keys the model's: on save, split each ``[n_layers, *shape]`` moment into
+    one entry per layer; on load, ``torch.stack`` them back. Both directions
+    hold under sharding for the same reason the weights do -- row ``i`` of a
+    ``Shard(1)`` stack is ``Shard(0)``. Watch for ``step``, which is a scalar
+    rather than a stacked tensor, and for the ``param_groups.<fqn>.<key>``
+    entries, which key off the group's first parameter.
+
+    Nothing in the stack hits this today: same-layout resumes are unaffected,
+    and an initial load of a foreign checkpoint is model-only by default.
+    """
+
+    @unittest.skip("TODO: known gap, see the class docstring. Remove to fix.")
+    def test_the_optimizer_state_is_keyed_the_same_way_in_both_layouts(self):
+        port = _free_port()
+        keys = {}
+        for stacked in (False, True):
+            with _process_group(0, 1, port):
+                model = _build(1, stacked=stacked)
+                optim = torch.optim.AdamW(list(model.named_parameters()))
+                init_optim_state(optim)
+                keys[stacked] = set(get_flat_optim_state_dict(optim))
+
+        self.assertEqual(keys[True], keys[False])
 
 
 if __name__ == "__main__":
