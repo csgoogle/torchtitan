@@ -39,6 +39,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
+from torchtitan.models.common.moe import MoELoadBalanceAuxLoss
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
@@ -580,6 +581,10 @@ def _enable_scan_layers(cfg: TPUTrainerConfig) -> None:
   # The routing metrics are captured by the MoE layer writing sidecar
   # attributes during forward, which a scan body cannot do.
   cfg.metrics.enable_moe_routing = False
+  # MaxText computes the load-balance loss from the local batch; match it.
+  # (The global variant's per-layer all-reduce is synchronous but 0.1 ms.)
+  for _, aux, _, _ in cfg.model_spec.model.traverse(MoELoadBalanceAuxLoss.Config):
+    aux.reduce_over_dp = False
   cfg.checkpoint = CheckpointManager.Config(enable=False)
   cfg.validator = Validator.Config(enable=False)
 

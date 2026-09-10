@@ -208,6 +208,11 @@ class MoELoadBalanceAuxLoss(Module):
         Torchtitan generally uses sum aggregation & global_bs division.
         Because batch_wise aux loss doesn't commute over microbatches, we ban
         batch_wise + PP usage in any case."""
+        reduce_over_dp: bool = True
+        """batch_wise only: all-reduce the per-expert token counts over the DP
+        mesh so f_i is the global-batch expert frequency. False computes f_i from
+        the local batch (MaxText's load-balance loss), which removes one
+        synchronous DP all-reduce per MoE layer from the forward."""
 
     def __init__(self, config: Config):
         super().__init__()
@@ -225,6 +230,7 @@ class MoELoadBalanceAuxLoss(Module):
         self.coeff = config.coeff
         self.global_batch_size = config.global_batch_size
         self.top_k = config.top_k
+        self.reduce_over_dp = config.reduce_over_dp
         self.dp_mesh: DeviceMesh | None = None
         self.cp_mesh: DeviceMesh | None = None
         self.tp_mesh: DeviceMesh | None = None
@@ -237,7 +243,7 @@ class MoELoadBalanceAuxLoss(Module):
         cp_mesh: DeviceMesh | None,
         tp_mesh: DeviceMesh | None,
     ) -> None:
-        self.dp_mesh = dp_mesh
+        self.dp_mesh = dp_mesh if self.reduce_over_dp else None
         self.cp_mesh = cp_mesh
         self.tp_mesh = tp_mesh
 
