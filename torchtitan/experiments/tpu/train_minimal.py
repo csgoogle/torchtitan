@@ -393,7 +393,7 @@ def start_trainer(config: JobConfig):
     if rank == 0:
       logger.info(
           "Training with config: %s",
-          json.dumps(config.to_dict(), indent=2, sort_keys=True)
+          json.dumps(config.to_dict(), indent=2)
       )
     trainer.train()
   finally:

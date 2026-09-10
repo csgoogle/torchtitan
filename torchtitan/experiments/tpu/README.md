@@ -443,6 +443,73 @@ xpk workload create \
 
 ---
 
+### Configuring XLA and libtpu flags
+
+`XLA_FLAGS` and `LIBTPU_INIT_ARGS` are typically set via environment variable by the launcher. We support configuring these as part of the TPUTrainerConfig via the `libtpu_init_flags` and `xla_flags` fields. This codifies these flags as citizens of the TorchTitan training configuration instead of them being documented only at the launcher level.
+
+Their override precedence is as follows:
+
+1. **Config**: Flags are stored as `libtpu_init_flags` and `xla_flags` in the TPUTrainerConfig.
+2. **CLI:** `--extra-libtpu-init-flags` and `--extra-xla-flags` is the additive layer: it **adds** flags the config does not set and **overrides** the ones it does, leaving the rest alone.
+
+    (Note: setting `--libtpu-init-flags` and `--xla-flags` in the command line without the `extra` keyword **replaces the entire set** of flags defined in the config. This enables runs with default flags by setting either or both to the empty string.)
+3. **Environment**: an exported `LIBTPU_INIT_ARGS` or `XLA_FLAGS` has the last word, **overriding** flags named in the config and **adding** any new flags.
+
+Values are whitespace-separated `flag=value` entries.
+
+#### Usage
+
+Taking [`qwen3_8b_tpu7x`](qwen3/config_registry.py#L534), which declares five flags including
+`xla_tpu_dvfs_p_state=7`:
+
+```bash
+# 1. Add a flag the config does not set.
+--extra-libtpu-init-flags "xla_dump_to=/tmp/hlo"
+
+# 2. Override a flag the config sets.
+--extra-libtpu-init-flags "xla_tpu_dvfs_p_state=5"
+
+# 3. Drop single flags (use libtpu/XLA default)
+--extra-libtpu-init-flags "!xla_tpu_enable_latency_hiding_layer_scheduler"
+
+# 4a. Drop the recipe's flags entirely -- set to the empty string.
+--libtpu-init-flags ""
+
+# 4b. Replace the *entire* set of flags set by the config
+--libtpu-init-flags "xla_tpu_enable_sparse_core_collective_aggregator=true \
+xla_tpu_enable_latency_hiding_layer_scheduler=true \
+xla_tpu_scoped_vmem_limit_kib=131072"
+```
+
+#### Flag bundling and merging flags
+
+Groups of flags that only make sense together can be found in named bundles in [`tpu_flags.py`](tpu_flags.py)
+
+A config can declare its flags by composing bundles and single knobs as so:
+
+```python
+libtpu_init_flags=tpu_flags.merge_flags(
+    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+    tpu_flags.TPU7X_THROUGHPUT_P_STATE,
+    xla_tpu_scoped_vmem_limit_kib=65472,
+)
+```
+
+#### Logging
+
+Overridden and removed flags are logged as `INFO`. If the environment sets a flag that overrides one set in the config, a warning is logged:
+
+```
+[titan] ... - INFO - Overriding LIBTPU_INIT_ARGS xla_tpu_dvfs_p_state=7 with 5 from the launch command.
+[titan] ... - INFO - Removing LIBTPU_INIT_ARGS xla_tpu_enable_latency_hiding_layer_scheduler=true at the request of the launch command.
+[titan] ... - WARNING - LIBTPU_INIT_ARGS already sets xla_tpu_scoped_vmem_limit_kib=131072 in the environment; keeping it and ignoring the config value 65472.
+```
+
+This also enables the `--debug.print-config` option to print the full configuration including the global XLA and libtpu flags set at launch (however: note that they may still be overridden by a LIBTPU_INIT_ARGS environment var and XLA_FLAGS may also be overridden per compile by torch_tpu via `TORCH_TPU_INTERNAL_XLA_OPTIONS` and the custom_compiler_options context manager)
+
+---
+
 ### Profile workloads using TensorBoard
 
 TorchTitan on TorchTPU integrates with a profiler to export profiling data for trained models. Use the `--profiling.enable-profiling` flag to enable profiling and the `--profiling...` flags for configuration.

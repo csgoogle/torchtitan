@@ -19,6 +19,7 @@ import jax
 import torchax
 import torchtitan.config
 from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.jax import utils as jax_utils
 from torchtitan.experiments.torchax import distributed
 from torchtitan.experiments.torchax import gmm
@@ -57,6 +58,8 @@ def _maybe_init_jax_distributed():
 def main_train_loop(job_config: Any):
   """Main training loop for torchax."""
   torchtitan.tools.logging.init_logger()
+  # Must apply XLA and libtpu flags before the JAX backend is initialized.
+  tpu_flags.apply_init_flags(job_config)
   _maybe_init_jax_distributed()  # multi-host JAX init (no-op on single-host)
   assert job_config.torchax_config.use_torchax, 'use_torchax must be True'
 

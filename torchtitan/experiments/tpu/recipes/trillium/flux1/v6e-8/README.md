@@ -31,7 +31,6 @@ xpk workload create \
 --num-slices=1 \
 --docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
 --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
---env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
 --command "\
     torchrun \
     --nnodes=2 \
@@ -53,6 +52,7 @@ xpk workload create \
     --splash-attention-kernel.use-splash-attention-kernel \
     --compile.enable \
     --compile.backend=tpu \
+    --libtpu-init-flags xla_tpu_scoped_vmem_limit_kib=65536 \
     activation-checkpoint:full \
     --activation-checkpoint.no-preserve-rng-state"
 ```
@@ -76,7 +76,6 @@ xpk workload create \
 --num-slices=1 \
 --docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
 --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
---env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
 --command "\
     torchrun \
     --nnodes=2 \
@@ -98,6 +97,7 @@ xpk workload create \
     --splash-attention-kernel.use-splash-attention-kernel \
     --compile.enable \
     --compile.backend=tpu \
+    --libtpu-init-flags xla_tpu_scoped_vmem_limit_kib=65536 \
     activation-checkpoint:full \
     --activation-checkpoint.no-preserve-rng-state"
 ```

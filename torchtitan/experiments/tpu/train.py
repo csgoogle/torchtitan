@@ -304,7 +304,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
       if rank == 0:
         logger.info(
             "Training with config: %s",
-            json.dumps(train_config.to_dict(), indent=2, sort_keys=True),
+            json.dumps(train_config.to_dict(), indent=2),
         )
       trainer.train()
   except Exception:

@@ -4,9 +4,10 @@ This recipe runs the FSDP-only Qwen3-30B-A3B benchmark on 128 TPU cores.
 See the TPU [README](../../../../README.md) for XPK installation and cluster
 setup.
 
-The `LIBTPU_INIT_ARGS` below must be set before PJRT initialization. The
+The libtpu init flags this recipe needs ride on the torchtitan config
+(`--libtpu-init-flags`), which exports them before PJRT initialization. The
 SparseCore collective aggregator is required by the latency-hiding layer
-scheduler for this workload, so keep the flags enabled or disabled together.
+scheduler for this workload, so keep those two enabled or disabled together.
 
 ```bash
 export PROJECT_ID=YOUR_PROJECT_ID
@@ -23,10 +24,11 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 # schedules that can make those collectives concurrent.
 # Request TPU7x performance state 7 for this throughput-oriented recipe. This
 # trades higher device power for faster compute rather than changing the graph.
-export LIBTPU_INIT_ARGS='--xla_tpu_enable_sparse_core_collective_aggregator=true \
-    --xla_tpu_enable_latency_hiding_layer_scheduler=true \
-    --xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false \
-    --xla_tpu_dvfs_p_state=7'
+
+LIBTPU_INIT_FLAGS="xla_tpu_enable_sparse_core_collective_aggregator=true \
+xla_tpu_enable_latency_hiding_layer_scheduler=true \
+xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false \
+xla_tpu_dvfs_p_state=7"
 
 xpk workload create \
 --workload="$WORKLOAD_NAME" \
@@ -36,7 +38,6 @@ xpk workload create \
 --tpu-type=tpu7x-4x4x4 \
 --num-slices=1 \
 --docker-image="$WORKLOAD_IMAGE" \
---env LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS" \
 --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
 --command "\
     torchrun \
@@ -47,16 +48,15 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.qwen3 \
-    --config=qwen3_moe_30b_fsdp_only_full_ac_benchmark"
+    --config=qwen3_moe_30b_fsdp_only_full_ac_benchmark \
+    --libtpu-init-flags \"$LIBTPU_INIT_FLAGS\""
 ```
 
-The scheduler is opt-in: omit the aggregator and scheduler flags to run the
-same TorchTitan configuration without it. The dual-SparseCore reduce-scatter
-flag is an independent recipe choice and may need to be disabled for schedules
-that overlap all-gather and reduce-scatter. The p-state flag is also independent
-and selects the throughput-oriented TPU7x operating point. These flags are
-launcher-owned because libtpu reads them before the TorchTitan configuration is
-constructed.
+The scheduler is opt-in: drop the aggregator and scheduler flags to run the same
+TorchTitan configuration without it. The dual-SparseCore reduce-scatter flag is
+an independent recipe choice and may need to be disabled for schedules that
+overlap all-gather and reduce-scatter. Exporting `LIBTPU_INIT_ARGS` from the
+launcher still works and wins over the config for any flag it names.
 
 In matched 30-step TPU7x runs, enabling the pair improved throughput by about
 5% at both GBS768/2K and GBS1024/2K. The runs retained FP32 FSDP reductions and
