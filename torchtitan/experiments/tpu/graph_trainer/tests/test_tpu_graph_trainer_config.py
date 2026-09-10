@@ -182,15 +182,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         2,
     )
 
-  def test_fsdp_pipeline_split_is_propagated(self) -> None:
+  def test_backward_layer_split_is_propagated(self) -> None:
     config = typing.cast(
         TPUTrainerConfig,
         ConfigManager().parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
             "--tpu_config.use_graph_split",
-            "--tpu_config.graph_split.backward_partition_mode=fsdp_region_local",
-            "--tpu_config.graph_split.backward_regions_per_executable=2",
+            "--tpu_config.graph_split.backward_partition_mode=by_layer",
+            "--tpu_config.graph_split.backward_layers_per_executable=2",
         ]),
     )
 
@@ -202,10 +202,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     self.assertEqual(
         graph_config.tpu_config.graph_split.backward_partition_mode,
-        "fsdp_region_local",
+        "by_layer",
     )
     self.assertEqual(
-        graph_config.tpu_config.graph_split.backward_regions_per_executable,
+        graph_config.tpu_config.graph_split.backward_layers_per_executable,
         2,
     )
 

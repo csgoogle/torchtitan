@@ -9,9 +9,9 @@
 ``use_graph_split`` first divides the mandatory joint graph into forward and
 backward GraphModules connected by explicit residual tensors. The forward graph
 can then be divided into sequential layer ranges. The backward graph can remain
-whole, group adjacent rematerialization regions sequentially, or form staggered
-FSDP all-gather/compute/reduce-scatter pipeline stages. These subdivisions are
-therefore always nested under the forward/backward split.
+whole, group adjacent layer computations with their FSDP collectives, or form
+staggered all-gather/compute/reduce-scatter pipeline stages. These subdivisions
+are therefore always nested under the forward/backward split.
 
 Each rematerialization region is one transformer layer. Combining regions in
 one executable changes only the compiler scheduling scope; it preserves the
@@ -19,16 +19,16 @@ per-layer activation-checkpoint boundaries and just-in-time recompute order.
 Multi-layer rematerialization instead trades fewer saved or offloaded boundaries
 for longer-lived intermediates or repeated recompute and is outside this pass.
 
-The result wrappers retain both the executable GraphModule and the node-to-
-partition metadata used to validate that semantic regions and collective chains
-remain indivisible.
+The result wrapper retains both the executable GraphModule and the node-to-
+partition metadata used to validate that layers and collective chains remain
+indivisible.
 """
 
 import operator
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -47,6 +47,10 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     _collect_bucketed_fsdp_comms,
+)
+from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
+    tpu_backend_compile_partitioned_pass,
+    tpu_backend_compile_pass,
 )
 from torchtitan.tools.logging import logger
 
@@ -144,23 +148,10 @@ class SplitForwardBackwardGraph:
 
 
 @dataclass
-class SequentialChunkedGraph:
+class PartitionedGraph:
   module: torch.fx.GraphModule
   partition_map: dict[torch.fx.Node, int]
-  unit_to_partition: dict[int, int]
-
-
-@dataclass
-class FSDPPipelineChunkedGraph:
-  module: torch.fx.GraphModule
-  partition_map: dict[torch.fx.Node, int]
-  compute_region_to_partition: dict[int, int]
-  ag_layer_to_partition: dict[int, int]
-  rs_layer_to_partition: dict[int, int]
-
-
-@dataclass
-class _UnitChunkedGraph(SequentialChunkedGraph):
+  layer_to_partition: dict[int, int]
   collective_layer_to_partition: dict[str, dict[int, int]]
 
 
@@ -189,17 +180,15 @@ class GraphSplitter:
       )
     if split_config.backward_partition_mode not in (
         "none",
-        "sequential",
+        "by_layer",
         "fsdp_pipeline",
-        "fsdp_region_local",
     ):
       raise ValueError(
-          "backward_partition_mode must be none, sequential, fsdp_pipeline, "
-          "or fsdp_region_local"
+          "backward_partition_mode must be none, by_layer, or fsdp_pipeline"
       )
-    if split_config.backward_regions_per_executable < 1:
+    if split_config.backward_layers_per_executable < 1:
       raise ValueError(
-          "backward_regions_per_executable must be at least 1"
+          "backward_layers_per_executable must be at least 1"
       )
     if split_config.backward_partition_mode != "none" and not enabled:
       raise ValueError("backward_partition_mode requires use_graph_split")
@@ -232,11 +221,6 @@ class GraphSplitter:
     if not self.enabled:
       raise RuntimeError("GraphSplitter is disabled")
 
-    from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
-        tpu_backend_compile_partitioned_pass,
-        tpu_backend_compile_pass,
-    )
-
     split = split_forward_backward_graph(traced.gm, traced.example_inputs)
 
     if self.config.forward_layers_per_executable > 0:
@@ -259,29 +243,12 @@ class GraphSplitter:
       )
 
     mode = self.config.backward_partition_mode
-    if mode in ("fsdp_pipeline", "fsdp_region_local"):
-      backward = split_backward_graph_by_fsdp_pipeline(
+    if mode in ("by_layer", "fsdp_pipeline"):
+      backward = split_backward_graph_by_layer(
           split.backward_graph,
           n_layers=self.n_layers,
-          regions_per_executable=(
-              self.config.backward_regions_per_executable
-          ),
-          collective_ownership=(
-              "region_local" if mode == "fsdp_region_local" else "staggered"
-          ),
-      )
-      split.backward_graph = backward.module
-      split.module.backward_graph = backward.module
-      tpu_backend_compile_partitioned_pass(
-          backward.module,
-          split.backward_example_inputs,
-          is_fwd=False,
-          donate_internal_buffers=self.config.donate_internal_buffers,
-      )
-    elif mode == "sequential":
-      backward = split_backward_graph_by_remat_region(
-          split.backward_graph,
-          self.config.backward_regions_per_executable,
+          layers_per_executable=self.config.backward_layers_per_executable,
+          pipeline_collectives=mode == "fsdp_pipeline",
       )
       split.backward_graph = backward.module
       split.module.backward_graph = backward.module
@@ -414,511 +381,84 @@ def _collect_collective_chains(
   return chains
 
 
-def _split_graph_by_units(
-    gm: torch.fx.GraphModule,
-    *,
-    unit_id_fn: Callable[[torch.fx.Node], int],
-    unit_name: str,
-    descending: bool,
-    graph_name: Literal["forward", "backward"],
-    isolate_prefix: bool,
-    units_per_executable: int,
-    n_layers: int | None = None,
-    fsdp_collective_schedule: (
-        Literal["staggered", "region_local"] | None
-    ) = None,
-) -> _UnitChunkedGraph:
-  """Split semantic units, optionally scheduling FSDP collectives around them.
-
-  A semantic unit is the indivisible group of body nodes for which
-  ``unit_id_fn(node)`` returns the same non-negative ID; a negative ID marks
-  unowned prefix or dependency-glue work. For example, ``_get_layer_id`` keeps
-  every FX op attributed to ``layers.3`` together without coupling this
-  algorithm to module-FQN metadata. The callback lets another grouping policy
-  reuse the same collective-safety and GraphModule materialization logic.
-
-  Sequential mode (``fsdp_collective_schedule=None``) backs forward layer
-  splitting and ``backward_partition_mode=sequential``. It groups adjacent
-  semantic units in graph order. When the next unit belongs to a later target
-  partition, the traversal switches partitions only after every launched
-  collective has reached its wait and it has left any TPU SPMD-safe region.
-  Thus neither structure is cut between executables.
-
-  FSDP-scheduled mode backs ``backward_partition_mode=fsdp_pipeline`` and
-  ``fsdp_region_local``. It identifies each layer's complete AG and RS chain,
-  then either staggers those chains around compute or assigns them to the same
-  executable as that layer's compute.
-
-  Algorithm:
-  1. Apply ``unit_id_fn`` to each body node and identify complete collective
-     chains, such as ``parameter -> cast -> AG -> wait`` and
-     ``dWeight -> cast -> RS -> wait -> cast``.
-  2. Derive forward or backward execution order from the collected unit IDs.
-     FSDP scheduling also verifies that every model layer maps to exactly one
-     compute unit and that those units cover non-overlapping layer ranges.
-  3. Assign, validate, and normalize partitions. When
-     ``fsdp_collective_schedule`` is set, it reassigns each complete AG/RS
-     chain as described in detail above before assigning compute and glue;
-     otherwise the sequential traversal advances only at a safe graph edge.
-  4. Pass the node-to-partition mapping to PyTorch ``split_module``, which
-     creates the parent GraphModule, child GraphModules, and lifted boundary
-     inputs/outputs. Compilation happens later in ``GraphSplitter``.
-  """
-  if units_per_executable < 1:
-    raise ValueError(
-        "units_per_executable must be at least 1, got "
-        f"{units_per_executable}"
-    )
-  if fsdp_collective_schedule not in (None, "staggered", "region_local"):
-    raise ValueError(
-        "fsdp_collective_schedule must be staggered, region_local, or None"
-    )
-  uses_fsdp_schedule = fsdp_collective_schedule is not None
-  if uses_fsdp_schedule and (n_layers is None or n_layers < 1):
-    raise ValueError(f"n_layers must be positive, got {n_layers}")
-  if uses_fsdp_schedule and graph_name != "backward":
-    raise ValueError("FSDP collective scheduling is backward-only")
-
-  # Stage 1: label body nodes and identify indivisible collective chains.
-  body_nodes = [
+def _body_nodes(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+  return [
       node
       for node in gm.graph.nodes
       if node.op not in ("placeholder", "output")
   ]
-  node_unit_ids = {
-      node: unit_id_fn(node) for node in body_nodes
+
+
+def _group_nodes_by_layer(
+    nodes: list[torch.fx.Node],
+    *,
+    excluded: set[torch.fx.Node] | None = None,
+) -> tuple[dict[torch.fx.Node, int], dict[int, set[torch.fx.Node]]]:
+  excluded = excluded or set()
+  node_layer_ids = {node: _get_layer_id(node) for node in nodes}
+  layer_nodes: dict[int, set[torch.fx.Node]] = defaultdict(set)
+  for node, layer_id in node_layer_ids.items():
+    if layer_id >= 0 and node not in excluded:
+      layer_nodes[layer_id].add(node)
+  return node_layer_ids, dict(layer_nodes)
+
+
+def _assign_partition(
+    partition_map: dict[torch.fx.Node, int],
+    nodes: set[torch.fx.Node],
+    partition: int,
+    owner: str,
+) -> None:
+  conflicts = {
+      node.name: partition_map[node]
+      for node in nodes
+      if node in partition_map and partition_map[node] != partition
   }
-  collective_chains = (
-      _collect_collective_chains(gm) if uses_fsdp_schedule else {}
-  )
-  collective_nodes: set[torch.fx.Node] = set().union(
-      *collective_chains.values()
-  )
-  unit_nodes: dict[int, set[torch.fx.Node]] = defaultdict(set)
-  layer_to_unit: dict[int, int] = {}
+  if conflicts:
+    raise ValueError(f"{owner} has conflicting ownership: {conflicts}")
+  partition_map.update(dict.fromkeys(nodes, partition))
 
-  # Stage 2: derive execution order and validate scheduled layer ownership.
-  if uses_fsdp_schedule:
-    assert n_layers is not None
-    for node in body_nodes:
-      if node in collective_nodes:
-        continue
-      layer_id = _get_layer_id(node)
-      if layer_id < 0:
-        continue
-      unit_id = node_unit_ids[node]
-      if unit_id < 0:
-        continue
-      previous = layer_to_unit.setdefault(layer_id, unit_id)
-      if previous != unit_id:
-        raise ValueError(
-            f"Layer {layer_id} spans {unit_name}s {previous} and {unit_id}"
-        )
-      unit_nodes[unit_id].add(node)
 
-    missing_layers = sorted(set(range(n_layers)) - layer_to_unit.keys())
-    if missing_layers:
-      raise ValueError(
-          f"FSDP {graph_name} split requires compute metadata for every "
-          f"layer; missing layers {missing_layers}"
-      )
-    unit_layers: dict[int, set[int]] = defaultdict(set)
-    for layer_id, unit_id in layer_to_unit.items():
-      unit_layers[unit_id].add(layer_id)
-    unit_ids = sorted(
-        unit_layers,
-        key=lambda unit_id: (
-            max(unit_layers[unit_id])
-            if descending
-            else min(unit_layers[unit_id])
-        ),
-        reverse=descending,
-    )
-    for first, second in zip(unit_ids, unit_ids[1:]):
-      first_layers = unit_layers[first]
-      second_layers = unit_layers[second]
-      overlaps = (
-          min(first_layers) <= max(second_layers)
-          if descending
-          else max(first_layers) >= min(second_layers)
-      )
-      if overlaps:
-        raise ValueError(
-            f"FSDP {graph_name} split requires "
-            f"{'descending' if descending else 'ascending'} {unit_name}s"
-        )
-  else:
-    unit_ids = sorted(
-        {unit_id for unit_id in node_unit_ids.values() if unit_id >= 0},
-        reverse=descending,
-    )
-    for node, unit_id in node_unit_ids.items():
-      if unit_id >= 0:
-        unit_nodes[unit_id].add(node)
-
-  if not unit_ids:
-    raise ValueError(
-        f"Cannot split {graph_name}: no {unit_name} metadata was found"
-    )
-
-  # Stage 3: assign every body node according to the selected mode.
-  partition_map: dict[torch.fx.Node, int] = {}
-  target_num_executables: int | None = None
-  has_prefix = False
-  raw_collective_layer_partitions: dict[str, dict[int, int]] = {}
-
-  if uses_fsdp_schedule:
-    assert n_layers is not None
-    assert fsdp_collective_schedule is not None
-    expected_collectives = ("ag", "rs")
-    num_units = len(unit_ids)
-
-    def compute_stage(index: int) -> int:
-      if fsdp_collective_schedule == "staggered":
-        return 2 + index // units_per_executable
-      return 1 + index // units_per_executable
-
-    def collective_stage(kind: str, index: int) -> int:
-      if fsdp_collective_schedule == "region_local":
-        return compute_stage(index)
-      if kind == "ag":
-        if index == 0:
-          return 1
-        return 2 + (index - 1) // units_per_executable
-      if index == num_units - 1:
-        return 3 + (num_units - 1) // units_per_executable
-      return 2 + (index + 1) // units_per_executable
-
-    unit_to_stage = {
-        unit_id: compute_stage(index)
-        for index, unit_id in enumerate(unit_ids)
-    }
-    collective_unit_to_stage = {
-        kind: {
-            unit_id: collective_stage(kind, index)
-            for index, unit_id in enumerate(unit_ids)
-        }
-        for kind in expected_collectives
-    }
-
-    def assign_nodes_to_partition(
-        nodes: set[torch.fx.Node], partition: int, owner: str
-    ) -> None:
-      conflicts = {
-          node.name: partition_map[node]
-          for node in nodes
-          if node in partition_map and partition_map[node] != partition
-      }
-      if conflicts:
-        raise ValueError(f"{owner} has conflicting ownership: {conflicts}")
-      partition_map.update(dict.fromkeys(nodes, partition))
-
-    _, analyzed_comms = _collect_bucketed_fsdp_comms(
-        gm, n_layers=n_layers
-    )
-    analyzed_owners = {
-        comm.launch: (comm.kind, comm.logical_index)
-        for comm in analyzed_comms
-        if comm.direction == "bwd"
-        and comm.kind in expected_collectives
-        and comm.logical_index is not None
-        and comm.logical_index < n_layers
-    }
-    comm_counts = {
-        layer_id: dict.fromkeys(expected_collectives, 0)
-        for layer_id in range(n_layers)
-    }
-    for producer, chain in collective_chains.items():
-      owner = analyzed_owners.get(producer)
-      if owner is None:
-        continue
-      kind, layer_id = owner
-      unit_id = layer_to_unit[layer_id]
-      assign_nodes_to_partition(
-          chain,
-          collective_unit_to_stage[kind][unit_id],
-          f"FSDP {kind} layer {layer_id}",
-      )
-      comm_counts[layer_id][kind] += 1
-
-    missing_comms = {
-        layer_id: tuple(kind for kind, count in counts.items() if count == 0)
-        for layer_id, counts in comm_counts.items()
-        if 0 in counts.values()
-    }
-    if missing_comms:
-      expected_names = " and ".join(kind.upper() for kind in expected_collectives)
-      raise ValueError(
-          f"FSDP {graph_name} split requires {expected_names} ownership for "
-          f"every layer; missing {missing_comms}"
-      )
-
-    for unit_id, nodes in unit_nodes.items():
-      assign_nodes_to_partition(
-          nodes,
-          unit_to_stage[unit_id],
-          f"{unit_name} {unit_id}",
-      )
-
-    for node in body_nodes:
-      if node not in partition_map:
-        partition_map[node] = max(
-            (
-                partition_map[input_node]
-                for input_node in node.all_input_nodes
-                if input_node in partition_map
-            ),
-            default=0,
-        )
-
-    for producer, chain in collective_chains.items():
-      partitions = {partition_map[node] for node in chain}
-      if len(partitions) != 1:
-        raise ValueError(
-            f"Collective {producer.name!r} spans FSDP {graph_name} "
-            f"partitions {sorted(partitions)}"
-        )
-    for node, partition in partition_map.items():
-      for input_node in node.all_input_nodes:
-        input_partition = partition_map.get(input_node)
-        if input_partition is not None and input_partition > partition:
-          raise ValueError(
-              f"FSDP {graph_name} split has a reverse dependency: "
-              f"{input_node.name} ({input_partition}) -> "
-              f"{node.name} ({partition})"
-          )
-
-    raw_collective_layer_partitions = {
-        kind: {
-            layer_id: collective_unit_to_stage[kind][unit_id]
-            for layer_id, unit_id in layer_to_unit.items()
-        }
-        for kind in expected_collectives
-    }
-  else:
-    first_unit_index = next(
-        (
-            index
-            for index, node in enumerate(body_nodes)
-            if node_unit_ids[node] >= 0
-        ),
-        None,
-    )
-    has_prefix = isolate_prefix and first_unit_index is not None and any(
-        node.op == "call_function"
-        for node in body_nodes[:first_unit_index]
-    )
-    unit_partition_offset = int(has_prefix)
-    num_unit_executables = (
-        len(unit_ids) + units_per_executable - 1
-    ) // units_per_executable
-    target_num_executables = (
-        num_unit_executables + unit_partition_offset
-    )
-    unit_to_target_partition = {
-        unit_id: unit_partition_offset + index // units_per_executable
-        for index, unit_id in enumerate(unit_ids)
-    }
-    node_to_target_partition = {
-        node: unit_to_target_partition[unit_id]
-        for unit_id, nodes in unit_nodes.items()
-        for node in nodes
-    }
-
-    current_partition = 0
-    target_partition = 0
-    current_unit_id = -1
-    collective_wait_counts = Counter(
-        producer
-        for node in body_nodes
-        if is_wait_tensor(node)
-        and (producer := _collective_producer(node)) is not None
-    )
-    pending_collectives: dict[torch.fx.Node, int] = {}
-    spmd_safe_depth = 0
-    for node in body_nodes:
-      node_unit_id = node_unit_ids[node]
-      starts_unit = node_unit_id >= 0 and node_unit_id != current_unit_id
-      if starts_unit:
-        current_unit_id = node_unit_id
-      if node in node_to_target_partition:
-        target_partition = max(
-            target_partition, node_to_target_partition[node]
-        )
-      if starts_unit and not pending_collectives and spmd_safe_depth == 0:
-        current_partition = target_partition
-
-      collective_producer = _collective_producer(node)
-      if is_wait_tensor(node):
-        if collective_producer not in partition_map:
-          raise ValueError(
-              f"Collective producer for {node.name!r} is not partitioned"
-          )
-        partition_map[node] = partition_map[collective_producer]
-        remaining_waits = pending_collectives[collective_producer] - 1
-        if remaining_waits:
-          pending_collectives[collective_producer] = remaining_waits
-        else:
-          del pending_collectives[collective_producer]
-      elif _is_getitem(node) and collective_producer is not None:
-        if collective_producer not in partition_map:
-          raise ValueError(
-              f"Collective producer for {node.name!r} is not partitioned"
-          )
-        partition_map[node] = partition_map[collective_producer]
-      else:
-        partition_map[node] = current_partition
-        if _is_collective(node):
-          pending_collectives[node] = max(1, collective_wait_counts[node])
-
-      if _is_spmd_region_marker(node, "enter_spmd_safe_region"):
-        spmd_safe_depth += 1
-      elif _is_spmd_region_marker(node, "exit_spmd_safe_region"):
-        spmd_safe_depth -= 1
-        if spmd_safe_depth < 0:
-          raise ValueError("Unbalanced TPU SPMD safe-region exit")
-
-    if pending_collectives:
-      raise ValueError(
-          f"{graph_name.capitalize()} graph has "
-          f"{len(pending_collectives)} unwaited collectives"
-      )
-    if spmd_safe_depth:
-      raise ValueError("Unbalanced TPU SPMD safe-region entry")
-
-  # Stage 3 continued: normalize IDs and verify each unit remains atomic.
+def _materialize_partitioned_graph(
+    gm: torch.fx.GraphModule,
+    partition_map: dict[torch.fx.Node, int],
+    layer_nodes: dict[int, set[torch.fx.Node]],
+    collective_layer_to_partition: dict[str, dict[int, int]] | None = None,
+) -> PartitionedGraph:
   actual_partitions = sorted(set(partition_map.values()))
-  normalized_partitions = {
+  normalized = {
       partition: index for index, partition in enumerate(actual_partitions)
   }
   partition_map = {
-      node: normalized_partitions[partition]
-      for node, partition in partition_map.items()
+      node: normalized[partition] for node, partition in partition_map.items()
   }
-  unit_to_partition = {}
-  for unit_id, nodes in unit_nodes.items():
-    unit_partitions = {partition_map[node] for node in nodes}
-    if len(unit_partitions) != 1:
+
+  layer_to_partition = {}
+  for layer_id, nodes in layer_nodes.items():
+    partitions = {partition_map[node] for node in nodes}
+    if len(partitions) != 1:
       raise ValueError(
-          f"{graph_name.capitalize()} {unit_name} {unit_id} spans "
-          f"partitions {sorted(unit_partitions)}"
+          f"Layer {layer_id} spans partitions {sorted(partitions)}"
       )
-    unit_to_partition[unit_id] = next(iter(unit_partitions))
+    layer_to_partition[layer_id] = next(iter(partitions))
+
   collective_layer_to_partition = {
       kind: {
-          layer_id: normalized_partitions[partition]
+          layer_id: normalized[partition]
           for layer_id, partition in layer_partitions.items()
       }
-      for kind, layer_partitions in raw_collective_layer_partitions.items()
+      for kind, layer_partitions in (
+          collective_layer_to_partition or {}
+      ).items()
   }
-
-  actual_num_executables = len(actual_partitions)
-  if (
-      target_num_executables is not None
-      and actual_num_executables != target_num_executables
-  ):
-    logger.warning(
-        "Targeted %d TPU %s executables, produced %d after preserving %s, "
-        "collective, and SPMD-safe boundaries",
-        target_num_executables,
-        graph_name,
-        actual_num_executables,
-        unit_name,
-    )
-
-  # Stage 4: materialize child GraphModules and retain audit metadata.
   chunked_gm = split_module(gm, None, lambda node: partition_map[node])
   chunked_gm.graph.lint()
   chunked_gm.recompile()
-  if uses_fsdp_schedule:
-    logger.info(
-        "Split TPU %s into %d FSDP-scheduled executables with at most %d "
-        "%ss per executable: compute=%s collectives=%s",
-        graph_name,
-        actual_num_executables,
-        units_per_executable,
-        unit_name,
-        unit_to_partition,
-        collective_layer_to_partition,
-    )
-  else:
-    node_counts = [0] * actual_num_executables
-    chunk_units: list[set[int]] = [
-        set() for _ in range(actual_num_executables)
-    ]
-    for node, partition in partition_map.items():
-      node_counts[partition] += 1
-      unit_id = node_unit_ids[node]
-      if unit_id >= 0:
-        chunk_units[partition].add(unit_id)
-    unit_ranges = [
-        (min(units), max(units)) if units else None
-        for units in chunk_units
-    ]
-    logger.info(
-        "Split TPU %s graph into %d executables (prefix=%s): nodes=%s "
-        "%ss=%s",
-        graph_name,
-        actual_num_executables,
-        has_prefix,
-        node_counts,
-        unit_name,
-        unit_ranges,
-    )
-  return _UnitChunkedGraph(
+  return PartitionedGraph(
       module=chunked_gm,
       partition_map=partition_map,
-      unit_to_partition=unit_to_partition,
+      layer_to_partition=layer_to_partition,
       collective_layer_to_partition=collective_layer_to_partition,
-  )
-
-
-def split_backward_graph_by_fsdp_pipeline(
-    gm: torch.fx.GraphModule,
-    *,
-    n_layers: int,
-    regions_per_executable: int = 1,
-    collective_ownership: Literal["staggered", "region_local"] = "staggered",
-) -> FSDPPipelineChunkedGraph:
-  """Create AG / compute / RS pipeline executables for backward.
-
-  Rematerialization regions and collective chains remain atomic. Staggered
-  ownership overlaps each region's compute with adjacent AG and RS work;
-  region-local ownership keeps all three operations in the same executable.
-  """
-  chunked = _split_graph_by_units(
-      gm,
-      unit_id_fn=_get_layer_id,
-      unit_name="remat region",
-      descending=True,
-      graph_name="backward",
-      isolate_prefix=True,
-      units_per_executable=regions_per_executable,
-      n_layers=n_layers,
-      fsdp_collective_schedule=collective_ownership,
-  )
-  return FSDPPipelineChunkedGraph(
-      module=chunked.module,
-      partition_map=chunked.partition_map,
-      compute_region_to_partition=chunked.unit_to_partition,
-      ag_layer_to_partition=chunked.collective_layer_to_partition["ag"],
-      rs_layer_to_partition=chunked.collective_layer_to_partition["rs"],
-  )
-
-
-def split_backward_graph_by_remat_region(
-    gm: torch.fx.GraphModule,
-    regions_per_executable: int,
-) -> SequentialChunkedGraph:
-  """Split backward into descending, complete rematerialization regions."""
-  return _split_graph_by_units(
-      gm,
-      unit_id_fn=_get_layer_id,
-      unit_name="remat region",
-      descending=True,
-      graph_name="backward",
-      isolate_prefix=True,
-      units_per_executable=regions_per_executable,
   )
 
 
@@ -927,17 +467,294 @@ def split_forward_graph_by_layer(
     layers_per_executable: int,
     *,
     isolate_prefix: bool = False,
-) -> SequentialChunkedGraph:
+) -> PartitionedGraph:
   """Split forward into ascending, complete transformer-layer ranges."""
-  return _split_graph_by_units(
-      gm,
-      unit_id_fn=_get_layer_id,
-      unit_name="layer",
-      descending=False,
-      graph_name="forward",
-      isolate_prefix=isolate_prefix,
-      units_per_executable=layers_per_executable,
+  if layers_per_executable < 1:
+    raise ValueError(
+        "layers_per_executable must be at least 1, got "
+        f"{layers_per_executable}"
+    )
+
+  body_nodes = _body_nodes(gm)
+  node_layer_ids, layer_nodes = _group_nodes_by_layer(body_nodes)
+  layer_ids = sorted(layer_nodes)
+  if not layer_ids:
+    raise ValueError("Cannot split forward: no layer metadata was found")
+
+  first_layer_index = next(
+      index
+      for index, node in enumerate(body_nodes)
+      if node_layer_ids[node] >= 0
   )
+  has_prefix = isolate_prefix and any(
+      node.op == "call_function" for node in body_nodes[:first_layer_index]
+  )
+  partition_offset = int(has_prefix)
+  layer_to_target = {
+      layer_id: partition_offset + index // layers_per_executable
+      for index, layer_id in enumerate(layer_ids)
+  }
+
+  partition_map: dict[torch.fx.Node, int] = {}
+  current_partition = 0
+  target_partition = 0
+  current_layer_id = -1
+  collective_wait_counts = Counter(
+      producer
+      for node in body_nodes
+      if is_wait_tensor(node)
+      and (producer := _collective_producer(node)) is not None
+  )
+  pending_collectives: dict[torch.fx.Node, int] = {}
+  spmd_safe_depth = 0
+  for node in body_nodes:
+    layer_id = node_layer_ids[node]
+    starts_layer = layer_id >= 0 and layer_id != current_layer_id
+    if starts_layer:
+      current_layer_id = layer_id
+      target_partition = max(target_partition, layer_to_target[layer_id])
+      if not pending_collectives and spmd_safe_depth == 0:
+        current_partition = target_partition
+
+    collective_producer = _collective_producer(node)
+    if is_wait_tensor(node):
+      if collective_producer not in partition_map:
+        raise ValueError(
+            f"Collective producer for {node.name!r} is not partitioned"
+        )
+      partition_map[node] = partition_map[collective_producer]
+      remaining_waits = pending_collectives[collective_producer] - 1
+      if remaining_waits:
+        pending_collectives[collective_producer] = remaining_waits
+      else:
+        del pending_collectives[collective_producer]
+    elif _is_getitem(node) and collective_producer is not None:
+      if collective_producer not in partition_map:
+        raise ValueError(
+            f"Collective producer for {node.name!r} is not partitioned"
+        )
+      partition_map[node] = partition_map[collective_producer]
+    else:
+      partition_map[node] = current_partition
+      if _is_collective(node):
+        pending_collectives[node] = max(1, collective_wait_counts[node])
+
+    if _is_spmd_region_marker(node, "enter_spmd_safe_region"):
+      spmd_safe_depth += 1
+    elif _is_spmd_region_marker(node, "exit_spmd_safe_region"):
+      spmd_safe_depth -= 1
+      if spmd_safe_depth < 0:
+        raise ValueError("Unbalanced TPU SPMD safe-region exit")
+
+  if pending_collectives:
+    raise ValueError(
+        f"Forward graph has {len(pending_collectives)} unwaited collectives"
+    )
+  if spmd_safe_depth:
+    raise ValueError("Unbalanced TPU SPMD safe-region entry")
+
+  chunked = _materialize_partitioned_graph(
+      gm, partition_map, layer_nodes
+  )
+  target_count = (
+      len(layer_ids) + layers_per_executable - 1
+  ) // layers_per_executable + partition_offset
+  actual_count = len(set(chunked.partition_map.values()))
+  if actual_count != target_count:
+    logger.warning(
+        "Targeted %d TPU forward executables, produced %d after preserving "
+        "layer, collective, and SPMD-safe boundaries",
+        target_count,
+        actual_count,
+    )
+  logger.info(
+      "Split TPU forward graph into %d executables (prefix=%s): layers=%s",
+      actual_count,
+      has_prefix,
+      chunked.layer_to_partition,
+  )
+  return chunked
+
+
+def _collect_backward_fsdp_owners(
+    gm: torch.fx.GraphModule,
+    *,
+    n_layers: int,
+    collective_chains: dict[torch.fx.Node, set[torch.fx.Node]],
+) -> dict[torch.fx.Node, tuple[str, int]]:
+  _, comms = _collect_bucketed_fsdp_comms(gm, n_layers=n_layers)
+  owners = {
+      comm.launch: (comm.kind, comm.logical_index)
+      for comm in comms
+      if comm.direction == "bwd"
+      and comm.kind in ("ag", "rs")
+      and comm.logical_index is not None
+      and comm.logical_index < n_layers
+  }
+  missing_chains = [
+      launch.name for launch in owners if launch not in collective_chains
+  ]
+  if missing_chains:
+    raise ValueError(
+        "FSDP backward collectives have incomplete chains: "
+        f"{sorted(missing_chains)}"
+    )
+  return owners
+
+
+def _validate_backward_partitions(
+    partition_map: dict[torch.fx.Node, int],
+    collective_chains: dict[torch.fx.Node, set[torch.fx.Node]],
+) -> None:
+  for producer, chain in collective_chains.items():
+    partitions = {partition_map[node] for node in chain}
+    if len(partitions) != 1:
+      raise ValueError(
+          f"Collective {producer.name!r} spans backward partitions "
+          f"{sorted(partitions)}"
+      )
+  for node, partition in partition_map.items():
+    for input_node in node.all_input_nodes:
+      input_partition = partition_map.get(input_node)
+      if input_partition is not None and input_partition > partition:
+        raise ValueError(
+            "Backward split has a reverse dependency: "
+            f"{input_node.name} ({input_partition}) -> "
+            f"{node.name} ({partition})"
+        )
+
+
+def split_backward_graph_by_layer(
+    gm: torch.fx.GraphModule,
+    *,
+    n_layers: int,
+    layers_per_executable: int = 1,
+    pipeline_collectives: bool = False,
+) -> PartitionedGraph:
+  """Split backward by layer, optionally pipelining complete FSDP AG/RS pairs.
+
+  The default keeps attributable FSDP collective chains with their layer and
+  also supports backward graphs with no FSDP collectives. Pipelining requires
+  both AG and RS ownership for every layer so it can safely form fill, overlap,
+  and drain stages.
+  """
+  if n_layers < 1:
+    raise ValueError(f"n_layers must be positive, got {n_layers}")
+  if layers_per_executable < 1:
+    raise ValueError(
+        "layers_per_executable must be at least 1, got "
+        f"{layers_per_executable}"
+    )
+
+  body_nodes = _body_nodes(gm)
+  collective_chains = _collect_collective_chains(gm)
+  collective_nodes: set[torch.fx.Node] = set().union(
+      *collective_chains.values()
+  )
+  _, layer_nodes = _group_nodes_by_layer(
+      body_nodes, excluded=collective_nodes
+  )
+  expected_layers = set(range(n_layers))
+  if set(layer_nodes) != expected_layers:
+    missing = sorted(expected_layers - layer_nodes.keys())
+    unexpected = sorted(layer_nodes.keys() - expected_layers)
+    raise ValueError(
+        "Backward split requires compute metadata for every layer; "
+        f"missing layers {missing}, unexpected layers {unexpected}"
+    )
+
+  layer_ids = sorted(layer_nodes, reverse=True)
+  layer_indices = {
+      layer_id: index for index, layer_id in enumerate(layer_ids)
+  }
+  compute_offset = 2 if pipeline_collectives else 1
+  raw_layer_to_partition = {
+      layer_id: compute_offset + index // layers_per_executable
+      for layer_id, index in layer_indices.items()
+  }
+  owners = _collect_backward_fsdp_owners(
+      gm,
+      n_layers=n_layers,
+      collective_chains=collective_chains,
+  )
+
+  if pipeline_collectives:
+    owned_collectives = set(owners.values())
+    missing_comms = {}
+    for layer_id in layer_ids:
+      missing = tuple(
+          kind
+          for kind in ("ag", "rs")
+          if (kind, layer_id) not in owned_collectives
+      )
+      if missing:
+        missing_comms[layer_id] = missing
+    if missing_comms:
+      raise ValueError(
+          "FSDP backward pipeline requires AG and RS ownership for every "
+          f"layer; missing {missing_comms}"
+      )
+
+  def collective_partition(kind: str, layer_id: int) -> int:
+    if not pipeline_collectives:
+      return raw_layer_to_partition[layer_id]
+    index = layer_indices[layer_id]
+    if kind == "ag":
+      return 1 if index == 0 else 2 + (index - 1) // layers_per_executable
+    if index == len(layer_ids) - 1:
+      return 3 + (len(layer_ids) - 1) // layers_per_executable
+    return 2 + (index + 1) // layers_per_executable
+
+  partition_map: dict[torch.fx.Node, int] = {}
+  raw_collective_partitions: dict[str, dict[int, int]] = {
+      "ag": {},
+      "rs": {},
+  }
+  for launch, (kind, layer_id) in owners.items():
+    partition = collective_partition(kind, layer_id)
+    _assign_partition(
+        partition_map,
+        collective_chains[launch],
+        partition,
+        f"FSDP {kind} layer {layer_id}",
+    )
+    raw_collective_partitions[kind][layer_id] = partition
+
+  for layer_id, nodes in layer_nodes.items():
+    _assign_partition(
+        partition_map,
+        nodes,
+        raw_layer_to_partition[layer_id],
+        f"layer {layer_id}",
+    )
+  for node in body_nodes:
+    if node not in partition_map:
+      partition_map[node] = max(
+          (
+              partition_map[input_node]
+              for input_node in node.all_input_nodes
+              if input_node in partition_map
+          ),
+          default=0,
+      )
+
+  _validate_backward_partitions(partition_map, collective_chains)
+  chunked = _materialize_partitioned_graph(
+      gm,
+      partition_map,
+      layer_nodes,
+      raw_collective_partitions,
+  )
+  logger.info(
+      "Split TPU backward into %d executables with at most %d layers each "
+      "(pipeline_collectives=%s): compute=%s collectives=%s",
+      len(set(chunked.partition_map.values())),
+      layers_per_executable,
+      pipeline_collectives,
+      chunked.layer_to_partition,
+      chunked.collective_layer_to_partition,
+  )
+  return chunked
 
 
 def split_forward_backward_graph(
@@ -1098,13 +915,11 @@ def split_forward_backward_graph(
 
 
 __all__ = [
-    "FSDPPipelineChunkedGraph",
     "GraphSplitter",
-    "SequentialChunkedGraph",
+    "PartitionedGraph",
     "SplitForwardBackwardGraph",
     "SplitForwardBackwardModule",
-    "split_backward_graph_by_fsdp_pipeline",
-    "split_backward_graph_by_remat_region",
+    "split_backward_graph_by_layer",
     "split_forward_backward_graph",
     "split_forward_graph_by_layer",
 ]
