@@ -623,6 +623,39 @@ def qwen3_235b_scan() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_235b_scan_loss_parity() -> TPUTrainerConfig:
+  """`qwen3_235b_scan` pinned to the GPU lane's optimisation settings.
+
+  Trajectory comparison against `qwen3_235b_a22b_loss_parity` on 64 B200 GPUs:
+  same aux-loss balancer, same lr 3e-4 with a 20-step linear warmup over 200
+  steps, the same 640-sequence global batch (5 x 128 TensorCores against the
+  GPU lane's 10 x 64 GPUs), FP32 gradient reduction, seed 42, `c4_test` with
+  the bundled test tokenizer. What differs is what is under test: the decoder
+  runs as one compiled scan with in-body FSDP gathers, host-offloaded layer
+  inputs and Pallas kernels.
+  """
+  cfg = qwen3_235b_scan()
+  cfg.optimizer = default_adamw(lr=3e-4)
+  cfg.optimizer.implementation = "fused"
+  cfg.lr_scheduler = LRSchedulersContainer.Config(
+      warmup_steps=20,
+      total_steps=200,
+      decay_type="linear",
+      min_lr_factor=0.1,
+  )
+  cfg.training.local_batch_size = 5
+  cfg.training.seq_len = 4096
+  cfg.training.steps = 200
+  cfg.training.mixed_precision_reduce = "float32"
+  cfg.metrics.log_freq = 5
+  # The GPU lane uses the canonical global-batch expert frequencies, so undo
+  # the MaxText-parity per-device setting for this comparison. The reduction is
+  # an all-reduce of [E] counts inside the scan body, measured at 0.1 ms.
+  for _, aux, _, _ in cfg.model_spec.model.traverse(MoELoadBalanceAuxLoss.Config):
+    aux.reduce_over_dp = True
+  return cfg
+
+
 def qwen3_moe_30b_scan_proxy() -> TPUTrainerConfig:
   """4 layers of the FSDP-only 30B-A3B recipe as one scan: single-host validation of scan + MoE."""
   cfg = _qwen3_moe_30b_fsdp_only_full_ac()
