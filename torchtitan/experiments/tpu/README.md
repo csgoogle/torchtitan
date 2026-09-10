@@ -194,17 +194,33 @@ To train larger models, use a multi-host configuration on Google Kubernetes Engi
 To provision Cloud TPUs, use one of the following methods:
 
 * **GKE:** Use GKE to provision and manage Cloud TPUs as a pool of accelerators for containerized machine learning workloads. Use the gcloud CLI to create GKE cluster instances manually for precise customization or to expand existing production GKE environments. For more information, see [TPUs in GKE](https://cloud.google.com/kubernetes-engine/docs/concepts/tpus).
-* **GKE and XPK:** The Accelerated Processing Kit (XPK) is a command-line tool that simplifies cluster creation and workload execution on GKE. It is designed for ML practitioners to provision Cloud TPUs and run training jobs without requiring deep Kubernetes expertise. Use XPK to quickly create GKE clusters and run workloads for proof-of-concept testing. For more information, see the [XPK GitHub repository](https://github.com/google/xpk).
+* **GKE and Cluster Toolkit (`gcluster`):** Cluster Toolkit (`gcluster`) is Google Cloud's modular, production-grade framework to deploy and manage AI infrastructure on GKE and submit batch workloads. It simplifies provisioning Cloud TPUs and running distributed training jobs using Kubernetes JobSet and Kueue without requiring manual YAML authoring. For more information, see the [Cluster Toolkit documentation](https://cloud.google.com/cluster-toolkit/docs/overview) and [GitHub repository](https://github.com/GoogleCloudPlatform/cluster-toolkit).
 * **GKE and TPU Cluster Director:** TPU Cluster Director is available through an All Capacity mode reservation, providing full access to reserved capacity without hold-backs. This mode offers full visibility into TPU hardware topology, utilization, and health status. For more information, see the [All Capacity mode overview](https://www.google.com/search?q=https://docs.cloud.google.com/tpu/docs/all-capacity-mode-overview).
 
-In this document, you use GKE managed by XPK. XPK is a command-line tool designed to simplify provisioning, managing, and running machine learning workloads.
+In this document, you use GKE managed by Cluster Toolkit (`gcluster`). Cluster Toolkit is Google Cloud's toolchain designed to simplify provisioning, managing, and running machine learning workloads.
 
-### Install XPK and its dependencies
+### Install Cluster Toolkit (`gcluster`) and its dependencies
 
-1. **Install XPK:** Follow the installation instructions in the [XPK GitHub repository](https://github.com/google/xpk).
+1. **Install Cluster Toolkit (`gcluster`):** Follow the installation instructions in the [Cluster Toolkit GitHub repository](https://github.com/GoogleCloudPlatform/cluster-toolkit):
 
 ```bash
-pip install xpk
+# Detect OS and Architecture
+OS_NAME=$(uname -s | tr '[:upper:]' '[:lower:]')
+CT_OS=$([ "$OS_NAME" = "darwin" ] && echo "mac" || echo "$OS_NAME")
+CT_ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+
+# Fetch the latest release tag
+CT_VERSION=$(curl -s https://api.github.com/repos/GoogleCloudPlatform/cluster-toolkit/releases/latest | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p')
+if [ -z "$CT_VERSION" ]; then
+  CT_VERSION="v1.103.0"
+fi
+
+mkdir -p ~/cluster-toolkit && cd ~/cluster-toolkit
+curl -fSL "https://github.com/GoogleCloudPlatform/cluster-toolkit/releases/download/${CT_VERSION}/gcluster_bundle_${CT_OS}_${CT_ARCH}.tgz" | tar -xz
+
+# Add gcluster to your PATH
+export PATH="$HOME/cluster-toolkit:$PATH"
+gcluster --version
 
 ```
 
@@ -225,7 +241,7 @@ export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
 export ACCELERATOR_TYPE=YOUR_ACCELERATOR_TYPE
-export BUCKET_NAME="gs://YOUR_BUCKET_NAME"
+export BUCKET_NAME="YOUR_BUCKET_NAME"
 export REPOSITORY=YOUR_REPOSITORY
 
 ```
@@ -236,13 +252,13 @@ Replace the following placeholders:
 * `YOUR_ZONE`: The zone where the cluster will be created. For TPU availability, see [Cloud TPU regions and zones](https://docs.cloud.google.com/tpu/docs/regions-zones) and your project's **Quotas** page.
 * `YOUR_CLUSTER_NAME`: The name of the new GKE cluster.
 * `YOUR_ACCELERATOR_TYPE`: The TPU version and topology (for example, `v6e-32`).
-* `YOUR_BUCKET_NAME`: The name of your Cloud Storage bucket for output.
+* `YOUR_BUCKET_NAME`: The name of your Cloud Storage bucket for output (without `gs://` prefix).
 * `YOUR_REPOSITORY`: The name of your Artifact Registry repository (for example, `test`).
 
 4. **Optional: Create a Cloud Storage bucket:**
 
 ```bash
-gcloud storage buckets create ${REPOSITORY} \
+gcloud storage buckets create gs://${BUCKET_NAME} \
     --project=${PROJECT_ID} \
     --location=US \
     --default-storage-class=STANDARD \
@@ -252,63 +268,20 @@ gcloud storage buckets create ${REPOSITORY} \
 
 ### Create a single-NIC, single-slice cluster
 
-We recommend using a custom network with an MTU of 8,896 for optimal performance.
+We recommend using Cluster Toolkit blueprints to provision the GKE cluster with Kueue and JobSet enabled.
 
-#### Option 1: Custom network (Recommended)
-
-1. Set the network environment variables:
+1. Clone the Cluster Toolkit reference repository:
 
 ```bash
-export NETWORK_NAME=YOUR_NETWORK_NAME
-export NETWORK_FW_NAME=YOUR_FIREWALL_NAME
-
+git clone https://github.com/GoogleCloudPlatform/cluster-toolkit.git
+cd cluster-toolkit
 ```
 
-2. Create the network and firewall rule:
+2. Deploy the TPU cluster using the reference blueprint:
 
 ```bash
-gcloud compute networks create ${NETWORK_NAME} \
-    --mtu=8896 \
-    --project=${PROJECT_ID} \
-    --subnet-mode=auto \
-    --bgp-routing-mode=regional
-
-gcloud compute firewall-rules create ${NETWORK_FW_NAME} \
-    --network=${NETWORK_NAME} \
-    --allow tcp,icmp,udp \
-    --project=${PROJECT_ID}
-
-```
-
-3. Create the cluster with optimized network settings:
-
-```bash
-export CLUSTER_ARGUMENTS="--network=${NETWORK_NAME} --subnetwork=${NETWORK_NAME}"
-
-xpk cluster create --cluster=${CLUSTER_NAME} \
-    --cluster-cpu-machine-type=n1-standard-8 \
-    --num-slices=1 \
-    --tpu-type=${ACCELERATOR_TYPE} \
-    --zone=${ZONE} \
-    --project=${PROJECT_ID} \
-    --on-demand \
-    --custom-cluster-arguments="${CLUSTER_ARGUMENTS}"
-
-```
-
-#### Option 2: Default network
-
-Create the cluster using default network settings:
-
-```bash
-xpk cluster create --cluster=${CLUSTER_NAME} \
-    --cluster-cpu-machine-type=n1-standard-8 \
-    --num-slices=1 \
-    --tpu-type=${ACCELERATOR_TYPE} \
-    --zone=${ZONE} \
-    --project=${PROJECT_ID} \
-    --on-demand
-
+gcluster deploy examples/gke-tpu-v6e/gke-tpu-v6e.yaml \
+    --vars project_id=${PROJECT_ID},region=${ZONE%-*},zone=${ZONE},deployment_name=${CLUSTER_NAME},machine_type=ct6e-standard-4t,tpu_topology=4x4,num_slices=1,authorized_cidr=0.0.0.0/0
 ```
 
 ### Build the TorchTitan TPU-enabled Docker image
@@ -370,22 +343,12 @@ docker push us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-co
 
 ```
 
-#### Optional: Attach Cloud Storage FUSE storage
+#### Storage Mounting with Cloud Storage FUSE
 
-To make data in Cloud Storage accessible to TorchTitan and to export logs and profiles, you can mount a bucket using Cloud Storage FUSE. This allows the bucket to appear as a local directory. For more information, see [XPK storage usage](https://github.com/AI-Hypercomputer/xpk/blob/main/docs/usage/storage.md).
+In Cluster Toolkit (`gcluster`), storage mounting is configured inline during workload submission via the `--mount` flag, eliminating the need for separate attachment steps.
 
 ```bash
-xpk storage attach my-gcsfuse-storage \
-  --type=gcsfuse \
-  --project=${PROJECT_ID} \
-  --cluster=${CLUSTER_NAME} \
-  --zone=${ZONE} \
-  --mount-point=/data \
-  --readonly=false \
-  --bucket=${BUCKET_NAME} \
-  --size=1 \
-  --auto-mount=false
-
+--mount "gs://${BUCKET_NAME};/data;rw;options=implicit-dirs"
 ```
 
 #### Deploy the training workload
@@ -393,21 +356,22 @@ xpk storage attach my-gcsfuse-storage \
 The following sample demonstrates Llama 8B training on a `v6e-32` using FSDP:
 
 ```bash
-export WORKLOAD_NAME=torchtitan-llama3-8b-xpk
+export WORKLOAD_NAME=torchtitan-llama3-8b
 
-# if using GCSFUSE, set the following parameters:
+# Note: Workload names must not exceed 28 characters due to Kubernetes DNS-1123 limits.
+# If using GCS FUSE, configure the dataset and assets paths within the mounted folder:
 # --dump_folder="/data/assets/hf/Llama-3.1-8B"
 # --dataloader.dataset_path="/data/assets/hf/Llama-3.1-8B"
 # --hf_assets_path="/data/assets/hf/Llama-3.1-8B"
-xpk workload create \
-    --workload=$WORKLOAD_NAME \
+gcluster job submit \
+    --name=$WORKLOAD_NAME \
     --cluster=$CLUSTER_NAME \
-    --zone=$ZONE \
+    --location=$ZONE \
     --project=$PROJECT_ID \
-    --tpu-type=$ACCELERATOR_TYPE \
+    --compute-type=$ACCELERATOR_TYPE \
     --num-slices=1 \
-    --docker-image="us-central1-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/torchtitan-container:latest" \
-    --storage=my-gcsfuse-storage \
+    --image="us-central1-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/torchtitan-container:latest" \
+    --mount="gs://${BUCKET_NAME};/data;rw;options=implicit-dirs" \
     --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
     --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
     --command 'torchrun \
@@ -443,6 +407,23 @@ xpk workload create \
 
 ---
 
+### Inspect and monitor workloads
+
+Cluster Toolkit provides subcommands to monitor, inspect, and stream logs from running workloads:
+
+```bash
+# List submitted workloads and statuses
+gcluster job list --cluster=${CLUSTER_NAME} --location=${ZONE} --project=${PROJECT_ID}
+
+# Stream real-time container logs (--main-only filters sidecar logs)
+gcluster job logs $WORKLOAD_NAME --cluster=${CLUSTER_NAME} --location=${ZONE} --project=${PROJECT_ID} --follow --main-only
+
+# Inspect job health and Kueue scheduling conditions
+gcluster job inspect --name $WORKLOAD_NAME --cluster=${CLUSTER_NAME} --location=${ZONE} --project=${PROJECT_ID} --show
+```
+
+---
+
 ### Profile workloads using TensorBoard
 
 TorchTitan on TorchTPU integrates with a profiler to export profiling data for trained models. Use the `--profiling.enable-profiling` flag to enable profiling and the `--profiling...` flags for configuration.
@@ -462,7 +443,7 @@ pip install xprof
 To view the profile captured for your TorchTitan training job, run:
 
 ```bash
-tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-llama3-8b-xpk/rank_0
+tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-llama3-8b/rank_0
 
 ```
 
@@ -471,10 +452,10 @@ tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-llama3-8b-xpk/rank_0
 To avoid incurring unnecessary charges, delete your resources when you are finished:
 
 ```bash
-# Delete the XPK workload.
-xpk workload delete --workload torchtitan-llama3-8b-xpk --cluster ${CLUSTER_NAME}
+# Cancel and delete the workload.
+gcluster job cancel $WORKLOAD_NAME --cluster=${CLUSTER_NAME} --location=${ZONE} --project=${PROJECT_ID}
 
-# Delete the GKE cluster.
-xpk cluster delete --cluster ${CLUSTER_NAME}
+# Destroy the GKE cluster deployment.
+gcluster destroy ${CLUSTER_NAME}
 
 ```
