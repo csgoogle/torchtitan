@@ -24,7 +24,7 @@ from typing import Any
 import torch
 import torch.distributed._functional_collectives as funcol
 from torch import nn
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from torchtitan.tools.logging import logger
 
@@ -45,12 +45,17 @@ class ScanFSDPSpec:
             whatever dtype the forward gathered in.
         sharded: ``False`` for a parameter SimpleFSDP left replicated. Nothing
             to gather in the forward; the gradient still has to be summed.
+        replicate_group_name: under ``hybrid_shard``, the process group of the
+            *replicate* mesh axis; ``None`` for a 1-D dp mesh. The forward needs
+            nothing from it -- the weight is already replicated along it -- but
+            the gradient is ``Partial`` on it and has to be summed.
     """
 
     group_name: str
     param_dtype: torch.dtype | None
     reduce_dtype: torch.dtype | None
     sharded: bool
+    replicate_group_name: str | None = None
 
 
 class _AllGatherReduceScatter(torch.autograd.Function):
@@ -72,8 +77,10 @@ class _AllGatherReduceScatter(torch.autograd.Function):
         group_name: str,
         param_dtype: torch.dtype | None,
         reduce_dtype: torch.dtype | None,
+        replicate_group_name: str | None,
     ) -> torch.Tensor:
         ctx.group_name = group_name
+        ctx.replicate_group_name = replicate_group_name
         ctx.reduce_dtype = reduce_dtype
         ctx.shard_dtype = shard.dtype
         if param_dtype is not None:
@@ -87,7 +94,12 @@ class _AllGatherReduceScatter(torch.autograd.Function):
         out = funcol.reduce_scatter_tensor(
             grad, reduceOp="sum", scatter_dim=0, group=ctx.group_name
         )
-        return out.to(ctx.shard_dtype), None, None, None
+        if ctx.replicate_group_name is not None:
+            # HSDP: the gradient is Partial on the replicate axis too. Reduce it
+            # after the scatter, not before -- same sum, on a tensor that is
+            # already `1/shard_degree` the size.
+            out = funcol.all_reduce(out, "sum", group=ctx.replicate_group_name)
+        return out.to(ctx.shard_dtype), None, None, None, None
 
 
 class _ReduceGradOnly(torch.autograd.Function):
@@ -132,11 +144,20 @@ def gather_slice(shard: torch.Tensor, spec: ScanFSDPSpec | None) -> torch.Tensor
         if not spec.group_name:
             # No mesh at all, so no other rank holds a gradient to add.
             return shard if spec.param_dtype is None else shard.to(spec.param_dtype)
+        # Replicated on every axis it has, so the gradient is `Partial` on
+        # every axis and each one needs its own sum.
         return _ReduceGradOnly.apply(
-            shard, (spec.group_name,), spec.param_dtype, spec.reduce_dtype
+            shard,
+            tuple(g for g in (spec.group_name, spec.replicate_group_name) if g),
+            spec.param_dtype,
+            spec.reduce_dtype,
         )
     return _AllGatherReduceScatter.apply(
-        shard, spec.group_name, spec.param_dtype, spec.reduce_dtype
+        shard,
+        spec.group_name,
+        spec.param_dtype,
+        spec.reduce_dtype,
+        spec.replicate_group_name,
     )
 
 
@@ -174,13 +195,21 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
             continue
 
         mesh = param.device_mesh
-        if mesh.ndim != 1:
+        # 1-D: `fully_shard`, one Shard placement. 2-D: `hybrid_shard`, which
+        # SimpleFSDP builds as exactly (Replicate(), Shard(dim)) over
+        # ("dp_replicate", "fsdp") -- so the shard axis is the last one, and the
+        # first contributes only the backward all-reduce.
+        if mesh.ndim == 1:
+            replicate_group_name = None
+        elif mesh.ndim == 2 and isinstance(param.placements[0], Replicate):
+            replicate_group_name = mesh.get_group(0).group_name
+        else:
             raise ValueError(
-                f"the scan body's gather needs a 1-D dp mesh, got {mesh.ndim}-D "
-                f"for {name}; hybrid_shard would need one collective per mesh "
-                "dim inside the loop"
+                "the scan body's gather understands a 1-D dp mesh or a 2-D "
+                f"hybrid_shard mesh, got {mesh.ndim}-D with placements "
+                f"{param.placements} for {name}"
             )
-        placement = param.placements[0]
+        placement = param.placements[-1]
         if isinstance(placement, Shard):
             if placement.dim != 1:
                 raise ValueError(
@@ -188,27 +217,39 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
                     "scan axis and the body gathers dim 1 (= dim 0 of the "
                     "per-layer weight)"
                 )
-            if param.shape[1] % mesh.size():
+            # Only the last axis shards the tensor, so only its degree matters.
+            # `mesh.size()` is every axis multiplied together, which under
+            # hybrid_shard asks for `replicate * shard` and rejects sizes that
+            # shard fine.
+            shard_degree = mesh.size(mesh.ndim - 1)
+            if param.shape[1] % shard_degree:
                 # Uneven shards. `redistribute` pads around its all-gather, so
                 # the unrolled path handles them; a bare collective cannot.
                 raise ValueError(
-                    f"{name} has dim 1 = {param.shape[1]}, which {mesh.size()} "
+                    f"{name} has dim 1 = {param.shape[1]}, which {shard_degree} "
                     "ranks cannot shard evenly, and the scan body's all-gather "
                     "needs equal shards"
                 )
             sharded = True
             n_sharded += 1
-        else:
+        elif isinstance(placement, Replicate):
             # `data_parallel` downgrades Shard to Replicate when dim 1 is
             # smaller than the mesh. Mirror that: no gather, but keep the
             # group, because the backward still has to sum the gradient.
             sharded = False
-        # The mesh is 1-D, checked above, so it names exactly one group.
+        else:
+            # `Partial` would reach the body as a tensor still owing a sum, and
+            # skipping it here would read it as a finished weight.
+            raise ValueError(
+                f"{name} is {placement} on the shard axis, and the scan body's "
+                "gather handles only Shard and Replicate"
+            )
         plan[name] = ScanFSDPSpec(
-            group_name=mesh.get_group().group_name,
+            group_name=mesh.get_group(mesh.ndim - 1).group_name,
             param_dtype=param_dtype,
             reduce_dtype=reduce_dtype,
             sharded=sharded,
+            replicate_group_name=replicate_group_name,
         )
 
     logger.info(
