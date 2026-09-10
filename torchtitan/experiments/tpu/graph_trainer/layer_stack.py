@@ -75,6 +75,7 @@ from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
 )
 from torchtitan.models.common.decoder import LayerDict
+from torchtitan.models.common.moe import MoE
 from torchtitan.tools.logging import logger
 
 
@@ -297,6 +298,16 @@ class LayerStack:
             )
         model.layers = StackedLayers(model.layers, self, use_scan=use_scan)
         self.layers = model.layers
+        if use_scan:
+            for name, module in self.layers["0"].named_modules():
+                if isinstance(module, MoE) and module.load_balance_coeff is not None:
+                    raise ValueError(
+                        f"{name}: --tpu-config.use-scan-layers cannot run an MoE "
+                        "with the expert-bias balancer (load_balance_coeff): it "
+                        "counts routed tokens into a per-layer buffer that an "
+                        "optimizer hook reads, and a scan body cannot write to a "
+                        "buffer. Use the aux-loss balancer (aux_loss_coeff)."
+                    )
 
     # -- running the layers ------------------------------------------------
 
@@ -363,6 +374,20 @@ class LayerStack:
             param = self.holder._parameters[_mangle(name)]
             xs[_mangle(name)] = param.to_local() if isinstance(param, DTensor) else param
 
+        # An MoE layer counts its routed tokens into `tokens_per_expert_E` in
+        # place. The body may not write to a captured buffer -- and it is one
+        # buffer shared by every layer anyway -- so each iteration counts into
+        # zeros of its own and the count is dropped. Nothing reads it: the
+        # aux-loss balancer does not, and the expert-bias balancer, which
+        # does, is rejected in `install`.
+        expert_counts = {
+            f"{name}.tokens_per_expert_E" if name else "tokens_per_expert_E": (
+                module.tokens_per_expert_E
+            )
+            for name, module in template.named_modules()
+            if isinstance(module, MoE)
+        }
+
         def body(carry, slices):
             # `slices` holds one layer's shard of each stack; `gather_slice`
             # makes it whole. Layer 0's module then stands in for every layer,
@@ -376,6 +401,9 @@ class LayerStack:
                 )
                 for name in self.names
             }
+            params.update(
+                {name: torch.zeros_like(buf) for name, buf in expert_counts.items()}
+            )
             out = functional_call(template, params, (carry, *args))
             # `scan` rejects a body that returns no per-iteration output, so
             # emit the cheapest possible one and drop it; only the carry is used.

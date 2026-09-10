@@ -579,6 +579,9 @@ def _30b_a3b_global_aux(
 def _235b_a22b(
     attn_backend: str,
     moe_comm_backend: str = "standard",
+    *,
+    load_balance_coeff: float | None = 1e-3,
+    aux_loss_coeff: float | None = None,
 ) -> Qwen3Model.Config:
     dim = 4096
     head_dim = 128
@@ -613,7 +616,21 @@ def _235b_a22b(
                 theta=5000000.0,
             ),
             moe_comm_backend=moe_comm_backend,
+            load_balance_coeff=load_balance_coeff,
+            aux_loss_coeff=aux_loss_coeff,
         ),
+    )
+
+
+def _235b_a22b_global_aux(
+    attn_backend: str,
+    moe_comm_backend: str = "standard",
+) -> Qwen3Model.Config:
+    return _235b_a22b(
+        attn_backend,
+        moe_comm_backend,
+        load_balance_coeff=None,
+        aux_loss_coeff=1e-3,
     )
 
 
@@ -630,6 +647,7 @@ qwen3_configs = {
     "30B-A3B": _30b_a3b,
     "30B-A3B-global-aux": _30b_a3b_global_aux,
     "235B-A22B": _235b_a22b,
+    "235B-A22B-global-aux": _235b_a22b_global_aux,
 }
 
 

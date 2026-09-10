@@ -521,6 +521,111 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+def _enable_fsdp_only_pallas_experts(cfg: TPUTrainerConfig) -> None:
+  """Local dropless dispatch with the Pallas grouped matmuls, no expert parallelism.
+
+  Same expert-kernel and splash settings as ``_qwen3_moe_30b_fsdp_only_full_ac``;
+  kept separate so a different model flavor can reuse them.
+  """
+  assert cfg.model_spec is not None
+  for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
+    experts.use_pallas_grouped_mm = True
+    experts.use_pallas_paired_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+    experts.use_kernel_native_weight_layout = True
+  cfg.splash_attention_kernel = SplashAttentionKernelConfig(
+      use_splash_attention_kernel=True,
+      use_vmap_bwd=True,
+      sa_use_document_aware_block_skipping=False,
+      sa_q_layout="SEQ_MINOR",
+      sa_k_layout="SEQ_MINOR",
+      sa_block_q=1024,
+      sa_block_kv=1024,
+      sa_block_dkv=1024,
+      sa_block_kv_compute=512,
+      sa_block_q_dkv=2048,
+      sa_block_kv_dkv=2048,
+      sa_block_kv_dkv_compute=1024,
+      sa_block_q_dq=1024,
+      sa_block_kv_dq=1024,
+  )
+  cfg.loss_kernel = LossKernelConfig(use_loss_kernel=False)
+  _enable_pallas_cross_entropy(cfg)
+
+
+def _enable_scan_layers(cfg: TPUTrainerConfig) -> None:
+  """Run the decoder as one scan under the graph trainer with the stacked layer
+  input offloaded inside the loop bodies (same recipe as llama3's
+  ``llama3_405b_scan``), with the eager fused AdamW."""
+  cfg.parallelism = ParallelismConfig(
+      use_simple_fsdp=True,
+      enable_tpu_topo_mesh=True,
+      data_parallel_shard_degree=-1,
+      expert_parallel_degree=1,
+  )
+  cfg.tpu_config = TPUConfig(
+      use_graph_trainer=True,
+      compile_mode="aot_fx_trace",
+      graph_trainer_memory_policy="full_and_scan_offload",
+      use_scan_layers=True,
+      enable_fused_optimizer=True,
+  )
+  cfg.optimizer.implementation = "fused"
+  cfg.compile = CompileConfig(
+      enable=True,
+      backend="tpu",
+      components=["model"],
+  )
+  # The routing metrics are captured by the MoE layer writing sidecar
+  # attributes during forward, which a scan body cannot do.
+  cfg.metrics.enable_moe_routing = False
+  cfg.checkpoint = CheckpointManager.Config(enable=False)
+  cfg.validator = Validator.Config(enable=False)
+
+
+def qwen3_235b_scan() -> TPUTrainerConfig:
+  """Qwen3-235B-A22B, FSDP-only with local dropless Pallas experts, decoder as one scan.
+
+  Uses the aux-loss balancer (the global-aux flavor, as the 30B recipes do):
+  the expert-bias balancer counts routed tokens into a buffer inside the layer,
+  which a scan body cannot write back.
+  """
+  cfg = qwen3_moe_30b()
+  cfg.model_spec = model_registry(
+      "235B-A22B-global-aux",
+      attn_backend="sdpa",
+      converters=[
+          TpuTokenDispatcherConverter.Config(),
+          TpuGroupedExpertsConverter.Config(),
+      ],
+  )
+  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
+  _enable_fsdp_only_pallas_experts(cfg)
+  _enable_scan_layers(cfg)
+  cfg.training.local_batch_size = 4
+  cfg.training.global_batch_size = -1
+  cfg.training.seq_len = 4096
+  cfg.training.steps = 1000
+  cfg.metrics.log_freq = 5
+  return cfg
+
+
+def qwen3_moe_30b_scan_proxy() -> TPUTrainerConfig:
+  """4 layers of the FSDP-only 30B-A3B recipe as one scan: single-host validation of scan + MoE."""
+  cfg = _qwen3_moe_30b_fsdp_only_full_ac()
+  assert cfg.model_spec is not None
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  model_config.layers = model_config.layers[:4]
+  _enable_scan_layers(cfg)
+  cfg.training.local_batch_size = 2
+  cfg.training.global_batch_size = -1
+  cfg.training.seq_len = 2048
+  cfg.training.steps = 5
+  cfg.metrics.log_freq = 1
+  return cfg
+
+
 def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
   """Proxy model for Qwen3 30B MoE (4 layers instead of 48) for testing/iterations."""
   cfg = qwen3_moe_30b()
