@@ -350,6 +350,14 @@ def llama3_405b_scan() -> TPUTrainerConfig:
   return _enable_scan_layers(llama3_405b())
 
 
+def llama3_405b_scan_lr8e5() -> TPUTrainerConfig:
+  """``llama3_405b_scan`` with upstream's 405B learning rate (8e-5 instead of the
+  70B-derived 3e-4); the lr lives in a param-group dict, so it is not CLI-addressable."""
+  config = llama3_405b_scan()
+  config.optimizer = default_adamw(lr=8e-5)
+  return config
+
+
 def llama3_debugmodel_scan() -> TPUTrainerConfig:
   """Debug-scale twin of ``llama3_405b_scan`` for single-host validation."""
   return _enable_scan_layers(llama3_debugmodel())
