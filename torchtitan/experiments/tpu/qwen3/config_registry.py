@@ -612,7 +612,10 @@ def qwen3_235b_scan() -> TPUTrainerConfig:
   for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
     experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
   _enable_scan_layers(cfg)
-  cfg.training.local_batch_size = 4
+  # 16 is MaxText's per-device batch for this model and the largest that fits
+  # (peak 87.9 of 94.7 GiB on 64 v7x chips); 1,827 tokens/s/device there,
+  # 1,903 with --training.mixed_precision_reduce=bfloat16.
+  cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = -1
   cfg.training.seq_len = 4096
   cfg.training.steps = 1000
