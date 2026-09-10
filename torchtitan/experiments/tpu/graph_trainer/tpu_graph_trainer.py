@@ -37,7 +37,7 @@ from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.functional import (
     functional_adamw_step,
-    update_model_and_optstate_buffers,
+    rebind_model_and_optstate_buffers,
 )
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
@@ -467,14 +467,16 @@ class TpuGraphTrainer(GraphTrainer):
                 [model], list(outputs[2 + 3 * n :])
             )
 
-        from torchtitan.experiments.tpu.compiled_optimizers.functional import update_model_and_optstate_buffers
-
-        update_model_and_optstate_buffers(
+        # The step program donates the parameter / moment inputs to its outputs
+        # (tpu_backend_pass.donated_input_indices), so the inputs are consumed
+        # and the outputs replace them instead of being copied back.
+        rebind_model_and_optstate_buffers(
             model,
             self._optstate_param_fqns,
             new_params,
             new_exp_avgs,
             new_exp_avg_sqs,
+            fqn_to_canonical=self._optstate_fqn_to_canonical,
         )
         model._optstate_step.copy_(
             new_step.detach() if isinstance(new_step, torch.Tensor) else new_step

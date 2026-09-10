@@ -13,7 +13,7 @@ import functools
 import logging
 import os
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 
@@ -40,6 +40,7 @@ def _import_static_compiler():
 def tpu_backend_compile_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple,
+    donated_inputs: Sequence[int] = (),
 ) -> torch.fx.GraphModule:
     """Terminal pass in the TPU graph pipeline: lowers gm into a static XLA binary.
 
@@ -97,7 +98,14 @@ def tpu_backend_compile_pass(
 
     t0 = time.time()
     logger.info("[tpu_backend_pass] StaticCompiler(gm, example_inputs) ...")
-    executable = StaticCompiler()(gm, list(example_inputs))
+    if donated_inputs:
+        logger.info(
+            f"[tpu_backend_pass] donating {len(donated_inputs)} inputs to their "
+            "outputs (parameters + optimizer state)"
+        )
+    executable = StaticCompiler()(
+        gm, list(example_inputs), donated_inputs=list(donated_inputs) or None
+    )
     elapsed = time.time() - t0
     logger.info(
         f"[tpu_backend_pass] StaticCompiler ready in {elapsed:.1f}s "
@@ -118,6 +126,47 @@ def tpu_backend_compile_pass(
 
     gm.forward = _compiled_forward  # type: ignore[method-assign]
     return gm
+
+
+def donated_input_indices(
+    state_fqns: Sequence[str],
+    input_subclass_layouts: Mapping[int, Any],
+) -> list[int]:
+    """Graph-input indices of the parameters and AdamW moments updated in-graph.
+
+    The in-graph optimizer returns a fresh tensor for every parameter,
+    ``exp_avg`` and ``exp_avg_sq`` it owns. Without donation XLA keeps the input
+    and the output copies of all three resident at once; donating the inputs
+    lets it alias them (``jax.buffer_donor`` -> ``input_output_alias``).
+
+    A parameter is optimizer-owned iff ``_register_optimizer_buffers`` gave it a
+    sibling ``_optstate_<leaf>_exp_avg`` buffer; the moments are the
+    ``_optstate_*_exp_avg`` / ``_optstate_*_exp_avg_sq`` buffers themselves
+    (``_optstate_step`` / ``_optstate_lr`` are not donated). ``state_fqns`` are
+    the leading graph inputs in order; a wrapper-subclass state leaf (a DTensor
+    parameter) occupies ``input_subclass_layouts[i].num_tensors`` consecutive
+    plain graph inputs, all of which are donated.
+    """
+    names = set(state_fqns)
+
+    def _optstate_sibling(fqn: str, kind: str) -> str:
+        parent, _, leaf = fqn.rpartition(".")
+        return f"{parent}._optstate_{leaf}_{kind}" if parent else f"_optstate_{leaf}_{kind}"
+
+    donated: list[int] = []
+    flat_index = 0
+    for i, fqn in enumerate(state_fqns):
+        leaf = fqn.rpartition(".")[2]
+        is_moment = leaf.startswith("_optstate_") and (
+            leaf.endswith("_exp_avg") or leaf.endswith("_exp_avg_sq")
+        )
+        is_owned_param = _optstate_sibling(fqn, "exp_avg") in names
+        layout = input_subclass_layouts.get(i)
+        width = layout.num_tensors if layout is not None else 1
+        if is_moment or is_owned_param:
+            donated.extend(range(flat_index, flat_index + width))
+        flat_index += width
+    return donated
 
 
 def construct_tpu_pass_pipeline(
@@ -220,7 +269,18 @@ def construct_tpu_pass_pipeline(
                 )
             )
 
-    passes.append(tpu_backend_compile_pass)
+    if config.tpu_config.optimizer_in_graph:
+        passes.append(
+            functools.partial(
+                tpu_backend_compile_pass,
+                donated_inputs=donated_input_indices(
+                    traced_result.state_fqns,
+                    traced_result.input_subclass_layouts,
+                ),
+            )
+        )
+    else:
+        passes.append(tpu_backend_compile_pass)
     return passes
 
 
@@ -237,6 +297,7 @@ def register() -> None:
 
 __all__ = [
     "tpu_backend_compile_pass",
+    "donated_input_indices",
     "construct_tpu_pass_pipeline",
     "register",
     "PASS_PIPELINE_REGISTRY",
