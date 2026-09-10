@@ -602,6 +602,10 @@ def qwen3_235b_scan() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   _enable_fsdp_only_pallas_experts(cfg)
+  # At 4096 x 1536 the paired dWeight kernel's full-K accumulators and output
+  # slabs need 105 MB of VMEM (64 MB scoped); 4 K slabs bring it under 30 MB.
+  for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
   _enable_scan_layers(cfg)
   cfg.training.local_batch_size = 4
   cfg.training.global_batch_size = -1
