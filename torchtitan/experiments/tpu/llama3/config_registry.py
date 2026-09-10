@@ -28,6 +28,7 @@ from torchtitan.hf_datasets.text_datasets import (
     HuggingFaceTextDataLoader,
 )
 from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama as tpu_parallelize_llama
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.models.llama3.config_registry import model_registry
 
 
@@ -313,6 +314,45 @@ def llama3_405b() -> TPUTrainerConfig:
           use_loss_kernel=True,
       ),
   )
+
+
+_FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
+
+
+def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
+  """Select the fused loss and its pre-construction LM-head override together.
+
+  Same mechanism as the qwen3 registry. The legacy ``loss_kernel.use_loss_kernel``
+  path swaps the LM head in ``workarounds.apply_patches`` but leaves
+  ``config.loss`` as plain cross entropy, which the graph trainer then feeds the
+  wrapper's ``(hidden, weight.T)`` tuple -- so it is turned off here.
+  """
+  config.loss = PallasCrossEntropyLoss.Config()
+  if _FUSED_LOSS_OVERRIDE not in config.override.imports:
+    config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+  config.loss_kernel.use_loss_kernel = False
+
+
+def _enable_scan_layers(config: TPUTrainerConfig) -> TPUTrainerConfig:
+  """Run the decoder as one scan under the graph trainer, offloading the stacked
+  layer input inside the loop bodies (PRs 353-361, 373, 374)."""
+  config.parallelism.use_simple_fsdp = True
+  config.tpu_config.use_graph_trainer = True
+  config.tpu_config.compile_mode = "aot_fx_trace"
+  config.tpu_config.use_scan_layers = True
+  config.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  _enable_pallas_cross_entropy(config)
+  return config
+
+
+def llama3_405b_scan() -> TPUTrainerConfig:
+  """Llama3 405B as ``llama3_405b`` plus scan-over-layers + in-loop offload."""
+  return _enable_scan_layers(llama3_405b())
+
+
+def llama3_debugmodel_scan() -> TPUTrainerConfig:
+  """Debug-scale twin of ``llama3_405b_scan`` for single-host validation."""
+  return _enable_scan_layers(llama3_debugmodel())
 
 
 def sft_llama3_8b_metamath() -> TPUTrainerConfig:
