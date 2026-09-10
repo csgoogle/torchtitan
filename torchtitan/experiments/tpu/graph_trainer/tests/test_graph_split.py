@@ -28,8 +28,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
 )
 from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_lib
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
-    split_backward_graph_by_fsdp_pipeline,
-    split_backward_graph_by_remat_region,
+    split_backward_graph_by_layer,
     split_forward_graph_by_layer,
     split_forward_backward_graph,
 )
@@ -107,6 +106,7 @@ class GraphSplitTest(absltest.TestCase):
       *,
       n_layers: int,
       reduce_dtype: torch.dtype = torch.float32,
+      fsdp_reshard_after_forward: str = "always",
   ):
     """Trace the shared model through real SimpleFSDP with fake collectives."""
 
@@ -137,7 +137,7 @@ class GraphSplitTest(absltest.TestCase):
 
     return self._apply_passes_and_split(
         traced,
-        fsdp_reshard_after_forward="always",
+        fsdp_reshard_after_forward=fsdp_reshard_after_forward,
     )
 
   def _assert_collective_chains_are_atomic(
@@ -170,6 +170,37 @@ class GraphSplitTest(absltest.TestCase):
         traced,
         fsdp_reshard_after_forward="never",
     )
+    self.assertTrue(
+        all(
+            not node.meta.get("autograd_backward", False)
+            for node in split.forward_graph.graph.nodes
+        )
+    )
+    self.assertNotEmpty(
+        [
+            node
+            for node in split.backward_graph.graph.nodes
+            if node.meta.get("autograd_backward", False)
+        ]
+    )
+    backward = split_backward_graph_by_layer(
+        split.backward_graph,
+        n_layers=2,
+    )
+    self.assertEqual(
+        backward.collective_layer_to_partition,
+        {"ag": {}, "rs": {}},
+    )
+    with self.assertRaisesRegex(
+        ValueError, "requires AG and RS ownership for every layer"
+    ):
+      split_backward_graph_by_layer(
+          split.backward_graph,
+          n_layers=2,
+          pipeline_collectives=True,
+      )
+    split.backward_graph = backward.module
+    split.module.backward_graph = backward.module
     traced.gm = split.module
     with mock.patch.object(
         graph_split_lib, "_enqueue_forward_graph_outputs"
@@ -188,19 +219,6 @@ class GraphSplitTest(absltest.TestCase):
       with self.subTest(output=name):
         torch.testing.assert_close(actual_value, expected_value)
     self.assertLen(output_names, len(actual))
-    self.assertTrue(
-        all(
-            not node.meta.get("autograd_backward", False)
-            for node in split.forward_graph.graph.nodes
-        )
-    )
-    self.assertNotEmpty(
-        [
-            node
-            for node in split.backward_graph.graph.nodes
-            if node.meta.get("autograd_backward", False)
-        ]
-    )
     enqueue.assert_called_once()
     enqueued_outputs = enqueue.call_args.args[0]
     self.assertLen(
@@ -262,7 +280,7 @@ class GraphSplitTest(absltest.TestCase):
       )
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
-    """Check sequential, pipelined, and region-local four-layer layouts.
+    """Check forward, by-layer, and pipelined four-layer layouts.
 
     Forward visits ``L0 -> L1 -> L2 -> L3``; backward visits the layers in
     reverse. ``AGn``, layer ``Ln`` compute, ``RSn``, and every collective's
@@ -273,31 +291,6 @@ class GraphSplitTest(absltest.TestCase):
     backward = split.backward_graph
     self.assertFalse(
         any("fsdp_bucket" in node.meta for node in backward.graph.nodes)
-    )
-
-    # Sequential backward: [prefix] [L3,L2] [L1,L0].
-    sequential = split_backward_graph_by_remat_region(backward, 2)
-    self.assertEqual(
-        sequential.unit_to_partition,
-        {3: 1, 2: 1, 1: 2, 0: 2},
-    )
-    partitionable = [
-        node
-        for node in backward.graph.nodes
-        if node.op not in ("placeholder", "output")
-    ]
-    first_layer_index = next(
-        index
-        for index, node in enumerate(partitionable)
-        if _get_layer_id(node) >= 0
-    )
-    prefix_nodes = partitionable[:first_layer_index]
-    self.assertNotEmpty(prefix_nodes)
-    self.assertTrue(
-        all(sequential.partition_map[node] == 0 for node in prefix_nodes)
-    )
-    self._assert_collective_chains_are_atomic(
-        backward, sequential.partition_map
     )
 
     forward_scenarios = (
@@ -317,16 +310,16 @@ class GraphSplitTest(absltest.TestCase):
             layers_per_executable,
             isolate_prefix=isolate_prefix,
         )
-        self.assertEqual(chunked.unit_to_partition, expected)
+        self.assertEqual(chunked.layer_to_partition, expected)
 
-    local_one = (1, 2, 3, 4)
-    local_three = (1, 1, 1, 2)
-    pipeline_scenarios = (
+    by_layer_one = (1, 2, 3, 4)
+    by_layer_three = (1, 1, 1, 2)
+    backward_scenarios = (
         # [AG3] [AG2,C3] [AG1,RS3,C2] ... [RS0]
         (
             "staggered-one-layer",
             1,
-            "staggered",
+            True,
             (2, 3, 4, 5),
             (1, 2, 3, 4),
             (3, 4, 5, 6),
@@ -335,60 +328,90 @@ class GraphSplitTest(absltest.TestCase):
         (
             "staggered-two-layers",
             2,
-            "staggered",
+            True,
             (2, 2, 3, 3),
             (1, 2, 2, 3),
             (2, 3, 3, 4),
         ),
-        # Each layer owns its AG, compute, and RS.
+        # By-layer mode keeps each AG/compute/RS chain in one executable.
         (
-            "region-local-one-layer",
+            "by-layer-one-layer",
             1,
-            "region_local",
-            local_one,
-            local_one,
-            local_one,
+            False,
+            by_layer_one,
+            by_layer_one,
+            by_layer_one,
         ),
-        # Region-local ownership accepts widths >1 and an incomplete tail.
+        # Width three accepts a partial final group for L0.
         (
-            "region-local-three-layers",
+            "by-layer-three-layers",
             3,
-            "region_local",
-            local_three,
-            local_three,
-            local_three,
+            False,
+            by_layer_three,
+            by_layer_three,
+            by_layer_three,
         ),
     )
-    for name, width, ownership, compute, ag, rs in pipeline_scenarios:
+    for name, width, pipeline, compute, ag, rs in backward_scenarios:
       with self.subTest(name):
-        chunked = split_backward_graph_by_fsdp_pipeline(
+        chunked = split_backward_graph_by_layer(
             backward,
             n_layers=4,
-            regions_per_executable=width,
-            collective_ownership=ownership,
+            layers_per_executable=width,
+            pipeline_collectives=pipeline,
         )
         layer_ids = (3, 2, 1, 0)
         self.assertEqual(
-            chunked.compute_region_to_partition,
+            chunked.layer_to_partition,
             dict(zip(layer_ids, compute, strict=True)),
         )
         self.assertEqual(
-            chunked.ag_layer_to_partition,
+            chunked.collective_layer_to_partition["ag"],
             dict(zip(layer_ids, ag, strict=True)),
         )
         self.assertEqual(
-            chunked.rs_layer_to_partition,
+            chunked.collective_layer_to_partition["rs"],
             dict(zip(layer_ids, rs, strict=True)),
         )
         self._assert_collective_chains_are_atomic(
             backward, chunked.partition_map
         )
 
+    # A real Zero2-like trace has RS but no backward AG ownership.
+    zero2_backward = self._trace_simple_fsdp(
+        n_layers=2,
+        fsdp_reshard_after_forward="never",
+    ).backward_graph
+    zero2_like = split_backward_graph_by_layer(
+        zero2_backward,
+        n_layers=2,
+    )
+    self.assertEmpty(zero2_like.collective_layer_to_partition["ag"])
+    self.assertEqual(
+        set(zero2_like.collective_layer_to_partition["rs"]),
+        {0, 1},
+    )
+    self.assertEqual(
+        zero2_like.collective_layer_to_partition["rs"],
+        zero2_like.layer_to_partition,
+    )
+    self._assert_collective_chains_are_atomic(
+        zero2_backward, zero2_like.partition_map
+    )
+    with self.assertRaisesRegex(
+        ValueError, "requires AG and RS ownership for every layer"
+    ):
+      split_backward_graph_by_layer(
+          zero2_backward,
+          n_layers=2,
+          pipeline_collectives=True,
+      )
+
     # Missing layer ownership must fail instead of silently cutting by position.
     for node in backward.graph.nodes:
       node.meta.pop("custom", None)
-    with self.assertRaisesRegex(ValueError, "no remat region metadata"):
-      split_backward_graph_by_remat_region(backward, 1)
+    with self.assertRaisesRegex(ValueError, "compute metadata for every layer"):
+      split_backward_graph_by_layer(backward, n_layers=4)
 
   def test_backward_fsdp_pipeline_keeps_bf16_reduce_cast_with_wait(self):
     """Keep ``dW -> RS(BF16) -> wait -> cast(FP32)`` in one executable."""
@@ -397,7 +420,11 @@ class GraphSplitTest(absltest.TestCase):
         reduce_dtype=torch.bfloat16,
     ).backward_graph
 
-    chunked = split_backward_graph_by_fsdp_pipeline(gm, n_layers=2)
+    chunked = split_backward_graph_by_layer(
+        gm,
+        n_layers=2,
+        pipeline_collectives=True,
+    )
 
     reduce_casts = [
         node

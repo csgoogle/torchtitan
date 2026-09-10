@@ -11,9 +11,8 @@ import torchtitan.trainer
 GraphTrainerFSDPSchedule = Literal["none", "prefetch", "interleave"]
 BackwardPartitionMode = Literal[
     "none",
-    "sequential",
+    "by_layer",
     "fsdp_pipeline",
-    "fsdp_region_local",
 ]
 
 
@@ -25,21 +24,18 @@ class GraphSplitterConfig:
   # Assign non-layer work before the first transformer layer to its own partition.
   forward_isolate_prefix: bool = False
   # Backward subdivision applied after the top-level forward/backward split.
-  # ``sequential`` groups adjacent rematerialization regions in their existing
-  # graph order; it keeps each collective launch/getitem/wait chain intact but
-  # does not move AG or RS work to match a layer's compute. ``fsdp_pipeline``
-  # explicitly moves each layer's AG earlier and RS later to form staggered
-  # stages. ``fsdp_region_local`` instead explicitly assigns each layer's AG,
-  # compute, and RS to the same executable.
+  # ``by_layer`` groups adjacent layer backward computations and co-locates any
+  # attributable FSDP collective chains with their layer. ``fsdp_pipeline``
+  # instead moves each layer's AG earlier and RS later to form overlap stages.
   backward_partition_mode: BackwardPartitionMode = "none"
-  # Maximum number of complete one-layer rematerialization regions assigned to
-  # one backward executable. Grouping regions widens the compiler scheduling
+  # Maximum number of complete transformer layers assigned to one backward
+  # executable. Grouping layers widens the compiler scheduling
   # window without changing activation-checkpoint boundaries: every layer keeps
   # its saved input and can be recomputed immediately before its own backward.
   # Multi-layer rematerialization is a separate memory-policy tradeoff that can
   # reduce saved/offloaded boundaries only by extending intermediate lifetimes
   # or repeating recompute, so it is intentionally outside this splitter.
-  backward_regions_per_executable: int = 1
+  backward_layers_per_executable: int = 1
   # Reuse dead internal split-boundary buffers through XLA input donation.
   # This should default to True: last-use donation is preferable and is safe
   # unless reusable-buffer identification is wrong. It remains False until
