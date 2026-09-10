@@ -49,6 +49,20 @@ class _ToyTransformer(nn.Module):
     return inputs
 
 
+class _BufferMutatingToyTransformer(_ToyTransformer):
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__(n_layers)
+    self.register_buffer("counters", torch.zeros(n_layers))
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    for layer_id, layer in enumerate(self.layers):
+      with torch.no_grad():
+        self.counters[layer_id].add_(inputs.detach().sum())
+      inputs = torch.relu(layer(inputs))
+    return inputs
+
+
 class GraphSplitTest(absltest.TestCase):
 
   def _build_toy_model(self, n_layers: int) -> _ToyTransformer:
@@ -154,8 +168,8 @@ class GraphSplitTest(absltest.TestCase):
           f"collective chain rooted at {launch.name} was split",
       )
 
-  def test_forward_backward_split_preserves_outputs_and_ordering(self):
-    """Preserve loss and every gradient while running forward before backward.
+  def test_forward_backward_split_preserves_values_mutations_and_ordering(self):
+    """Preserve values and forward mutations while ordering forward first.
 
     The traced result is ``(loss, parameter gradients..., input gradient)``.
     Splitting must preserve every value, keep autograd work in backward, and
@@ -227,6 +241,43 @@ class GraphSplitTest(absltest.TestCase):
     )
     self.assertIs(enqueued_outputs[0], actual[0])
 
+    # Side-effect-only writes have no users in the joint graph. They must still
+    # become ignored forward outputs so each layer's persistent buffer updates.
+    mutating_model = _BufferMutatingToyTransformer(n_layers=2)
+    annotate_module_fqns(mutating_model)
+    mutating_inputs = torch.randn(6, 8, requires_grad=True)
+    mutating_trace = self._trace_toy_model(
+        model=mutating_model,
+        inputs=mutating_inputs,
+    )
+    joint_mutations = [
+        node
+        for node in mutating_trace.gm.graph.nodes
+        if graph_split_lib.is_mutation_node(node)
+    ]
+    self.assertLen(joint_mutations, 2)
+    self.assertTrue(all(not node.users for node in joint_mutations))
+    initial_counters = mutating_model.counters.clone()
+    run_traced(mutating_trace, module=mutating_model)(mutating_inputs)
+    expected_counters = mutating_model.counters.clone()
+    mutating_model.counters.copy_(initial_counters)
+
+    mutating_split = self._apply_passes_and_split(
+        mutating_trace,
+        fsdp_reshard_after_forward="never",
+    )
+    self.assertLen(
+        [
+            node
+            for node in mutating_split.forward_graph.graph.nodes
+            if graph_split_lib.is_mutation_node(node)
+        ],
+        2,
+    )
+    mutating_trace.gm = mutating_split.module
+    run_traced(mutating_trace, module=mutating_model)(mutating_inputs)
+    torch.testing.assert_close(mutating_model.counters, expected_counters)
+
   def test_forward_backward_boundary_edge_cases(self):
     """Keep gradient epilogues and dynamic scalar uses on the backward side."""
     model = self._build_toy_model(n_layers=2)
@@ -278,6 +329,23 @@ class GraphSplitTest(absltest.TestCase):
           size_nodes[0].name,
           {node.name for node in split.backward_graph.graph.nodes},
       )
+
+    with self.subTest("unclassified forward mutation fails closed"):
+      late_mutation_model = self._build_toy_model(n_layers=2)
+      late_mutation_model.register_buffer("counter", torch.zeros(()))
+      inputs = torch.randn(2, 8, requires_grad=True)
+
+      def step(inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        loss = late_mutation_model(inputs).sum()
+        with torch.no_grad():
+          late_mutation_model.counter.add_(inputs.detach().sum())
+        return (loss, *torch.autograd.grad(loss, inputs))
+
+      traced = minimal_fx_tracer(step, module=late_mutation_model)(inputs)
+      with self.assertRaisesRegex(
+          ValueError, "would discard forward mutation nodes"
+      ):
+        split_forward_backward_graph(traced.gm, traced.example_inputs)
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.

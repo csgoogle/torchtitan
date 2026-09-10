@@ -48,6 +48,12 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     _collect_bucketed_fsdp_comms,
 )
+from torchtitan.experiments.graph_trainer.graph_pp.partition import (
+    _forward_mutations_to_materialize,
+)
+from torchtitan.experiments.graph_trainer.graph_pp.utils import (
+    is_mutation_node,
+)
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     tpu_backend_compile_partitioned_pass,
     tpu_backend_compile_pass,
@@ -91,6 +97,7 @@ class SplitForwardBackwardModule(nn.Module):
       backward_output_positions: tuple[int, ...],
       constant_outputs: dict[int, Any],
       num_direct_forward_outputs: int,
+      num_residual_outputs: int,
       num_outputs: int,
   ) -> None:
     super().__init__()
@@ -100,6 +107,7 @@ class SplitForwardBackwardModule(nn.Module):
     self.backward_output_positions = backward_output_positions
     self.constant_outputs = constant_outputs
     self.num_direct_forward_outputs = num_direct_forward_outputs
+    self.num_residual_outputs = num_residual_outputs
     self.num_outputs = num_outputs
 
   def forward(self, *flat_inputs: Any) -> tuple[Any, ...]:
@@ -107,7 +115,12 @@ class SplitForwardBackwardModule(nn.Module):
     direct_forward_outputs = forward_outputs[
         : self.num_direct_forward_outputs
     ]
-    residuals = forward_outputs[self.num_direct_forward_outputs :]
+    residual_end = (
+        self.num_direct_forward_outputs + self.num_residual_outputs
+    )
+    residuals = forward_outputs[
+        self.num_direct_forward_outputs : residual_end
+    ]
     # A compiled child may return lazy outputs without enqueueing its executable.
     # Residual dependencies cover only the forward children that produce those
     # residuals; direct outputs such as loss may come from other children. Enqueue
@@ -832,7 +845,31 @@ def split_forward_backward_graph(
       forward_output_positions.append(position)
       forward_output_nodes.append(output)
 
-  forward_roots = [*forward_output_nodes, *residual_nodes]
+  # Reuse GraphPP's forward-mutation analysis. ``mutation_saved_values`` are
+  # forward-created tensor bases whose mutated contents backward must receive
+  # as residuals. ``forward_mutation_outputs`` are otherwise-dead mutation
+  # results exposed only to keep state updates (for example, MoE token-count
+  # buffer writes) live in the forward graph; the wrapper ignores their values.
+  mutation_saved_values, forward_mutation_outputs = (
+      _forward_mutations_to_materialize(
+          gm,
+          fwd_outputs=forward_output_nodes,
+          bwd_outputs=backward_output_nodes,
+          backward_only_names=set(),
+      )
+  )
+  for node in mutation_saved_values:
+    make_available_to_backward(node)
+  forward_mutation_outputs = [
+      node
+      for node in forward_mutation_outputs
+      if node not in forward_output_nodes and node not in residual_set
+  ]
+  forward_roots = [
+      *forward_output_nodes,
+      *residual_nodes,
+      *forward_mutation_outputs,
+  ]
   forward_needed: set[torch.fx.Node] = set(placeholders)
 
   def add_forward_dependencies(node: torch.fx.Node) -> None:
@@ -848,6 +885,19 @@ def split_forward_backward_graph(
 
   for root in forward_roots:
     add_forward_dependencies(root)
+
+  discarded_forward_mutations = [
+      node.name
+      for node in nodes
+      if node not in backward_node_set
+      and node not in forward_needed
+      and is_mutation_node(node)
+  ]
+  if discarded_forward_mutations:
+    raise ValueError(
+        "Graph split would discard forward mutation nodes: "
+        f"{discarded_forward_mutations}"
+    )
 
   forward_fx = torch.fx.Graph()
   forward_env: dict[torch.fx.Node, torch.fx.Node] = {}
@@ -890,10 +940,11 @@ def split_forward_backward_graph(
   residual_examples = tuple(node.meta["val"] for node in residual_nodes)
   logger.info(
       "Split TPU graph into %d forward and %d backward nodes with %d tensor "
-      "residuals",
+      "residuals and %d side-effect outputs",
       len(list(forward_gm.graph.nodes)),
       len(list(backward_gm.graph.nodes)),
       len(residual_nodes),
+      len(forward_mutation_outputs),
   )
   module = SplitForwardBackwardModule(
       forward_gm,
@@ -902,6 +953,7 @@ def split_forward_backward_graph(
       backward_output_positions=tuple(backward_output_positions),
       constant_outputs=constant_outputs,
       num_direct_forward_outputs=len(forward_output_nodes),
+      num_residual_outputs=len(residual_nodes),
       num_outputs=len(original_outputs),
   )
   return SplitForwardBackwardGraph(
