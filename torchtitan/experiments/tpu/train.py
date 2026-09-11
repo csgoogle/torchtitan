@@ -8,6 +8,7 @@
 
 import argparse
 import functools
+import importlib
 import json
 import tempfile
 from typing import Any, List, Optional, Sequence, Tuple, cast
@@ -15,6 +16,7 @@ from typing import Any, List, Optional, Sequence, Tuple, cast
 from absl import flags
 from absl.flags import argparse_flags
 import os
+import spmd_types as spmd
 import torch
 import torch.distributed as dist
 from torchtitan.config.configurable import Configurable
@@ -22,19 +24,40 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_applied
 from torchtitan.experiments.tpu import gmain
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
-import torchtitan.experiments.tpu.redacted  # trigger model registration
-import torchtitan.experiments.tpu.redacted  # trigger model registration
-import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
-import torchtitan.experiments.tpu.flux  # trigger model registration
 from torchtitan.experiments.tpu.graph_trainer.config import (
     to_tpu_graph_trainer_config,
 )
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
+from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 import torchtitan.train
+
+
+def _import_optional_model_packages() -> None:
+  """Import the other TPU model packages for their legacy side-effect registration.
+
+  ``--module=torchtitan.experiments.tpu.<model>`` imports the package that is
+  actually trained, so these imports only matter for the legacy ``--model.name``
+  path. A package that has not been adapted to the current upstream must not
+  take every other model down with it, so an ImportError is reported, loudly,
+  and skipped.
+  """
+  for name in ("redacted", "redacted", "deepseek_v3", "flux"):
+    try:
+      importlib.import_module(f"torchtitan.experiments.tpu.{name}")
+    except ImportError as e:  # pylint: disable=broad-except
+      logger.warning(
+          "torchtitan.experiments.tpu.%s failed to import and is unavailable"
+          " from this entry point: %s",
+          name,
+          e,
+      )
+
+
+_import_optional_model_packages()
 
 from absl import app
 
@@ -72,9 +95,8 @@ class TPUTrainer(torchtitan.train.Trainer):
   def forward_backward_step(
       self,
       *,
-      input_dict: dict[str, torch.Tensor],
-      labels: torch.Tensor,
-      global_valid_tokens: float,
+      input_dict: dict[str, Any] | list[dict[str, Any]],
+      global_valid_tokens: torch.Tensor,
   ) -> torch.Tensor:
     config = self.config
     use_graph_split = (
@@ -85,7 +107,6 @@ class TPUTrainer(torchtitan.train.Trainer):
     if not use_graph_split:
       return super().forward_backward_step(
           input_dict=input_dict,
-          labels=labels,
           global_valid_tokens=global_valid_tokens,
       )
 
@@ -96,22 +117,37 @@ class TPUTrainer(torchtitan.train.Trainer):
     from torch_tpu._internal.sync import synchronize  # pylint: disable=g-import-not-at-top
 
     assert len(self.model_parts) == 1
-    inputs, labels, extra_kwargs = self.post_dataloading_process(
-        input_dict, labels
+    assert isinstance(input_dict, dict)
+    model = self.model_parts[0]
+    # Same preprocessing as ``Trainer.forward_backward_step``: labels come in
+    # the batch, the model derives its masks / SPMD annotations.
+    inputs, labels, extra_kwargs = cast(BaseModel, model).preprocess_inputs(
+        input_dict,
+        parallel_dims=self.parallel_dims,
+        parallelism=config.parallelism,
+        max_num_documents=self.dataloader.max_num_documents,
+        max_context_length=config.training.max_context_length,
+    )
+    self.ntokens_seen += (
+        labels[0].numel() if isinstance(labels, tuple) else labels.numel()
     )
 
     with self.train_context():
-      pred = self.model_parts[0](inputs, **extra_kwargs)
-      loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
+      pred = model(inputs, **extra_kwargs)
+      loss_kwargs = {}
+      if "positions" in extra_kwargs:
+        loss_kwargs["positions"] = extra_kwargs["positions"]
+      loss, _ = self.loss_fn(pred, labels, global_valid_tokens, **loss_kwargs)
       del pred
 
       # Materialize the forward graph without waiting for execution to
       # complete. This splits the deferred-op graph so the backward pass
       # compiles as a separate (smaller) XLA program. Autograd state is
-      # unaffected — loss.backward() can still propagate gradients.
+      # unaffected -- loss.backward() can still propagate gradients.
       synchronize(loss, wait=False)
 
-      loss.backward()
+      with spmd.no_typecheck():
+        loss.backward()
 
     return loss
 
@@ -183,19 +219,13 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
         train_config, gt_registry, target_cls=TpuGraphTrainer.Config
     )
 
-    splash_obj = cast(Any, getattr(train_config, "splash_attention_kernel", None))
     moe_obj = cast(Any, getattr(train_config, "moe", getattr(train_config, "redacted", None)))
     tpu_extra = TpuGraphTrainerConfig(
         device="tpu",
-        attention_backend=getattr(
-            splash_obj,
-            "sa_attention_backend",
-            "splash"
-            if getattr(splash_obj, "use_splash_attention_kernel", False)
-            else "sdpa-no-scale",
-        )
-        if splash_obj is not None
-        else "sdpa-no-scale",
+        # Every TPU language model runs splash (the only inner attention with
+        # a torch_tpu lowering); the recipe's ``sa_*`` tuning is applied to
+        # the modules by ``workarounds.apply_patches``.
+        attention_backend="splash",
         moe_enabled=getattr(moe_obj, "enabled", False)
         if moe_obj is not None
         else False,

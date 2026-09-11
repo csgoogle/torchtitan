@@ -29,9 +29,9 @@ from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import STACK_ATTR
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
 from torchtitan.experiments.tpu.workarounds import use_real_rope_arithmetic_patch
+from torchtitan.experiments.tpu.llama3 import model_registry
+from torchtitan.experiments.tpu.qwen3 import model_registry as qwen3_registry
 from torchtitan.models.common.rope import ComplexRoPE
-from torchtitan.models.llama3 import model_registry
-from torchtitan.models.qwen3 import model_registry as qwen3_registry
 
 
 SEQ_LEN = 32
@@ -39,13 +39,19 @@ SEED = 1234
 
 
 def _config(registry=model_registry):
-    """A debug model, shortened to ``SEQ_LEN`` so the RoPE cache stays small."""
-    config = registry("debugmodel", attn_backend="sdpa").model
-    for layer in config.layers:
-        layer.attention.rope = dataclasses.replace(
-            layer.attention.rope, max_seq_len=SEQ_LEN
-        )
-    return config
+    """A debug model at ``SEQ_LEN`` so the RoPE cache stays small.
+
+    The TPU registries install ``SplashAttention``, whose reference path runs
+    on CPU; upstream's flex inner attention has no CPU kernel.
+    """
+    return registry("debugmodel", seq_len=SEQ_LEN).model
+
+
+def _tokens(model, batch: int = 2):
+    """A token-major batch of ``batch`` rows and its per-row positions."""
+    tokens = torch.randint(0, model.config.vocab_size, (batch * SEQ_LEN,))
+    positions = torch.arange(SEQ_LEN).repeat(batch)
+    return tokens, positions
 
 
 def _build(
@@ -180,18 +186,20 @@ class TestLayerStack(unittest.TestCase):
     def test_forward_matches_unrolled(self):
         model = _build(stacked=False)
         stacked = _build(stacked=True)
-        tokens = torch.randint(0, model.config.vocab_size, (2, SEQ_LEN))
+        tokens, positions = _tokens(model)
 
         torch.testing.assert_close(
-            stacked(tokens), model(tokens), rtol=0, atol=0
+            stacked(tokens, positions), model(tokens, positions), rtol=0, atol=0
         )
 
     def test_scan_forward_matches_the_loop(self):
         plain = _build(stacked=False)
         scanned = _build(stacked=True, scan=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens, positions = _tokens(plain)
 
-        torch.testing.assert_close(scanned(tokens), plain(tokens), rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(
+            scanned(tokens, positions), plain(tokens, positions), rtol=1e-6, atol=1e-6
+        )
 
     def test_the_body_recomputes_its_gather_in_backward(self):
         """The in-body gather is worth nothing unless backward redoes it.
@@ -212,12 +220,12 @@ class TestLayerStack(unittest.TestCase):
             return forward, backward
 
         model = _build(stacked=True, scan=True)
-        tokens = torch.randint(0, model.config.vocab_size, (2, SEQ_LEN))
+        tokens, positions = _tokens(model)
         default = functorch_config.activation_memory_budget
         with patch.object(
             partitioners, "min_cut_rematerialization_partition", capture
         ):
-            model(tokens).sum().backward()
+            model(tokens, positions).sum().backward()
 
         self.assertTrue(captured, "the scan body was never partitioned")
         budget, backward = captured[0]
@@ -237,10 +245,10 @@ class TestLayerStack(unittest.TestCase):
         """
         plain = _build(stacked=False)
         scanned = _build(stacked=True, scan=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens, positions = _tokens(plain)
 
         for model in (plain, scanned):
-            model(tokens).sum().backward()
+            model(tokens, positions).sum().backward()
 
         # `_parameters`, not `get_parameter`: SimpleFSDP shadows each name with a
         # property returning the gathered tensor, which has no `.grad`.
@@ -312,7 +320,7 @@ class TestLayerStack(unittest.TestCase):
         """A checkpoint written by the unrolled model loads into the stacked one."""
         plain = _build(stacked=False)
         stacked = _build(stacked=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens, positions = _tokens(plain)
 
         # Perturb the source so a no-op load cannot pass.
         with torch.no_grad():
@@ -321,7 +329,7 @@ class TestLayerStack(unittest.TestCase):
         checkpoint = copy.deepcopy(plain.state_dict())
 
         stacked.load_state_dict(checkpoint)
-        torch.testing.assert_close(stacked(tokens), plain(tokens), rtol=0, atol=0)
+        torch.testing.assert_close(stacked(tokens, positions), plain(tokens, positions), rtol=0, atol=0)
 
 
 @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
@@ -394,9 +402,11 @@ class TestQwen3(unittest.TestCase):
 
     def test_scan_forward_matches_the_loop(self):
         plain, scanned = self._pair(stacked=True, scan=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens, positions = _tokens(plain)
 
-        torch.testing.assert_close(scanned(tokens), plain(tokens), rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(
+            scanned(tokens, positions), plain(tokens, positions), rtol=1e-6, atol=1e-6
+        )
 
 
 if __name__ == "__main__":

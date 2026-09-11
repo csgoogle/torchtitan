@@ -212,7 +212,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_attention_parity_recipe_adds_bf16_rope(self) -> None:
     config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.bf16_rope",
+        "torchtitan.experiments.tpu.overrides.bf16_rope.tpu_activation_dtype_cossin_rope",
         config.override.imports,
     )
 
@@ -260,7 +260,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.fused_loss",
+        "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head",
         graph_config.override.imports,
     )
     apply_overrides(graph_config.override, graph_config)
@@ -350,7 +350,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     passes = construct_tpu_pass_pipeline(
-        typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
+        typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0, state_fqns=[], input_subclass_layouts={})),
         graph_config,
     )
     pass_names = [
@@ -395,7 +395,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         target_cls=TpuGraphTrainer.Config,
     )
     passes = construct_tpu_pass_pipeline(
-        typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
+        typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0, state_fqns=[], input_subclass_layouts={})),
         graph_config,
     )
     pass_names = {
@@ -425,7 +425,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
     with self.assertRaisesRegex(ValueError, "rematerialization"):
       construct_tpu_pass_pipeline(
-          typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
+          typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0, state_fqns=[], input_subclass_layouts={})),
           graph_config,
       )
 

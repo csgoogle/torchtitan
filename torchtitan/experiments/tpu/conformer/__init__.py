@@ -1,10 +1,11 @@
 """Registration of Conformer model for TorchTitan."""
 
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.validate import Validator
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.protocols import train_spec
 from . import model
@@ -37,7 +38,10 @@ train_spec.register_train_spec(
         loss_config=CrossEntropyLoss.Config(),
         optimizer_config=default_adamw(lr=8e-4),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
-        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        dataloader_config=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+            shuffle=False,
+        ),
         tokenizer_config=HuggingFaceTokenizer.Config(),
         validator_config=Validator.Config(enable=True),
         state_dict_adapter=None,

@@ -31,7 +31,7 @@ import torch.multiprocessing as mp
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
-from torchtitan.models.llama3 import model_registry
+from torchtitan.experiments.tpu.llama3 import model_registry
 
 
 SEED = 1234
@@ -54,7 +54,7 @@ def _build(world_size: int, *, stacked: bool) -> torch.nn.Module:
         world_size=world_size,
     )
     with torch.device("meta"):
-        model = model_registry("debugmodel", attn_backend="sdpa").model.build()
+        model = model_registry("debugmodel", seq_len=32).model.build()
     model = apply_simple_fsdp(
         model,
         parallel_dims=parallel_dims,

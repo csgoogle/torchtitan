@@ -17,9 +17,6 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ma
 from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_kernel import QKVLayout
 import jax.numpy as jnp
 import torch
-from torchtitan.models.common.attention import segment_ids_from_positions
-from torch import nn
-from torch.distributed.tensor import DTensor
 
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
@@ -599,102 +596,11 @@ def splash_sdpa(
   return result
 
 
-class SplashAttention(nn.Module):
-  """Inner attention using custom Splash Attention Pallas kernel."""
+def __getattr__(name: str):
+  # The inner-attention module moved to ``torchtitan.experiments.tpu.attention``
+  # (a first-class ``Module`` with a ``Config``); keep the old import path.
+  if name == "SplashAttention":
+    from torchtitan.experiments.tpu.attention import SplashAttention  # pylint: disable=g-import-not-at-top
 
-  def __init__(
-      self,
-      is_causal: bool = True,
-      local_window_size: Optional[int] = None,
-      original_module: Optional[nn.Module] = None,
-      **sa_kwargs,
-  ) -> None:
-    super().__init__()
-    self.is_causal = is_causal
-    self.local_window_size = local_window_size
-    self.original_module = original_module
-    self.sa_kwargs = sa_kwargs
-
-  def forward(
-      self,
-      q: torch.Tensor,
-      k: torch.Tensor,
-      v: torch.Tensor,
-      *,
-      scale: Optional[float] = None,
-      enable_gqa: bool = False,
-      is_causal: Optional[bool] = None,
-      attention_masks: Any = None,
-      positions: Optional[torch.Tensor] = None,
-      segment_ids: Optional[torch.Tensor] = None,
-      **kwargs,
-  ) -> torch.Tensor:
-    # Fallback to original module if on CPU or sequence length is too small
-    # for the Pallas kernel
-    seq_len = q.shape[1]
-    causal = is_causal if is_causal is not None else self.is_causal
-    if (
-        q.device.type == "cpu" or seq_len < 128
-    ) and self.original_module is not None:
-      return self.original_module(
-          q,
-          k,
-          v,
-          scale=scale,
-          enable_gqa=enable_gqa,
-          is_causal=causal,
-          attention_masks=attention_masks,
-          positions=positions,
-          segment_ids=segment_ids,
-          **kwargs,
-      )
-
-    # Override is_causal if passed explicitly, else use stored value
-    causal = is_causal if is_causal is not None else self.is_causal
-
-    q_is_dt = isinstance(q, DTensor)
-    q_mesh = q_placements = None
-    if q_is_dt:
-      q_mesh, q_placements = q.device_mesh, q.placements
-      q = q.to_local()
-
-    if isinstance(k, DTensor):
-      k = k.to_local()
-    if isinstance(v, DTensor):
-      v = v.to_local()
-    if isinstance(positions, DTensor):
-      positions = positions.to_local()
-    if isinstance(segment_ids, DTensor):
-      segment_ids = segment_ids.to_local()
-
-    # TorchTitan passes tensors as (B, S, H, D). However, the splash_sdpa
-    # Pallas kernel expects (B, H, S, D). We transpose them here to match the
-    # kernel's expected layout.
-    q_trans = q.transpose(1, 2).contiguous()
-    k_trans = k.transpose(1, 2).contiguous()
-    v_trans = v.transpose(1, 2).contiguous()
-
-    # `segment_ids` is computed once per step in `Decoder.forward` and threaded
-    # down. The fallback is for callers that pass only `positions` --
-    # correct, but
-    # it runs once per layer, which profiling showed to be 25% of device time.
-    if segment_ids is None and positions is not None:
-      segment_ids = segment_ids_from_positions(positions)
-
-    out = splash_sdpa(
-        q_trans,
-        k_trans,
-        v_trans,
-        segment_ids=segment_ids,
-        scale=scale,
-        is_causal=causal,
-        local_window_size=self.local_window_size,
-        enable_gqa=enable_gqa,
-        **self.sa_kwargs,
-    )
-
-    # Transpose back to (B, S, H, D)
-    out = out.transpose(1, 2)
-    if q_is_dt:
-      out = DTensor.from_local(out, q_mesh, q_placements)
-    return out
+    return SplashAttention
+  raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

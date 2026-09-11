@@ -90,7 +90,9 @@ class Qwen3Model(Decoder):
         ) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
-            training = config.training
+            # Tests build this with a bare namespace; tolerate a missing
+            # training block (no aux-loss scaling then).
+            training = getattr(config, "training", None)
 
             # Fork (b2ae4ce1): size the batch-wise MoE aux loss. Upstream's
             # TrainingConfig is a token budget now, and its trainer no longer
@@ -99,14 +101,19 @@ class Qwen3Model(Decoder):
             # DP degree the per-step total is unknowable from the config alone,
             # so absent explicit kwargs assume no gradient accumulation.
             global_batch_size = kwargs.get(
-                "global_batch_size", training.num_tokens_per_train_step
+                "global_batch_size",
+                training.num_tokens_per_train_step if training is not None else -1,
             )
             local_global_batch_size = kwargs.get("local_global_batch_size")
             if local_global_batch_size is None:
                 local_global_batch_size = (
                     global_batch_size
                     if global_batch_size > 0
-                    else training.num_tokens_per_microbatch_per_dp_rank
+                    else (
+                        training.num_tokens_per_microbatch_per_dp_rank
+                        if training is not None
+                        else 1
+                    )
                 )
             if global_batch_size < 0:
                 global_batch_size = local_global_batch_size

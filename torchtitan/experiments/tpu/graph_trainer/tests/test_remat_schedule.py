@@ -147,7 +147,8 @@ def _trace_simple_fsdp_remat_graph(n_layers: int = 3):
             parallelism=SimpleNamespace(
                 fsdp_reshard_after_forward="always",
                 pipeline_parallel_degree=1,
-            )
+            ),
+            compile=SimpleNamespace(full_recompute_save_ops=""),
         ),
     )
     selective_activation_remat_pass(traced.gm)

@@ -171,7 +171,8 @@ torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.llama3 \
     --config=llama3_1b \
     --hf_assets_path=assets/hf/Llama-3.2-1B/ \
-    --training.seq_len=128 \
+    --training.max_context_length=128 \
+    --training.num_tokens_per_microbatch_per_dp_rank=512 \
     --training.steps=10 \
     --training.dtype=bfloat16 \
     --training.mixed_precision_param=bfloat16
@@ -419,13 +420,12 @@ xpk workload create \
         -m torchtitan.experiments.tpu.train \
         --module=torchtitan.experiments.tpu.llama3 \
         --config=llama3_8b \
-        --training.seq_len=512 \
-        --dataloader.dataset=c4_test \
+        --training.max_context_length=512 \
+        --training.num_tokens_per_microbatch_per_dp_rank=512 \
         --training.dtype=bfloat16 \
         --training.mixed_precision_param=bfloat16 \
         --training.steps=10 \
         --hf_assets_path=assets/hf/Llama-3.1-8B/ \
-        --dataloader.dataset_path=tests/assets/c4_test \
         --metrics.log_freq=5 \
         --metrics.enable_tensorboard \
         --profiler.profile_freq=5 \

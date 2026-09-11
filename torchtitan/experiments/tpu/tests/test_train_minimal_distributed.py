@@ -190,13 +190,13 @@ class TrainMinimalDistributedTest(
             f"--config={config}",
             f"--optimizer.implementation={optimizer_implementation}",
             "--hf_assets_path=tests/assets/tokenizer",
-            "--dataloader.dataset_path=tests/assets/c4_test",
-            "--training.seq_len=128",
-            "--dataloader.dataset=c4_test",
+            # c4_test is the debug configs' dataset already; the Grain dataset
+            # field is not CLI-addressable.
+            "--training.max_context_length=128",
             "--training.steps=3",
             "--training.mixed_precision_param=float32",
             "--training.mixed_precision_reduce=float32",
-            "--training.local_batch_size=2",
+            "--training.num_tokens_per_microbatch_per_dp_rank=256",  # 2 x 128
         ] + (args or []),
         tensor_parallel_degree=tensor_parallel_degree,
         data_parallel_shard_degree=data_parallel_shard_degree,

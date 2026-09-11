@@ -5,11 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 import torchtitan.components.loss as loss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.hf_datasets.text_datasets import DATASETS
 import torchtitan.models.common as common_models
 import torchtitan.models.deepseek_v3 as deepseek_v3_models
 from torchtitan.models.deepseek_v3.model import DeepSeekV3Model
@@ -23,8 +24,11 @@ __all__ = [
 ]
 
 
+# TODO(tpu): swap in the splash converter -- "sdpa" no longer exists upstream
+# (only flex / flex_flash / varlen); TPU attention will be selected through a
+# ModelConfigConverter passed as ``converters=`` to ``model_registry``.
 def _testmodel(
-    attn_backend: str = "sdpa",
+    attn_backend: str = "flex",
 ) -> deepseek_v3_models.DeepSeekV3Model.Config:
   dim = 128
   head_dim = 16
@@ -53,7 +57,7 @@ def _testmodel(
       non_blocking_capacity_factor=None,
       rope=common_models.ComplexRoPE.Config(
           dim=head_dim,
-          max_seq_len=128,
+          max_context_length=128,
           theta=10000.0,
           scaling="yarn",
           rope_factor=40.0,
@@ -84,7 +88,7 @@ def _testmodel(
 
 
 def _testmodel_moe(
-    attn_backend: str = "sdpa",
+    attn_backend: str = "flex",
 ) -> deepseek_v3_models.DeepSeekV3Model.Config:
   dim = 128
   head_dim = 16
@@ -113,7 +117,7 @@ def _testmodel_moe(
       non_blocking_capacity_factor=None,
       rope=common_models.ComplexRoPE.Config(
           dim=head_dim,
-          max_seq_len=128,
+          max_context_length=128,
           theta=10000.0,
           scaling="yarn",
           rope_factor=40.0,
@@ -143,24 +147,25 @@ def _testmodel_moe(
   )
 
 
+def _native(flavor: str, attn_backend: str = "flex") -> deepseek_v3_models.DeepSeekV3Model.Config:
+  """Upstream flavor at its maximum context length (upstream now stores
+  ``(builder, max_context_length)`` tuples and requires ``seq_len``)."""
+  get_config, max_context_len = deepseek_v3_models.deepseekv3_configs[flavor]
+  return get_config(
+      attn_backend=attn_backend,
+      moe_comm_backend="standard",
+      seq_len=max_context_len,
+  )
+
+
 deepseekv3_configs = {
     "testmodel": _testmodel(),
     "testmodel_moe": _testmodel_moe(),
-    "debugmodel": deepseek_v3_models.deepseekv3_configs["debugmodel"](
-        attn_backend="sdpa", moe_comm_backend="standard"
-    ),
-    "debugmodel_flex_attn": deepseek_v3_models.deepseekv3_configs["debugmodel"](
-        attn_backend="flex", moe_comm_backend="standard"
-    ),
-    "16B": deepseek_v3_models.deepseekv3_configs["16B"](
-        attn_backend="flex", moe_comm_backend="standard"
-    ),
-    "236B": deepseek_v3_models.deepseekv3_configs["236B"](
-        attn_backend="flex", moe_comm_backend="standard"
-    ),
-    "671B": deepseek_v3_models.deepseekv3_configs["671B"](
-        attn_backend="flex", moe_comm_backend="standard"
-    ),
+    "debugmodel": _native("debugmodel"),
+    "debugmodel_flex_attn": _native("debugmodel"),
+    "16B": _native("16B"),
+    "236B": _native("236B"),
+    "671B": _native("671B"),
 }
 
 
@@ -175,7 +180,10 @@ register_train_spec(
         loss_config=loss.ChunkedLossWrapper.Config(),
         optimizer_config=default_adamw(lr=8e-4),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
-        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        dataloader_config=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+            shuffle=False,
+        ),
         validator_config=Validator.Config(enable=True),
         state_dict_adapter=DeepSeekV3StateDictAdapter,
     ),

@@ -7,9 +7,10 @@
 """Mamba-2 TPU model definitions, training specifications, and configs."""
 
 from torchtitan.components import loss
-from torchtitan.components import lr_scheduler
+from torchtitan.components import optimizer as lr_scheduler
 from torchtitan.components import optimizer
 from torchtitan.components import validate
+from torchtitan.components import data as data_components
 from torchtitan.hf_datasets import text_datasets
 from torchtitan.protocols import train_spec
 
@@ -82,8 +83,11 @@ _mamba2_train_spec = train_spec.TrainSpec(
     lr_scheduler_config=lr_scheduler.LRSchedulersContainer.Config(
         warmup_steps=1000
     ),
-    dataloader_config=text_datasets.HuggingFaceTextDataLoader.Config(
-        dataset="c4_test"
+    dataloader_config=data_components.GrainDataLoader.Config(
+        dataset=data_components.ConcatThenSplitPackingConfig(
+            dataset=text_datasets.DATASETS["c4_test"]
+        ),
+        shuffle=False,
     ),
     validator_config=validate.Validator.Config(enable=True),
     state_dict_adapter=None,

@@ -27,6 +27,7 @@ from torchtitan.distributed import utils as dist_utils
 import torchtitan.experiments.tpu.conformer  # trigger conformer_tpu model registration
 import torchtitan.experiments.tpu.gmain as gmain
 import torchtitan.experiments.tpu.model_annotator as model_annotator
+from torchtitan.experiments.tpu.redacted.random_dataset import RandomTokensDatasetConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 import torchtitan.experiments.tpu.utils as tpu_utils
 import torchtitan.protocols.train_spec as train_spec_module
@@ -112,9 +113,16 @@ def train_step(
   return loss
 
 
+def _batch_shape(train_config) -> tuple[int, int]:
+  """(local_batch_size, seq_len) from the token-count TrainingConfig fields."""
+  seq_len = train_config.training.max_context_length
+  return train_config.training.num_tokens_per_microbatch_per_dp_rank // seq_len, seq_len
+
+
 def build_random_dataloader(train_config, vocab_size, device):
-  local_batch_size = train_config.training.local_batch_size
-  seq_len = train_config.training.seq_len
+  """Synthetic [B, S] inputs; CTC targets are shorter than the inputs, which the
+  Grain text pipeline cannot express, so this stays a local generator."""
+  local_batch_size, seq_len = _batch_shape(train_config)
   # Inputs should be token IDs for the embedding layer
   x = torch.randint(0, vocab_size, (local_batch_size, seq_len), device=device)
 
@@ -135,7 +143,7 @@ def build_random_dataloader(train_config, vocab_size, device):
     )
 
   while True:
-    yield {"input": x}, targets
+    yield {"input": x, "labels": targets}
 
 
 def start_trainer(train_config: TPUTrainerConfig) -> None:
@@ -231,7 +239,9 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       train_config.tokenizer.build(tokenizer_path=train_config.hf_assets_path),
   )
 
-  if train_config.dataloader.dataset == "random":
+  if isinstance(
+      getattr(train_config.dataloader, "dataset", None), RandomTokensDatasetConfig
+  ):
     logger.info("Using random data loader instead of real dataset.")
     dataloader = build_random_dataloader(
         train_config, model_args.vocab_size, device  # pytype: disable=attribute-error
@@ -241,8 +251,8 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=tokenizer,
-        seq_len=train_config.training.seq_len,
-        local_batch_size=train_config.training.local_batch_size,
+        max_context_length=train_config.training.max_context_length,
+        num_tokens_per_batch=train_config.training.num_tokens_per_microbatch_per_dp_rank,
     )
 
   logger.info(
@@ -267,7 +277,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
     model = model_args.build()
 
   model_param_count, _ = model_args.get_nparams_and_flops(
-      model, train_config.training.seq_len
+      model, train_config.training.max_context_length
   )
   logger.info(
       "Model %s %s size: %d total parameters",
@@ -361,13 +371,12 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
     torch.distributed.barrier()
 
   steps = train_config.training.steps
-  local_batch_size = train_config.training.local_batch_size
-  seq_len = train_config.training.seq_len
+  local_batch_size, seq_len = _batch_shape(train_config)
 
   (
       model_param_count,
       num_flops_per_token,
-  ) = model_args.get_nparams_and_flops(model, train_config.training.seq_len)
+  ) = model_args.get_nparams_and_flops(model, seq_len)
   metrics_processor.num_flops_per_token = num_flops_per_token
 
   device_name = utils.device_module.get_device_name()
@@ -404,6 +413,8 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
       t0 = time.perf_counter()
       batch = next(data_iterator)
       metrics_processor.data_loading_times.append(time.perf_counter() - t0)
+      # The Grain loader yields token-major [T]; the model consumes [B, S].
+      batch_inputs = batch["input"].reshape(local_batch_size, seq_len)
 
       if parallel_dims.fsdp_enabled or (
           isinstance(train_config, TPUTrainerConfig)
@@ -412,12 +423,12 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         compute_dtype = TORCH_DTYPE_MAP[
             train_config.training.mixed_precision_param
         ]
-        inputs = batch[0]["input"].to(device, dtype=compute_dtype)
+        inputs = batch_inputs.to(device, dtype=compute_dtype)
       else:
-        inputs = batch[0]["input"].to(
-            device, dtype=next(model.parameters()).dtype
-        )
-      targets = batch[1].to(device)
+        inputs = batch_inputs.to(device, dtype=next(model.parameters()).dtype)
+      targets = batch["labels"].to(device)
+      if targets.dim() == 1:  # token-major text batch (not CTC targets)
+        targets = targets.view(local_batch_size, seq_len)
 
       with jax_profiler.TraceAnnotation("train", step_num=step):
         use_ctc = (

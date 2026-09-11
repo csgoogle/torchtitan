@@ -198,6 +198,10 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # required because ``@dataclass(slots=True)`` replaces the class object
     # after decoration, leaving the ``__class__`` cell that zero-arg
     # ``super()`` relies on pointing at a stale class. See bpo-46404.
+    # TPU has no CUDA graphs (``wrap_with_cuda_graph`` is a no-op off CUDA),
+    # so opt out before upstream's validation rejects TPU-only components
+    # (e.g. the TPU token dispatchers) for not being CUDA-graph safe.
+    self.training.disable_cuda_graphs = True
     super(BaseTPUTrainerConfig, self).__post_init__()
     # This prevents creating folder in
     # torchtitan.distributed.utils.init_distributed

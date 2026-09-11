@@ -7,9 +7,10 @@
 
 # pylint: disable=invalid-name,unused-argument
 
-from torchtitan.components import checkpoint
+from torchtitan.components import checkpointer as checkpoint
+from torchtitan.components import data as data_components
 from torchtitan.components import loss
-from torchtitan.components import lr_scheduler
+from torchtitan.components import optimizer as lr_scheduler
 from torchtitan.components import metrics
 from torchtitan.components import optimizer
 from torchtitan.config import configs
@@ -110,16 +111,24 @@ mamba2_configs = {
 }
 
 
+DEFAULT_MAX_CONTEXT_LENGTH = 2048
+
+
 def model_registry(
     flavor: str,
     ssm_backend: str = "pallas",
+    *,
+    seq_len: int | None = None,
     **kwargs,
 ) -> model_spec.ModelSpec:
+  # Mamba-2 has no positional cache, so ``seq_len`` only reports the training
+  # context length on the ModelSpec (mirrors upstream ``model_registry``).
   config = mamba2_configs[flavor](ssm_backend=ssm_backend, **kwargs)
   return model_spec.ModelSpec(
       name="mamba2",
       flavor=flavor,
       model=config,
+      max_context_length=seq_len or DEFAULT_MAX_CONTEXT_LENGTH,
       parallelize_fn=parallelize.parallelize_mamba2,
       pipelining_fn=None,
       post_optimizer_build_fn=None,
@@ -132,9 +141,11 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=1),
-      model_spec=model_registry("debugmodel"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
+      model_spec=model_registry("debugmodel", seq_len=512),
+      dataloader=data_components.GrainDataLoader.Config(
+          dataset=data_components.ConcatThenSplitPackingConfig(
+              dataset=text_datasets.DATASETS["c4_test"]
+          ),
       ),
       optimizer=optimizer.default_adamw(lr=8e-4),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -144,7 +155,9 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=8, seq_len=512, steps=10
+          num_tokens_per_microbatch_per_dp_rank=8 * 512,
+          max_context_length=512,
+          steps=10,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -159,9 +172,11 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("130M"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
+      model_spec=model_registry("130M", seq_len=2048),
+      dataloader=data_components.GrainDataLoader.Config(
+          dataset=data_components.ConcatThenSplitPackingConfig(
+              dataset=text_datasets.DATASETS["c4_test"]
+          ),
       ),
       optimizer=optimizer.default_adamw(lr=8e-4),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -171,7 +186,9 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=16, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=16 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -186,9 +203,11 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("370M"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
+      model_spec=model_registry("370M", seq_len=2048),
+      dataloader=data_components.GrainDataLoader.Config(
+          dataset=data_components.ConcatThenSplitPackingConfig(
+              dataset=text_datasets.DATASETS["c4_test"]
+          ),
       ),
       optimizer=optimizer.default_adamw(lr=6e-4),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -198,7 +217,9 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=8, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=8 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -213,9 +234,11 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("780M"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
+      model_spec=model_registry("780M", seq_len=2048),
+      dataloader=data_components.GrainDataLoader.Config(
+          dataset=data_components.ConcatThenSplitPackingConfig(
+              dataset=text_datasets.DATASETS["c4_test"]
+          ),
       ),
       optimizer=optimizer.default_adamw(lr=5e-4),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -225,7 +248,9 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=4, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=4 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -240,9 +265,11 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("1.3B"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
+      model_spec=model_registry("1.3B", seq_len=2048),
+      dataloader=data_components.GrainDataLoader.Config(
+          dataset=data_components.ConcatThenSplitPackingConfig(
+              dataset=text_datasets.DATASETS["c4_test"]
+          ),
       ),
       optimizer=optimizer.default_adamw(lr=4e-4),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -252,7 +279,9 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=2, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=2 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -267,9 +296,11 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
-      model_spec=model_registry("2.7B"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
+      model_spec=model_registry("2.7B", seq_len=2048),
+      dataloader=data_components.GrainDataLoader.Config(
+          dataset=data_components.ConcatThenSplitPackingConfig(
+              dataset=text_datasets.DATASETS["c4_test"]
+          ),
       ),
       optimizer=optimizer.default_adamw(lr=3e-4),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -279,7 +310,9 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=2, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=2 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -294,9 +327,11 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       loss=loss.CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=1),
-      model_spec=model_registry("2.7B"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
+      model_spec=model_registry("2.7B", seq_len=262144),
+      dataloader=data_components.GrainDataLoader.Config(
+          dataset=data_components.ConcatThenSplitPackingConfig(
+              dataset=text_datasets.DATASETS["c4_test"]
+          ),
       ),
       optimizer=optimizer.default_adamw(lr=3e-4),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
@@ -306,7 +341,9 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=8, seq_len=262144, steps=1000
+          num_tokens_per_microbatch_per_dp_rank=8 * 262144,
+          max_context_length=262144,
+          steps=1000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(

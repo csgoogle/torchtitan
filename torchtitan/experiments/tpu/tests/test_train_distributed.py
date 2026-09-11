@@ -246,7 +246,8 @@ class TrainDistributedTest(
           args=[
               "--training.dtype=bfloat16",
               "--loss_kernel.use_loss_kernel",
-              "--training.seq_len=1024",
+              "--training.max_context_length=1024",
+              "--training.num_tokens_per_microbatch_per_dp_rank=4096",  # 4 x 1024
               "--loss_kernel.loss_b_block_size=128",
               "--loss_kernel.loss_h_block_size=128",
               "--loss_kernel.loss_v_block_size=128",
@@ -328,7 +329,8 @@ class TrainDistributedTest(
           args=[
               "--training.dtype=bfloat16",
               "--loss_kernel.use_loss_kernel",
-              "--training.seq_len=1024",
+              "--training.max_context_length=1024",
+              "--training.num_tokens_per_microbatch_per_dp_rank=4096",  # 4 x 1024
               "--loss_kernel.loss_b_block_size=128",
               "--loss_kernel.loss_h_block_size=128",
               "--loss_kernel.loss_v_block_size=128",
@@ -397,18 +399,27 @@ class TrainDistributedTest(
       dataset="c4_test",
       args: list[str] | None = None,
   ):
+    # The Grain ``dataloader.dataset`` field is not CLI-addressable; every
+    # debug config already reads the local test asset (c4_test / cc12m-test).
+    del dataset_path, dataset
+    if module == "flux":
+      # Flux's context length is derived from img_size (512 tokens for the
+      # debug model), so only the batch (1 image) is overridden.
+      batch_args = ["--training.num_tokens_per_microbatch_per_dp_rank=512"]
+    else:
+      batch_args = [
+          "--training.max_context_length=128",
+          "--training.num_tokens_per_microbatch_per_dp_rank=512",  # 4 x 128
+      ]
     default_args = [
         f"--module={module}",
         f"--config={config}",
         f"--optimizer.implementation={optimizer_implementation}",
-        f"--dataloader.dataset_path={dataset_path}",
-        f"--dataloader.dataset={dataset}",
         "--hf_assets_path=tests/assets/tokenizer",
-        "--training.seq_len=128",
         "--training.steps=3",
         "--training.mixed_precision_param=float32",
         "--training.mixed_precision_reduce=float32",
-        f"--training.local_batch_size={1 if module == 'flux' else 4}",
+        *batch_args,
     ]
     if not args:
       args = []

@@ -308,11 +308,15 @@ class DistributedUnitTestRunner:
     """Generates the full global batch on CPU (deterministically)."""
     torch.manual_seed(1 + self.current_step)
 
+    # Token-major: ``batch_size`` rows of ``seq_len`` tokens folded into one
+    # ``[T]`` stream; ``_run_step`` derives the per-row positions from
+    # ``self._seq_len``.
+    self._seq_len = seq_len
     global_input = torch.randint(
-        0, self.model_args.vocab_size, (batch_size, seq_len), device="cpu"
+        0, self.model_args.vocab_size, (batch_size * seq_len,), device="cpu"
     )
     global_target = torch.randn(
-        batch_size, seq_len, self.model_args.vocab_size, device="cpu"
+        batch_size * seq_len, self.model_args.vocab_size, device="cpu"
     )
     return global_input, global_target
 
@@ -326,13 +330,13 @@ class DistributedUnitTestRunner:
       return global_input, global_target
 
     elif self.input_distribution == InputDistribution.SPLIT_BATCH:
-      # FSDP: Slice the global batch for this rank
-      batch_size = global_input.size(0)
-      assert batch_size % self.world_size == 0
+      # FSDP: Slice the global batch (whole rows) for this rank
+      num_tokens = global_input.size(0)
+      assert num_tokens % (self.world_size * self._seq_len) == 0
 
-      local_bs = batch_size // self.world_size
-      start = self.rank * local_bs
-      end = start + local_bs
+      local_tokens = num_tokens // self.world_size
+      start = self.rank * local_tokens
+      end = start + local_tokens
 
       return global_input[start:end], global_target[start:end]
 
@@ -349,7 +353,10 @@ class DistributedUnitTestRunner:
     if backward:
       model.zero_grad()
 
-    output = model(inputs)
+    positions = torch.arange(self._seq_len, device=inputs.device).repeat(
+        inputs.shape[0] // self._seq_len
+    )
+    output = model(inputs, positions)
     loss = None
 
     if backward and targets is not None:
@@ -573,18 +580,15 @@ def _run_cpu_verification(
 
     logging.info("CPU model initialized with distributed weights.")
 
-    # Build mock dataloader from recorded inputs/labels to ensure exact data parity
+    # Build mock dataloader from the recorded batches to ensure exact data
+    # parity (token-major ``input`` / ``labels`` / ``positions`` dicts, the
+    # same shape the Grain loader yields).
     mock_dataloader = []
     for step in sorted(recorded_history.keys()):
-      if "inputs" in recorded_history[step] and "labels" in recorded_history[step]:
-        mock_dataloader.append(
-            (
-                {"input": recorded_history[step]["inputs"]},
-                recorded_history[step]["labels"],
-            )
-        )
-      else:
+      batch = recorded_history[step].get("batch")
+      if batch is None or "input" not in batch or "labels" not in batch:
         raise RuntimeError(f"Step {step} missing recorded inputs/labels!")
+      mock_dataloader.append(dict(batch))
 
     trainer_cpu.dataloader = mock_dataloader
 

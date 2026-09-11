@@ -175,11 +175,16 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     optimizer_cpu = optim.Adam(model_cpu.parameters(), lr=0.01)
     optimizer_device = optim.Adam(model_device.parameters(), lr=0.01)
 
+    # Token-major batch: ``batch`` rows of ``seq_len`` tokens folded into
+    # one ``[T]`` stream, with per-row positions marking the row starts.
+    positions_cpu = torch.arange(seq_len).repeat(batch)
+    positions_device = positions_cpu.to(self.accelerator_device)
+
     # Run 3 training steps
     for step in range(n_steps):
       # Generate new tokens for each step
       tokens_cpu = torch.randint(
-          0, vocab_size, (batch, seq_len), device="cpu"
+          0, vocab_size, (batch * seq_len,), device="cpu"
       )
       tokens_device = tokens_cpu.to(self.accelerator_device)
 
@@ -188,8 +193,8 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
         optimizer_cpu.zero_grad()
         optimizer_device.zero_grad()
         # Forward pass
-        out_cpu = model_cpu(tokens_cpu)
-        out_device = model_device(tokens_device)
+        out_cpu = model_cpu(tokens_cpu, positions_cpu)
+        out_device = model_device(tokens_device, positions_device)
         loss_cpu = loss_fn(
             out_cpu.view(-1, vocab_size),
             tokens_cpu.view(-1)

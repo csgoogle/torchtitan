@@ -195,18 +195,9 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       routed_output_RD: torch.Tensor,
       metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
       x_TD: torch.Tensor,
-      *,
-      num_local_tokens_after_padding: int,
-      local_seq_len_after_padding: int,
   ) -> torch.Tensor:
     if self.ep_mesh is not None:
-      return super().combine(
-          routed_output_RD,
-          metadata,
-          x_TD,
-          num_local_tokens_after_padding=num_local_tokens_after_padding,
-          local_seq_len_after_padding=local_seq_len_after_padding,
-      )
+      return super().combine(routed_output_RD, metadata, x_TD)
 
     assert isinstance(metadata, LocalDispatchMetadata)
     routed_output_ND = (

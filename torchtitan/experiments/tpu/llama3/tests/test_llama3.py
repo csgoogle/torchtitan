@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
 import torchtitan.experiments.tpu.llama3 as llama3_tpu
-from torchtitan.models.common.attention import GQAttention as Attention, QKVLinear, ScaledDotProductAttention
+from torchtitan.models.common.attention import GQAttention as Attention
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
@@ -234,13 +234,16 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
     attention_cpu, attention_device = self._setup_module_cpu_device(
         Attention, init_fn=init_linear_weights, config=attention_config
     )
+    # Token-major activations: ``batch`` rows of ``seq_len`` tokens.
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, config.dim), requires_grad=True
+        (batch * seq_len, config.dim), requires_grad=True
     )
+    positions_cpu = torch.arange(seq_len).repeat(batch)
+    positions_device = positions_cpu.to(self.accelerator_device)
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      out_cpu = attention_cpu(x_cpu, None)
-      out_device = attention_device(x_device, None)
+      out_cpu = attention_cpu(x_cpu, None, positions_cpu)
+      out_device = attention_device(x_device, None, positions_device)
       test_utils.check_equivalence(
           out_device.cpu(),
           out_cpu,
@@ -288,7 +291,7 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
     )
 
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, config.dim), requires_grad=True
+        (batch * seq_len, config.dim), requires_grad=True
     )
 
     with self.subTest(name="ForwardPass"):
@@ -344,12 +347,14 @@ class Llama3Test(base_device_test.BaseAcceleratorDeviceTest):
         )
     )
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, config.dim), requires_grad=True
+        (batch * seq_len, config.dim), requires_grad=True
     )
+    positions_cpu = torch.arange(seq_len).repeat(batch)
+    positions_device = positions_cpu.to(self.accelerator_device)
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      out_cpu = transformer_block_cpu(x_cpu, None)
-      out_device = transformer_block_device(x_device, None)
+      out_cpu = transformer_block_cpu(x_cpu, None, positions_cpu)
+      out_device = transformer_block_device(x_device, None, positions_device)
       test_utils.check_equivalence(
           out_device.cpu(),
           out_cpu,

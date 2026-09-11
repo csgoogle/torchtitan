@@ -38,6 +38,10 @@ class WorkaroundsTest(parameterized.TestCase):
       3. Offset positions: non-zero KV cache start position offsets
       4. Arbitrary position IDs
     """
+    self.skipTest(
+        "use_rope_tpu_optimization_patch is a no-op on the token-major layout:"
+        " upstream's _reshape_for_broadcast already indexes with 1-D positions"
+    )
     # Save original function
     original_reshape = (
         rope._reshape_for_broadcast  # pylint: disable=protected-access
@@ -207,13 +211,12 @@ class WorkaroundsTest(parameterized.TestCase):
       patch_kwargs = {"block_q": 128}
       workarounds.use_splash_attention_patch(attention_block, patch_kwargs)
 
-      # Force the CPU to run the patched kernel by removing the CPU fallback
-      attention_block.inner_attention.original_module = None
 
-      # Ensure seq_len >= 128 to avoid fallback
+      # Ensure seq_len >= 128 to avoid fallback. Activations are token-major
+      # ``[T, D]``; the CPU device would take the reference path, so pretend
+      # the tensors live on a TPU for the dispatch decision.
       seq_len = 128
       tokens = torch.randn(
-          1,
           seq_len,
           config.dim,
           requires_grad=False,
@@ -221,12 +224,9 @@ class WorkaroundsTest(parameterized.TestCase):
       )
 
       # Create positions for two segments of length 64
-      positions = (
-          torch.cat([torch.arange(64), torch.arange(64)])
-          .unsqueeze(0)
-          .to("cpu")
-      )
+      positions = torch.cat([torch.arange(64), torch.arange(64)]).to("cpu")
       kwargs = {"positions": positions}
+      attention_block.inner_attention._use_kernel = lambda q, row_len: True
 
       out = attention_block(tokens, None, **kwargs)
 
@@ -243,7 +243,7 @@ class WorkaroundsTest(parameterized.TestCase):
           " trigger.",
       )
 
-      # Expected: 64 zeros followed by 64 ones
+      # Expected: 64 zeros followed by 64 ones (one packed row of batch 1)
       expected_segment_ids = (
           torch.cat([
               torch.zeros(64, dtype=torch.int32),
@@ -321,12 +321,10 @@ class WorkaroundsTest(parameterized.TestCase):
     fused_head = fused_loss_lm_head(linear_config).build()
     fused_head.load_state_dict(unfused_head.state_dict())
 
-    unfused_hidden = torch.randn(2, 4, 8, requires_grad=True)
+    # Token-major ``[T, D]`` hidden states and ``[T]`` labels.
+    unfused_hidden = torch.randn(8, 8, requires_grad=True)
     fused_hidden = unfused_hidden.detach().clone().requires_grad_(True)
-    labels = torch.tensor([
-        [1, 4, components_loss.IGNORE_INDEX, 2],
-        [5, 3, 0, 7],
-    ])
+    labels = torch.tensor([1, 4, components_loss.IGNORE_INDEX, 2, 5, 3, 0, 7])
 
     expected_loss = components_loss.cross_entropy_loss(
         unfused_head(unfused_hidden), labels
@@ -410,7 +408,7 @@ class WorkaroundsTest(parameterized.TestCase):
     from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
     from torchtitan.experiments.tpu import workarounds
 
-    config = llama3_configs["debugmodel"](attn_backend="sdpa")
+    config = llama3_configs["debugmodel"][0](attn_backend="flex", seq_len=128)
     adapter = Llama3StateDictAdapter(config, None)
 
     with torch.device("meta"):
@@ -438,7 +436,7 @@ class WorkaroundsTest(parameterized.TestCase):
     from torchtitan.models.llama3 import llama3_configs
     from torchtitan.experiments.tpu import workarounds
 
-    config = llama3_configs["debugmodel"](attn_backend="sdpa")
+    config = llama3_configs["debugmodel"][0](attn_backend="flex", seq_len=128)
 
     def build(patch):
       torch.manual_seed(0)

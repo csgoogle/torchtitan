@@ -62,15 +62,16 @@ class StateRecorderCallback:
       step: int,
       model: nn.Module,
       loss: torch.Tensor,
-      inputs: torch.Tensor = None,
-      labels: torch.Tensor = None,
+      batch: Dict[str, torch.Tensor] | None = None,
   ):
-    """Records the state at the current step."""
+    """Records the state at the current step, plus the batch that produced it."""
     self.history[step] = self.capture_fn(model, loss)
-    if inputs is not None:
-      self.history[step]["inputs"] = inputs.detach().cpu().clone()
-    if labels is not None:
-      self.history[step]["labels"] = labels.detach().cpu().clone()
+    if batch is not None:
+      self.history[step]["batch"] = {
+          key: value.detach().cpu().clone()
+          for key, value in batch.items()
+          if value is not None
+      }
 
   def get_history(self) -> Dict[int, Any]:
     """Returns the recorded state history."""
@@ -134,10 +135,10 @@ class StateValidatorCallback:
       step: int,
       model: nn.Module,
       loss: torch.Tensor,
-      inputs: torch.Tensor = None,
-      labels: torch.Tensor = None,
+      batch: Dict[str, torch.Tensor] | None = None,
   ):
     """Validates the current state against the reference history."""
+    del batch  # the reference run replays the recorded batches
     if not self.in_context:
       raise RuntimeError("on_step can only be called within a 'with' context.")
     if step not in self.recorded_history:

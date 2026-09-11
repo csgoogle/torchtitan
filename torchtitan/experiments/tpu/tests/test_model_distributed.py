@@ -98,8 +98,9 @@ def _run_model_distributed(
   )
 
   n_steps = train_config.training.steps
-  batch_size = train_config.training.local_batch_size
-  seq_len = train_config.training.seq_len
+  seq_len = train_config.training.max_context_length
+  num_tokens = train_config.training.num_tokens_per_microbatch_per_dp_rank
+  batch_size = num_tokens // seq_len
   for step in range(n_steps):
     logging.info("Step %s / %s", step, n_steps)
     # Generate new inputs for each step
@@ -134,15 +135,27 @@ def _run_model_distributed(
         logging.info("calling loss.backward()")
         loss.backward()
     else:
+      # Token-major batch: ``batch_size`` rows of ``seq_len`` tokens, folded
+      # into one ``[T]`` stream with per-row positions (document boundaries).
       tokens_cpu = torch.randint(
-          0, model_args.vocab_size, (batch_size, seq_len), device="cpu"
+          0, model_args.vocab_size, (num_tokens,), device="cpu"
       )
+      positions_cpu = torch.arange(seq_len).repeat(batch_size)
       tokens_device = tokens_cpu.to(device)
       optimizer.zero_grad()
       with train_context():  # pytype: disable=not-callable
         logging.info("calling model()")
-        out_device = model(tokens_device)
-        loss = loss_fn(out_device, tokens_device)
+        inputs, labels, extra_kwargs = model.preprocess_inputs(
+            {
+                "input": tokens_device,
+                "labels": tokens_device,
+                "positions": positions_cpu.to(device),
+            },
+            parallel_dims=parallel_dims,
+            parallelism=train_config.parallelism,
+        )
+        out_device = model(inputs, **extra_kwargs)
+        loss = loss_fn(out_device, labels)
         if isinstance(loss, tuple):
           loss, _ = loss
         logging.info("calling loss.backward()")
@@ -246,9 +259,9 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
         f"--config={config}",
         "--optimizer.implementation=foreach",
         "--hf_assets_path=tests/assets/tokenizer",
-        f"--dataloader.dataset_path={dataset_path}",
-        f"--dataloader.dataset={dataset}",
-        "--training.seq_len=32",
+        # 2 rows of 32 tokens per rank.
+        "--training.max_context_length=32",
+        "--training.num_tokens_per_microbatch_per_dp_rank=64",
         "--training.steps=3",
     ]
     if module == "flux":

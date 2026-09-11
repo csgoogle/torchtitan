@@ -8,9 +8,10 @@ import os
 from functools import partial
 from typing import cast
 from torch import nn
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.validate import Validator
@@ -36,8 +37,9 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUConfig,
     TPUTrainerConfig,
 )
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.experiments.tpu.qwen3 import model_registry
+from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
 from torchtitan.models.common.moe import MoELoadBalanceAuxLoss
 from torchtitan.models.qwen3.model import Qwen3Model
@@ -46,8 +48,31 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.profiler import Profiler
 
 
-_FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
-_BF16_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.bf16_rope"
+_FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
+_BF16_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.bf16_rope.tpu_activation_dtype_cossin_rope"
+
+
+def _c4_test_loader() -> GrainDataLoader.Config:
+  return GrainDataLoader.Config(
+      dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+      shuffle=False,
+  )
+
+
+def _set_batch(
+    training: TrainingConfig,
+    *,
+    local_batch_size: int,
+    seq_len: int,
+    global_batch_size: int = -1,
+) -> None:
+  """Express the old ``(local_batch_size, seq_len, global_batch_size)`` recipe
+  geometry in upstream's token budget."""
+  training.num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len
+  training.max_context_length = seq_len
+  training.num_tokens_per_train_step = (
+      -1 if global_batch_size < 0 else global_batch_size * seq_len
+  )
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
@@ -57,10 +82,10 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
     config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
-def qwen3_debugmodel() -> TPUTrainerConfig:
-  """Qwen3 debug model configuration for TPU."""
+def qwen3_debugmodel(seq_len: int = 2048) -> TPUTrainerConfig:
+  """Qwen3 debug model configuration for TPU (8 rows of ``seq_len`` per rank)."""
 
-  model_spec = model_registry("debugmodel", attn_backend="sdpa")
+  model_spec = model_registry("debugmodel", seq_len=seq_len)
   model_spec.parallelize_fn = tpu_parallelize_qwen3
 
   model_config = cast(Qwen3Model.Config, model_spec.model)
@@ -72,7 +97,9 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
       "weight": partial(nn.init.normal_, std=1.0)
   }
   return TPUTrainerConfig(
-      loss=CrossEntropyLoss.Config(),
+      loss=CrossEntropyLoss.Config(
+          global_vocab_size=decoder_vocab_size(model_spec),
+      ),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
       optimizer=default_adamw(lr=8e-4),
@@ -83,13 +110,11 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=TrainingConfig(
-          local_batch_size=8,
-          seq_len=2048,
+          num_tokens_per_microbatch_per_dp_rank=8 * seq_len,
+          max_context_length=seq_len,
           steps=10,
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=_c4_test_loader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           pipeline_parallel_schedule="Interleaved1F1B"
@@ -102,6 +127,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
       validator=Validator.Config(
           freq=5,
           steps=10,
+          dataloader=_c4_test_loader(),
       ),
   )
 
@@ -114,23 +140,26 @@ def qwen3_moe_testmodel() -> TPUTrainerConfig:
       name="qwen3_tpu",
       flavor="testmodel_moe",
       model=config,
+      max_context_length=128,
       parallelize_fn=tpu_parallelize_qwen3,
       pipelining_fn=None,
       post_optimizer_build_fn=None,
       state_dict_adapter=Qwen3StateDictAdapter,
   )
   cfg.model_spec.model.enable_weight_tying = False
+  cfg.loss = CrossEntropyLoss.Config(
+      global_vocab_size=decoder_vocab_size(cfg.model_spec),
+  )
 
   # Override with previous debug_model train_config values
-  cfg.training.seq_len = 128
-  cfg.training.local_batch_size = 4
+  _set_batch(cfg.training, local_batch_size=4, seq_len=128)
 
   return cfg
 
 
 def qwen3_1_7b() -> TPUTrainerConfig:
   """Qwen3 1.7B model configuration for TPU."""
-  model_spec = model_registry("1.7B", attn_backend="sdpa")
+  model_spec = model_registry("1.7B")
   model_config = cast(Qwen3Model.Config, model_spec.model)
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
@@ -139,7 +168,9 @@ def qwen3_1_7b() -> TPUTrainerConfig:
   model_spec.parallelize_fn = tpu_parallelize_qwen3
 
   return TPUTrainerConfig(
-      loss=CrossEntropyLoss.Config(),
+      loss=CrossEntropyLoss.Config(
+          global_vocab_size=decoder_vocab_size(model_spec),
+      ),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
       optimizer=default_adamw(lr=8e-4),
@@ -151,14 +182,12 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           max_norm=1.0,
-          local_batch_size=1,
-          seq_len=2048,
+          num_tokens_per_microbatch_per_dp_rank=1 * 2048,
+          max_context_length=2048,
           steps=15,
           mixed_precision_reduce="bfloat16",
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=_c4_test_loader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
@@ -206,7 +235,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
 
 def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
   """Qwen3 8B model configuration for TPU (regular trainer)."""
-  model_spec = model_registry("8B", attn_backend="sdpa")
+  model_spec = model_registry("8B")
   model_config = cast(Qwen3Model.Config, model_spec.model)
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
@@ -215,7 +244,9 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
   model_spec.parallelize_fn = tpu_parallelize_qwen3
 
   return TPUTrainerConfig(
-      loss=CrossEntropyLoss.Config(),
+      loss=CrossEntropyLoss.Config(
+          global_vocab_size=decoder_vocab_size(model_spec),
+      ),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
       optimizer=default_adamw(lr=8e-4),
@@ -227,14 +258,12 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           max_norm=1.0,
-          local_batch_size=6,
-          seq_len=2048,
+          num_tokens_per_microbatch_per_dp_rank=6 * 2048,
+          max_context_length=2048,
           steps=15,
           mixed_precision_reduce="float32",
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=_c4_test_loader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
@@ -282,7 +311,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
 
 def qwen3_8b() -> TPUTrainerConfig:
   """Qwen3 8B model configuration for TPU."""
-  model_spec = model_registry("8B", attn_backend="sdpa")
+  model_spec = model_registry("8B")
   model_config = cast(Qwen3Model.Config, model_spec.model)
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
@@ -307,14 +336,12 @@ def qwen3_8b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           max_norm=1.0,
-          local_batch_size=6,
-          seq_len=2048,
+          num_tokens_per_microbatch_per_dp_rank=6 * 2048,
+          max_context_length=2048,
           steps=15,
           mixed_precision_reduce="float32",
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=_c4_test_loader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
@@ -367,18 +394,21 @@ def qwen3_8b() -> TPUTrainerConfig:
 def qwen3_moe_30b() -> TPUTrainerConfig:
   """TPU specialization of the global-aux Qwen3 30B recipe."""
   cfg = TPUTrainerConfig.derive_from(qwen3_30b_a3b_global_aux())
-  cfg.loss = CrossEntropyLoss.Config()
   cfg.model_spec = model_registry(
       "30B-A3B-global-aux",
-      attn_backend="sdpa",
       converters=[
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
       ],
   )
+  cfg.loss = CrossEntropyLoss.Config(
+      global_vocab_size=decoder_vocab_size(cfg.model_spec),
+  )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
-  cfg.training.local_batch_size = 6
-  cfg.training.global_batch_size = 768
+  cfg.dataloader = _c4_test_loader()
+  _set_batch(
+      cfg.training, local_batch_size=6, seq_len=2048, global_batch_size=768
+  )
   cfg.parallelism = ParallelismConfig(
       use_simple_fsdp=True,
       data_parallel_shard_degree=-1,
@@ -431,9 +461,9 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
     experts.pallas_grouped_mm_tile_m = 256
     experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
     experts.use_kernel_native_weight_layout = True
-  cfg.training.local_batch_size = 6
-  cfg.training.global_batch_size = 768
-  cfg.training.seq_len = 2048
+  _set_batch(
+      cfg.training, local_batch_size=6, seq_len=2048, global_batch_size=768
+  )
   cfg.training.steps = 8
   cfg.tpu_config = TPUConfig(
       use_graph_trainer=True,
@@ -599,11 +629,13 @@ def qwen3_235b_scan() -> TPUTrainerConfig:
   cfg = qwen3_moe_30b()
   cfg.model_spec = model_registry(
       "235B-A22B-global-aux",
-      attn_backend="sdpa",
       converters=[
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
       ],
+  )
+  cfg.loss = CrossEntropyLoss.Config(
+      global_vocab_size=decoder_vocab_size(cfg.model_spec),
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   _enable_fsdp_only_pallas_experts(cfg)
@@ -615,9 +647,7 @@ def qwen3_235b_scan() -> TPUTrainerConfig:
   # 16 is MaxText's per-device batch for this model and the largest that fits
   # (peak 87.9 of 94.7 GiB on 64 v7x chips); 1,827 tokens/s/device there,
   # 1,903 with --training.mixed_precision_reduce=bfloat16.
-  cfg.training.local_batch_size = 16
-  cfg.training.global_batch_size = -1
-  cfg.training.seq_len = 4096
+  _set_batch(cfg.training, local_batch_size=16, seq_len=4096)
   cfg.training.steps = 1000
   cfg.metrics.log_freq = 5
   return cfg
@@ -643,8 +673,7 @@ def qwen3_235b_scan_loss_parity() -> TPUTrainerConfig:
       decay_type="linear",
       min_lr_factor=0.1,
   )
-  cfg.training.local_batch_size = 5
-  cfg.training.seq_len = 4096
+  _set_batch(cfg.training, local_batch_size=5, seq_len=4096)
   cfg.training.steps = 200
   cfg.training.mixed_precision_reduce = "float32"
   cfg.metrics.log_freq = 5
@@ -663,9 +692,7 @@ def qwen3_moe_30b_scan_proxy() -> TPUTrainerConfig:
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   model_config.layers = model_config.layers[:4]
   _enable_scan_layers(cfg)
-  cfg.training.local_batch_size = 2
-  cfg.training.global_batch_size = -1
-  cfg.training.seq_len = 2048
+  _set_batch(cfg.training, local_batch_size=2, seq_len=2048)
   cfg.training.steps = 5
   cfg.metrics.log_freq = 1
   return cfg

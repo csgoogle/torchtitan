@@ -1,27 +1,63 @@
-import torchtitan.components.loss as loss
-from torchtitan.components.optimizer import OptimizersContainer, default_adamw
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.components.validate import Validator
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.protocols.train_spec import TrainSpec, register_train_spec
+"""Llama3 on the TorchTPU lane.
+
+Thin wrapper over ``torchtitan.models.llama3``: the same model configs, with
+every flex inner attention swapped for the TPU splash kernel
+(``SplashAttentionConverter``) and the TPU parallelizer installed.
+"""
+
+from torchtitan.experiments.tpu.attention import SplashAttentionConverter
 import torchtitan.models.common as common_models
+from torchtitan.models.common.config_utils import TpGemmBackend
 import torchtitan.models.llama3 as llama3_models
+from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.protocols.model_spec import ModelSpec
 
 from .infra.parallelize import parallelize_llama
-from .infra.pipeline import pipeline_llama
 
 __all__ = [
     "parallelize_llama",
     "llama3_configs",
+    "model_registry",
+    "tpu_converters",
 ]
 
 
-def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
+def tpu_converters(
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> list[ModelConfigConverter.Config]:
+  """The splash converter first, then whatever the recipe asked for."""
+  return [SplashAttentionConverter.Config(), *(converters or [])]
+
+
+def model_registry(
+    flavor: str,
+    *,
+    seq_len: int | None = None,
+    attn_backend: str = "flex",
+    tp_gemm_backend: TpGemmBackend = "default",
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> ModelSpec:
+  """Upstream's llama3 registry with splash attention and the TPU parallelizer.
+
+  ``attn_backend`` names the upstream inner attention the converter replaces;
+  it never survives to the built model.
+  """
+  model_spec = llama3_models.model_registry(
+      flavor,
+      seq_len=seq_len,
+      attn_backend=attn_backend,
+      tp_gemm_backend=tp_gemm_backend,
+      converters=tpu_converters(converters),
+  )
+  model_spec.parallelize_fn = parallelize_llama
+  return model_spec
+
+
+def _testmodel(seq_len: int = 512) -> llama3_models.Llama3Model.Config:
   dim = 64
   n_heads = 8
   n_layers = 1
-  return llama3_models.Llama3Model.Config(
+  config = llama3_models.Llama3Model.Config(
       dim=dim,
       vocab_size=128,
       tok_embeddings=common_models.Embedding.Config(
@@ -44,39 +80,23 @@ def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
           n_heads=n_heads,
           n_kv_heads=n_heads,
           hidden_dim=4 * dim,
-          attn_backend=attn_backend,
+          attn_backend="flex",
           rope=common_models.ComplexRoPE.Config(
               dim=dim // n_heads,
-              max_seq_len=512,
+              max_context_length=seq_len,
           ),
       ),
   )
+  return SplashAttentionConverter.Config().build().convert(config)
 
 
+# Ready-built model configs for the unit tests (``testmodel`` is tiny; the
+# named flavors are upstream's at their default context length).
 llama3_configs = {
-    "testmodel": _testmodel("sdpa"),
-    "debugmodel": llama3_models.llama3_configs["debugmodel"]("sdpa"),
-    "debugmodel_flex_attn": llama3_models.llama3_configs["debugmodel"]("flex"),
-    "1B": llama3_models.llama3_configs["1B"]("sdpa"),
-    "8B": llama3_models.llama3_configs["8B"]("sdpa"),
-    "70B": llama3_models.llama3_configs["70B"]("sdpa"),
-    "405B": llama3_models.llama3_configs["405B"]("sdpa"),
+    "testmodel": _testmodel(),
+    "debugmodel": model_registry("debugmodel", seq_len=2048).model,
+    "1B": model_registry("1B").model,
+    "8B": model_registry("8B").model,
+    "70B": model_registry("70B").model,
+    "405B": model_registry("405B").model,
 }
-
-# pytype: disable=wrong-arg-types
-register_train_spec(
-    name="llama3_tpu",
-    train_spec=TrainSpec(
-        model_cls=llama3_models.Llama3Model,
-        model_args=llama3_configs,
-        parallelize_fn=parallelize_llama,
-        pipelining_fn=pipeline_llama,
-        loss_config=loss.ChunkedLossWrapper.Config(),
-        optimizer_config=default_adamw(lr=8e-4),
-        lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
-        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        validator_config=Validator.Config(enable=True),
-        state_dict_adapter=llama3_models.Llama3StateDictAdapter,
-    )
-)
-# pytype: enable=wrong-arg-types

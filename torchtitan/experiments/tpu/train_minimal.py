@@ -39,7 +39,7 @@ JobConfig = torchtitan.trainer.Trainer.Config
 ParallelDims = torchtitan.distributed.ParallelDims
 logger = torchtitan.tools.logging.logger
 
-TrainStepCallback = Callable[[int, nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], None]
+TrainStepCallback = Callable[[int, nn.Module, torch.Tensor, dict[str, torch.Tensor]], None]
 
 
 def _gather_along_first_dim(tensor: torch.Tensor, group) -> torch.Tensor:
@@ -97,6 +97,17 @@ class TrainerMinimal:
           enable_cpu_backend=job_config.training.enable_cpu_offload,
           base_folder=job_config.dump_folder,
       )
+    elif job_config.parallelism.spmd_backend == "spmd_types":
+      # spmd_types needs a device mesh, and a mesh needs torch.distributed.
+      # A single-process run (the CPU reference of the parity tests) has
+      # neither, and with one rank the backends are numerically identical.
+      logger.info(
+          "Single-process run: using the partial_dtensor SPMD backend"
+          " (spmd_types needs an initialized process group)"
+      )
+      job_config.parallelism.spmd_backend = "partial_dtensor"
+    # Same activation as Trainer.__init__: the backend is a process global.
+    dist_utils.set_spmd_backend(job_config.parallelism.spmd_backend)
 
     parallelism_config = self.job_config.parallelism
     self.parallel_dims = ParallelDims(
@@ -107,6 +118,7 @@ class TrainerMinimal:
         pp=parallelism_config.pipeline_parallel_degree,
         ep=parallelism_config.expert_parallel_degree,
         world_size=self.world_size,
+        spmd_backend=parallelism_config.spmd_backend,
     )
 
     logger.info(f"parallel_dims: {self.parallel_dims}")
@@ -149,12 +161,15 @@ class TrainerMinimal:
         job_config.tokenizer.build(tokenizer_path=job_config.hf_assets_path)
     )
 
+    self.num_tokens_per_batch = (
+        job_config.training.num_tokens_per_microbatch_per_dp_rank
+    )
     self.dataloader = job_config.dataloader.build(
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=self.tokenizer,
-        seq_len=job_config.training.seq_len,
-        local_batch_size=job_config.training.local_batch_size,
+        max_context_length=job_config.training.max_context_length,
+        num_tokens_per_batch=self.num_tokens_per_batch,
     )
 
     model_config = self.model_spec.model
@@ -189,7 +204,9 @@ class TrainerMinimal:
     (
         model_param_count,
         _,
-    ) = model_config.get_nparams_and_flops(model, job_config.training.seq_len)
+    ) = model_config.get_nparams_and_flops(
+        model, job_config.training.max_context_length
+    )
 
     logger.info(
         f"Model {self.model_spec.name} {self.model_spec.flavor} "
@@ -251,32 +268,29 @@ class TrainerMinimal:
     try:
 
       def get_batch():
-        batch = next(data_iterator)
-        tokens = batch[0]["input"].to(self.device)
-        labels = batch[1].to(self.device)
-        return tokens, labels
+        """One microbatch as ``(inputs, labels, extra_kwargs, local_valid_tokens)``.
 
-      def _get_dummy_batch():
-        vocab_size = getattr(self.model_config, "vocab_size", 32000)
-        tokens = torch.randint(
-            0,
-            vocab_size,
-            (
-                self.job_config.training.local_batch_size,
-                self.job_config.training.seq_len,
-            ),
-            device=self.device,
+        The dataloader yields the batch dict (``input``, ``labels``,
+        ``positions``, ``padding_mask``, ``num_valid_tokens``); the model's
+        ``preprocess_inputs`` builds any masks / SPMD annotations and splits
+        out ``inputs`` and ``labels``, exactly as ``Trainer`` does.
+        """
+        batch = dict(next(data_iterator))
+        local_valid_tokens = batch.pop("num_valid_tokens", None)
+        for key, value in batch.items():
+          if isinstance(value, torch.Tensor):
+            batch[key] = value.to(self.device)
+        if local_valid_tokens is None:
+          local_valid_tokens = (batch["labels"] != IGNORE_INDEX).sum()
+        local_valid_tokens = torch.as_tensor(
+            local_valid_tokens, dtype=torch.int64, device=self.device
         )
-        labels = torch.randint(
-            0,
-            vocab_size,
-            (
-                self.job_config.training.local_batch_size,
-                self.job_config.training.seq_len,
-            ),
-            device=self.device,
+        inputs, labels, extra_kwargs = self.model.preprocess_inputs(
+            batch,
+            parallel_dims=self.parallel_dims,
+            parallelism=self.job_config.parallelism,
         )
-        return tokens, labels
+        return inputs, labels, extra_kwargs, local_valid_tokens
 
       total_tokens = 0
       total_time = 0.0
@@ -289,27 +303,27 @@ class TrainerMinimal:
         for step in range(self.job_config.training.steps):
           step_start_time = time.time()
           self.optimizers.zero_grad()
-          tokens, labels = get_batch()
-          # In distributed settings, we sum locally calculated valid tokens
-          # across all data-parallel ranks to get the global token count,
-          # which is used to scale the loss and gradients.
-          # We need this global count because TorchTitan's FSDP
-          # implementation disables automatic gradient division in favor of
-          # global token-based scaling.
-          # Valid tokens exclude those marked with IGNORE_INDEX (pytorch
-          # default is -100), representing padding or ignored tokens.
-          local_valid_tokens = (labels != IGNORE_INDEX).sum().to(self.device)
-          if self.world_size > 1 and self.parallel_dims.dp_enabled:
-            global_valid_tokens = dist_utils.dist_sum(
-                local_valid_tokens, self.batch_mesh
-            )
-          else:
-            global_valid_tokens = local_valid_tokens.float()
-
-          # train_context would take care of converting labels to DTensors using
-          # https://docs.pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.loss_parallel
+          # train_context activates the configured SPMD backend and mesh; the
+          # model's preprocess_inputs runs inside it so spmd_types annotations
+          # see the mesh.
           with self.train_context():  # pytype: disable=not-callable
-            pred = self.model(tokens)
+            tokens, labels, extra_kwargs, local_valid_tokens = get_batch()
+            # In distributed settings, we sum locally calculated valid tokens
+            # across all data-parallel ranks to get the global token count,
+            # which is used to scale the loss and gradients.
+            # We need this global count because TorchTitan's FSDP
+            # implementation disables automatic gradient division in favor of
+            # global token-based scaling.
+            # Valid tokens exclude those marked with IGNORE_INDEX (pytorch
+            # default is -100), representing padding or ignored tokens.
+            if self.world_size > 1 and self.parallel_dims.dp_enabled:
+              global_valid_tokens = dist_utils.dist_sum_tensor(
+                  local_valid_tokens, self.batch_mesh
+              )
+            else:
+              global_valid_tokens = local_valid_tokens
+
+            pred = self.model(tokens, **extra_kwargs)
             loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
             # need to free pred before bwd to avoid peaking memory
             del pred
@@ -319,23 +333,27 @@ class TrainerMinimal:
           step_time = time.time() - step_start_time
 
           if self.step_callback is not None:
-            gathered_tokens = tokens
-            gathered_labels = labels
+            # The whole global batch (token-major, concatenated over DP
+            # ranks) so a single-device reference run can replay it exactly.
+            batch = {
+                "input": tokens,
+                "labels": labels,
+                "positions": extra_kwargs.get("positions"),
+            }
             if self.batch_mesh is not None:
               dp_group = self.batch_mesh.get_group()
-              gathered_tokens = _gather_along_first_dim(tokens, dp_group)
-              gathered_labels = _gather_along_first_dim(labels, dp_group)
-            self.step_callback(step, self.model, loss, gathered_tokens, gathered_labels)
+              batch = {
+                  key: _gather_along_first_dim(value, dp_group)
+                  for key, value in batch.items()
+                  if value is not None
+              }
+            self.step_callback(step, self.model, loss, batch)
 
           if step >= self.job_config.lr_scheduler.warmup_steps:
-            total_tokens += (
-                self.job_config.training.local_batch_size *
-                self.job_config.training.seq_len)
+            total_tokens += self.num_tokens_per_batch
             total_time += step_time
 
-          tokens_per_sec = (
-              self.job_config.training.local_batch_size *
-              self.job_config.training.seq_len) / step_time
+          tokens_per_sec = self.num_tokens_per_batch / step_time
 
           logger.info(
               "Step %d/%d | Loss: %.4f | Step time: %.2f sec | "

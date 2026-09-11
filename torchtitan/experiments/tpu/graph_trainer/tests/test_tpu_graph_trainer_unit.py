@@ -101,8 +101,8 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
         self.config_manager.parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            "--training.local_batch_size=2",
-            "--training.seq_len=16",
+            "--training.max_context_length=16",
+            "--training.num_tokens_per_microbatch_per_dp_rank=32",
             "--tpu_config.compile_mode=fullgraph",
         ]),
     )
@@ -131,8 +131,8 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
         self.config_manager.parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            "--training.local_batch_size=2",
-            "--training.seq_len=16",
+            "--training.max_context_length=16",
+            "--training.num_tokens_per_microbatch_per_dp_rank=32",
             "--tpu_config.compile_mode=fullgraph",
             "--loss-kernel.use-loss-kernel",
         ]),

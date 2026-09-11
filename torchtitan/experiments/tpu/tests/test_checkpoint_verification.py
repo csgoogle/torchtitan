@@ -80,10 +80,10 @@ class TrainCheckpointVerificationTest(
     base_args = [
         "--module", "torchtitan.experiments.tpu.llama3",
         "--config", "llama3_debugmodel",
-        "--dataloader.dataset_path=tests/assets/c4_test",
         "--hf_assets_path=tests/assets/tokenizer",
-        "--training.seq_len=128",
-        "--training.local_batch_size=4",
+        # 4 rows of 128 tokens per rank.
+        "--training.max_context_length=128",
+        "--training.num_tokens_per_microbatch_per_dp_rank=512",
         "--debug.deterministic",
         "--debug.seed=42",
     ]

@@ -5,12 +5,17 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.loss import MSELoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
 import torchtitan.models.flux as native_flux_models
-from torchtitan.models.flux.flux_datasets import FluxDataLoader
+from torchtitan.components.data import GrainDataLoader
+from torchtitan.models.flux.flux_datasets import (
+    DATASETS,
+    FluxCollator,
+    FluxValidationDatasetConfig,
+)
 from torchtitan.models.flux.validate import FluxValidator
 from torchtitan.experiments.tpu.flux.infra.parallelize import parallelize_flux
 from torchtitan.models.flux.model.model import FluxModel
@@ -21,10 +26,10 @@ __all__ = [
     "parallelize_flux",
 ]
 
+# Upstream now stores ``(builder, max_context_length)`` tuples.
 flux_configs = {
-    "flux-dev": native_flux_models.flux_configs["flux-dev"](),
-    "flux-schnell": native_flux_models.flux_configs["flux-schnell"](),
-    "flux-debug": native_flux_models.flux_configs["flux-debug"](),
+    flavor: builder()
+    for flavor, (builder, _max_context_length) in native_flux_models.flux_configs.items()
 }
 
 
@@ -39,8 +44,19 @@ register_train_spec(
         loss_config=MSELoss.Config(),
         optimizer_config=default_adamw(lr=1e-4),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
-        dataloader_config=FluxDataLoader.Config(),
-        validator_config=FluxValidator.Config(enable=True),
+        dataloader_config=GrainDataLoader.Config(
+            dataset=DATASETS["cc12m-test"],
+            collator=FluxCollator.Config(),
+        ),
+        validator_config=FluxValidator.Config(
+            enable=True,
+            dataloader=GrainDataLoader.Config(
+                dataset=FluxValidationDatasetConfig(
+                    dataset=DATASETS["cc12m-test-validation"],
+                ),
+                collator=FluxCollator.Config(),
+            ),
+        ),
         state_dict_adapter=FluxStateDictAdapter,
     )
 )

@@ -66,7 +66,6 @@ class TpuActivationDtypeCosSinRoPE(CosSinRoPE):
 
 
 @override(
-    "tpu_activation_dtype_cossin_rope",
     target=CosSinRoPE.Config,
     exact=True,
     description="Evaluate cos/sin RoPE in the activation dtype on TPU.",

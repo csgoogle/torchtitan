@@ -820,7 +820,9 @@ class MoE(Module):
         The module lives in ``router.aux_loss`` (upstream's slot); trainers and
         ``configure_moe_aux_loss_reduction`` address it through the MoE.
         """
-        aux_loss = self.router.aux_loss
+        # getattr: a router without an aux-loss slot must not raise inside a
+        # property (nn.Module.__getattr__ would report MoE has no 'aux_loss').
+        aux_loss = getattr(self.router, "aux_loss", None)
         return aux_loss if isinstance(aux_loss, MoELoadBalanceAuxLoss) else None
 
     def forward(self, x_TD: torch.Tensor, **router_kwargs) -> torch.Tensor:

@@ -41,7 +41,6 @@ class FusedLossLinearWrapper(Linear):
 
 
 @override(
-    "tpu_fused_loss_lm_head",
     target=Linear.Config,
     fqns=["model_spec.model.lm_head"],
     exact=True,

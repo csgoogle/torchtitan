@@ -16,6 +16,76 @@ import tyro
 
 from torchtitan.trainer import Trainer
 
+# Fork (google-pytorch): TPU-lane options frozen alongside upstream's set.
+# Extend this list deliberately when a TPU config gains a CLI-visible field.
+_FORK_CLI_OPTIONS = frozenset(
+    {
+        "redacted.enable_manual_ddp",
+        "redacted.use_chunked_loss",
+        "redacted.use_segment_matmul_kernel",
+        "redacted.enable_manual_ddp",
+        "redacted.remat_chunks",
+        "redacted.use_chunked_loss",
+        "conformer.ctc_loss_target_len",
+        "conformer.use_ctc_loss",
+        "conformer.use_jax_ctc_loss",
+        "flux.precomputed_dataset_path",
+        "flux.random_dataset",
+        "lora.force_lora_parameter_ddp",
+        "lora.lora_alpha",
+        "lora.lora_dtype",
+        "lora.lora_rank",
+        "lora.use_lora",
+        "loss_kernel.enable_pallas_loss_kernel",
+        "loss_kernel.loss_b_block_size",
+        "loss_kernel.loss_h_block_size",
+        "loss_kernel.loss_v_block_size",
+        "loss_kernel.use_loss_kernel",
+        "metrics.enable_moe_routing",
+        "parallelism.enable_tpu_topo_mesh",
+        "parallelism.use_simple_fsdp",
+        "qwen3.use_fill_indices_kernel",
+        "qwen3.use_gmm_kernel",
+        "splash_attention_kernel.sa_block_dkv",
+        "splash_attention_kernel.sa_block_kv",
+        "splash_attention_kernel.sa_block_kv_compute",
+        "splash_attention_kernel.sa_block_kv_dkv",
+        "splash_attention_kernel.sa_block_kv_dkv_compute",
+        "splash_attention_kernel.sa_block_kv_dq",
+        "splash_attention_kernel.sa_block_q",
+        "splash_attention_kernel.sa_block_q_dkv",
+        "splash_attention_kernel.sa_block_q_dq",
+        "splash_attention_kernel.sa_k_layout",
+        "splash_attention_kernel.sa_q_layout",
+        "splash_attention_kernel.sa_use_document_aware_block_skipping",
+        "splash_attention_kernel.sa_use_fused_bwd_kernel",
+        "splash_attention_kernel.sa_v_layout",
+        "splash_attention_kernel.use_splash_attention_kernel",
+        "splash_attention_kernel.use_tokamax_splash_attention_kernel",
+        "splash_attention_kernel.use_vmap_bwd",
+        "tpu_config.apply_rope_complex_workaround",
+        "tpu_config.compile_mode",
+        "tpu_config.compile_optimizer",
+        "tpu_config.eager_mode",
+        "tpu_config.enable_amp",
+        "tpu_config.enable_fused_optimizer",
+        "tpu_config.enable_graph_trainer_remat_schedule",
+        "tpu_config.enable_mfu_benchmark",
+        "tpu_config.graph_trainer_fsdp_prefetch_distance",
+        "tpu_config.graph_trainer_fsdp_schedule",
+        "tpu_config.graph_trainer_memory_policy",
+        "tpu_config.log_freq",
+        "tpu_config.mfu_benchmark_start_step",
+        "tpu_config.optimizer_in_graph",
+        "tpu_config.use_graph_split",
+        "tpu_config.use_graph_trainer",
+        "tpu_config.use_jax_profiler",
+        "tpu_config.use_scan_layers",
+        "tpu_config.use_simple_fsdp",
+        "tpu_config.use_stacked_layers",
+    }
+)
+
 _FROZEN_CLI_OPTIONS = frozenset(
     {
         "activation_checkpoint.debug",
@@ -419,7 +489,7 @@ class TestCliOptionsFrozen(unittest.TestCase):
         for config in configs:
             current |= _cli_options(config)
 
-        added = sorted(current - _FROZEN_CLI_OPTIONS)
+        added = sorted(current - _FROZEN_CLI_OPTIONS - _FORK_CLI_OPTIONS)
         self.assertFalse(
             added, f"The command-line options are frozen, but this adds {added}."
         )

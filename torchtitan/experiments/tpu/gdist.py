@@ -3,6 +3,7 @@
 A trimmed down version to be used in OSS environments.
 """
 
+import cloudpickle
 import abc
 import pathlib
 import random
@@ -11,11 +12,25 @@ import string
 import sys
 import tempfile
 
+from absl import flags
 from absl import logging
 import portpicker
 import torch
 from torch.distributed.launcher import api
 from typing_extensions import override
+
+
+def _run_cloudpickled(payload: bytes):
+  """Worker entry point: unpack the cloudpickled ``(fn, args)`` and run it.
+
+  Spawned workers never go through ``absl.app.run``, so absl flags (e.g.
+  torch_tpu's) would raise ``UnparsedFlagAccessError`` on first read; mark
+  them parsed at their defaults, as a fresh ``app.run`` with no flags would.
+  """
+  if not flags.FLAGS.is_parsed():
+    flags.FLAGS.mark_as_parsed()
+  fn, args = cloudpickle.loads(payload)
+  return fn(*args)
 
 
 def torchrun(fn, *, nnodes=None, nproc_per_node=None):
@@ -62,7 +77,14 @@ def torchrun(fn, *, nnodes=None, nproc_per_node=None):
     )
 
     try:
-      ret = api.elastic_launch(launch_config, environment.run(fn))(*args)
+      # ``elastic_launch`` ships ``args`` to the spawned workers with the
+      # standard pickler, which cannot serialize the closures upstream's model
+      # configs carry (e.g. ``_fused_qkv_param_init``'s local ``_init``).
+      # cloudpickle can; send one payload and unpack it in the worker.
+      payload = cloudpickle.dumps((fn, args))
+      ret = api.elastic_launch(
+          launch_config, environment.run(_run_cloudpickled)
+      )(payload)
       if all(v is None for v in ret.values()):
         # if all the local ranks returned `None` this was probably
         # a `main()` method with a void return signature

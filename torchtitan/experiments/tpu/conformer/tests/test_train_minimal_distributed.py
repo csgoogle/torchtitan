@@ -40,11 +40,10 @@ class TrainMinimalDistributedTest(
 
     config_args = [
         "--module=torchtitan.experiments.tpu.conformer",
-        "--config=conformer_test",
-        "--training.seq_len=128",  # Override to smaller length for test speed
-        "--dataloader.dataset=random",
+        "--config=conformer_test_random",  # synthetic tokens baked into the config
+        "--training.max_context_length=128",  # smaller length for test speed
         "--training.steps=5",
-        "--training.local_batch_size=4",
+        "--training.num_tokens_per_microbatch_per_dp_rank=512",  # 4 x 128
     ]
     if extra_args:
       config_args.extend(extra_args)

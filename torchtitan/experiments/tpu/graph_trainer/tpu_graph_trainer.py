@@ -24,11 +24,14 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
+from torch import nn
 
 from torchtitan.components.loss import ChunkedLossWrapper
+from torchtitan.distributed import utils as dist_utils
+from torchtitan.experiments.graph_trainer.common_utils import accumulate_param_grads_
 from torchtitan.components.optimizer import (
     collect_moe_routing_metric_tensors,
     set_moe_routing_metric_tensors,
@@ -45,6 +48,8 @@ from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
 from torchtitan.experiments.tpu.graph_trainer.mfu_benchmark import MfuBenchmark
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import register as register_tpu_pipeline
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.models.common.aux_loss import AuxLoss
+from torchtitan.protocols import BaseModel
 from torchtitan.tools.logging import logger
 
 
@@ -53,7 +58,7 @@ class TpuGraphTrainerConfig:
     """Subset of job/TPU config carried forward into TpuGraphTrainer."""
 
     device: str = "tpu"
-    attention_backend: str = "sdpa-no-scale"
+    attention_backend: str = "splash"
     moe_enabled: bool = False
     moe_padded_dispatcher: bool = False
     moe_capacity_factor: float = 1.25
@@ -154,9 +159,7 @@ class TpuGraphTrainer(GraphTrainer):
                 final_step=tpu_extra.mfu_benchmark_final_step,
             )
 
-    def train_step(
-        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
-    ) -> None:
+    def train_step(self, data_iterator: Iterator[dict[str, Any]]) -> None:
         """Override of GraphTrainer.train_step to branch into optimizer_in_graph loop when enabled."""
         if not self._optimizer_in_graph:
             super().train_step(data_iterator)
@@ -215,12 +218,15 @@ class TpuGraphTrainer(GraphTrainer):
 
     def _train_step_optimizer_in_graph(
         self,
-        data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]],
+        data_iterator: Iterator[dict[str, Any]],
     ) -> None:
-        """TPU/PJRT addition: runs joint fwd+loss+bwd+opt training loop when optimizer_in_graph is active."""
-        from torchtitan.components.loss import IGNORE_INDEX
-        from torchtitan.distributed import utils as dist_utils
+        """TPU/PJRT addition: runs joint fwd+loss+bwd+opt training loop when optimizer_in_graph is active.
 
+        Mirrors ``Trainer.train_step``'s batch handling (labels travel inside the
+        batch, ``num_valid_tokens`` is popped and summed over DP), but the
+        gradient clipping and the AdamW update run inside the traced program,
+        so the eager optimizer / clip_grad_norm_ path is skipped.
+        """
         self._register_optimizer_buffers()
 
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
@@ -229,30 +235,31 @@ class TpuGraphTrainer(GraphTrainer):
         model = self.model_parts[0]
         model._optstate_lr.fill_(lr)
 
-        microbatches = []
-        local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        microbatches: list[dict[str, Any]] = []
+        local_valid_tokens = 0
         for _ in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
-            local_valid_tokens += (labels != IGNORE_INDEX).sum()
-            microbatches.append((input_dict, labels))
-        local_valid_tokens = local_valid_tokens.to(self.device)
+            input_dict = next(data_iterator)
+            local_valid_tokens += input_dict.pop("num_valid_tokens")
+            microbatches.append(input_dict)
+        local_valid_tokens_tensor = torch.tensor(
+            local_valid_tokens, dtype=torch.int64, device=self.device
+        )
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(
-                local_valid_tokens, batch_mesh
+            global_valid_tokens = dist_utils.dist_sum_tensor(
+                local_valid_tokens_tensor, batch_mesh
             )
         else:
-            global_valid_tokens = local_valid_tokens.float()
+            global_valid_tokens = local_valid_tokens_tensor
+        AuxLoss.set_step_denominator(global_valid_tokens)
 
         accumulated_losses = []
-        for input_dict, labels in microbatches:
+        for input_dict in microbatches:
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):
-                    input_dict[k] = v.to(self.device)
-            labels = labels.to(self.device)
+                    input_dict[k] = v.to(self.device, non_blocking=True)
             loss = self.forward_backward_step(
                 input_dict=input_dict,
-                labels=labels,
                 global_valid_tokens=global_valid_tokens,  # type: ignore[arg-type]
             )
             accumulated_losses.append(loss.detach())
@@ -281,29 +288,45 @@ class TpuGraphTrainer(GraphTrainer):
     def forward_backward_step(
         self,
         *,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
+        input_dict: dict[str, Any] | list[dict[str, Any]],
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Override of GraphTrainer.forward_backward_step to branch into AdamW step when optimizer_in_graph is set."""
         if not self._optimizer_in_graph:
             return super().forward_backward_step(
                 input_dict=input_dict,
-                labels=labels,
                 global_valid_tokens=global_valid_tokens,
             )
+        assert isinstance(input_dict, dict)
         return self._fwd_bwd_adamw_step(
             input_dict=input_dict,
-            labels=labels,
             global_valid_tokens=global_valid_tokens,
         )
+
+    def _preprocess_inputs(
+        self, input_dict: dict[str, Any]
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        """The model's own batch preprocessing (masks, SPMD annotation, split)."""
+        assert len(self.model_parts) == 1
+        model = cast(BaseModel, self.model_parts[0])
+        inputs, labels, extra_kwargs = model.preprocess_inputs(
+            input_dict,
+            parallel_dims=self.parallel_dims,
+            parallelism=self.config.parallelism,
+            max_num_documents=self.dataloader.max_num_documents,
+            max_context_length=self.config.training.max_context_length,
+        )
+        self.ntokens_seen += (
+            labels[0].numel() if isinstance(labels, tuple) else labels.numel()
+        )
+        return inputs, labels, extra_kwargs
 
     def _make_fx_forward_backward_step(
         self,
         model: nn.Module,
-        inputs: torch.Tensor,
-        labels: torch.Tensor,
-        global_valid_tokens: float,
+        inputs: torch.Tensor | tuple[torch.Tensor, ...],
+        labels: torch.Tensor | tuple[torch.Tensor, ...],
+        global_valid_tokens: torch.Tensor,
         params: list[torch.Tensor],
         extra_kwargs: dict[str, Any],
     ) -> torch.Tensor:
@@ -326,17 +349,23 @@ class TpuGraphTrainer(GraphTrainer):
             PASS_PIPELINE_REGISTRY,
         )
 
+        maybe_register_blockmask_pytree_node()
         if self._traced_step is None:
             if self.config.compile.precompile_artifact_dir:
-                self._load_precompiled_fx_trace(model)
+                self._load_precompiled_fx_trace(
+                    model, (inputs, labels, global_valid_tokens, extra_kwargs)
+                )
             else:
                 fwd_bwd_fn = make_fwd_bwd_step(
                     model,
                     self.loss_fn,
                     collect_moe_routing_metrics=self._collect_moe_routing_metrics,
                 )
-                maybe_register_blockmask_pytree_node()
-                with self.train_context():
+                trace_context = dist_utils.get_spmd_context(
+                    parallel_dims=self.parallel_dims,
+                    spmd_typechecking=False,
+                )
+                with trace_context():
                     self._traced_step = minimal_fx_tracer(
                         fwd_bwd_fn,
                         module=model,
@@ -362,7 +391,11 @@ class TpuGraphTrainer(GraphTrainer):
                     self._traced_step.gm, self._traced_step.example_inputs
                 )
         with self.train_context():
-            outputs = run_traced(self._traced_step, module=model)(
+            outputs = run_traced(
+                self._traced_step,
+                module=model,
+                precompile_meshes=self._precompile_meshes(),
+            )(
                 inputs,
                 labels,
                 global_valid_tokens,
@@ -375,18 +408,27 @@ class TpuGraphTrainer(GraphTrainer):
                 [model], list(outputs[1 + len(params) :])
             )
 
-        for param, grad in zip(params, grads, strict=True):
-            if param.requires_grad and grad is not None:
-                param.grad = grad
-
+        accumulate_param_grads_(params, grads)
         return loss
+
+    def _precompile_meshes(self):
+        """SPMD meshes a precompiled artifact needs to re-bind its collectives."""
+        if not (
+            self.config.compile.precompile_artifact_dir
+            and self.config.parallelism.spmd_backend == "spmd_types"
+        ):
+            return None
+        from torchtitan.experiments.graph_trainer.precompile import (
+            get_spmd_precompile_meshes,
+        )
+
+        return get_spmd_precompile_meshes(self.parallel_dims)
 
     def _fwd_bwd_adamw_step(
         self,
         *,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
-        global_valid_tokens: float,
+        input_dict: dict[str, Any],
+        global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """TPU/PJRT addition: lowers and runs joint forward, backward, and AdamW optimizer FX graph step."""
         from torchtitan.experiments.graph_trainer.common_utils import (
@@ -404,9 +446,7 @@ class TpuGraphTrainer(GraphTrainer):
         assert len(self.model_parts) == 1
         model = self.model_parts[0]
 
-        inputs, labels, extra_kwargs = self.post_dataloading_process(
-            input_dict, labels
-        )
+        inputs, labels, extra_kwargs = self._preprocess_inputs(input_dict)
 
         if self._traced_step is None:
             maybe_register_blockmask_pytree_node()
@@ -429,10 +469,16 @@ class TpuGraphTrainer(GraphTrainer):
                 collect_moe_routing_metrics=self._collect_moe_routing_metrics,
             )
 
-            with self.train_context():
+            trace_context = dist_utils.get_spmd_context(
+                parallel_dims=self.parallel_dims,
+                spmd_typechecking=False,
+            )
+            with trace_context():
                 self._traced_step = minimal_fx_tracer(
                     fwd_bwd_adamw,
                     module=model,
+                    prepare_inputs=self._prepare_trace_inputs,
+                    prepare_call_inputs=self._prepare_trace_call_inputs,
                 )(
                     inputs,
                     labels,
@@ -449,7 +495,11 @@ class TpuGraphTrainer(GraphTrainer):
             )
 
         with self.train_context():
-            outputs = run_traced(self._traced_step, module=model)(
+            outputs = run_traced(
+                self._traced_step,
+                module=model,
+                precompile_meshes=self._precompile_meshes(),
+            )(
                 inputs,
                 labels,
                 global_valid_tokens,

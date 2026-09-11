@@ -15,7 +15,8 @@ from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.model import ModelConfigConverter
-from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
+from spmd_types import SpmdType
+from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.logging import logger
 
 
@@ -26,7 +27,7 @@ _CANONICAL_TO_NATIVE_WEIGHT = {
 }
 
 
-def _transpose_last_two_dims(layout: SpmdLayout, *, ndim: int = 3) -> SpmdLayout:
+def _transpose_last_two_dims(layout: SpmdType, *, ndim: int = 3) -> SpmdType:
     """Transpose tensor-dimension references in an SPMD layout."""
 
     if ndim < 2:
@@ -35,8 +36,10 @@ def _transpose_last_two_dims(layout: SpmdLayout, *, ndim: int = 3) -> SpmdLayout
     permutation = list(range(ndim))
     permutation[-2], permutation[-1] = permutation[-1], permutation[-2]
 
+    # ``SpmdType.local_type`` maps each mesh axis to its per-axis type
+    # (``spmd.S(dim)`` / ``R`` / ``V`` / ...); shard dims are tensor dims.
     axis_types = {}
-    for axis, axis_type in layout.axis_types.items():
+    for axis, axis_type in layout.local_type.items():
         if isinstance(axis_type, spmd.Shard):
             if not 0 <= axis_type.dim < ndim:
                 raise ValueError(
@@ -54,7 +57,7 @@ def _transpose_last_two_dims(layout: SpmdLayout, *, ndim: int = 3) -> SpmdLayout
         partition_spec = tuple(partition_spec[dim] for dim in permutation)
     return replace(
         layout,
-        axis_types=axis_types,
+        local_type=axis_types,
         partition_spec=partition_spec,
     )
 
@@ -116,7 +119,6 @@ class TpuGroupedExperts(GroupedExperts):
             self.w3_EDF = torch.nn.Parameter(
                 torch.empty(config.num_experts, config.dim, config.hidden_dim)
             )
-            self.token_dispatcher = config.token_dispatcher.build()
         else:
             super().__init__(config)
 
@@ -214,16 +216,18 @@ class TpuGroupedExperts(GroupedExperts):
                     canonical_key
                 ).transpose(-2, -1).contiguous()
 
-    def _experts_forward(
+    def forward(
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
     ) -> torch.Tensor:
+        # Upstream's ``GroupedExperts.forward`` is the raw expert computation
+        # (dispatch/combine live in ``RoutedExperts``), so this is the seam.
         # The Qwen TPU recipe uses Pallas because native torch._grouped_mm mode-2
         # dWeight is incorrect at M=4096. See
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
         if not self.use_pallas_grouped_mm:
-            return super()._experts_forward(x_RD, num_tokens_per_expert_E)
+            return super().forward(x_RD, num_tokens_per_expert_E)
         def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 

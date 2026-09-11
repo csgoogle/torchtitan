@@ -29,61 +29,44 @@ def _extract_splash_kwargs(sa_config: Any) -> dict[str, Any]:
   return kwargs
 
 
+def _splash_attention_modules(model: nn.Module) -> list[nn.Module]:
+  """The first-class ``SplashAttention`` inner attentions of ``model``."""
+  from torchtitan.experiments.tpu.attention import SplashAttention  # pylint: disable=g-import-not-at-top
+
+  return [m for m in model.modules() if isinstance(m, SplashAttention)]
+
+
 def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
-  """Patches splash attention into the model."""
+  """Patches splash attention into the model.
+
+  Language models built through ``SplashAttentionConverter`` already carry
+  ``SplashAttention`` inner attentions; for those this only pushes the recipe /
+  CLI kernel tuning (``sa_*`` block sizes, layouts, ...) into the modules. The
+  module-replacement path below remains for models that still build a
+  ``ScaledDotProductAttention`` / ``FlexAttention`` (Flux, [redacted] wrappers).
+  """
   from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa as standard_splash_sdpa  # pylint: disable=g-import-not-at-top
   import types
 
   # Extract parameters internally using our safe prefix mapper
   sa_kwargs = _extract_splash_kwargs(sa_config)
 
-  def _splash_forward(
-      self,
-      q,
-      k,
-      v,
-      *,
-      scale=None,
-      enable_gqa=False,
-      is_causal=True,
-      **extra_args,
-  ):
-    """Replace ScaledDotProductAttention.forward with splash_sdpa.
-
-    Reads ``sliding_window_size`` from the patched module if set; otherwise
-    behaves as before (causal or full mask depending on ``is_causal``). Most
-    torchtitan wrappers don't expose this attribute → defaults to None.
-    """
-    if extra_args.get("attention_masks") is not None:
-      raise ValueError(
-          "TPU SplashAttention Pallas kernel does not support runtime"
-          " attention_masks."
-      )
-
-    # TorchTitan passes tensors as (B, S, H, D). However, the splash_sdpa Pallas kernel
-    # expects (B, H, S, D). We transpose them here to match the kernel's expected layout.
-    # We also prevent torch.compile failures by ensuring tensors are contiguous for the
-    # custom Pallas kernel, which doesn't handle arbitrary strides. This is a
-    # no-op in eager mode if the tensors are already contiguous.
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
-    v = v.transpose(1, 2).contiguous()
-
-    local_window_size = getattr(self, "sliding_window_size", None)
-
-
-    out = standard_splash_sdpa(
-        q,
-        k,
-        v,
-        scale=scale,
-        is_causal=is_causal,
-        local_window_size=local_window_size,
-        enable_gqa=enable_gqa,
-        **sa_kwargs,
+  converted = _splash_attention_modules(model)
+  if converted:
+    windowed = 0
+    for module in converted:
+      module.configure_kernel(use_tokamax=False, **sa_kwargs)
+      if module.sliding_window_size is not None:
+        windowed += 1
+    logger.info(
+        "Splash attention ENABLED: configured %d SplashAttention modules "
+        "(causal=%d, sliding-window=%d) with %s",
+        len(converted),
+        len(converted) - windowed,
+        windowed,
+        sa_kwargs,
     )
-    # Transpose back to (B, S, H, D) so the rest of the TorchTitan model receives its expected format
-    return out.transpose(1, 2)
+    return
 
   def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
     """Replaces [redacted]'s native SDPA with splash_sdpa.
@@ -100,9 +83,9 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     ``attention_layer_pattern=[local_rope, local_rope, local_rope, global_nope]``
     and ``local_attention_window_size=N``), reads
     ``self.sliding_window_size`` per-layer:
-      * None  → full causal (CausalMask) — same as before, identical to the
+      * None  -> full causal (CausalMask) -- same as before, identical to the
                 old redacted path where every layer is global causal.
-      * int N → causal sliding-window (LocalMask with window_size=(N, 0)).
+      * int N -> causal sliding-window (LocalMask with window_size=(N, 0)).
                 The splash kernel's per-window cache means each unique window
                 size compiles its own kernel; mixing windowed and non-windowed
                 layers in one model is supported.
@@ -123,7 +106,7 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     # Per-layer mask selection. [redacted]'s ScaledDotProductAttention sets
     # `sliding_window_size` from the layer config (None for global, int for
     # local). Models without local layers don't set the attribute at all;
-    # default to None ⇒ same behavior as before this change.
+    # default to None => same behavior as before this change.
     local_window_size = getattr(self, "sliding_window_size", None)
 
     # splash_sdpa expects enable_gqa=False as heads are already tiled.
@@ -141,10 +124,10 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     return out.transpose(-3, -2).contiguous()
 
   # Patch all attention modules in the model. For [redacted] modules, also note
-  # whether each layer has a local sliding-window — useful for mixed
+  # whether each layer has a local sliding-window -- useful for mixed
   # local/global models (REDACTED PT MoE) so the kernel cache shows the expected
   # mix of CausalMask and LocalMask compiled ops.
-  from torchtitan.experiments.tpu.kernels.splash_attention import SplashAttention  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.attention import SplashAttention  # pylint: disable=g-import-not-at-top
 
   replacements = []
   _patched = 0
@@ -185,12 +168,12 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     if local_window_size is None:
       local_window_size = getattr(parent_module, "sliding_window_size", None)
 
-    splash_attn = SplashAttention(
+    splash_attn = SplashAttention.Config(
         is_causal=True,  # Default for LMs
-        local_window_size=local_window_size,
-        original_module=child_module,
+        sliding_window_size=local_window_size,
         **sa_kwargs,
-    )
+    ).build()
+    splash_attn.original_module = child_module
 
     setattr(parent_module, child_name, splash_attn)
     _patched += 1
@@ -203,8 +186,8 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
     raise ValueError(
         "Splash attention patch was requested but NO matching attention"
-        " modules (ScaledDotProductAttention, FlexAttention) were found in the"
-        f" model. Found module types: {all_classes}"
+        " modules (SplashAttention, ScaledDotProductAttention, FlexAttention)"
+        f" were found in the model. Found module types: {all_classes}"
     )
   else:
     logger.info(
@@ -246,6 +229,16 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
 
   # Extract parameters dynamically using our shared prefix mapper helper!
   sa_kwargs = _extract_splash_kwargs(sa_config)
+
+  converted = _splash_attention_modules(model)
+  if converted:
+    for module in converted:
+      module.configure_kernel(use_tokamax=True, **sa_kwargs)
+    logger.info(
+        "Tokamax splash attention ENABLED: configured %d SplashAttention modules",
+        len(converted),
+    )
+    return
 
   def _splash_forward(
       self,
@@ -407,50 +400,21 @@ def use_gmm_kernel_patch(
 ) -> None:
   """Enables the GMM kernel for GroupedExperts modules in the model.
 
-  This workload-specific monkey patch directly intercepts and overrides the
-  `_run_experts_grouped_mm` runner inside Torchtitan's MoE module. This allows
-  us to synchronously route execution to our locally compiled JAX/Pallas
-  kernel (`gmm.grouped_matrix_multiply`).
+  The pre-merge implementation monkey-patched
+  ``torchtitan.models.common.moe._run_experts_grouped_mm`` and
+  ``indices_padding_wrapper``. Upstream's ``GroupedExperts`` now runs
+  ``torch._grouped_mm`` from its own ``_grouped_mm`` method and neither hook
+  exists any more, so the patch has no seam to attach to. The supported TPU
+  grouped-matmul path is ``TpuGroupedExperts`` (``grouped_experts.py``,
+  selected with ``TpuGroupedExpertsConverter`` +
+  ``use_pallas_grouped_mm=True``).
   """
-  logger.info("Applying GMM Kernel patch to Torchtitan's MoE module.")
-  from torchtitan.experiments.tpu.kernels import gmm  # pylint: disable=g-import-not-at-top
-  import torchtitan.models.common.moe as torchtitan_moe  # pylint: disable=g-import-not-at-top
-
-  # Explicitly intercept and rewrite the Torchtitan inner executor
-  # for `_run_experts_grouped_mm`. This is significantly more robust than
-  # hijacking PyTorch's ATen dispatch because it guarantees we call the custom
-  # Pallas kernel synchronously without torch._grouped_mm interfering.
-  def _custom_run_experts_grouped_mm(
-      w1: torch.Tensor,
-      w2: torch.Tensor,
-      w3: torch.Tensor,
-      x: torch.Tensor,
-      num_tokens_per_expert: torch.Tensor,
-  ) -> torch.Tensor:
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    h = F.silu(
-        gmm.grouped_matrix_multiply(
-            x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets
-        )
-    )
-    h = h * gmm.grouped_matrix_multiply(
-        x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
-    )
-    out = gmm.grouped_matrix_multiply(
-        h, w2.bfloat16().transpose(-2, -1), offs=offsets
-    ).type_as(x)
-    return out
-
-  # Bypass the Triton-based padding dependency that Torchtitan injects for
-  # non-EP setups. Pallas naturally handles the unpadded jagged offsets.
-  def bypassed_padding_wrapper(fn):
-    logger.info(
-        "indices_padding_wrapper bypassed since Pallas kernel handles padding."
-    )
-    return fn
-
-  torchtitan_moe.indices_padding_wrapper = bypassed_padding_wrapper  # pyrefly: ignore[missing-attribute]
-  torchtitan_moe._run_experts_grouped_mm = _custom_run_experts_grouped_mm
+  del model
+  raise NotImplementedError(
+      "--qwen3.use_gmm_kernel: the module-level grouped_mm patch has no hook"
+      " after the upstream merge (GroupedExperts._grouped_mm is a method now)."
+      " Use TpuGroupedExpertsConverter with use_pallas_grouped_mm=True instead."
+  )
 
 
 def use_fill_indices_patch(
@@ -486,87 +450,17 @@ def use_cpu_safe_histc_patch() -> None:
 
 
 def use_rope_tpu_optimization_patch() -> None:
-  """Monkey patches torchtitan.models.common.rope._reshape_for_broadcast with a TPU-optimized path.
+  """No-op since the token-major merge; kept for callers and tests.
 
-  Why upstream torch.gather is slow on TPU:
-  1. Index Tensor Bloat: Upstream expands the 2D `positions` tensor into a
-     massive 4D index tensor, multiplying its memory size by `cache_width`
-     (e.g., 33.5 MB vs 262 KB).
-  2. Forced Scalar Memory Lookups: The mathematical API of `torch.gather`
-     requires an independent scalar index for every single element in the
-     output tensor. Because XLA cannot assume the indices are identical at
-     runtime, it must generate machine code that computes a dynamic memory
-     address and fetches exactly 1 scalar number at a time (millions of
-     scattered scalar fetches), destroying memory bandwidth.
-
-  Why direct 2D advanced indexing is fast on TPU:
-  1. 128x Smaller Index: Uses the 2D `positions` tensor directly without
-     expanding it.
-  2. Fast Contiguous Vector Loads: By writing `rope_cache[positions]`, we
-     semantically request entire rows of the matrix. Because XLA knows the
-     elements of a row are stored contiguously in physical memory
-     (Row-Major order), it compiles a single Vector Load instruction
-     (HLO Gather with slice_sizes=[1, cache_width]). The TPU calculates just
-     one dynamic address per row and scoops up the entire vector block in a
-     single fast hardware cycle.
-  3. O(1) Metadata Unsqueeze: We reshape the 3D result to 4D via
-     `.unsqueeze(2)`, which only modifies shape metadata and does zero
-     memory work.
-
-  Equivalence: Both methods mathematically compute
-  `rope_cache[positions[b, s], k]`, providing exact bitwise parity while
-  eliminating the TPU scalar lookup bottleneck.
+  The patch replaced ``torch.gather`` over a 4-D expanded index with a 2-D
+  ``rope_cache[positions]`` lookup for ``[B, S]`` positions. Upstream's
+  ``_reshape_for_broadcast`` now takes ``[T]`` positions and already does
+  ``rope_cache[positions].view(T, 1, width)`` -- the fast path this used to
+  install -- so there is nothing left to patch.
   """
-  try:
-    import torchtitan.models.common.rope as rope
-    import spmd_types as spmd
-    from torch.fx.experimental.symbolic_shapes import guard_or_false  # pylint: disable=g-import-not-at-top,g-importing-member
-  except ImportError:
-    return
-
-  @spmd.local_map(out_types={"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R})
-  def _reshape_for_broadcast_patched(
-      rope_cache: torch.Tensor,
-      query_shape: torch.Size | tuple[int, ...],
-      positions: torch.Tensor | None = None,
-  ) -> torch.Tensor:
-    ndim = len(query_shape)
-    assert ndim > 1
-    bsz, seqlen = query_shape[:2]
-    cache_width = rope_cache.shape[-1]
-
-    # Case 1: No positions (sequential). Unchanged from original.
-    if positions is None:
-      rope_cache = rope_cache[0:seqlen]
-      shape = [
-          d if i == 1 else cache_width if i == ndim - 1 else 1
-          for i, d in enumerate(query_shape)
-      ]
-      return rope_cache.view(*shape)
-
-    # Case 2: Singleton positions (bsz=1). Unchanged from original.
-    if guard_or_false(positions.size(0) == 1):
-      rope_cache = rope_cache[positions.squeeze(0)]
-      shape = [
-          d if i == 1 else cache_width if i == ndim - 1 else 1
-          for i, d in enumerate(query_shape)
-      ]
-      return rope_cache.view(*shape)
-    # Case 3: Per-batch positions (bsz > 1).
-    # Replaces slow 4D torch.gather (33.5 MB index, scalar HLO lookups)
-    # with fast 2D indexing rope_cache[positions].unsqueeze(2) (262 KB index,
-    # native TPU 2D embedding lookup copying contiguous vector rows).
-    else:
-      # Index 2D cache [max_seqlen, cache_width] with 2D positions [bsz, seqlen]:
-      # yields [bsz, seqlen, cache_width]. unsqueeze(2) inserts head
-      # dimension, returning shape [bsz, seqlen, 1, cache_width].
-      return rope_cache[positions].unsqueeze(2)
-
-  rope._reshape_for_broadcast = _reshape_for_broadcast_patched
   logger.info(
-      "Monkey-patched "
-      "torchtitan.models.common.rope._reshape_for_broadcast "
-      "with TPU optimized path"
+      "RoPE TPU optimization patch is a no-op: upstream's token-major "
+      "_reshape_for_broadcast already indexes the cache with 1-D positions"
   )
 
 
@@ -595,9 +489,16 @@ def use_real_rope_arithmetic_patch() -> None:
 
   def _apply_rotary_emb_real(
       query: torch.Tensor,
-      key: torch.Tensor,
+      key: torch.Tensor | None,
       rope_cache: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor]:
+      *,
+      inverse: bool = False,
+  ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    # Same contract as upstream's complex form: ``query`` / ``key`` are
+    # ``[T, H, K]`` (any leading shape), ``rope_cache`` broadcasts against the
+    # ``[..., K // 2]`` complex view, ``inverse`` conjugates the cache.
+    if inverse:
+      rope_cache = rope_cache.conj()
     cache = torch.view_as_real(rope_cache)
     cos, sin = cache[..., 0], cache[..., 1]
 
@@ -607,9 +508,12 @@ def use_real_rope_arithmetic_patch() -> None:
       rotated = torch.stack(
           [real * cos - imag * sin, real * sin + imag * cos], dim=-1
       )
-      return rotated.flatten(3).type_as(x)
+      return rotated.flatten(-2).type_as(x)
 
-    return rotate(query), rotate(key)
+    query_out = rotate(query)
+    if key is None:
+      return query_out
+    return query_out, rotate(key)
 
   # `staticmethod`, matching what it replaces: the model calls this on an
   # instance but passes query itself as the first argument.
