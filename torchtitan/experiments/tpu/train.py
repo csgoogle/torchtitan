@@ -19,8 +19,8 @@ import torch
 import torch.distributed as dist
 from torchtitan.config.configurable import Configurable
 from torchtitan.config.manager import ConfigManager
-from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_applied
 from torchtitan.experiments.tpu import gmain
+from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.redacted  # trigger model registration
@@ -29,6 +29,7 @@ import torchtitan.experiments.tpu.flux  # trigger model registration
 from torchtitan.experiments.tpu.graph_trainer.config import (
     to_tpu_graph_trainer_config,
 )
+from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_applied
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
@@ -51,11 +52,16 @@ class TPUTrainer(torchtitan.train.Trainer):
     The torch_tpu synchronize() materializes the forward graph without
     breaking autograd, so loss.backward() still propagates gradients
     correctly through the full model.
+
+  compile_grad_norm:
+    Compiles the DTensor-aware global gradient norm as a standalone static XLA
+    graph. In-place clipping remains on PyTorch's eager path.
   """
 
   def __init__(self, job_config: Configurable.Config):
     super().__init__(job_config)
 
+    self._compiled_grad_norm: Optional[CompiledGradNorm] = None
     if isinstance(job_config, tpu_job_config_module.TPUTrainerConfig):
       from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
       self.loss_fn = build_cross_entropy_loss(job_config)
@@ -63,10 +69,21 @@ class TPUTrainer(torchtitan.train.Trainer):
       tpu_config = job_config.tpu_config
       if not tpu_config.enable_amp:
         logger.info("AMP is disabled, using uniform precision training.")
+      self._compiled_grad_norm = (
+          CompiledGradNorm() if tpu_config.compile_grad_norm else None
+      )
       if tpu_config.compile_optimizer:
         from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
         apply_compiled_optimizer(self)
 
+  def _clip_grad_norm(self) -> torch.Tensor:
+    if self._compiled_grad_norm is None:
+      return super()._clip_grad_norm()
+    parameters = [p for m in self.model_parts for p in m.parameters()]
+    return self._compiled_grad_norm.clip_grad_norm_(
+        parameters,
+        self.config.training.max_norm,
+    )
 
   def forward_backward_step(
       self,
@@ -127,7 +144,14 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   model_spec = train_config.model_spec
   assert model_spec is not None
   model_name = model_spec.name
+  use_graph_trainer = model_name != "flux" and (
+      train_config.tpu_config.use_graph_trainer
+      or train_config.tpu_config.compile_mode == "aot_fx_trace"
+  )
   if model_name == "flux":
+    # FluxTrainer owns a separate train_step and bypasses the TPU integration.
+    if train_config.tpu_config.compile_grad_norm:
+      raise ValueError("compile_grad_norm does not support FluxTrainer")
     from torchtitan.models.flux.trainer import FluxTrainer
     trainer_cls = FluxTrainer
   # Note: TpuGraphTrainer is designed primarily for joint full-graph tracing
@@ -136,13 +160,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   # without fullgraph compilation (e.g. alongside `layer` compile mode) can cause
   # severe HBM fragmentation and stack reservation collisions (e.g. 78.46G memory
   # reservation bottlenecks across multiple disjoint overlay modules).
-  elif (
-      isinstance(train_config, tpu_job_config_module.TPUTrainerConfig)
-      and (
-          train_config.tpu_config.use_graph_trainer
-          or train_config.tpu_config.compile_mode == "aot_fx_trace"
-      )
-  ):
+  elif use_graph_trainer:
     if (
         train_config.tpu_config.use_graph_trainer
         and train_config.tpu_config.compile_mode
@@ -153,7 +171,10 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
           f" (current mode: {train_config.tpu_config.compile_mode}). This may"
           " lead to severe HBM fragmentation and stack reservation OOMs."
       )
-    from torchtitan.experiments.tpu.graph_trainer import TpuGraphTrainer, TpuGraphTrainerConfig
+    from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+      TpuGraphTrainer,
+      TpuGraphTrainerConfig,
+    )
 
     if model_name == "qwen3":
       from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
