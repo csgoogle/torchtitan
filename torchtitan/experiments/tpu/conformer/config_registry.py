@@ -83,3 +83,44 @@ def conformer_debugmodel() -> TPUTrainerConfig:
   )
   return config
 
+
+
+# ---------------------------------------------------------------------------
+# Recipe configs
+#
+# One config per recipe variant under torchtitan/experiments/tpu/recipes,
+# carrying everything the recipe used to pass on the launcher command line.
+# The Conformer recipe needs no libtpu init flags.
+# ---------------------------------------------------------------------------
+
+
+def _conformer_test_v6e_8() -> TPUTrainerConfig:
+  """Shared base for the Conformer v6e-8 recipes.
+
+  Data parallelism is replicated (DDP) rather than sharded: the model is small
+  enough that sharding its parameters costs more in collectives than it saves.
+  """
+  config = conformer_test()
+  config.parallelism.data_parallel_shard_degree = 1
+  config.parallelism.data_parallel_replicate_degree = -1
+  config.training.local_batch_size = 512
+  config.training.steps = 20
+  config.metrics.log_freq = 1
+  # Synthetic audio-shaped batches; the Conformer trainer builds these itself
+  # rather than going through the text dataloader.
+  config.dataloader.dataset = "random"
+  return config
+
+
+def conformer_test_v6e_8_compile() -> TPUTrainerConfig:
+  """Conformer on v6e-8, compiled (recipes/trillium/conformer/v6e-8)."""
+  config = _conformer_test_v6e_8()
+  config.compile.enable = True
+  return config
+
+
+def conformer_test_v6e_8_eager() -> TPUTrainerConfig:
+  """Conformer on v6e-8, eager (recipes/trillium/conformer/v6e-8)."""
+  config = _conformer_test_v6e_8()
+  config.tpu_config.eager_mode = "DEFER_AND_FUSE"
+  return config

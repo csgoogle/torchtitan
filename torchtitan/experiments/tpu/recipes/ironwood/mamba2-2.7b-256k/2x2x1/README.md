@@ -67,7 +67,12 @@ safely and avoiding OOMs.
 
 ## Training Commands
 
+Both variants below run a config from [`mamba2/config_registry.py`](../../../../mamba2/config_registry.py) that
+carries the whole recipe, so the launch command passes nothing but `--config`.
+
 ### Option A: Local Batch Size 8 (High Throughput & High Memory Utilization, Global Batch 64)
+
+Config: `mamba2_2_7b_256k_tpu7x_2x2x1_lbs8`.
 
 ```bash
 export WORKLOAD_NAME="mamba2-27b-256k-b8-$(date +%Y%m%d-%H%M%S)"
@@ -90,16 +95,12 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.mamba2 \
-    --config=mamba2_2_7b_256k \
-    --hf_assets_path=tests/assets/tokenizer \
-    --dataloader.dataset=c4_test \
-    --training.steps=100 \
-    --training.local_batch_size=8 \
-    --training.seq_len=262144 \
-    --training.mixed_precision_param=bfloat16"
+    --config=mamba2_2_7b_256k_tpu7x_2x2x1_lbs8"
 ```
 
 ### Option B: Global Batch Size 8 (Local Batch Size 1 across 8 TPU cores)
+
+Config: `mamba2_2_7b_256k_tpu7x_2x2x1_lbs1`.
 
 ```bash
 export WORKLOAD_NAME="mamba2-27b-256k-gb8-$(date +%Y%m%d-%H%M%S)"
@@ -122,13 +123,7 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.mamba2 \
-    --config=mamba2_2_7b_256k \
-    --hf_assets_path=tests/assets/tokenizer \
-    --dataloader.dataset=c4_test \
-    --training.steps=100 \
-    --training.local_batch_size=1 \
-    --training.seq_len=262144 \
-    --training.mixed_precision_param=bfloat16"
+    --config=mamba2_2_7b_256k_tpu7x_2x2x1_lbs1"
 ```
 
 ## Performance & Memory Metrics Comparison

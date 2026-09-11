@@ -16,15 +16,16 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ## Notes
 
 - **Master weights are float32** (config_registry default). Compute runs in bf16 via `mixed_precision_param=bfloat16`.
-- VMEM tuning: `--libtpu-init-flags xla_tpu_scoped_vmem_limit_kib=131072`, a
-  libtpu init flag the config exports before PJRT initialization.
 - Dataset: `c4_test` (synthetic/test dataset).
 - Tokenizer: `tests/assets/tokenizer`.
-- Model configuration used is `llama3_8b` from `config_registry.py`.
+- Model configuration used is `llama3_8b_v6e_8` from [`llama3/config_registry.py`](../../../../llama3/config_registry.py).
+  It carries the training flags and the libtpu init flags
+  (`--xla_tpu_scoped_vmem_limit_kib=131072`), which the trainer exports before
+  PJRT initialization -- so the launch command passes nothing but `--config`.
 
 ## Training Configuration Details
 
-We are running with the following key configurations (explicitly passed as flags):
+We are running with the following key configurations, all built into the config:
 - **Sequence Length**: 8192
 - **Local Batch Size**: 2 (Global batch size = 2 * 8 = 16)
 - **Torch Compile**: Enabled for `model` component.
@@ -56,19 +57,7 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.llama3 \
-    --config=llama3_8b \
-    --hf_assets_path=tests/assets/tokenizer \
-    --dataloader.dataset_path=tests/assets/c4_test \
-    --training.steps=20 \
-    --training.local_batch_size=2 \
-    --training.seq_len=8192 \
-    --compile.enable \
-    --parallelism.use_simple_fsdp \
-    --splash_attention_kernel.use_splash_attention_kernel \
-    --splash_attention_kernel.sa_block_kv_compute=2048 \
-    --loss_kernel.use_loss_kernel \
-    --tpu_config.eager_mode=DEFER_AND_FUSE \
-    --libtpu-init-flags xla_tpu_scoped_vmem_limit_kib=131072"
+    --config=llama3_8b_v6e_8"
 ```
 
 ## Expected Metrics

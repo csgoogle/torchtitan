@@ -16,6 +16,7 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
@@ -388,3 +389,56 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
   )
   config.optimizer.implementation = "foreach"
   return config
+
+
+# ---------------------------------------------------------------------------
+# Recipe configs
+#
+# One config per distinct recipe configuration under
+# torchtitan/experiments/tpu/recipes, carrying everything the recipe used to
+# pass on the launcher command line -- including the libtpu init flags it used
+# to export. A name carries the slice only when that slice needs settings of its
+# own; a configuration validated across several slices of the same hardware is
+# named after the hardware and shared by those recipe READMEs.
+# ---------------------------------------------------------------------------
+
+
+def _llama3_8b_v6e(local_batch_size: int) -> TPUTrainerConfig:
+  """Llama3 8B v6e recipe base; the slices differ only in local batch size."""
+  cfg = llama3_8b()
+  cfg.hf_assets_path = "tests/assets/tokenizer"
+  cfg.dataloader.dataset_path = "tests/assets/c4_test"
+  cfg.training.local_batch_size = local_batch_size
+  cfg.training.steps = 20
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      xla_tpu_scoped_vmem_limit_kib=131072,
+  )
+  return cfg
+
+
+def llama3_8b_v6e_8() -> TPUTrainerConfig:
+  """Llama3 8B on v6e-8 (recipes/trillium/llama3-8b/v6e-8)."""
+  return _llama3_8b_v6e(local_batch_size=2)
+
+
+def llama3_8b_v6e_256() -> TPUTrainerConfig:
+  """Llama3 8B on v6e-256 (recipes/trillium/llama3-8b/v6e-256)."""
+  return _llama3_8b_v6e(local_batch_size=4)
+
+
+def llama3_70b_tpu7x() -> TPUTrainerConfig:
+  """Llama3 70B on tpu7x (recipes/ironwood/llama3-70b/tpu7x-*).
+
+  Local batch size 4 holds at both tpu7x-2x2x4 (32 devices) and tpu7x-64, so
+  they differ only in the launcher's node count.
+  """
+  cfg = llama3_70b()
+  cfg.hf_assets_path = "tests/assets/tokenizer"
+  cfg.dataloader.dataset_path = "tests/assets/c4_test"
+  cfg.training.local_batch_size = 4
+  cfg.training.steps = 20
+  cfg.parallelism.enable_tpu_topo_mesh = True
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      xla_tpu_scoped_vmem_limit_kib=131072,
+  )
+  return cfg

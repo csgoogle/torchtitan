@@ -17,10 +17,13 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 
 ## Notes
 
-- **Model Configuration**: `reg_trainer_qwen3_8b` from `config_registry.py`.
-- **Memory/Barrier Tuning**: `--libtpu-init-flags "xla_tpu_use_enhanced_launch_barrier=false xla_tpu_scoped_vmem_limit_kib=65536"`. These are libtpu init flags,
-  carried by the torchtitan config and exported before PJRT initialization
-  rather than set by the launcher.
+- **Model Configuration**: `qwen3_8b_v6e` from [`qwen3/config_registry.py`](../../../../qwen3/config_registry.py).
+  The config carries every training flag below plus the libtpu init flags
+  (`--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_scoped_vmem_limit_kib=65536`),
+  which the trainer exports before PJRT initialization -- so the launch command
+  passes nothing but `--config`.
+  A name without a slice is shared with the other slices of the same
+  hardware, which need no settings of their own.
 - **Dataset**: `c4_test` (synthetic/test dataset)
 
 ## Training Configuration Details
@@ -56,28 +59,7 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.qwen3 \
-    --config=reg_trainer_qwen3_8b \
-    --training.local_batch_size=6 \
-    --training.seq_len=2048 \
-    --training.mixed_precision_reduce=float32 \
-    --compile.enable \
-    --parallelism.use_simple_fsdp \
-    --parallelism.enable_tpu_topo_mesh \
-    --splash_attention_kernel.use_splash_attention_kernel \
-    --splash_attention_kernel.sa_block_q=1024 \
-    --splash_attention_kernel.sa_block_kv=1024 \
-    --splash_attention_kernel.sa_block_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_compute=1024 \
-    --splash_attention_kernel.sa_block_q_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_dkv_compute=1024 \
-    --splash_attention_kernel.sa_block_q_dq=1024 \
-    --splash_attention_kernel.sa_block_kv_dq=1024 \
-    --loss_kernel.use_loss_kernel \
-    --tpu_config.eager_mode=DEFER_AND_FUSE \
-    --tpu_config.use_graph_split \
-    --tpu_config.compile_mode=layer \
-    --libtpu-init-flags \"xla_tpu_use_enhanced_launch_barrier=false xla_tpu_scoped_vmem_limit_kib=65536\""
+    --config=qwen3_8b_v6e"
 ```
 
 ## Expected Metrics

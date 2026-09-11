@@ -21,27 +21,28 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
   processes. Throughput and MFU below are per device (per core); MFU is measured against
   the per-core bf16 peak of 1,153.5 TFLOP/s (half of the 2,307 TFLOP/s chip peak).
 - **Master weights are float32** (config_registry default). Compute runs in bf16 via `mixed_precision_param=bfloat16`.
-- VMEM tuning: `--libtpu-init-flags xla_tpu_scoped_vmem_limit_kib=131072`, a
-  libtpu init flag the config exports before PJRT initialization.
 - Dataset: `c4_test` (synthetic/test dataset).
 - Tokenizer: `tests/assets/tokenizer`.
-- Model configuration used is `llama3_70b` from [`llama3/config_registry.py`](../../../../llama3/config_registry.py).
+- Model configuration used is `llama3_70b_tpu7x` from [`llama3/config_registry.py`](../../../../llama3/config_registry.py).
+  It carries the training flags and the libtpu init flags
+  (`--xla_tpu_scoped_vmem_limit_kib=131072`), which the trainer exports before
+  PJRT initialization -- so the launch command passes nothing but `--config`.
+  A name without a slice is shared with the other slices of the same
+  hardware, which need no settings of their own.
 
 ## Training Configuration Details
 
-Defaults from [`llama3_70b`](../../../../llama3/config_registry.py):
+Settings in [`llama3_70b_tpu7x`](../../../../llama3/config_registry.py):
 - **Sequence Length**: 8192
+- **Local Batch Size**: 4 (Global batch size = 4 * 32 = 128)
 - **Torch Compile**: Layerwise, with the `tpu` backend. `compile.components=["model"]`
   together with the default `tpu_config.compile_mode="layer"` compiles each
   TransformerBlock separately (`fullgraph=True`) rather than the model as one graph.
 - **Simple FSDP**: Enabled.
+- **Topology-Aware Mesh**: Enabled.
 - **Splash Attention**: Enabled with block size 2048.
 - **Loss Kernel**: Enabled.
 - **Activation Checkpointing**: Full.
-
-Overridden on the command line:
-- **Local Batch Size**: 4 (Global batch size = 4 * 32 = 128)
-- **Topology-Aware Mesh**: Enabled via `--parallelism.enable_tpu_topo_mesh`.
 
 ## Training Command
 
@@ -67,13 +68,7 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.llama3 \
-    --config=llama3_70b \
-    --hf_assets_path=tests/assets/tokenizer \
-    --dataloader.dataset_path=tests/assets/c4_test \
-    --training.steps=20 \
-    --training.local_batch_size=4 \
-    --parallelism.enable_tpu_topo_mesh \
-    --libtpu-init-flags xla_tpu_scoped_vmem_limit_kib=131072"
+    --config=llama3_70b_tpu7x"
 ```
 
 ## Expected Metrics

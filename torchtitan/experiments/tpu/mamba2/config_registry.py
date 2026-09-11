@@ -314,3 +314,46 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       ),
       activation_checkpoint=activation_checkpoint.FullAC.Config(),
   )
+
+
+# ---------------------------------------------------------------------------
+# Recipe configs
+#
+# One config per recipe variant under torchtitan/experiments/tpu/recipes,
+# carrying everything the recipe used to pass on the launcher command line.
+# The Mamba-2 long-context recipe needs no libtpu init flags.
+# ---------------------------------------------------------------------------
+
+
+def _mamba2_2_7b_256k_tpu7x_2x2x1(
+    local_batch_size: int,
+) -> tpu_job_config.TPUTrainerConfig:
+  """Shared base for the 256K-context Mamba-2 2.7B recipes on tpu7x-2x2x1.
+
+  Mamba-2's linear O(B * S) attention substitute is what makes a 262,144-token
+  sequence fit; the two recipe variants only trade batch size against memory.
+  """
+  cfg = mamba2_2_7b_256k()
+  cfg.training.local_batch_size = local_batch_size
+  cfg.training.seq_len = 262144
+  cfg.training.steps = 100
+  cfg.training.mixed_precision_param = "bfloat16"
+  return cfg
+
+
+def mamba2_2_7b_256k_tpu7x_2x2x1_lbs8() -> tpu_job_config.TPUTrainerConfig:
+  """Mamba-2 2.7B at 256K on tpu7x-2x2x1, local batch 8 (global 64).
+
+  See recipes/ironwood/mamba2-2.7b-256k/2x2x1: high throughput and high memory
+  utilization, 16.8M tokens per step.
+  """
+  return _mamba2_2_7b_256k_tpu7x_2x2x1(local_batch_size=8)
+
+
+def mamba2_2_7b_256k_tpu7x_2x2x1_lbs1() -> tpu_job_config.TPUTrainerConfig:
+  """Mamba-2 2.7B at 256K on tpu7x-2x2x1, local batch 1 (global 8).
+
+  See recipes/ironwood/mamba2-2.7b-256k/2x2x1: the low-memory variant, 2.1M
+  tokens per step.
+  """
+  return _mamba2_2_7b_256k_tpu7x_2x2x1(local_batch_size=1)

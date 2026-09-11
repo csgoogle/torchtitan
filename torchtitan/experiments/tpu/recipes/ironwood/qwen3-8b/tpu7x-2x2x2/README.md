@@ -17,10 +17,17 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ## Notes
 
 - **Devices vs chips**: an ironwood chip exposes two TensorCores, and torchtitan runs one process per core. `tpu7x-16` is therefore 16 devices on 8 chips, run as 2 hosts x 8 processes. 
+- **Model Configuration**: `qwen3_8b_tpu7x` from [`qwen3/config_registry.py`](../../../../qwen3/config_registry.py).
+  The config carries the training flags and the libtpu init flags, so the launch
+  command passes nothing but `--config`.
+  A name without a slice is shared with the other slices of the same
+  hardware, which need no settings of their own.
 - **SparseCore Offloading**: This configuration achieves high MFU by utilizing
-  SparseCore collective offloading for FSDP, requested through the config's
-  `--libtpu-init-flags` and exported before PJRT initialization.
-- **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--tpu_config.compile_optimizer` and `--tpu_config.optimizer_in_graph`.
+  SparseCore collective offloading for FSDP, requested by the config's
+  `libtpu_init_flags` (SparseCore collective aggregator, latency-hiding layer
+  scheduler, dual-SparseCore reduce-scatter, TPU7x p-state 7 and a 65472 KiB
+  vmem limit).
+- **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph.
 - **Splash Attention**: Splash Attention block sizes are manually tuned to 1024 across the board for optimal tile sizing.
 
 ## Training Command
@@ -48,28 +55,7 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.qwen3 \
-    --config=qwen3_8b \
-    --training.local_batch_size=6 \
-    --training.seq_len=2048 \
-    --training.steps=30 \
-    --training.mixed_precision_reduce=float32 \
-    --parallelism.use_simple_fsdp \
-    --parallelism.enable_tpu_topo_mesh \
-    --splash_attention_kernel.use_splash_attention_kernel \
-    --splash_attention_kernel.sa_block_q=1024 \
-    --splash_attention_kernel.sa_block_kv=1024 \
-    --splash_attention_kernel.sa_block_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_compute=1024 \
-    --splash_attention_kernel.sa_block_q_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_dkv=1024 \
-    --splash_attention_kernel.sa_block_kv_dkv_compute=1024 \
-    --splash_attention_kernel.sa_block_q_dq=1024 \
-    --splash_attention_kernel.sa_block_kv_dq=1024 \
-    --tpu_config.use_graph_trainer \
-    --tpu_config.compile_mode=aot_fx_trace \
-    --tpu_config.compile_optimizer \
-    --tpu_config.optimizer_in_graph \
-    --libtpu-init-flags \"xla_tpu_dvfs_p_state=7 xla_tpu_scoped_vmem_limit_kib=65472 xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_latency_hiding_layer_scheduler=true xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false\""
+    --config=qwen3_8b_tpu7x"
 ```
 
 ## Expected Metrics

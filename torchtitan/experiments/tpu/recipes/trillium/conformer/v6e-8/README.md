@@ -14,6 +14,11 @@ export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
 ```
 
 ## Notes as of 5/21/26
+- Configs: `conformer_test_v6e_8_compile` (compiled) and
+  `conformer_test_v6e_8_eager` (eager) in
+  [`conformer/config_registry.py`](../../../../conformer/config_registry.py).
+  Each carries the whole recipe, so the launch command passes nothing but
+  `--config`. This recipe needs no libtpu init flags.
 - `--tpu_config.use_simple_fsdp` is enabled.
 - `--compile.enable` is enabled with `--tpu_config.compile_mode=layer`.
 
@@ -40,21 +45,7 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.conformer.train_minimal \
     --module=torchtitan.experiments.tpu.conformer \
-    --config=conformer_test \
-    --parallelism.data_parallel_shard_degree=1 \
-    --parallelism.data_parallel_replicate_degree=-1 \
-    --activation_checkpoint.mode=full \
-    --training.local_batch_size=512 \
-    --training.dtype=float32 \
-    --training.mixed_precision_param=bfloat16 \
-    --tpu_config.use_simple_fsdp \
-    --tpu_config.compile_mode=layer \
-    --splash_attention_kernel.use_splash_attention_kernel \
-    --metrics.log_freq=1 \
-    --conformer.use-ctc-loss \
-    --compile.enable \
-    --dataloader.dataset=random \
-    --training.steps=20
+    --config=conformer_test_v6e_8_compile
 "
 ```
 
@@ -89,20 +80,7 @@ xpk workload create \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.conformer.train_minimal \
     --module=torchtitan.experiments.tpu.conformer \
-    --config=conformer_test \
-    --parallelism.data_parallel_shard_degree=1 \
-    --parallelism.data_parallel_replicate_degree=-1 \
-    --activation_checkpoint.mode=full \
-    --training.local_batch_size=512 \
-    --training.dtype=float32 \
-    --training.mixed_precision_param=bfloat16 \
-    --tpu_config.use_simple_fsdp \
-    --tpu_config.eager_mode=DEFER_AND_FUSE \
-    --splash_attention_kernel.use_splash_attention_kernel \
-    --metrics.log_freq=1 \
-    --conformer.use-ctc-loss \
-    --dataloader.dataset=random \
-    --training.steps=20
+    --config=conformer_test_v6e_8_eager
 "
 ```
 

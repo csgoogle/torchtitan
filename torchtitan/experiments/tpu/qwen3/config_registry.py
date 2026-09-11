@@ -26,6 +26,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuTokenDispatcherConverter,
@@ -499,4 +500,70 @@ def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   # Slice layers to only keep 4 layers to save memory and compile time
   model_config.layers = model_config.layers[:4]
+  return cfg
+
+
+# ---------------------------------------------------------------------------
+# Recipe configs
+#
+# One config per distinct recipe configuration under
+# torchtitan/experiments/tpu/recipes, carrying everything the recipe used to
+# pass on the launcher command line -- including the libtpu init flags it used
+# to export. A name carries the slice only when that slice needs settings of its
+# own; a configuration validated across several slices of the same hardware is
+# named after the hardware and shared by those recipe READMEs.
+# ---------------------------------------------------------------------------
+
+
+def qwen3_8b_v6e() -> TPUTrainerConfig:
+  """Regular-trainer Qwen3 8B on v6e (recipes/trillium/qwen3-8b/v6e-{8,256}).
+
+  Local batch size 6 holds at both slices, so they differ only in the launcher's
+  node count. The GraphTrainer still OOMs on v6e, hence the regular trainer with
+  FullAC (SelectiveAC exceeds the XLA activation limits on v6e) and
+  layer-by-layer compilation.
+  """
+  cfg = reg_trainer_qwen3_8b()
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      tpu_flags.DISABLE_ENHANCED_LAUNCH_BARRIER,
+      xla_tpu_scoped_vmem_limit_kib=65536,
+  )
+  return cfg
+
+
+def qwen3_8b_tpu7x() -> TPUTrainerConfig:
+  """GraphTrainer Qwen3 8B on tpu7x (recipes/ironwood/qwen3-8b/tpu7x-*).
+
+  Local batch size 6 holds at both tpu7x-2x2x2 (16 devices) and tpu7x-4x4x4 (128
+  devices), so they differ only in the launcher's node count. SparseCore
+  collective offloading plus the latency-hiding layer scheduler carry the FSDP
+  collectives, and the optimizer step is captured into the joint
+  forward/backward graph.
+  """
+  cfg = qwen3_8b()
+  cfg.training.steps = 30
+  cfg.parallelism.enable_tpu_topo_mesh = True
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+      tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+      tpu_flags.TPU7X_THROUGHPUT_P_STATE,
+      xla_tpu_scoped_vmem_limit_kib=65472,
+  )
+  return cfg
+
+
+def qwen3_moe_30b_tpu7x_4x4x4() -> TPUTrainerConfig:
+  """Qwen3 30B-A3B FSDP-only benchmark on tpu7x-4x4x4, 128 devices.
+
+  See recipes/ironwood/qwen3-30b-a3b/tpu7x-4x4x4. The SparseCore collective
+  aggregator, the latency-hiding layer scheduler and the dual-SparseCore
+  reduce-scatter together gave about 5% more throughput in matched 30-step runs
+  at GBS768/2K and GBS1024/2K.
+  """
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+      tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+      tpu_flags.TPU7X_THROUGHPUT_P_STATE,
+  )
   return cfg

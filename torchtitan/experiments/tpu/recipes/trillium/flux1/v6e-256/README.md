@@ -16,6 +16,13 @@ export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
 
 ## SimpleFSDP + SplashAttention + torch.compile
 
+Configs: `flux_dev_v6e_256_float32` and `flux_dev_v6e_256_bfloat16` in
+[`flux/config_registry.py`](../../../../flux/config_registry.py). Each carries
+the whole recipe, including the libtpu init flags -- the SparseCore collective-offload bundle (all-gather and reduce-scatter
+  offloaded onto the SparseCores) --
+which the trainer exports before PJRT initialization, so the launch command
+passes nothing but `--config`.
+
 ### float32 + MixedPrecision bfloat16
 
 ```bash
@@ -38,22 +45,8 @@ xpk workload create \
     --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
-    --module=flux \
-    --config=flux_dev \
-    --optimizer.implementation=foreach \
-    --metrics.log_freq=1 \
-    --training.steps=40 \
-    --training.dtype=float32 \
-    --training.local_batch_size=2 \
-    --dataloader.img_size=1024 \
-    --flux.random_dataset \
-    --parallelism.use_simple_fsdp \
-    --splash-attention-kernel.use-splash-attention-kernel \
-    --compile.enable \
-    --compile.backend=tpu \
-    --libtpu-init-flags \"xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_sparse_core_offload_queuing_in_lhs=true xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true\" \
-    activation-checkpoint:full \
-    --activation-checkpoint.no-preserve-rng-state"
+    --module=torchtitan.experiments.tpu.flux \
+    --config=flux_dev_v6e_256_float32"
 ```
 
 **6/11/26: With this configuration you should observe the following metrics**
@@ -83,22 +76,8 @@ xpk workload create \
     --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
-    --module=flux \
-    --config=flux_dev \
-    --optimizer.implementation=foreach \
-    --metrics.log_freq=1 \
-    --training.steps=40 \
-    --training.dtype=bfloat16 \
-    --training.local_batch_size=3 \
-    --dataloader.img_size=1024 \
-    --flux.random_dataset \
-    --parallelism.use_simple_fsdp \
-    --splash-attention-kernel.use-splash-attention-kernel \
-    --compile.enable \
-    --compile.backend=tpu \
-    --libtpu-init-flags \"xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_sparse_core_offload_queuing_in_lhs=true xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true\" \
-    activation-checkpoint:full \
-    --activation-checkpoint.no-preserve-rng-state"
+    --module=torchtitan.experiments.tpu.flux \
+    --config=flux_dev_v6e_256_bfloat16"
 ```
 
 **6/11/26: With this configuration you should observe the following metrics**
