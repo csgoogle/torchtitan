@@ -38,7 +38,7 @@ def flux_debugmodel() -> FluxTrainer.Config:
         tpu_config=TPUConfig(eager_mode="DEFER_AND_FUSE"),
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_registry("flux-debug"),
-        optimizer=default_adamw(lr=8e-4),
+        optimizer=default_adamw(lr=8e-4, implementation="foreach"),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=1,
             decay_ratio=0.0,
@@ -101,7 +101,7 @@ def flux_dev() -> FluxTrainer.Config:
         tpu_config=TPUConfig(eager_mode="DEFER_AND_FUSE"),
         metrics=MetricsProcessor.Config(log_freq=100),
         model_spec=model_registry("flux-dev"),
-        optimizer=default_adamw(lr=1e-4),
+        optimizer=default_adamw(lr=1e-4, implementation="foreach"),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=3000,
             decay_ratio=0.0,
@@ -152,7 +152,7 @@ def flux_schnell() -> FluxTrainer.Config:
         tpu_config=TPUConfig(eager_mode="DEFER_AND_FUSE"),
         metrics=MetricsProcessor.Config(log_freq=100),
         model_spec=model_registry("flux-schnell"),
-        optimizer=default_adamw(lr=1e-4),
+        optimizer=default_adamw(lr=1e-4, implementation="foreach"),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=3000,
             decay_ratio=0.0,

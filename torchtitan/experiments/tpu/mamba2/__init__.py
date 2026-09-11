@@ -78,7 +78,7 @@ _mamba2_train_spec = train_spec.TrainSpec(
     parallelize_fn=parallelize_mamba2,
     pipelining_fn=None,
     loss_config=loss.CrossEntropyLoss.Config(),
-    optimizer_config=optimizer.default_adamw(lr=8e-4),
+    optimizer_config=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
     lr_scheduler_config=lr_scheduler.LRSchedulersContainer.Config(
         warmup_steps=1000
     ),

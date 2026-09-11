@@ -32,7 +32,7 @@ def conformer_test() -> TPUTrainerConfig:
       hf_assets_path="tests/assets/tokenizer",
       dump_folder=os.environ.get("TEST_TMPDIR", ".") + "/outputs",
       model_spec=_conformer_model_spec("test"),
-      optimizer=default_adamw(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
       dataloader=HuggingFaceTextDataLoader.Config(
           dataset="c4_test",
@@ -82,4 +82,3 @@ def conformer_debugmodel() -> TPUTrainerConfig:
       mixed_precision_param="bfloat16",
   )
   return config
-

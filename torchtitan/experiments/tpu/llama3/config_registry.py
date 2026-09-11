@@ -39,7 +39,7 @@ def llama3_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -78,7 +78,7 @@ def llama3_1b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -117,7 +117,7 @@ def llama3_8b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/Llama-3.1-8B",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=3e-4, eps=1e-8),
+      optimizer=default_adamw(lr=3e-4, eps=1e-8, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -173,7 +173,6 @@ def llama3_8b() -> TPUTrainerConfig:
           use_loss_kernel=True,
       ),
   )
-  config.optimizer.implementation = "foreach"
   return config
 
 
@@ -185,7 +184,7 @@ def llama3_70b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=3e-4),
+      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -251,7 +250,7 @@ def llama3_405b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=3e-4),
+      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -328,7 +327,7 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/Llama-3.1-8B",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=2e-5),
+      optimizer=default_adamw(lr=2e-5, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=25,
           decay_ratio=0.9,
@@ -386,5 +385,4 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
           use_loss_kernel=True,
       ),
   )
-  config.optimizer.implementation = "foreach"
   return config
