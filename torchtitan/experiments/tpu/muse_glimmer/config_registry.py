@@ -203,3 +203,14 @@ def muse_glimmer_30b_gt(seq_len: int = 8192) -> TPUTrainerConfig:
   config.tpu_config.compile_mode = "aot_fx_trace"
   config.tpu_config.graph_trainer_memory_policy = "full"
   return config
+
+
+def muse_glimmer_30b_sac(seq_len: int = 16384) -> TPUTrainerConfig:
+  """``muse_glimmer_30b_fused_ce`` with op-level selective activation
+  checkpointing instead of full AC. The 16k profile shows full AC recomputing
+  every dense GEMM and attention forward (recorded 3409 TFLOP/step vs ~2830
+  model TFLOP) at a peak HBM of only 50.6 of 94.75 GB, so saving the matmul
+  outputs is affordable."""
+  config = muse_glimmer_30b_fused_ce(seq_len=seq_len)
+  config.activation_checkpoint = SelectiveAC.Config()
+  return config
