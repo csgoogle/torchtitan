@@ -8,6 +8,7 @@ import torchtitan.distributed
 from torchtitan.models.qwen3 import parallelize as dtensor_parallelize
 
 
+from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
     data_parallel as simple_fsdp_data_parallel,
@@ -68,23 +69,10 @@ def parallelize_qwen3(
           training=training,
       )
 
-    dp_mesh_names = (
-          ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-      )
-    dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-
-    dp_mode = "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
-    mp_policy = SimpleFSDPMixedPrecisionPolicy(
-          param_dtype=torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_param],
-          reduce_dtype=reduce_dtype,
-      )
-    model = simple_fsdp_data_parallel(
-          model,
-          dp_mesh,
-          mode=dp_mode,
-          mp_policy=mp_policy,
-      )
-    logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
+    # Mesh names changed upstream ('fsdp' -> 'dp_shard' x 'cp'); use the
+    # graph trainer's helper, which resolves them and the MoE expert meshes.
+    model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
+    logger.info("Applied SimpleFSDP to the model")
   else:
     dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]

@@ -13,10 +13,7 @@ from torch import nn
 
 import torchtitan.config
 import torchtitan.distributed
-from torchtitan.experiments.graph_trainer.simple_fsdp import (
-    MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
-    data_parallel as simple_fsdp_data_parallel,
-)
+from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.models.muse_glimmer import parallelize as upstream_parallelize
 from torchtitan.tools.logging import logger
@@ -42,8 +39,6 @@ def parallelize_muse_glimmer(
   """
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
-  reduce_dtype = torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_reduce]
-
   if effective_compile_config.enable and hasattr(model, "layers"):
     for layer in model.layers.values():
       apply_spmd_safe(layer)
@@ -63,22 +58,10 @@ def parallelize_muse_glimmer(
   )
 
   if parallelism.use_simple_fsdp and not skip_dp:
-    dp_mesh_names = (
-        ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-    )
-    dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-    dp_mode = "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
-    mp_policy = SimpleFSDPMixedPrecisionPolicy(
-        param_dtype=torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=reduce_dtype,
-    )
-    model = simple_fsdp_data_parallel(
-        model,
-        dp_mesh,
-        mode=dp_mode,
-        mp_policy=mp_policy,
-    )
-    logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
+    # Mesh names changed upstream ('fsdp' -> 'dp_shard' x 'cp'); use the
+    # graph trainer's helper, which resolves them and the MoE expert meshes.
+    model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
+    logger.info("Applied SimpleFSDP to the model")
 
   if compile_mode == "fullgraph":
     apply_spmd_safe(model)
