@@ -6,9 +6,12 @@
 
 """Muse Glimmer training configs for the TorchTPU lane.
 
-Text-only. The output soft-cap lives in the ``SoftCappedLinear`` lm_head, so
-the plain (non-fused) cross entropy is used: the TPU fused Pallas CE kernel
-projects the LM head inside the kernel and has no logit-transform hook yet.
+Text-only. The output soft-cap lives in the ``SoftCappedLinear`` lm_head. The
+``*_fused_ce`` configs swap that head for the TPU fused Pallas cross entropy
+(``_enable_pallas_cross_entropy``): the kernel projects the LM head per vocab
+tile and re-applies the head's ``cap * tanh(z * mul / cap)`` transform to each
+tile in-kernel, so the ``[T, 202048]`` fp32 logits are never materialized. The
+two base configs keep the plain cross entropy.
 """
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -19,6 +22,7 @@ from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.muse_glimmer import model_registry
 from torchtitan.experiments.tpu.tpu_job_config import (
     LossKernelConfig,
@@ -35,6 +39,31 @@ def _loader(dataset: str, *, shuffle: bool) -> GrainDataLoader.Config:
       dataset=ConcatThenSplitPackingConfig(dataset=DATASETS[dataset]),
       shuffle=shuffle,
   )
+
+
+_FUSED_LOSS_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_soft_capped_lm_head"
+)
+
+
+def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
+  """Select the fused loss and its pre-construction LM-head override together.
+
+  Same idiom as the llama3 / qwen3 registries, with two Muse specifics: the
+  override targets ``SoftCappedLinear.Config`` (Muse's lm_head type), and the
+  head's soft-cap / output multiplier are copied into the loss config, because
+  the wrapper only hands ``(hidden, weight.T)`` to the loss and the transform
+  is applied inside the fused kernel. The legacy ``loss_kernel.use_loss_kernel``
+  path is turned off for the same reason as in llama3.
+  """
+  lm_head = config.model_spec.model.lm_head
+  config.loss = PallasCrossEntropyLoss.Config(
+      soft_cap=lm_head.output_soft_cap_temp,
+      output_multiplier=lm_head.output_multiplier,
+  )
+  if _FUSED_LOSS_OVERRIDE not in config.override.imports:
+    config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+  config.loss_kernel.use_loss_kernel = False
 
 
 def muse_glimmer_debugmodel(seq_len: int = 2048) -> TPUTrainerConfig:
@@ -145,3 +174,20 @@ def muse_glimmer_30b(seq_len: int = 8192) -> TPUTrainerConfig:
       splash_attention_kernel=_splash_2048(),
       loss_kernel=LossKernelConfig(use_loss_kernel=False),
   )
+
+
+def muse_glimmer_debugmodel_fused_ce(seq_len: int = 2048) -> TPUTrainerConfig:
+  """``muse_glimmer_debugmodel`` with the soft-capped LM head deferred to the
+  fused Pallas cross entropy (cap 20, multiplier 1.0 for the debug flavor)."""
+  config = muse_glimmer_debugmodel(seq_len=seq_len)
+  _enable_pallas_cross_entropy(config)
+  return config
+
+
+def muse_glimmer_30b_fused_ce(seq_len: int = 8192) -> TPUTrainerConfig:
+  """``muse_glimmer_30b`` with the soft-capped LM head deferred to the fused
+  Pallas cross entropy (cap 20, multiplier 0.196), so the ``[T, 202048]`` fp32
+  logits and their gradient are never materialized in HBM."""
+  config = muse_glimmer_30b(seq_len=seq_len)
+  _enable_pallas_cross_entropy(config)
+  return config
