@@ -191,3 +191,15 @@ def muse_glimmer_30b_fused_ce(seq_len: int = 8192) -> TPUTrainerConfig:
   config = muse_glimmer_30b(seq_len=seq_len)
   _enable_pallas_cross_entropy(config)
   return config
+
+
+def muse_glimmer_30b_gt(seq_len: int = 8192) -> TPUTrainerConfig:
+  """``muse_glimmer_30b_fused_ce`` under the graph trainer: the whole step
+  (forward, loss, backward) traced once (``aot_fx_trace``) and compiled into
+  one XLA program, with the graph trainer's full-recompute memory policy in
+  place of module-level full AC. Same SimpleFSDP data parallelism."""
+  config = muse_glimmer_30b_fused_ce(seq_len=seq_len)
+  config.tpu_config.use_graph_trainer = True
+  config.tpu_config.compile_mode = "aot_fx_trace"
+  config.tpu_config.graph_trainer_memory_policy = "full"
+  return config
