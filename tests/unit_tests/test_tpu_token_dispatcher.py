@@ -1,13 +1,111 @@
 from unittest import mock
 
+import pytest
 import torch
 
+from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    minimal_fx_tracer,
+    run_traced,
+)
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
+    scale_route_weights,
     stable_grouped_reduce,
 )
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+
+
+def test_scale_route_weights_matches_native_autograd():
+    generator = torch.Generator().manual_seed(2468)
+    routed = torch.randn(17, 11, dtype=torch.bfloat16, generator=generator)
+    scores = torch.randn(17, dtype=torch.float32, generator=generator)
+    grad_output = torch.randn(17, 11, dtype=torch.bfloat16, generator=generator)
+
+    for routed_requires_grad, scores_require_grad in (
+        (True, True),
+        (True, False),
+        (False, True),
+        (False, False),
+    ):
+        actual_routed = routed.detach().requires_grad_(routed_requires_grad)
+        actual_scores = scores.detach().requires_grad_(scores_require_grad)
+        actual = scale_route_weights(actual_routed, actual_scores)
+
+        reference_routed = routed.detach().requires_grad_(routed_requires_grad)
+        reference_scores = scores.detach().requires_grad_(scores_require_grad)
+        reference = (
+            reference_routed.float() * reference_scores.reshape(-1, 1)
+        ).to(reference_routed.dtype)
+
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        actual_inputs = tuple(
+            value
+            for value in (actual_routed, actual_scores)
+            if value.requires_grad
+        )
+        if not actual_inputs:
+            continue
+        reference_inputs = tuple(
+            value
+            for value in (reference_routed, reference_scores)
+            if value.requires_grad
+        )
+        actual_grads = torch.autograd.grad(actual, actual_inputs, grad_output)
+        reference_grads = torch.autograd.grad(
+            reference, reference_inputs, grad_output
+        )
+        for actual_grad, reference_grad in zip(
+            actual_grads, reference_grads, strict=True
+        ):
+            torch.testing.assert_close(actual_grad, reference_grad, rtol=0, atol=0)
+
+
+def test_scale_route_weights_validates_shapes():
+    with pytest.raises(ValueError, match=r"routed\[N, D\] and scores\[N\]"):
+        scale_route_weights(torch.ones(3), torch.ones(3))
+    with pytest.raises(ValueError, match="row count must match"):
+        scale_route_weights(torch.ones(3, 2), torch.ones(4))
+
+
+def test_scale_route_weights_retains_native_dtype_fallback():
+    routed = torch.randn(5, 3, dtype=torch.float32, requires_grad=True)
+    scores = torch.randn(5, dtype=torch.float32, requires_grad=True)
+    grad_output = torch.randn_like(routed)
+
+    actual = scale_route_weights(routed, scores)
+    expected = routed * scores.reshape(-1, 1)
+    actual_grads = torch.autograd.grad(actual, (routed, scores), grad_output)
+    expected_grads = torch.autograd.grad(expected, (routed, scores), grad_output)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual_grad, expected_grad in zip(
+        actual_grads, expected_grads, strict=True
+    ):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
+def test_scale_route_weights_traces_forward_and_backward():
+    def step(routed, scores, grad_output):
+        weighted = scale_route_weights(routed, scores)
+        return torch.autograd.grad(
+            weighted, (routed, scores), grad_output
+        )
+
+    generator = torch.Generator().manual_seed(9753)
+    routed = torch.randn(
+        17, 11, dtype=torch.bfloat16, generator=generator, requires_grad=True
+    )
+    scores = torch.randn(
+        17, dtype=torch.float32, generator=generator, requires_grad=True
+    )
+    grad_output = torch.randn(17, 11, dtype=torch.bfloat16, generator=generator)
+    expected = step(routed, scores, grad_output)
+    traced = minimal_fx_tracer(step)(routed, scores, grad_output)
+    actual = run_traced(traced)(routed, scores, grad_output)
+
+    for actual_grad, expected_grad in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 
 
 def test_local_reorder_matches_reference_forward_and_backward():
@@ -95,7 +193,9 @@ def test_local_reorder_preserves_unused_gradients():
 def test_local_combine_matches_standard_dispatcher():
     generator = torch.Generator().manual_seed(5678)
     actual_dispatcher = TpuAllToAllTokenDispatcher.Config(
-        num_experts=3, top_k=2
+        num_experts=3,
+        top_k=2,
+        fuse_route_score_backward=True,
     ).build()
     reference_dispatcher = AllToAllTokenDispatcher.Config(
         num_experts=3, top_k=2
@@ -209,6 +309,7 @@ def test_converter_preserves_fields_and_is_idempotent():
     assert isinstance(root.dispatcher, TpuAllToAllTokenDispatcher.Config)
     assert root.dispatcher.num_experts == 8
     assert root.dispatcher.top_k == 2
+    assert not root.dispatcher.fuse_route_score_backward
 
     dispatcher = root.dispatcher
     converter.convert(root)

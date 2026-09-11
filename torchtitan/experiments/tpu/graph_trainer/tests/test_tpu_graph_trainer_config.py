@@ -58,6 +58,9 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
 )
+from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
+)
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
 from torchtitan.models.common import ComplexRoPE, Linear
 
@@ -313,12 +316,34 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(config.splash_attention_kernel.sa_block_q_dkv, 2048)
     self.assertEqual(config.splash_attention_kernel.sa_block_kv_dkv, 2048)
     self.assertEqual(config.splash_attention_kernel.sa_block_kv_dkv_compute, 1024)
+    assert config.model_spec is not None
+    dispatchers = list(
+        config.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+    )
+    self.assertTrue(dispatchers)
+    self.assertTrue(
+        all(
+            not dispatcher.fuse_route_score_backward
+            for _, dispatcher, _, _ in dispatchers
+        )
+    )
 
   def test_attention_parity_recipe_adds_bf16_rope(self) -> None:
     config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
     self.assertIn(
         "torchtitan.experiments.tpu.overrides.bf16_rope",
         config.override.imports,
+    )
+    assert config.model_spec is not None
+    dispatchers = list(
+        config.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+    )
+    self.assertTrue(dispatchers)
+    self.assertTrue(
+        all(
+            dispatcher.fuse_route_score_backward
+            for _, dispatcher, _, _ in dispatchers
+        )
     )
 
     graph_config = to_tpu_graph_trainer_config(

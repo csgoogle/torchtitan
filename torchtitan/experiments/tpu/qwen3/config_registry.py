@@ -30,6 +30,7 @@ import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
 from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
 )
 from torchtitan.experiments.tpu.tpu_job_config import (
@@ -522,6 +523,14 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   # policy choice, not a numerics-preserving optimization; keep it out of the
   # default recipe pending a longer convergence comparison.
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
+  assert cfg.model_spec is not None
+  dispatchers = list(
+      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+  )
+  if not dispatchers:
+    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
+  for _, dispatcher, _, _ in dispatchers:
+    dispatcher.fuse_route_score_backward = True
   return cfg
 
 

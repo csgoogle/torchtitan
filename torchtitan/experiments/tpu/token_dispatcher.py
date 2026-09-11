@@ -24,14 +24,77 @@ the transport was omitted here while the reusable local VJPs were retained.
 from dataclasses import dataclass
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from torchtitan.config import derive
+from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
     AllToAllTokenDispatcher,
     LocalDispatchMetadata,
 )
 from torchtitan.protocols.model import ModelConfigConverter
+
+
+class _ScaleRouteWeights(torch.autograd.Function):
+  """Scale expert outputs and fuse the FP32 route-score gradient reduction."""
+
+  @staticmethod
+  def forward(ctx, routed_output_ND, scores_N):
+    ctx.set_materialize_grads(False)
+    ctx.save_for_backward(routed_output_ND, scores_N)
+    return (
+        routed_output_ND.float() * scores_N.reshape(-1, 1)
+    ).to(routed_output_ND.dtype)
+
+  @staticmethod
+  @once_differentiable
+  def backward(ctx, grad_output_ND):
+    if grad_output_ND is None:
+      return None, None
+
+    routed_output_ND, scores_N = ctx.saved_tensors
+    grad_routed_output_ND = None
+    if ctx.needs_input_grad[0]:
+      grad_routed_output_ND = (
+          grad_output_ND.float() * scores_N.reshape(-1, 1)
+      ).to(routed_output_ND.dtype)
+
+    grad_scores_N = None
+    if ctx.needs_input_grad[1]:
+      grad_scores_N = route_score_grad(grad_output_ND, routed_output_ND)
+    return grad_routed_output_ND, grad_scores_N
+
+
+def scale_route_weights(
+    routed_output_ND: torch.Tensor,
+    scores_N: torch.Tensor,
+) -> torch.Tensor:
+  """Weight expert outputs while optimizing the supported TPU backward."""
+  if routed_output_ND.ndim != 2 or scores_N.ndim != 1:
+    raise ValueError("route weighting expects routed[N, D] and scores[N]")
+  if routed_output_ND.shape[0] != scores_N.shape[0]:
+    raise ValueError(
+        "route weighting row count must match score count: "
+        f"{routed_output_ND.shape[0]} != {scores_N.shape[0]}"
+    )
+
+  # For Qwen's BF16 expert outputs and FP32 normalized scores, save the expert
+  # output in BF16 and fuse its conversion, multiplication, and hidden-dimension
+  # reduction in dScore. This avoids native autograd's saved FP32 [N, D] tensor
+  # and matches the gradient implied by MaxText's FP32 route-weighted combine:
+  # https://github.com/AI-Hypercomputer/maxtext/blob/263b8c18e32ed1da4dbb4eb1476c5e3d87b4d9eb/src/maxtext/layers/moe.py#L1044-L1063
+  # XLA may reassociate the FP32 reduction, so numerical equivalence is expected,
+  # but bitwise identity is not guaranteed. Other dtypes retain native autograd.
+  if (
+      routed_output_ND.dtype != torch.bfloat16
+      or scores_N.dtype != torch.float32
+      or routed_output_ND.device.type not in ("cpu", "tpu")
+  ):
+    return (
+        routed_output_ND.float() * scores_N.reshape(-1, 1)
+    ).to(routed_output_ND.dtype)
+  return _ScaleRouteWeights.apply(routed_output_ND, scores_N)
 
 
 class _StableGroupedReduce(torch.autograd.Function):
@@ -174,7 +237,11 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
 
   @dataclass(kw_only=True, slots=True)
   class Config(AllToAllTokenDispatcher.Config):
-    pass
+    fuse_route_score_backward: bool = False
+
+  def __init__(self, config: Config):
+    super().__init__(config)
+    self.fuse_route_score_backward = config.fuse_route_score_backward
 
   def _local_reorder(
       self,
@@ -209,10 +276,16 @@ class TpuAllToAllTokenDispatcher(AllToAllTokenDispatcher):
       )
 
     assert isinstance(metadata, LocalDispatchMetadata)
-    routed_output_ND = (
-        routed_output_RD.float()
-        * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
-    ).to(routed_output_RD.dtype)
+    if self.fuse_route_score_backward:
+      routed_output_ND = scale_route_weights(
+          routed_output_RD,
+          metadata.topk_scores_experts_sorted_N,
+      )
+    else:
+      routed_output_ND = (
+          routed_output_RD.float()
+          * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
+      ).to(routed_output_RD.dtype)
     return stable_grouped_reduce(
         routed_output_ND,
         metadata.token_indices_experts_sorted_N,
@@ -251,5 +324,6 @@ __all__ = [
     "TpuAllToAllTokenDispatcher",
     "TpuTokenDispatcherConverter",
     "local_reorder",
+    "scale_route_weights",
     "stable_grouped_reduce",
 ]
