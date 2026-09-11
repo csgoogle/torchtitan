@@ -143,6 +143,9 @@ class Attention(GQAttention):
             attention_masks=attention_masks,
             scale=self.scaling,
             enable_gqa=self.enable_gqa,
+            # fork: TPU splash attention derives the packed-document mask from
+            # positions (no BlockMask); flex/varlen accept and ignore it.
+            positions=positions,
         ).contiguous()
         output = output.view(num_tokens, -1)
 
