@@ -24,6 +24,7 @@ from torchtitan.models.common.attention import (
     get_causal_mask_mod,
     ScaledDotProductAttention,
     get_efficient_causal_mask_mod_for_packed_document,
+    segment_ids_from_positions,
     VarlenAttention,
 )
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
@@ -273,10 +274,19 @@ class Decoder(BaseModel):
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
+        # Packed-document segment ids for the TPU splash inner attention are
+        # computed here, above the layers, because every layer shares
+        # ``positions`` and each layer is its own activation-checkpoint region:
+        # deriving them inside the attention module runs the cumsum once per
+        # layer in forward and again in the backward recompute.
+        segment_ids = (
+            segment_ids_from_positions(positions) if positions is not None else None
+        )
+
         # `LayerDict` runs the layers itself (a subclass can change how, e.g.
         # scan-over-layers); the layer signature is ``(h, attention_masks,
-        # positions)``.
-        h = self.layers(h, attention_masks, positions)
+        # positions, segment_ids)``.
+        h = self.layers(h, attention_masks, positions, segment_ids)
 
         h = self.norm(h) if self.norm is not None else h
 

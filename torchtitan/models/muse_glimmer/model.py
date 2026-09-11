@@ -29,6 +29,7 @@ from torchtitan.models.common.attention import (
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
     GQAttention,
+    segment_ids_from_positions,
     VarlenAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
@@ -113,6 +114,7 @@ class Attention(GQAttention):
         x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = x_TD.shape[0]
         xq, xk, xv = self.qkv_linear(x_TD)
@@ -144,8 +146,10 @@ class Attention(GQAttention):
             scale=self.scaling,
             enable_gqa=self.enable_gqa,
             # fork: TPU splash attention derives the packed-document mask from
-            # positions (no BlockMask); flex/varlen accept and ignore it.
+            # positions (no BlockMask); flex/varlen accept and ignore both.
+            # ``segment_ids`` is the once-per-step hoist from the model forward.
             positions=positions,
+            segment_ids=segment_ids,
         ).contiguous()
         output = output.view(num_tokens, -1)
 
@@ -182,9 +186,12 @@ class MuseGlimmerTransformerBlock(TransformerBlock):
         x: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ):
         h = x + self.post_attention_norm(
-            self.attention(self.attention_norm(x), attention_masks, positions)
+            self.attention(
+                self.attention_norm(x), attention_masks, positions, segment_ids
+            )
         )
         out = h + self.post_ffn_norm(self.feed_forward(self.ffn_norm(h)))
         return out
@@ -537,8 +544,15 @@ class MuseGlimmerModel(Decoder):
         else:
             h_TD = tokens
 
+        # fork: packed-document segment ids for the TPU splash inner attention,
+        # computed once per step above the layers (each layer is its own
+        # activation-checkpoint region, so an in-layer cumsum runs 2x per layer).
+        segment_ids = (
+            segment_ids_from_positions(positions) if positions is not None else None
+        )
+
         for layer in self.layers.values():
-            h_TD = layer(h_TD, attention_masks, positions)
+            h_TD = layer(h_TD, attention_masks, positions, segment_ids)
 
         h_TD = self.norm(h_TD) if self.norm is not None else h_TD
 
