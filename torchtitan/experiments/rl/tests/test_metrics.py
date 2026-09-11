@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
-import os as os
+import os
 from unittest.mock import MagicMock
 
 import pytest

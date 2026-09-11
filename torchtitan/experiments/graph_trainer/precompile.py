@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import os as os
+import os
 import pickle
 from dataclasses import dataclass
-from typing import NewType, TYPE_CHECKING
+from typing import Any, NewType, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torchtitan.distributed import ParallelDims
@@ -19,8 +19,11 @@ if TYPE_CHECKING:
 
 import torch
 import torch.utils._pytree as pytree
+from torch.distributed.device_mesh import DeviceMesh
 
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    _unwrap_subclasses,
+    extract_train_state,
     SubclassLayout,
     TracedResult,
 )
@@ -28,6 +31,42 @@ from torchtitan.experiments.graph_trainer.storage import StorageAdapter
 from torchtitan.tools.logging import logger
 
 ConfigFingerprint = NewType("ConfigFingerprint", str)
+
+
+def flatten_runtime_inputs(
+    module: torch.nn.Module,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    precompile_meshes: list[DeviceMesh] | None = None,
+) -> tuple[Any, ...]:
+    """Flatten live model state, meshes, and call inputs for a precompiled graph."""
+    model_state, optim_state = extract_train_state(module)
+    state_flat, _ = pytree.tree_flatten({"model": model_state, "optim": optim_state})
+    user_inputs_flat, _ = pytree.tree_flatten((args, kwargs))
+    flat_inputs, _ = _unwrap_subclasses(
+        [*state_flat, *(precompile_meshes or []), *user_inputs_flat]
+    )
+    return tuple(flat_inputs)
+
+
+def get_spmd_precompile_meshes(parallel_dims: ParallelDims) -> list[DeviceMesh]:
+    """
+    Return SPMD meshes that must be registered as runtime graph inputs.
+
+    Pre-registering meshes allows PG lookups for collectives in forward code (ambient mesh)
+    to appear in graph as custom op results (indexing input meshes), rather than
+    opaque objects with no source, matching graph structure from legacy DTensor path.
+    """
+    candidates = [
+        parallel_dims.spmd_dense_mesh(),
+        parallel_dims.spmd_sparse_mesh(),
+        parallel_dims.get_optional_mesh("pp"),
+    ]
+    meshes: list[DeviceMesh] = []
+    for mesh in candidates:
+        if mesh is not None and all(mesh is not other for other in meshes):
+            meshes.append(mesh)
+    return meshes
 
 
 def compute_config_fingerprint(
@@ -54,6 +93,11 @@ def compute_config_fingerprint(
     h.update(f"compile:mode:{compile_config.mode}\n".encode())
     h.update(f"compile:backend:{compile_config.backend}\n".encode())
     h.update(f"compile:passes:{list(compile_config.passes)}\n".encode())
+    h.update(f"compile:memory_policy:{compile_config.memory_policy}\n".encode())
+    h.update(
+        "compile:full_recompute_save_ops:"
+        f"{compile_config.full_recompute_save_ops}\n".encode()
+    )
     h.update(
         f"compile:ep_overlap:enabled:{compile_config.ep_overlap.enabled}\n".encode()
     )
@@ -81,19 +125,20 @@ def compute_config_fingerprint(
 
 
 def _register_coor_ops() -> None:
-    """Register CooR custom ops required for deserialization.
+    """Register CooR custom ops required for tracing and deserialization.
 
     CooR-compiled artifacts reference custom ops (e.g.
     device_mesh._runtime_compute_coordinate_on_dim) that are lazily
     registered. The ops module uses @torch.library.custom_op with
     DeviceMesh, which requires DeviceMesh to be registered as an
-    opaque type first. Must be called before deserializing any
+    opaque type first. Must be called before tracing or deserializing a
     CooR-compiled artifact.
     """
     from torch.distributed.device_mesh import _register_distributed_opaque_types
 
     _register_distributed_opaque_types()
     from torch.distributed._ops import device_mesh as _dm_ops  # noqa: F401
+    from torch.distributed.tensor import _collective_utils  # noqa: F401
 
 
 def _validate_config_fingerprint(
@@ -208,7 +253,7 @@ class PrecompiledFxTraceArtifact:
             config_fingerprint=config_fingerprint or ConfigFingerprint(""),
         )
 
-    def to_traced_result(self) -> TracedResult:
+    def to_traced_result(self, example_inputs: tuple[Any, ...]) -> TracedResult:
         """Deserialize back into a TracedResult.
 
         Registers CooR custom ops, then deserializes the GraphModule
@@ -234,7 +279,7 @@ class PrecompiledFxTraceArtifact:
 
         return TracedResult(
             gm=gm,
-            example_inputs=(),
+            example_inputs=example_inputs,
             num_flat_inputs=self.num_flat_inputs,
             input_subclass_layouts=self.input_subclass_layouts,
             user_inputs_spec=dummy_spec,
@@ -276,6 +321,7 @@ def precompile_fx_trace_save(
 def precompile_fx_trace_load(
     storage: StorageAdapter,
     expected_fingerprint: ConfigFingerprint,
+    example_inputs: tuple[Any, ...],
 ) -> TracedResult:
     """Load a precompiled aot_fx_trace artifact.
 
@@ -300,4 +346,4 @@ def precompile_fx_trace_load(
         f"fingerprint={artifact.config_fingerprint}"
     )
 
-    return artifact.to_traced_result()
+    return artifact.to_traced_result(example_inputs)

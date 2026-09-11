@@ -10,21 +10,23 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
-from torchtitan.components.dataloader import DataloaderExhaustedError
-from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.config import TORCH_DTYPE_MAP
+from torchtitan.components.data.loader import DataloaderExhaustedError
+from torchtitan.config import apply_overrides, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.distributed.cudagraph import wrap_with_cuda_graph
 from torchtitan.experiments.torchft.config.job_config import FaultTolerance
 from torchtitan.experiments.torchft.manager import (
     maybe_semi_sync_training,
     TorchFTManager,
 )
 from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
+from torchtitan.models.common.aux_loss import AuxLoss, collect_aux_loss_metrics
+from torchtitan.observability.sdc_replayer import ScalarStateAccessor, SDCReplayer
 from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
@@ -37,6 +39,7 @@ class FaultTolerantTrainer(Trainer):
         fault_tolerance: FaultTolerance = field(default_factory=FaultTolerance)
 
     ft_manager: TorchFTManager
+    sdc_replayer: SDCReplayer | None
 
     @record
     def __init__(self, config: Config):
@@ -56,6 +59,7 @@ class FaultTolerantTrainer(Trainer):
 
         # init distributed and build meshes (FT override handles ft_manager creation)
         self.parallel_dims = parallel_dims = self.init_distributed()
+        dist_utils.set_spmd_backend(config.parallelism.spmd_backend)
 
         # Logging needs to happen after distributed initialized
         config.maybe_log()
@@ -90,13 +94,17 @@ class FaultTolerantTrainer(Trainer):
             else None
         )
 
+        num_pp_microbatches = (
+            config.parallelism.num_pp_microbatches if parallel_dims.pp_enabled else 1
+        )
         # build dataloader
+        num_tokens_per_batch = config.training.num_tokens_per_microbatch_per_dp_rank
         self.dataloader = config.dataloader.build(
             dp_world_size=batch_degree,
             dp_rank=batch_rank,
             tokenizer=self.tokenizer,
-            seq_len=config.training.seq_len,
-            local_batch_size=config.training.local_batch_size,
+            max_context_length=config.training.max_context_length,
+            num_tokens_per_batch=num_tokens_per_batch,
         )
 
         # build model (using meta init)
@@ -106,6 +114,12 @@ class FaultTolerantTrainer(Trainer):
             config=config,
         )
         self.model_config = model_config
+
+        # Apply overrides after model config updates, before building the model.
+        if config.override.imports:
+            apply_overrides(config.override, config)
+        # Overrides can change fields checked during config construction.
+        config.__post_init__()
 
         logger.info(
             f"Building {model_spec.name} {model_spec.flavor} "
@@ -135,7 +149,9 @@ class FaultTolerantTrainer(Trainer):
         (
             model_param_count,
             self.metrics_processor.num_flops_per_token,
-        ) = model_config.get_nparams_and_flops(model, config.training.seq_len)
+        ) = model_config.get_nparams_and_flops(
+            model, config.training.max_context_length
+        )
 
         logger.info(
             f"{color.blue}Model {model_spec.name} {model_spec.flavor} "
@@ -158,26 +174,24 @@ class FaultTolerantTrainer(Trainer):
             compile_config=config.compile,
         )
 
-        # verify batch sizes
-        global_batch_size = config.training.global_batch_size
-        if global_batch_size < 0:
-            # This global batch size results in 1 gradient accumulation
-            # step.
-            global_batch_size = config.training.local_batch_size * batch_degree
-        assert global_batch_size > 0
-        assert (
-            global_batch_size % (config.training.local_batch_size * batch_degree) == 0
-        ), (
-            f"global batch size must be multiple of local batch size times "
-            f"data-parallel degree ({global_batch_size} "
-            f"% ({config.training.local_batch_size} * {batch_degree}) != 0)"
+        self.num_pp_microbatches = num_pp_microbatches
+        num_tokens_per_dp_rank = (
+            config.training.num_tokens_per_microbatch_per_dp_rank
+            * self.num_pp_microbatches
         )
-
-        # calculate gradient accumulation steps
-        self.gradient_accumulation_steps = global_batch_size // (
-            config.training.local_batch_size * batch_degree
+        num_tokens_per_train_step = config.training.num_tokens_per_train_step
+        if num_tokens_per_train_step < 0:
+            num_tokens_per_train_step = num_tokens_per_dp_rank * batch_degree
+        if num_tokens_per_train_step % (num_tokens_per_dp_rank * batch_degree) != 0:
+            raise ValueError(
+                "training.num_tokens_per_train_step "
+                f"({num_tokens_per_train_step}) must be divisible by the number "
+                "of tokens processed globally in one gradient accumulation "
+                f"iteration ({num_tokens_per_dp_rank * batch_degree})."
+            )
+        self.gradient_accumulation_steps = num_tokens_per_train_step // (
+            num_tokens_per_dp_rank * batch_degree
         )
-        assert self.gradient_accumulation_steps > 0
 
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
@@ -281,6 +295,24 @@ class FaultTolerantTrainer(Trainer):
         self.step = 0
         self.ntokens_seen = 0
 
+        # SDC replay state is process-local and not checkpointed; its check
+        # schedule restarts after every checkpoint load (see load_state_dict).
+        self.sdc_replayer = None
+        if config.sdc_replayer is not None:
+            self.sdc_replayer = config.sdc_replayer.build(
+                modules=self.model_parts,
+                device=self.device,
+                # ntokens_seen is the only trainer scalar the replayed
+                # forward/backward mutates; self.step is incremented outside
+                # the replay boundary and needs no capture.
+                scalar_state={
+                    "ntokens_seen": ScalarStateAccessor(
+                        get=lambda: self.ntokens_seen,
+                        set=lambda value: setattr(self, "ntokens_seen", value),
+                    )
+                },
+            )
+
         # FT addition: pass ft_manager to CheckpointManager
         self.checkpointer = config.checkpoint.build(
             dataloader=self.dataloader,
@@ -299,7 +331,27 @@ class FaultTolerantTrainer(Trainer):
 
         self.train_context = dist_utils.get_spmd_context(
             parallel_dims=parallel_dims,
+            spmd_typechecking=(
+                config.parallelism.spmd_backend == "spmd_types"
+                and config.debug.spmd_typechecking
+            ),
         )
+        if parallel_dims.pp_enabled:
+            self.fwd_bwd_fn = self._pp_forward_backward_body
+            self._pp_loss_sentinel_on_non_last_stage = torch.full(
+                (1,), -1.0, device=self.device
+            )
+        else:
+            self.fwd_bwd_fn = self._forward_backward_body
+
+        if not config.training.disable_cuda_graphs:
+            sdc_config = config.sdc_replayer
+            self.fwd_bwd_fn = wrap_with_cuda_graph(
+                self.fwd_bwd_fn,
+                gradient_accumulation_steps=self.gradient_accumulation_steps,
+                sdc_num_steps=sdc_config.num_steps if sdc_config is not None else 0,
+                sdc_num_replays=sdc_config.num_replays if sdc_config is not None else 0,
+            )
 
         # Build validator if validation is configured
         if config.validator.enable:
@@ -323,8 +375,8 @@ class FaultTolerantTrainer(Trainer):
                 loss_fn=self.loss_fn,
                 validation_context=self.train_context,
                 metrics_processor=self.metrics_processor,
-                seq_len=config.training.seq_len,
-                local_batch_size=config.training.local_batch_size,
+                seq_len=config.training.max_context_length,
+                num_tokens_per_batch=num_tokens_per_batch,
                 pp_schedule=pp_schedule,
                 pp_has_first_stage=pp_has_first_stage,
                 pp_has_last_stage=pp_has_last_stage,
@@ -332,10 +384,10 @@ class FaultTolerantTrainer(Trainer):
 
         logger.info(
             "Trainer is initialized with "
-            f"local batch size {config.training.local_batch_size}, "
-            f"global batch size {global_batch_size}, "
+            f"{num_tokens_per_dp_rank} tokens per DP rank, "
+            f"{num_tokens_per_train_step} tokens per train step, "
             f"gradient accumulation steps {self.gradient_accumulation_steps}, "
-            f"sequence length {config.training.seq_len}, "
+            f"maximum context length {config.training.max_context_length}, "
             f"total steps {config.training.steps} "
             f"(warmup {config.lr_scheduler.warmup_steps})"
         )
@@ -368,50 +420,78 @@ class FaultTolerantTrainer(Trainer):
 
         return ParallelDims.from_config(config.parallelism, world_size)
 
-    def train_step(
-        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
-    ):
-        self.optimizers.zero_grad()
+    def train_step(self, data_iterator: Iterator[dict[str, Any]]):
+        self.optimizers.zero_grad(set_to_none=self.config.training.disable_cuda_graphs)
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
+        should_log = self.metrics_processor.should_log(self.step)
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
         parallel_dims = self.parallel_dims
-
-        # Collect all microbatches on CPU and count total valid tokens
-        microbatches = []
+        # All groups form one optimizer step; each group feeds one fwd-bwd call.
+        microbatch_groups: list[list[dict[str, Any]]] = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
-        for _microbatch in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
-            local_valid_tokens += (labels != IGNORE_INDEX).sum()
-            microbatches.append((input_dict, labels))
+        for _ in range(self.gradient_accumulation_steps):
+            microbatches = []
+            for _ in range(self.num_pp_microbatches):
+                input_dict = next(data_iterator)
+                # Popped so the batch reaching the model holds only its kwargs.
+                local_valid_tokens += input_dict.pop("num_valid_tokens")
+                microbatches.append(input_dict)
+            microbatch_groups.append(microbatches)
 
-        # All-reduce to get global token count across DP ranks
-        # Move to GPU for distributed communication
+        # Keep the global token count on device so loss normalization does not
+        # introduce a CPU synchronization in the training path.
+        global_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(
-                local_valid_tokens.to(self.device), batch_mesh
+            global_valid_tokens = dist_utils.dist_sum_tensor(
+                global_valid_tokens, batch_mesh
             )
-        else:
-            global_valid_tokens = float(local_valid_tokens.item())
 
-        # Process each microbatch: move to GPU, forward/backward, then free
-        accumulated_losses = []
-        for input_dict, labels in microbatches:
-            # Move tensors to GPU
-            for k, v in input_dict.items():
-                if isinstance(v, torch.Tensor):
-                    input_dict[k] = v.to(self.device)
-            labels = labels.to(self.device)
+        # Auxiliary losses normalize by the same per-step token count as the
+        # main loss, so their scale is independent of parallelism degrees.
+        AuxLoss.set_step_denominator(global_valid_tokens)
 
-            loss = self.forward_backward_step(
-                input_dict=input_dict,
-                labels=labels,
-                global_valid_tokens=global_valid_tokens,
-            )
-            accumulated_losses.append(loss.detach())
+        accumulated_loss: torch.Tensor | None = None
+        for fwd_bwd_index, microbatches in enumerate(microbatch_groups):
+            input_dict_mbs = []
+            for input_dict in microbatches:
+                for key, value in input_dict.items():
+                    if isinstance(value, torch.Tensor):
+                        input_dict[key] = value.to(self.device)
+                input_dict_mbs.append(input_dict)
+
+            if parallel_dims.pp_enabled:
+                fwd_bwd_input_dict = input_dict_mbs
+            else:
+                assert len(input_dict_mbs) == 1
+                fwd_bwd_input_dict = input_dict_mbs[0]
+
+            def fwd_bwd() -> torch.Tensor:
+                return self.forward_backward_step(
+                    input_dict=fwd_bwd_input_dict,
+                    global_valid_tokens=global_valid_tokens,
+                )
+
+            if self.sdc_replayer is not None and fwd_bwd_index == 0:
+                # Only the step's first gradient-accumulation group is
+                # replay-checked; under PP one group is a complete pipeline
+                # schedule. Later groups exercise the same compute and
+                # communication paths, so checking them too would only add
+                # overhead.
+                loss = self.sdc_replayer.run_fwd_bwd(fwd_bwd, step=self.step)
+            else:
+                loss = fwd_bwd()
+            if should_log:
+                loss = loss.detach()
+                if accumulated_loss is None:
+                    # Take ownership before the next replay overwrites the
+                    # graph-owned output. Later losses accumulate in place.
+                    accumulated_loss = loss.clone()
+                else:
+                    accumulated_loss.add_(loss)
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
@@ -424,31 +504,29 @@ class FaultTolerantTrainer(Trainer):
         self.optimizers.step()
         self.lr_schedulers.step()
 
-        # Reduce the data collected over gradient accumulation steps.
-        loss = torch.sum(torch.stack(accumulated_losses))
-
         # log metrics
-        if not self.metrics_processor.should_log(self.step):
+        if not should_log:
             return
 
+        assert accumulated_loss is not None
+
         if parallel_dims.dp_cp_enabled:
-            loss = loss.detach()
             # FT addition: use ft_manager.loss_sync_pg for extra process group
             ft_pg = self.ft_manager.loss_sync_pg
             loss_mesh = parallel_dims.get_optional_mesh("loss")
 
             # For global_avg_loss, we want the average loss across all ranks:
-            # loss = local_loss_sum / global_valid_tokens
+            # accumulated_loss = local_loss_sum / global_valid_tokens
             # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
-            #                 = sum(loss)
+            #                 = sum(accumulated_loss)
             #
             # For global_max_loss, we want the max of local average losses across ranks:
             # local_avg_loss = local_loss_sum / local_valid_tokens
-            #                = (loss * global_valid_tokens) / local_valid_tokens
+            #                = (accumulated_loss * global_valid_tokens) / local_valid_tokens
             # global_max_loss = max(local_avg_loss)
-            local_avg_loss = loss * global_valid_tokens / local_valid_tokens
+            local_avg_loss = accumulated_loss * global_valid_tokens / local_valid_tokens
             global_avg_loss, global_max_loss, global_ntokens_seen = (
-                dist_utils.dist_sum(loss, loss_mesh, ft_pg),
+                dist_utils.dist_sum(accumulated_loss, loss_mesh, ft_pg),
                 dist_utils.dist_max(local_avg_loss, loss_mesh, ft_pg),
                 dist_utils.dist_sum(
                     torch.tensor(
@@ -459,12 +537,13 @@ class FaultTolerantTrainer(Trainer):
                 ),
             )
         else:
-            global_avg_loss = global_max_loss = loss.detach().item()
+            global_avg_loss = global_max_loss = accumulated_loss.item()
             global_ntokens_seen = self.ntokens_seen
 
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
+            **collect_aux_loss_metrics(self.parallel_dims),
         }
         self.metrics_processor.log(
             self.step,

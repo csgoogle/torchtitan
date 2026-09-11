@@ -11,14 +11,13 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from torchtitan.models.common.attention import (
-    AttentionMasksType,
-    GQAttention,
-    VarlenAttention,
-)
+from torchtitan.models.common.attention import AttentionMasksType, VarlenAttention
 from torchtitan.models.common.config_utils import update_moe_aux_loss_configs
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.models.utils import get_moe_model_nparams_and_flops
+from torchtitan.models.utils import (
+    get_nparams_and_active_nparams,
+    quadratic_attention_flops_per_token,
+)
 
 
 class Qwen3TransformerBlock(TransformerBlock):
@@ -91,12 +90,24 @@ class Qwen3Model(Decoder):
         ) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
-            local_global_batch_size = kwargs.get(
-                "local_global_batch_size", config.training.local_batch_size
-            )
+            training = config.training
+
+            # Fork (b2ae4ce1): size the batch-wise MoE aux loss. Upstream's
+            # TrainingConfig is a token budget now, and its trainer no longer
+            # passes batch sizes here; the scale only needs the local/global
+            # ratio, so token counts stand in for sequence counts. Without the
+            # DP degree the per-step total is unknowable from the config alone,
+            # so absent explicit kwargs assume no gradient accumulation.
             global_batch_size = kwargs.get(
-                "global_batch_size", config.training.global_batch_size
+                "global_batch_size", training.num_tokens_per_train_step
             )
+            local_global_batch_size = kwargs.get("local_global_batch_size")
+            if local_global_batch_size is None:
+                local_global_batch_size = (
+                    global_batch_size
+                    if global_batch_size > 0
+                    else training.num_tokens_per_microbatch_per_dp_rank
+                )
             if global_batch_size < 0:
                 global_batch_size = local_global_batch_size
 
@@ -126,13 +137,19 @@ class Qwen3Model(Decoder):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-
-            assert isinstance(self.layers[0].attention, GQAttention.Config)
-            assert self.layers[0].attention.head_dim is not None
-            return get_moe_model_nparams_and_flops(
-                self,
-                model,
-                self.layers[0].attention.n_heads,
-                2 * self.layers[0].attention.head_dim,
-                seq_len,
-            )
+            nparams, active_nparams = get_nparams_and_active_nparams(model)
+            attention_op_flops = 0
+            for layer in self.layers:
+                attention = layer.attention
+                head_dim = (
+                    attention.head_dim
+                    if attention.head_dim is not None
+                    else attention.dim // attention.n_heads
+                )
+                attention_op_flops += quadratic_attention_flops_per_token(
+                    num_heads=attention.n_heads,
+                    qk_head_dim=head_dim,
+                    v_head_dim=head_dim,
+                    seq_len=seq_len,
+                )
+            return nparams, 6 * active_nparams + attention_op_flops

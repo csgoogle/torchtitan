@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from typing import Any, cast, TypeAlias
@@ -12,20 +12,18 @@ from typing import Any, cast, TypeAlias
 import torch
 import torch.nn as nn
 from torch.distributed.pipelining.schedules import _PipelineSchedule
-
-from torchtitan.components.dataloader import BaseDataLoader
-from torchtitan.components.loss import IGNORE_INDEX, LossFunction
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.components.data.collators import TrainerBatch
+from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.components.loss import LossFunction
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import Configurable, ParallelismConfig
-from torchtitan.distributed import full_dtensor, ParallelDims, utils as dist_utils
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.models.common.attention import FlexAttention, VarlenAttention
-from torchtitan.models.common.decoder import Decoder
+from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.observability import structured_logger as sl
+from torchtitan.protocols.model import BaseModel
 from torchtitan.tools import utils
-from torchtitan.tools.logging import logger
 
 ValidationContext: TypeAlias = Callable[[], AbstractContextManager[None]]
 
@@ -35,6 +33,12 @@ class BaseValidator(Configurable):
     class Config(Configurable.Config):
         freq: int = 10
         """Frequency of validation"""
+
+        def __post_init__(self) -> None:
+            if self.freq <= 0:
+                raise ValueError(
+                    f"validation frequency must be positive, got {self.freq}"
+                )
 
     def __init__(
         self,
@@ -76,20 +80,22 @@ class Validator(BaseValidator):
 
         steps: int = -1
         """
-        Number of steps to take in the validation set, -1 means consuming
-        all the data in the validation dataset.
-        WARNING: When setting to -1 there could be hangs due to mismatch among ranks
+        Number of validation steps. -1 consumes the finite dataset and therefore
+        requires an effective data-parallel degree of one.
         """
 
         dataloader: BaseDataLoader.Config = field(
-            default_factory=lambda: HuggingFaceTextDataLoader.Config(
-                dataset="c4_validation",
-                infinite=False,
+            default_factory=lambda: GrainDataLoader.Config(
+                dataset=ConcatThenSplitPackingConfig(
+                    dataset=DATASETS["c4_validation"],
+                ),
+                repeat=False,
             )
         )
         """DataLoader configuration for validation"""
 
         def __post_init__(self):
+            BaseValidator.Config.__post_init__(self)
             assert (
                 self.steps > 0 or self.steps == -1
             ), "validation steps must be positive or -1"
@@ -108,7 +114,7 @@ class Validator(BaseValidator):
         validation_context: ValidationContext,
         metrics_processor: MetricsProcessor,
         seq_len: int,
-        local_batch_size: int,
+        num_tokens_per_batch: int,
         pp_schedule: _PipelineSchedule | None = None,
         pp_has_first_stage: bool | None = None,
         pp_has_last_stage: bool | None = None,
@@ -119,96 +125,17 @@ class Validator(BaseValidator):
         self.tokenizer = tokenizer
         self.parallel_dims = parallel_dims
         self.loss_fn = loss_fn
-        self.dl_config = replace(config.dataloader, infinite=config.steps != -1)
+        # A bounded validation run repeats data; steps=-1 consumes one finite pass.
+        self.dl_config = replace(config.dataloader, repeat=config.steps != -1)
         self.dp_world_size = dp_world_size
         self.dp_rank = dp_rank
         self.seq_len = seq_len
-        self.local_batch_size = local_batch_size
+        self.num_tokens_per_batch = num_tokens_per_batch
         self.validation_context = validation_context
         self.metrics_processor = metrics_processor
         self.pp_schedule = pp_schedule
         self.pp_has_first_stage = pp_has_first_stage
         self.pp_has_last_stage = pp_has_last_stage
-
-        if config.steps == -1:
-            logger.warning(
-                "Setting validation steps to -1 might cause hangs because of "
-                "unequal sample counts across ranks when dataset is exhausted."
-            )
-
-    def post_dataloading_process(
-        self,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
-        model_parts: list[nn.Module],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """
-        Post-processing hook after data loading and before model forward pass.
-
-        This method processes the raw data from the dataloader and prepares it for
-        the model's forward pass. It separates the main input tensor from auxiliary
-        inputs and constructs additional keyword arguments (e.g., attention masks).
-
-        Args:
-            input_dict: Dictionary containing tensors from the dataloader. Must
-                contain an "input" key with the main input tensor. May contain
-                additional keys for auxiliary inputs (e.g., position ids).
-            labels: Target labels for the batch.
-            model_parts: List of model parts for accessing model methods.
-
-        Returns:
-            A tuple of (inputs, labels, extra_kwargs) where:
-                - inputs: Main input tensor extracted from input_dict["input"].
-                - labels: Target labels (potentially modified by CP sharding).
-                - extra_kwargs: Additional keyword arguments for the model forward
-                    (e.g. positions, attention_masks), forwarded to every
-                    pipeline-parallel stage.
-        """
-        inputs = input_dict["input"]
-        extra_kwargs: dict[str, Any] = {
-            k: v for k, v in input_dict.items() if k != "input"
-        }
-
-        # TODO: deduplicate with Trainer.post_dataloading_process which has
-        # the same logic; extract a shared function to prevent further drift.
-        # The dataloader always provides per-document positions, which drive
-        # both RoPE and block_causal attention masking.
-        model_config = getattr(model_parts[0], "config", None)
-
-        positions = extra_kwargs.get("positions", None)
-        # positions and attention_masks are optional (Decoder.forward defaults
-        # both to None). Build masks only for the masked backends (Flex/Varlen),
-        # which is where get_attention_masks is defined. A maskless backend (the
-        # SDPA config used by the graph_trainer tests) still receives positions
-        # for RoPE but no masks — it relies on is_causal instead.
-        if isinstance(model_config, Decoder.Config) and positions is not None:
-            inner_attention = getattr(
-                model_config.first_attention, "inner_attention", None
-            )
-            if isinstance(
-                inner_attention, (FlexAttention.Config, VarlenAttention.Config)
-            ):
-                model = cast(Decoder, model_parts[0])
-                extra_kwargs["attention_masks"] = model.get_attention_masks(
-                    positions=positions,
-                )
-
-        if self.parallel_dims.cp_enabled:
-            inputs, labels, extra_kwargs = prepare_context_parallel_input(
-                inputs,
-                labels,
-                extra_kwargs,
-                self.parallel_dims.get_mesh("cp"),
-                inputs.device,
-                self.parallelism.context_parallel_load_balancer,
-            )
-
-        if self.parallelism.spmd_backend == "full_dtensor":
-            inputs, labels, extra_kwargs = full_dtensor.parallelize_inputs(
-                self.parallel_dims, inputs, labels, extra_kwargs
-            )
-
-        return inputs, labels, extra_kwargs
 
     @sl.log_trace_span("eval")
     @torch.no_grad()
@@ -224,68 +151,91 @@ class Validator(BaseValidator):
 
         parallel_dims = self.parallel_dims
 
-        accumulated_losses = []
+        accumulated_loss: torch.Tensor | None = None
         device_type = utils.device_type
+        total_global_valid_tokens = torch.zeros(
+            (), dtype=torch.int64, device=device_type
+        )
         num_steps = 0
+        num_pp_microbatches = (
+            self.parallelism.num_pp_microbatches if parallel_dims.pp_enabled else 1
+        )
 
         validation_dataloader = self.dl_config.build(
             dp_world_size=self.dp_world_size,
             dp_rank=self.dp_rank,
             tokenizer=self.tokenizer,
-            seq_len=self.seq_len,
-            local_batch_size=self.local_batch_size,
+            max_context_length=self.seq_len,
+            num_tokens_per_batch=self.num_tokens_per_batch,
         )
 
-        for input_dict, labels in validation_dataloader:
+        validation_iterator = iter(iterate_and_close_dataloader(validation_dataloader))
+        while True:
             # pyrefly: ignore [missing-attribute, unsupported-operation]
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
 
-            self.metrics_processor.ntokens_since_last_log += labels.numel()
-            for k, v in input_dict.items():
-                input_dict[k] = v.to(device_type)
-            labels = labels.to(device_type)
+            try:
+                microbatches = []
+                local_valid_tokens = 0
+                for _ in range(num_pp_microbatches):
+                    input_dict = next(validation_iterator)
+                    # Popped so the batch reaching the model holds only its kwargs.
+                    local_valid_tokens += input_dict.pop("num_valid_tokens")
+                    self.metrics_processor.ntokens_since_last_log += input_dict[
+                        "labels"
+                    ].numel()
+                    for k, v in input_dict.items():
+                        input_dict[k] = v.to(device_type)
+                    microbatches.append(input_dict)
+            except StopIteration:
+                break
 
-            # Count valid tokens for this batch
-            local_valid_tokens = torch.tensor(0, dtype=torch.int64, device=device_type)
-            local_valid_tokens += (labels != IGNORE_INDEX).sum()
-
-            # All-reduce token count across DP ranks to get global token count
+            # All-reduce token count across DP ranks while keeping it on device.
+            local_valid_tokens_tensor = torch.tensor(
+                local_valid_tokens, dtype=torch.int64, device=device_type
+            )
             if parallel_dims.dp_enabled:
                 batch_mesh = parallel_dims.get_mesh("batch")
-                global_valid_tokens = dist_utils.dist_sum(
-                    local_valid_tokens, batch_mesh, None
+                global_valid_tokens = dist_utils.dist_sum_tensor(
+                    local_valid_tokens_tensor, batch_mesh, None
                 )
             else:
-                global_valid_tokens = float(local_valid_tokens.item())
-
-            # Process data (extract inputs, handle attention masks, CP sharding)
-            inputs, labels, extra_kwargs = self.post_dataloading_process(
-                input_dict, labels, model_parts
-            )
+                global_valid_tokens = local_valid_tokens_tensor
 
             if parallel_dims.pp_enabled:
                 assert self.pp_schedule is not None
                 assert self.pp_has_first_stage is not None
                 assert self.pp_has_last_stage is not None
-                # Pipeline Parallel forward inside eval() call
-                with self.validation_context():
-                    targets, losses = (
-                        (labels, []) if self.pp_has_last_stage else (None, None)
+
+                arg_mbs: list[tuple[torch.Tensor, ...]] = []
+                kwarg_mbs: list[dict[str, Any]] = []
+                target_mbs: list[torch.Tensor] | None = (
+                    [] if self.pp_has_last_stage else None
+                )
+
+                for input_dict in microbatches:
+                    inputs, labels, extra_kwargs = cast(
+                        BaseModel, model_parts[0]
+                    ).preprocess_inputs(
+                        input_dict,
+                        parallel_dims=self.parallel_dims,
+                        parallelism=self.parallelism,
                     )
                     if self.pp_has_first_stage:
-                        self.pp_schedule.eval(
-                            inputs,
-                            **extra_kwargs,
-                            target=targets,
-                            losses=losses,
-                        )
-                    else:
-                        self.pp_schedule.eval(
-                            **extra_kwargs,
-                            target=targets,
-                            losses=losses,
-                        )
+                        arg_mbs.append((inputs,))  # pyrefly: ignore[bad-argument-type]
+                    kwarg_mbs.append(extra_kwargs)
+                    if target_mbs is not None:
+                        target_mbs.append(labels)  # pyrefly: ignore[bad-argument-type]
+
+                with self.validation_context():
+                    losses = [] if self.pp_has_last_stage else None
+                    self.pp_schedule.eval(
+                        arg_mbs=arg_mbs if self.pp_has_first_stage else None,
+                        kwarg_mbs=kwarg_mbs,
+                        target_mbs=target_mbs,
+                        losses=losses,
+                    )
 
                 # accumulate losses across pipeline microbatches
                 # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
@@ -296,26 +246,50 @@ class Validator(BaseValidator):
                 else:
                     loss_sum = torch.tensor([-1.0], device=device_type)
             else:
+                assert len(microbatches) == 1
+                input_dict = microbatches[0]
+                inputs, labels, extra_kwargs = cast(
+                    BaseModel, model_parts[0]
+                ).preprocess_inputs(
+                    input_dict,
+                    parallel_dims=self.parallel_dims,
+                    parallelism=self.parallelism,
+                )
                 with self.validation_context():
                     assert len(model_parts) == 1
                     predictions = model_parts[0](inputs, **extra_kwargs)
                     loss_sum, _ = self.loss_fn(predictions, labels)
 
-            accumulated_losses.append(loss_sum.detach() / global_valid_tokens)
+            loss_sum = loss_sum.detach()
+            if accumulated_loss is None:
+                accumulated_loss = loss_sum.clone()
+            else:
+                accumulated_loss.add_(loss_sum)
+            total_global_valid_tokens.add_(global_valid_tokens)
             num_steps += 1
 
-        # Compute average loss
-        loss = torch.sum(torch.stack(accumulated_losses))
-        loss /= num_steps
+        assert accumulated_loss is not None
+        num_global_valid_tokens = int(total_global_valid_tokens.item())
         if parallel_dims.dp_cp_enabled:
-            global_avg_loss = dist_utils.dist_sum(
-                loss, parallel_dims.get_optional_mesh("loss")
+            global_loss_sum = dist_utils.dist_sum(
+                accumulated_loss, parallel_dims.get_optional_mesh("loss")
             )
         else:
-            global_avg_loss = float(loss.item())
+            global_loss_sum = float(accumulated_loss.item())
+        global_avg_loss = global_loss_sum / num_global_valid_tokens
 
         self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
 
         # Set model back to train mode
         for model in model_parts:
             model.train()
+
+
+def iterate_and_close_dataloader(
+    dataloader: BaseDataLoader,
+) -> Iterator[TrainerBatch]:
+    """Close a temporary dataloader when its consumer stops iterating."""
+    try:
+        yield from dataloader
+    finally:
+        dataloader.close()

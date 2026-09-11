@@ -19,7 +19,7 @@ Usage:
 """
 
 import argparse
-import os as os
+import os
 import subprocess
 import tempfile
 import time

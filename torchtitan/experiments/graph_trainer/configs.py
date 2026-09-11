@@ -20,7 +20,12 @@ from torchtitan.trainer import Trainer
 EpOverlapChunkDim = Literal["batch", "seq"]
 EpOverlapChunkStrategy = Literal["eager", "graph"]
 GraphTrainerMemoryPolicy = Literal[
-    "default", "full", "eager", "sac_and_offload", "full_and_scan_offload"
+    "default",
+    "full",
+    "eager",
+    "min_cut",
+    "sac_and_offload",
+    "full_and_scan_offload",
 ]
 
 TRANSFORMER_BLOCK_FQN = "layers.*"
@@ -101,10 +106,12 @@ class GraphTrainerCompileConfig(CompileConfig):
     """
     Memory optimization policy for activation management (SAC, offload).
         default: SAC — save all compute-intensive ops and FSDP all_gathers.
-        full: full recompute — only layer outputs are saved. Mirrors
-            eager's full AC (checkpoint_wrapper with no context_fn).
+        full: full recompute, saving layer outputs and operations selected by
+            full_recompute_save_ops. With no selectors, this mirrors eager's
+            full AC (checkpoint_wrapper with no context_fn).
         eager: SAC alternating mm ops between save/recompute, matching the
             eager AC policy in torchtitan.distributed.activation_checkpoint.
+        min_cut: choose saved activations with the min-cut partitioner.
         sac_and_offload: SAC + CPU offload — apply default SAC first,
             then offload surviving MUST_SAVE activations to CPU within
             the cpu_offload_budget_gb budget.
@@ -114,6 +121,14 @@ class GraphTrainerCompileConfig(CompileConfig):
             backward scan reads, which is the whole sequence-length
             dependence of the run. The transfers are placed inside the loop
             bodies, so the device holds one slice rather than the stack.
+    """
+
+    full_recompute_save_ops: str = ""
+    """Operations to save instead of recomputing under the ``full`` policy.
+
+    Each selector has the form ``MODULE_FQN_PATTERN::OP``. Separate multiple
+    selectors with ``|`` and quote the full argument in the shell. For example:
+    ``layers.*.moe.router.gate::aten.mm.dtype | layers.*.attention.wkv_a::aten.mm.default``.
     """
 
     pass_pipeline: str = "default"
@@ -247,19 +262,17 @@ def to_graph_trainer_config(
     from the graph_trainer model_registry. The compile field is removed and
     left as the GraphTrainer.Config default; callers should explicitly set it.
     """
-    from .cudagraph import cudagraph_annotate_trace_post_processor
     from .trainer import GraphTrainer
 
     if target_cls is None:
         target_cls = GraphTrainer.Config
 
     d = {f.name: getattr(base_config, f.name) for f in fields(base_config)}
-    flavor = (
-        base_config.model_spec.flavor
-        if hasattr(base_config, "model_spec") and base_config.model_spec is not None
-        else base_config.model.flavor
+    d["parallelism"] = replace(
+        base_config.parallelism,
+        spmd_backend="spmd_types",
     )
-    graph_spec = model_registry(flavor)
+    graph_spec = model_registry(base_config.model_spec.flavor)
     # Wrap the base model config in the graph_trainer's model config class
     # (e.g. GraphTrainerQwen3Model.Config) while preserving all field values
     # (including moe_comm_backend etc.).
@@ -292,12 +305,5 @@ def to_graph_trainer_config(
         d["loss"] = ChunkedLossWrapperWithParamGrads.Config(
             **{f.name: getattr(loss_cfg, f.name) for f in fields(loss_cfg)}
         )
-
-    # Merge CUDA graph kernel annotations into profiler traces when profiling
-    # is active.  No-op otherwise (and no-op when requirements aren't met).
-    # It's also a no-op if there is CUDA graph is not enabled.
-    profiler = d.get("profiler")
-    if profiler is not None:
-        profiler.trace_post_processor = cudagraph_annotate_trace_post_processor()
 
     return target_cls(**d)

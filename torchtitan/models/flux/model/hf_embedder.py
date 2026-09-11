@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os as os
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -61,17 +61,6 @@ class FluxEmbedder(Module):
         for name, param in self.hf_module.named_parameters():
             if not param.is_contiguous():
                 param.data = param.data.contiguous()
-
-    def init_weights(self):
-        self.hf_module.init_weights()
-        # Initialize buffers that might be uninitialized after to_empty from meta device
-        for _, buffer in self.hf_module.named_buffers():
-            # Standard transformers models use position_ids as a buffer.
-            # We need to initialize it with arange(0, seq_len) to match the embedding range.
-            if buffer.shape[-1] > 1:
-                buffer.data.copy_(
-                    torch.arange(buffer.size(-1), device=buffer.device, dtype=buffer.dtype).view(buffer.shape)
-                )
 
     def forward(self, batch_tokens: Tensor) -> Tensor:
         """

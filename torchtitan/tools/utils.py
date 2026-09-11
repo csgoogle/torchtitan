@@ -15,7 +15,6 @@ from types import ModuleType, SimpleNamespace
 
 import psutil
 import torch
-import torch.distributed as dist
 from torch._utils import _get_available_device_type, _get_device_module
 
 from torchtitan.observability import structured_logger as sl
@@ -33,6 +32,19 @@ def has_cuda_capability(major: int, minor: int) -> bool:
         and torch.version.hip is None
         and torch.cuda.get_device_capability() >= (major, minor)
     )
+
+
+def get_cuda_flash_attention_impl() -> str | None:
+    """Return the FlashAttention implementation for the current CUDA architecture."""
+
+    # FA4 advertises Hopper support, but as of writing it hangs under
+    # torch.compile there, so Hopper (sm90) stays on FA3.
+    # https://github.com/pytorch/torchtitan/pull/4413
+    if has_cuda_capability(10, 0):
+        return "FA4"
+    if has_cuda_capability(9, 0):
+        return "FA3"
+    return None
 
 
 def has_rocm_capability(major: int, minor: int) -> bool:
@@ -192,7 +204,6 @@ class GarbageCollection:
                 "Force GC to perform collection to obtain debug information",
                 generation=2,
             )
-            gc.collect()
             sl.add_step_tag("gc")
             return True
         if step_count > 1 and step_count % self.gc_freq == 0:
@@ -260,7 +271,7 @@ def get_peak_flops(device_name: str) -> float:
         # GB300 data from https://www.nvidia.com/en-us/data-center/dgx-gb300
         return 2.5e15
     elif "B300" in device_name or "B200" in device_name:
-        # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
+        # data from https://resources.nvidia.com/en-us-blackwell-architecture
         # Checked after GB300 to avoid false match on "GB300"
         return 2.25e15
     elif "MI355X" in device_name:
@@ -283,34 +294,9 @@ def get_peak_flops(device_name: str) -> float:
         # Standard EU mode (i.e. 448 max compute units): 298.2 TFLOPS (BF16)
         max_comp_units = torch.xpu.get_device_properties("xpu").max_compute_units
         return 512 * max_comp_units * 1300 * 10**6
-    elif "l40s" in device_name:
+    elif "l40s" in device_name.casefold():
         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
         return 362e12
-    elif "tpu" in device_name.lower():
-        # torch_tpu reports "TPU v6e"; older torchtitan builds reported
-        # "tpu-v6e" (and "tpu-7x" for v7). Match both, case-insensitively.
-        tpu_name = device_name.lower().replace("-", " ")
-        if "v4" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/v4
-            return 275e12
-        elif "v5e" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/v5e
-            return 197e12
-        elif "v5p" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/v5p
-            # The quoted number is per chip. We use this number as we assume
-            # megacore is enabled for v5p.
-            return 459e12
-        elif "v6e" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/v6e
-            return 918e12
-        elif "v7" in tpu_name or "7x" in tpu_name:
-            # data from https://docs.cloud.google.com/tpu/docs/tpu7x
-            # The quoted number is per chip. We halve it for per-core FLOPS.
-            return 2307e12 / 2
-        logger.warning(
-            f"Unrecognized TPU device name: {device_name}, fallback to A100"
-        )
     elif "neuron" in device_name:
         # AWS Trainium/Inferentia: query chip type via torch.neuron
         # TensorEngine BF16 TFLOPS per NeuronCore × default Logical NeuronCore (LNC) count per device
@@ -329,6 +315,28 @@ def get_peak_flops(device_name: str) -> float:
                 f"Unknown neuron device: {neuron_device_name}, fallback to trn2/trn3"
             )
             return 79e12 * 2
+
+    elif device_name.startswith("TPU"):
+        # Google Cloud TPU: dense BF16 matrix-engine (MXU) peak, per device.
+        # Source: https://cloud.google.com/tpu/docs/system-architecture-tpu-vm
+        if "v4" in device_name:
+            return 275e12
+        elif "v5e" in device_name:
+            return 197e12
+        elif "v5p" in device_name:
+            return 459e12
+        elif "v6e" in device_name:
+            return 918e12
+        elif "v7" in device_name or "7x" in device_name:
+            # 2307 TFLOPS is the published per-chip figure; v7 exposes each of
+            # its two TensorCores as a separate device, so halve for per-device.
+            # torch_tpu may report the generation as "7x" rather than "v7".
+            return 2307e12 / 2
+        else:
+            logger.warning(
+                f"Peak flops undefined for TPU: {device_name}, fallback to A100"
+            )
+            return 312e12
 
     else:  # for other GPU types, assume A100
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")

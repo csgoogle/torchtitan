@@ -32,7 +32,7 @@ def graph_trainer_qwen3_debugmodel_moe() -> GraphTrainer.Config:
 
 
 def graph_trainer_qwen3_14b() -> GraphTrainer.Config:
-    config = to_graph_trainer_config(qwen3_14b(), model_registry)
+    config = to_graph_trainer_config(qwen3_14b(seq_len=4096), model_registry)
     config.compile = GraphTrainerCompileConfig(enable=True)
     return config
 

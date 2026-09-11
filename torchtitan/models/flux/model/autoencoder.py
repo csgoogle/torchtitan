@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os as os
+import os
 from dataclasses import dataclass
 
 import torch
@@ -430,16 +430,6 @@ class AutoEncoder(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
-
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.GroupNorm):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
 
 
 def load_ae(

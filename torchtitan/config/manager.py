@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import importlib
-import os as os
+import os
 import sys
 import warnings
 from dataclasses import field, fields, is_dataclass, make_dataclass
@@ -14,16 +14,6 @@ from typing import Any
 import tyro
 
 from torchtitan.tools.logging import logger
-
-
-def _reconstruct_config(base, custom, data):
-    """Reconstructs a merged config instance for pickling."""
-    # pylint: disable=g-import-not-at-top
-    from torchtitan.config.manager import ConfigManager
-
-    config_manager = ConfigManager(base)
-    merged_cls = config_manager._merge_configs(base, custom)
-    return config_manager._dict_to_dataclass(merged_cls, data)
 
 
 class ConfigManager:
@@ -205,20 +195,7 @@ class ConfigManager:
             if name not in b_map:
                 result.append((name, f.type, f))
 
-        merged_cls = make_dataclass(f"Merged{base.__name__}", result, bases=(base,))
-
-        # In torchtitan g3, this class needs to be pickleable when spawning
-        # processes, as we explicitly set start_method to "spawn".
-        # In OSS, this "fork" is the default start_method, avoiding this issue.
-        # Dynamically created classes via make_dataclass (e.g. when using
-        # job.custom_config_module) are not pickleable by default because they
-        # cannot be looked up in the module, leading to PicklingError. We define
-        # __reduce__ to provide a pickling protocol for these dynamic configs.
-        def __reduce__(self):
-            return (_reconstruct_config, (base, custom, self.to_dict()))
-
-        merged_cls.__reduce__ = __reduce__
-        return merged_cls
+        return make_dataclass(f"Merged{base.__name__}", result, bases=(base,))
 
     def _validate_config(self) -> None:
         # TODO: temporary mitigation of BC breaking change in hf_assets_path
@@ -264,6 +241,43 @@ class ConfigManager:
                 instance_from_str=lambda args: args[0].split(","),
                 is_instance=lambda instance: all(isinstance(i, str) for i in instance),
                 str_from_instance=lambda instance: [",".join(instance)],
+            )
+
+        @registry.primitive_rule
+        def override_imports_rule(type_info: tyro.constructors.PrimitiveTypeInfo):
+            """Parse ``--override.imports`` targets, each with optional kwargs.
+
+            Needed because ``OverrideConfig.imports`` is a ``str | tuple`` union,
+            which tyro cannot render as a CLI flag on its own. Tokens are space-
+            or comma-separated ``module.function`` targets; attach kwargs to a
+            target with ``target=<json>`` (see ``parse_cli_imports``),
+            e.g. ``--override.imports
+            'my_pkg.triton_rope.triton_rope={"block_size": 256}'``.
+            """
+            from torchtitan.config.override import (
+                format_cli_imports,
+                OverrideImport,
+                parse_cli_imports,
+            )
+
+            if type_info.type != list[OverrideImport]:
+                return None
+            return tyro.constructors.PrimitiveConstructorSpec(
+                nargs="*",
+                metavar="TARGET[='{\"k\": v}'] ...",
+                instance_from_str=lambda args: parse_cli_imports(args),
+                is_instance=lambda instance: isinstance(instance, list)
+                and all(
+                    isinstance(i, str)
+                    or (
+                        isinstance(i, tuple)
+                        and len(i) == 2
+                        and isinstance(i[0], str)
+                        and isinstance(i[1], dict)
+                    )
+                    for i in instance
+                ),
+                str_from_instance=lambda instance: format_cli_imports(instance),
             )
 
 

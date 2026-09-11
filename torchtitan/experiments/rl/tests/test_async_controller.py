@@ -8,10 +8,11 @@
 the consume-time staleness invariant, the metrics timer drain, and RolloutTurnID."""
 
 import asyncio
+import logging
 
 import pytest
 
-from torchtitan.experiments.rl.components.batcher import BatchConfig, Batcher
+from torchtitan.experiments.rl.components.batcher import Batcher
 from torchtitan.experiments.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
@@ -53,9 +54,15 @@ def _trainable_group(group_id: int, *, num_samples: int) -> TrainingSampleGroup:
     )
 
 
-def _build_batcher(*, num_groups_per_train_step: int) -> Batcher:
+def _untrainable_group(group_id: int) -> TrainingSampleGroup:
+    return TrainingSampleGroup(group_id=group_id, training_samples=[], metrics=[])
+
+
+def _build_batcher(*, num_prompts_per_train_step: int) -> Batcher:
     return Batcher.Config().build(
-        num_groups_per_train_step=num_groups_per_train_step,
+        num_tokens_per_microbatch_per_dp_rank=16384,
+        max_context_length=2048,
+        num_prompts_per_train_step=num_prompts_per_train_step,
         dp_degree=1,
         pad_id=0,
     )
@@ -64,48 +71,190 @@ def _build_batcher(*, num_groups_per_train_step: int) -> Batcher:
 def test_batcher_counts_trainable_groups_not_rollouts() -> None:
     # Target is 2 GROUPS. A single group with many rollouts is not a full batch; two groups are,
     # regardless of how many rollouts each contributes.
-    batcher = _build_batcher(num_groups_per_train_step=2)
-    assert (
-        batcher.add_training_samples(
-            training_sample_group=_trainable_group(0, num_samples=8)
-        )
-        is None
+    batcher = _build_batcher(num_prompts_per_train_step=2)
+    batch, group_is_trainable = batcher.add_training_samples(
+        training_sample_group=_trainable_group(0, num_samples=8)
     )
-    batch = batcher.add_training_samples(
+    assert batch is None
+    assert group_is_trainable
+    batch, group_is_trainable = batcher.add_training_samples(
         training_sample_group=_trainable_group(1, num_samples=1)
     )
     assert batch is not None
+    assert group_is_trainable
 
 
 def test_batcher_carries_metric_only_groups_until_trainable_batch() -> None:
     # Metric-only (empty) groups do not count toward the target and cannot form a zero-token batch;
     # they ride along until a trainable group completes the batch.
-    batcher = _build_batcher(num_groups_per_train_step=1)
+    batcher = _build_batcher(num_prompts_per_train_step=1)
     metric_only = TrainingSampleGroup(group_id=0, training_samples=[], metrics=[])
-    assert batcher.add_training_samples(training_sample_group=metric_only) is None
-    batch = batcher.add_training_samples(
+    assert batcher.add_training_samples(training_sample_group=metric_only) == (
+        None,
+        False,
+    )
+    batch, group_is_trainable = batcher.add_training_samples(
         training_sample_group=_trainable_group(1, num_samples=2)
     )
     assert batch is not None
+    assert group_is_trainable
     assert batch.num_global_valid_tokens > 0
 
 
-def test_microbatch_grid_spreads_pad_rows_across_cells() -> None:
-    # 5 real rows, local_batch_size=2, dp_degree=2 -> 4 cells x 2 = 8 rows (3 pad).
-    # Round-robin dealing spreads the pad rows so no (microbatch, rank) cell is all-pad.
-    batcher = Batcher.Config(batch=BatchConfig(local_batch_size=2, seq_len=2)).build(
-        num_groups_per_train_step=1,
+def test_batcher_warns_after_each_batch_of_untrainable_groups(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    batcher = _build_batcher(num_prompts_per_train_step=2)
+
+    with caplog.at_level(logging.WARNING):
+        batcher.add_training_samples(training_sample_group=_untrainable_group(0))
+        batcher.add_training_samples(training_sample_group=_untrainable_group(1))
+
+    assert (
+        "Consecutive untrainable batches: 1/10 "
+        "(2 rollout groups produced no trainable samples)."
+    ) in caplog.text
+
+
+def test_batcher_resets_no_progress_count_on_trainable_group(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    batcher = _build_batcher(num_prompts_per_train_step=2)
+
+    with caplog.at_level(logging.WARNING):
+        batcher.add_training_samples(training_sample_group=_untrainable_group(0))
+        batcher.add_training_samples(training_sample_group=_untrainable_group(1))
+        batcher.add_training_samples(
+            training_sample_group=_trainable_group(2, num_samples=1)
+        )
+        caplog.clear()
+        batcher.add_training_samples(training_sample_group=_untrainable_group(3))
+
+    assert "zero-output batch equivalents" not in caplog.text
+
+
+def test_batcher_raises_at_consecutive_untrainable_group_limit() -> None:
+    batcher = _build_batcher(num_prompts_per_train_step=2)
+
+    for group_id in range(19):
+        batcher.add_training_samples(training_sample_group=_untrainable_group(group_id))
+
+    with pytest.raises(RuntimeError, match="10 consecutive untrainable batches"):
+        batcher.add_training_samples(training_sample_group=_untrainable_group(19))
+
+
+def test_microbatch_grid_avoids_all_padding_cells_when_possible() -> None:
+    # 5 real rows, 2 rows/rank, dp_degree=2 -> 4 cells x 2 = 8 rows (3 pad).
+    # Redistributing one row into the fourth cell keeps every cell trainable.
+    batcher = Batcher.Config(max_num_documents=4).build(
+        num_tokens_per_microbatch_per_dp_rank=4,
+        max_context_length=2,
+        num_prompts_per_train_step=1,
         dp_degree=2,
         pad_id=0,
     )
-    batch = batcher.add_training_samples(
+    batch, group_is_trainable = batcher.add_training_samples(
         training_sample_group=_trainable_group(0, num_samples=5)
     )
     assert batch is not None
+    assert group_is_trainable
     cells = [microbatch for ranks in batch.microbatches for microbatch in ranks]
     assert len(cells) == 4  # 2 microbatches x 2 ranks
     for cell in cells:
-        assert cell.loss_mask.any(dim=1).any()  # at least one real (non-pad) row
+        assert cell.loss_mask.any()
+        assert cell.padding_mask.shape == cell.token_ids.shape
+        assert not cell.padding_mask[cell.loss_mask].any()
+
+
+def test_document_limit_applies_to_each_local_microbatch() -> None:
+    # Each row holds two documents, but a local microbatch is capped at three.
+    # The batcher must keep all five documents and split the rows 2 + 3.
+    batcher = Batcher.Config(max_num_documents=3).build(
+        num_tokens_per_microbatch_per_dp_rank=8,
+        max_context_length=4,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+    )
+    batch, group_is_trainable = batcher.add_training_samples(
+        training_sample_group=_trainable_group(0, num_samples=5)
+    )
+
+    assert batch is not None
+    assert group_is_trainable
+    assert len(batch.microbatches) == 2
+    num_documents = []
+    for (microbatch,) in batch.microbatches:
+        real_document_starts = (microbatch.positions == 0) & ~microbatch.padding_mask
+        num_documents.append(int(real_document_starts.sum().item()))
+    assert num_documents == [2, 3]
+    assert sum(num_documents) == 5
+
+
+def test_document_limit_can_be_smaller_than_rows_per_microbatch() -> None:
+    batcher = Batcher.Config(max_num_documents=1).build(
+        num_tokens_per_microbatch_per_dp_rank=4,
+        max_context_length=2,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+    )
+    batch, _ = batcher.add_training_samples(
+        training_sample_group=_trainable_group(0, num_samples=2)
+    )
+
+    assert batch is not None
+    assert len(batch.microbatches) == 2
+    for (microbatch,) in batch.microbatches:
+        real_document_starts = (microbatch.positions == 0) & ~microbatch.padding_mask
+        assert int(real_document_starts.sum().item()) == 1
+
+
+def test_batcher_filters_training_samples_longer_than_context() -> None:
+    batcher = Batcher.Config().build(
+        num_tokens_per_microbatch_per_dp_rank=4,
+        max_context_length=4,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+    )
+    sample = _training_sample(group_id=0, rollout_id=0)
+    sample.token_ids = list(range(6))
+    sample.loss_mask = [False] * 6
+    sample.logprobs = [0.0] * 6
+    sample.advantage = [0.0] * 6
+
+    pending, group_is_trainable = batcher.add_training_samples(
+        training_sample_group=TrainingSampleGroup(
+            group_id=0,
+            training_samples=[sample],
+            metrics=[],
+        )
+    )
+    assert pending is None
+    assert not group_is_trainable
+
+    batch, _ = batcher.add_training_samples(
+        training_sample_group=_trainable_group(1, num_samples=1)
+    )
+    assert batch is not None
+    dropped_metric = next(
+        metric
+        for metric in batch.metrics
+        if metric.key == "batcher/num_samples_dropped_oversized"
+    )
+    assert dropped_metric.value.value == 1
+
+
+def test_batcher_requires_whole_rows_per_microbatch() -> None:
+    with pytest.raises(ValueError, match="must be divisible"):
+        Batcher.Config().build(
+            num_tokens_per_microbatch_per_dp_rank=5,
+            max_context_length=3,
+            num_prompts_per_train_step=1,
+            dp_degree=1,
+            pad_id=0,
+        )
 
 
 def test_compute_perf_ratio_metrics_reads_flushed_means() -> None:
@@ -180,7 +329,9 @@ def test_untrainable_group_releases_before_training() -> None:
     async def run() -> None:
         buffer = RolloutGroupWorkBuffer.Config().build(max_active_rollout_groups=1)
         batcher = Batcher.Config().build(
-            num_groups_per_train_step=1,
+            num_tokens_per_microbatch_per_dp_rank=16384,
+            max_context_length=2048,
+            num_prompts_per_train_step=1,
             dp_degree=1,
             pad_id=0,
         )
@@ -193,9 +344,11 @@ def test_untrainable_group_releases_before_training() -> None:
             group_id=0, training_samples=[], metrics=[]
         )
         await buffer.release_active_groups(1, reason="untrainable_group")
-        assert (
-            batcher.add_training_samples(training_sample_group=training_sample_group)
-            is None
+        assert batcher.add_training_samples(
+            training_sample_group=training_sample_group
+        ) == (
+            None,
+            False,
         )
 
     asyncio.run(run())
@@ -206,5 +359,71 @@ def test_compute_policy_age_metrics_raises_on_consume_time_staleness() -> None:
         compute_policy_age_metrics(
             trainer_policy_version=4,
             min_policy_versions=[0],
+            target_offpolicy_steps=3,
             max_offpolicy_steps=3,
         )
+
+
+def test_compute_policy_age_metrics_uses_hard_offpolicy_limit() -> None:
+    metrics = compute_policy_age_metrics(
+        trainer_policy_version=4,
+        min_policy_versions=[0],
+        target_offpolicy_steps=3,
+        max_offpolicy_steps=4,
+    )
+    assert any(metric.key == "train_batch/policy_age_max" for metric in metrics)
+
+    with pytest.raises(RuntimeError, match="admitted stale training data"):
+        compute_policy_age_metrics(
+            trainer_policy_version=5,
+            min_policy_versions=[0],
+            target_offpolicy_steps=3,
+            max_offpolicy_steps=4,
+        )
+
+
+def _fifo_buffer(*, capacity: int, window_size: int = 1) -> RolloutGroupWorkBuffer:
+    return RolloutGroupWorkBuffer.Config().build(
+        max_active_rollout_groups=capacity,
+        window_size=window_size,
+    )
+
+
+def test_work_buffer_rejects_window_larger_than_capacity() -> None:
+    with pytest.raises(ValueError, match="window_size"):
+        _fifo_buffer(capacity=2, window_size=3)
+
+
+async def _admit(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
+    if not await buffer.wait_for_slot():
+        raise RuntimeError("buffer closed unexpectedly")
+    await buffer.add_work(RolloutGroupWork(group_id=group_id, sample=object()))
+
+
+async def _finalize(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
+    await buffer.finalize_work(RolloutGroup(group_id=group_id, rollouts=[]))
+
+
+def test_windowed_fifo_takes_within_anchored_window() -> None:
+    async def run() -> None:
+        # Window [g0, g3]: g1/g2/g3 may bypass stuck g0; g4 remains blocked.
+        buffer = _fifo_buffer(capacity=8, window_size=4)
+        for group_id in range(5):
+            await _admit(buffer, group_id)
+        await buffer.claim_next()  # g0 -> INFLIGHT and stuck
+        for group_id in (1, 2, 3, 4):
+            await _finalize(buffer, group_id)
+
+        assert (await buffer.take_finalized()).group_id == 1
+        assert (await buffer.take_finalized()).group_id == 2
+        assert (await buffer.take_finalized()).group_id == 3
+
+        taker = asyncio.create_task(buffer.take_finalized())
+        await asyncio.sleep(0)
+        assert not taker.done()  # g4 is finalized but outside the anchored window
+
+        await _finalize(buffer, 0)
+        assert (await taker).group_id == 0
+        assert (await buffer.take_finalized()).group_id == 4
+
+    asyncio.run(run())

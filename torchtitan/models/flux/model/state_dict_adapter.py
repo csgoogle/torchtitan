@@ -6,7 +6,7 @@
 
 import json
 import logging
-import os as os
+import os
 import re
 from collections import defaultdict
 from typing import Any

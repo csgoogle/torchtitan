@@ -6,7 +6,7 @@
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,8 @@ from torchtitan.components.optimizer import (
     collect_moe_routing_metric_tensors,
     set_moe_routing_metric_tensors,
 )
+from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed.cudagraph import cudagraph_teardown
 from torchtitan.experiments.graph_trainer.common_utils import (
     accumulate_param_grads_,
     compute_annotated_loss,
@@ -26,11 +28,13 @@ from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     trace_input_preparer_keys,
 )
-from torchtitan.experiments.graph_trainer.cudagraph import cudagraph_teardown
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
     run_traced,
     TracedResult,
+)
+from torchtitan.experiments.graph_trainer.memory_policy import (
+    validate_memory_policy_config,
 )
 from torchtitan.experiments.graph_trainer.passes import (
     apply_graph_passes,
@@ -46,6 +50,8 @@ from torchtitan.experiments.graph_trainer.registry import (
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
+from torchtitan.observability import structured_logger as sl
+from torchtitan.protocols import BaseModel
 from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
@@ -121,6 +127,8 @@ class GraphTrainer(Trainer):
     def __init__(self, config):
         super().__init__(config)
 
+        validate_memory_policy_config(self.config.compile)
+
         _maybe_apply_numa_binding(self.device.index, self.device.type)
 
         # Lazy state for aot_fx_trace mode
@@ -142,27 +150,30 @@ class GraphTrainer(Trainer):
     def forward_backward_step(
         self,
         *,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
-        global_valid_tokens: float,
+        input_dict: dict[str, Any] | list[dict[str, Any]],
+        global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        if self.config.compile.mode != "aot_fx_trace":
+        if self.parallel_dims.pp_enabled or self.config.compile.mode != "aot_fx_trace":
             return super().forward_backward_step(
                 input_dict=input_dict,
-                labels=labels,
-                global_valid_tokens=global_valid_tokens,
-            )
-        if self.parallel_dims.pp_enabled:
-            return self._graph_pp_forward_backward_step(
-                input_dict=input_dict,
-                labels=labels,
                 global_valid_tokens=global_valid_tokens,
             )
 
+        assert isinstance(input_dict, dict)
         assert len(self.model_parts) == 1
         model = self.model_parts[0]
 
-        inputs, labels, extra_kwargs = self.post_dataloading_process(input_dict, labels)
+        with sl.log_trace_span("preprocess_inputs"):
+            inputs, labels, extra_kwargs = cast(BaseModel, model).preprocess_inputs(
+                input_dict,
+                parallel_dims=self.parallel_dims,
+                parallelism=self.config.parallelism,
+            )
+            # MTP returns one labels tensor per prediction; index 0 contains
+            # the complete main-model labels used for token accounting.
+            self.ntokens_seen += (
+                labels[0].numel() if isinstance(labels, tuple) else labels.numel()
+            )
         # remove_duplicate=False to preserve duplicate parameter entries
         # from weight tying (e.g. shared embedding/output weights).
         params = [
@@ -179,37 +190,17 @@ class GraphTrainer(Trainer):
             extra_kwargs,
         )
 
-    def _graph_pp_forward_backward_step(
+    def _load_precompiled_fx_trace(
         self,
-        *,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
-        global_valid_tokens: float,
-    ) -> torch.Tensor:
-        inputs, labels, extra_kwargs = self.post_dataloading_process(input_dict, labels)
-        loss_kwargs = {"global_valid_tokens": global_valid_tokens}
-        with self.train_context():
-            targets, losses = (labels, []) if self.pp_has_last_stage else (None, None)
-            schedule_args = (inputs,) if self.pp_has_first_stage else ()
-            self.pp_schedule.step(
-                *schedule_args,
-                **extra_kwargs,
-                target=targets,
-                losses=losses,
-                loss_kwargs=loss_kwargs,
-                return_outputs=False,
-            )
-
-        if self.pp_has_last_stage:
-            assert losses is not None
-            return torch.sum(torch.stack(losses)).to(self.device)
-        return torch.tensor([-1.0], device=self.device)
-
-    def _load_precompiled_fx_trace(self, model: nn.Module) -> None:
+        model: nn.Module,
+        runtime_args: tuple[Any, ...],
+    ) -> None:
         """Load a precompiled aot_fx_trace artifact from disk."""
         from torchtitan.experiments.graph_trainer.precompile import (
             _FX_TRACE_ARTIFACT_KEY,
             compute_config_fingerprint,
+            flatten_runtime_inputs,
+            get_spmd_precompile_meshes,
             precompile_fx_trace_load,
         )
         from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
@@ -227,32 +218,50 @@ class GraphTrainer(Trainer):
         config_fingerprint = compute_config_fingerprint(
             model, compile_config, self.parallel_dims
         )
+        precompile_meshes = (
+            get_spmd_precompile_meshes(self.parallel_dims)
+            if self.config.parallelism.spmd_backend == "spmd_types"
+            else None
+        )
 
         self._traced_step = precompile_fx_trace_load(
             storage,
             expected_fingerprint=config_fingerprint,
+            example_inputs=flatten_runtime_inputs(
+                model,
+                runtime_args,
+                {},
+                precompile_meshes=precompile_meshes,
+            ),
         )
 
     def _make_fx_forward_backward_step(
         self,
         model: nn.Module,
-        inputs: torch.Tensor,
-        labels: torch.Tensor,
-        global_valid_tokens: float,
+        inputs: torch.Tensor | tuple[torch.Tensor, ...],
+        labels: torch.Tensor | tuple[torch.Tensor, ...],
+        global_valid_tokens: torch.Tensor,
         params: list[torch.Tensor],
         extra_kwargs: dict[str, Any],
     ) -> torch.Tensor:
         maybe_register_blockmask_pytree_node()
         if self._traced_step is None:
             if self.config.compile.precompile_artifact_dir:
-                self._load_precompiled_fx_trace(model)
+                self._load_precompiled_fx_trace(
+                    model,
+                    (inputs, labels, global_valid_tokens, extra_kwargs),
+                )
             else:
                 fwd_bwd_fn = make_fwd_bwd_step(
                     model,
                     self.loss_fn,
                     collect_moe_routing_metrics=self._collect_moe_routing_metrics,
                 )
-                with self.train_context(), log_timer("minimal_fx_tracer"):
+                trace_context = dist_utils.get_spmd_context(
+                    parallel_dims=self.parallel_dims,
+                    spmd_typechecking=False,
+                )
+                with trace_context(), log_timer("minimal_fx_tracer"):
                     self._traced_step = minimal_fx_tracer(
                         fwd_bwd_fn,
                         module=model,
@@ -286,7 +295,21 @@ class GraphTrainer(Trainer):
                     self._traced_step.gm, self._traced_step.example_inputs
                 )
         with self.train_context():
-            outputs = run_traced(self._traced_step, module=model)(
+            precompile_meshes = None
+            if (
+                self.config.compile.precompile_artifact_dir
+                and self.config.parallelism.spmd_backend == "spmd_types"
+            ):
+                from torchtitan.experiments.graph_trainer.precompile import (
+                    get_spmd_precompile_meshes,
+                )
+
+                precompile_meshes = get_spmd_precompile_meshes(self.parallel_dims)
+            outputs = run_traced(
+                self._traced_step,
+                module=model,
+                precompile_meshes=precompile_meshes,
+            )(
                 inputs,
                 labels,
                 global_valid_tokens,
@@ -325,9 +348,7 @@ class GraphTrainer(Trainer):
                     args, kwargs = prepared
         return args, kwargs
 
-    def train_step(
-        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
-    ):
+    def train_step(self, data_iterator: Iterator[dict[str, Any]]):
         PRE_TRAIN_STEP_HOOKS.get(self.config.compile.pass_pipeline, lambda _: None)(
             self
         )

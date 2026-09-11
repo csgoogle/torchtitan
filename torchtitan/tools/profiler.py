@@ -6,19 +6,26 @@
 
 """Kineto profiler + memory-snapshot lifecycle."""
 
-import os as os
+import inspect
+import os
 import pickle
 import time
 from dataclasses import dataclass
-from typing import Annotated
 
 import torch
-import tyro
 from torchtitan.config import Configurable
-from torchtitan.config.function import Function
+from torchtitan.distributed.cudagraph import get_cudagraph_annotations
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module, device_type
+
+# torch's export_chrome_trace gained cuda_graph_annotations when the offline joiner
+# (torch.cuda._annotate_cuda_graph_trace) was removed. Older versions still export, just
+# without the CUDA graph annotations baked in.
+_EXPORT_SUPPORTS_ANNOTATIONS = (
+    "cuda_graph_annotations"
+    in inspect.signature(torch.profiler.profile.export_chrome_trace).parameters
+)
 
 # Paths expects by meta internal tooling
 PROFILE_DIR = "profiling/traces"  # Profiler.Config.save_traces_folder default
@@ -167,6 +174,12 @@ class Profiler(Configurable):
         enable_memory_snapshot: bool = False
         """Whether to dump memory snapshot."""
 
+        memory_snapshot_freq: int | None = None
+        """How often to collect memory snapshots, in iterations.
+
+        Defaults to ``profile_freq`` when unset for backward compatibility.
+        """
+
         save_memory_snapshot_folder: str = MEMORY_DIR
         """Memory snapshot files location."""
 
@@ -177,14 +190,14 @@ class Profiler(Configurable):
         are dropped once full. Bounds host memory and snapshot size / dump time.
         """
 
-        trace_post_processor: Annotated[
-            Function.Config | None, tyro.conf.Suppress
-        ] = None
-        """Optional hook invoked with the trace path after each export.
-
-        Wraps ``fn(trace_path: str) -> None``.
-        Set programmatically (not via CLI) — tyro cannot parse Callable types.
-        """
+        def __post_init__(self) -> None:
+            if self.enable_profiling and self.profile_freq < (
+                self.profiler_warmup + self.profiler_active
+            ):
+                raise ValueError(
+                    "profiler.profile_freq must be greater than or equal to "
+                    "profiler_warmup + profiler_active."
+                )
 
     def __init__(
         self,
@@ -280,9 +293,6 @@ class Profiler(Configurable):
         )
 
         rank = torch.distributed.get_rank()
-        post_processor = (
-            cfg.trace_post_processor.build() if cfg.trace_post_processor else None
-        )
 
         def trace_handler(prof):
             curr_trace_dir_name = PROFILE_ITER_DIR.format(step=prof.step_num)
@@ -294,10 +304,19 @@ class Profiler(Configurable):
             begin = time.monotonic()
 
             output_file = os.path.join(curr_trace_dir, PROFILE_FILE.format(rank=rank))
-            prof.export_chrome_trace(output_file)
-
-            if post_processor is not None:
-                post_processor(output_file)
+            # CUDA graph annotations are baked in during the export rather than
+            # joined onto the written file afterwards: re-reading and rewriting a
+            # gzipped trace paid the compression cost twice.
+            annotations = get_cudagraph_annotations()
+            if annotations and not _EXPORT_SUPPORTS_ANNOTATIONS:
+                logger.warning(
+                    "This torch does not support cuda_graph_annotations on "
+                    "export_chrome_trace; the trace will have no CUDA graph kernel "
+                    "annotations."
+                )
+                annotations = None
+            extra = {"cuda_graph_annotations": annotations} if annotations else {}
+            prof.export_chrome_trace(output_file, **extra)
 
             logger.info(
                 f"Finished dumping profiler traces in {time.monotonic() - begin:.2f} seconds"
@@ -319,11 +338,6 @@ class Profiler(Configurable):
         }
 
         wait = profile_freq - (active + warmup)
-        assert (
-            wait >= 0
-        ), "profile_freq must be greater than or equal to warmup + active"
-        from torchtitan.tools.utils import device_type
-        
         activities = [torch.profiler.ProfilerActivity.CPU]
         experimental_config = None
         if device_type == "tpu":
@@ -370,6 +384,18 @@ class Profiler(Configurable):
         if not cfg.enable_memory_snapshot:
             return None
 
+        memory_snapshot_freq = (
+            cfg.profile_freq
+            if cfg.memory_snapshot_freq is None
+            else cfg.memory_snapshot_freq
+        )
+        if memory_snapshot_freq <= 0:
+            raise ValueError(
+                "Memory snapshot frequency must be greater than zero; set "
+                "profiler.memory_snapshot_freq or profiler.profile_freq to a "
+                "positive value."
+            )
+
         snapshot_dir = os.path.join(base_folder, cfg.save_memory_snapshot_folder)
         if not os.path.exists(snapshot_dir):
             os.makedirs(snapshot_dir, exist_ok=True)
@@ -378,7 +404,7 @@ class Profiler(Configurable):
         logger.info(f"Memory profiler active. Snapshot will be saved at {snapshot_dir}")
         return MemoryProfiler(
             global_step,
-            cfg.profile_freq,
+            memory_snapshot_freq,
             snapshot_dir,
             leaf_folder,
             rank,

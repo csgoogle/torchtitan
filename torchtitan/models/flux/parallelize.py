@@ -28,15 +28,14 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.context_parallel import apply_cp_to_forward
 from torchtitan.distributed.fsdp import (
     disable_fsdp_gradient_division,
     enable_fsdp_symm_mem,
+    resolve_fsdp_mesh,
 )
-from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh
+from torchtitan.distributed.spmd_types import annotate_replicated_parameters
 from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
 from torchtitan.models.flux.model.model import FluxModel
-from torchtitan.models.flux.sharding import annotate_dp_cp_params_as_r
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel as simple_fsdp_data_parallel,
 )
@@ -70,9 +69,7 @@ def parallelize_flux(
 
     if parallelism.spmd_backend == "spmd_types":
         model.parallelize(parallel_dims)
-        annotate_dp_cp_params_as_r(model, parallel_dims)
-    elif parallel_dims.cp_enabled:
-        apply_cp(model, parallel_dims.get_mesh("cp"))
+        annotate_replicated_parameters(model, parallel_dims)
 
     if compile_config.enable and "model" in compile_config.components:
         apply_compile(model, compile_config)
@@ -225,40 +222,6 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointingConfig):
     logger.info("Applied full activation checkpointing to the model")
 
 
-def apply_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
-    """
-    Apply context parallelism to the Flux model.
-
-    Args:
-        model: The Flux model with double_blocks and single_blocks containing
-            inner attention modules.
-        cp_mesh: Device mesh for context parallel dimension
-
-    Note:
-        - Uses SDPA attention type
-        - Applies to all inner_attention modules in double_blocks and single_blocks
-    """
-    # Collect all inner_attention modules from the Flux model
-    attention_modules = []
-
-    # pyrefly: ignore [not-iterable]
-    for double_block in model.double_blocks:
-        # pyrefly: ignore [missing-attribute]
-        attention_modules.append(double_block.img_attn.inner_attention)
-        # pyrefly: ignore [missing-attribute]
-        attention_modules.append(double_block.txt_attn.inner_attention)
-        # pyrefly: ignore [missing-attribute]
-        attention_modules.append(double_block.inner_attention)
-
-    # pyrefly: ignore [not-iterable]
-    for single_block in model.single_blocks:
-        # pyrefly: ignore [missing-attribute]
-        attention_modules.append(single_block.inner_attention)
-
-    # Apply CP using direct forward wrapping (always uses SDPA for Flux)
-    apply_cp_to_forward(attention_modules, cp_mesh)
-
-
 def parallelize_encoders(
     t5_model: FluxEmbedder,
     clip_model: FluxEmbedder,
@@ -279,7 +242,7 @@ def parallelize_encoders(
         dp_mesh = parallel_dims.get_activated_mesh(["dp_replicate", "fsdp"])
         dp_mesh_dims = None
         assert dp_mesh is not None
-        
+
     use_simple_fsdp = getattr(parallelism, "use_simple_fsdp", False)
     if use_simple_fsdp:
         dp_mode = (
@@ -305,24 +268,24 @@ def parallelize_encoders(
             fsdp_config["dp_mesh_dims"] = dp_mesh_dims
         if training.enable_cpu_offload:
             fsdp_config["offload_policy"] = CPUOffloadPolicy()
-    
+
         # NOTE: only apply FSDP to the T5 encoder, not the CLIP text encoder.
         # CLIP Text encoder has low computation / communication ratio, so it's not necessary to apply FSDP to it.
         hf_module = t5_model.hf_module
         assert isinstance(hf_module, nn.Module)
         if parallel_dims.spmd_backend == "spmd_types":
-            annotate_dp_cp_params_as_r(hf_module, parallel_dims)
-        # pyrefly: ignore [missing-attribute]
+            annotate_replicated_parameters(hf_module, parallel_dims)
+        # pyrefly: ignore [missing-attribute, not-iterable]
         for block in hf_module.encoder.block:
             fully_shard(block, **fsdp_config)
         fully_shard(hf_module, **fsdp_config)
-    
+
         if enable_symm_mem:
             enable_fsdp_symm_mem(hf_module)
-    
+
         # Disable FSDP's automatic gradient division for all FSDP modules
         disable_fsdp_gradient_division(hf_module)
-    
+
         logger.info("Applied fully_shard to the T5 encoder model")
 
     logger.info("Applied fully_shard to the T5 encoder model")

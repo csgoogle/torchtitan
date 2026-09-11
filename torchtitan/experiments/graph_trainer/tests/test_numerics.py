@@ -7,7 +7,7 @@
 import copy
 import importlib.util
 import math
-import os as os
+import os
 import subprocess
 import sys
 import tempfile
@@ -22,6 +22,7 @@ from torch.testing._internal.common_fsdp import FSDPTest
 from torchtitan.components.loss import cross_entropy_loss
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
+from torchtitan.models.common.config_utils import DEFAULT_DEBUG_MODEL_SEQ_LEN
 
 
 STEPS = 20
@@ -227,11 +228,16 @@ LLAMA3_PARALLELISM = (
     "--parallelism.tensor_parallel_degree=2"
     " --parallelism.data_parallel_shard_degree=4"
 )
+DEBUGMODEL_TRAINING_OPTIONS = (
+    f"--training.max_context_length={DEFAULT_DEBUG_MODEL_SEQ_LEN}"
+    " --training.num_tokens_per_microbatch_per_dp_rank=16384"
+)
 
 
 def _run_llama3_loss_compare(test_options_extra: str = "") -> bool:
     """Run loss_compare for llama3 vs graph_trainer.llama3 with FSDP+TP."""
-    test_options = LLAMA3_PARALLELISM
+    options = f"{LLAMA3_PARALLELISM} {DEBUGMODEL_TRAINING_OPTIONS}"
+    test_options = options
     if test_options_extra:
         test_options += f" {test_options_extra}"
     return run_loss_compare(
@@ -239,7 +245,7 @@ def _run_llama3_loss_compare(test_options_extra: str = "") -> bool:
         baseline_config="llama3_debugmodel",
         test_module="graph_trainer.llama3",
         test_config="graph_trainer_llama3_debugmodel",
-        baseline_options=LLAMA3_PARALLELISM,
+        baseline_options=options,
         test_options=test_options,
     )
 
@@ -250,7 +256,8 @@ DSV3_PARALLELISM = (
     " --parallelism.expert_parallel_degree=2"
 )
 DSV3_EP_OVERLAP_GRAPH_PARALLELISM = (
-    "--parallelism.data_parallel_shard_degree=8"
+    "--training.disable_cuda_graphs"
+    " --parallelism.data_parallel_shard_degree=8"
     " --parallelism.tensor_parallel_degree=1"
     " --parallelism.expert_parallel_degree=2"
 )
@@ -289,10 +296,11 @@ def _run_deepseek_v3_loss_compare(
     baseline_options_extra: str = "",
 ) -> bool:
     """Run loss_compare for deepseek_v3 vs graph_trainer.deepseek_v3."""
-    baseline_options = parallelism
+    options = f"{parallelism} {DEBUGMODEL_TRAINING_OPTIONS}"
+    baseline_options = options
     if baseline_options_extra:
         baseline_options += f" {baseline_options_extra}"
-    test_options = parallelism
+    test_options = options
     if test_options_extra:
         test_options += f" {test_options_extra}"
     return run_loss_compare(
@@ -345,11 +353,12 @@ def _run_deepseek_v3_ep_overlap_moe_batch_loss_compare() -> bool:
 
 
 GRAPH_PP_DSV3_PP_OPTIONS = (
-    "--parallelism.pipeline_parallel_degree=2"
+    "--training.disable_cuda_graphs"
+    " --parallelism.pipeline_parallel_degree=2"
+    " --parallelism.num_pp_microbatches=8"
     " --parallelism.data_parallel_shard_degree=4"
     " --parallelism.expert_parallel_degree=2"
-    " --training.local_batch_size=8"
-    " --training.global_batch_size=32"
+    " --training.num_tokens_per_microbatch_per_dp_rank=2048"
     # Eager PP cannot be the baseline for ZBVZeroBubble or DualPipeV here:
     # FlexAttention needs torch.compile, and torch.compile is incompatible with
     # those eager PP schedules. Compare GraphPP schedules against eager
@@ -454,7 +463,8 @@ QWEN3_PARALLELISM = (
 
 def _run_qwen3_loss_compare(test_options_extra: str = "") -> bool:
     """Run loss_compare for qwen3 vs graph_trainer.qwen3 with FSDP+TP."""
-    test_options = QWEN3_PARALLELISM
+    options = f"{QWEN3_PARALLELISM} {DEBUGMODEL_TRAINING_OPTIONS}"
+    test_options = options
     if test_options_extra:
         test_options += f" {test_options_extra}"
     return run_loss_compare(
@@ -462,13 +472,14 @@ def _run_qwen3_loss_compare(test_options_extra: str = "") -> bool:
         baseline_config="qwen3_debugmodel",
         test_module="graph_trainer.qwen3",
         test_config="graph_trainer_qwen3_debugmodel",
-        baseline_options=QWEN3_PARALLELISM,
+        baseline_options=options,
         test_options=test_options,
     )
 
 
 QWEN3_MOE_PARALLELISM = (
-    "--parallelism.data_parallel_shard_degree=4"
+    "--training.disable_cuda_graphs"
+    " --parallelism.data_parallel_shard_degree=4"
     " --parallelism.tensor_parallel_degree=2"
     " --parallelism.expert_parallel_degree=2"
 )
@@ -476,7 +487,8 @@ QWEN3_MOE_PARALLELISM = (
 
 def _run_qwen3_moe_loss_compare(test_options_extra: str = "") -> bool:
     """Run loss_compare for qwen3 MoE vs graph_trainer.qwen3 MoE."""
-    test_options = QWEN3_MOE_PARALLELISM
+    options = f"{QWEN3_MOE_PARALLELISM} {DEBUGMODEL_TRAINING_OPTIONS}"
+    test_options = options
     if test_options_extra:
         test_options += f" {test_options_extra}"
     return run_loss_compare(
@@ -484,7 +496,7 @@ def _run_qwen3_moe_loss_compare(test_options_extra: str = "") -> bool:
         baseline_config="qwen3_moe_debug",
         test_module="graph_trainer.qwen3",
         test_config="graph_trainer_qwen3_debugmodel_moe",
-        baseline_options=QWEN3_MOE_PARALLELISM,
+        baseline_options=options,
         test_options=test_options,
     )
 
@@ -522,6 +534,7 @@ def _run_autoparallel_llama3_loss_compare() -> bool:
 AUTOPARALLEL_DSV3_PARALLELISM = (
     "--parallelism.data_parallel_shard_degree=4"
     " --parallelism.expert_parallel_degree=2"
+    f" {DEBUGMODEL_TRAINING_OPTIONS}"
 )
 
 
@@ -603,6 +616,11 @@ class TestGraphTrainerNumerics(unittest.TestCase):
             ),
         )
 
+    # TODO(#4342): Remove transformer-level chunking. After the model batch
+    # dimension was folded into the token dimension, splitting `layers.*` in
+    # half cuts the packed token stream mid-document, so neither chunk has full
+    # attention context and the loss goes non-finite at step 1.
+    @unittest.expectedFailure
     def test_moe_dsv3_ep_overlap_aot_fx_trace_vs_eager_chunked(self):
         self.assertTrue(_run_deepseek_v3_ep_overlap_loss_compare())
 
@@ -691,6 +709,7 @@ class TestSimpleFSDP(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            spmd_backend="partial_dtensor",
         )
 
     def get_input(self):

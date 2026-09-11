@@ -10,16 +10,34 @@ import os as os
 from tests.integration_tests import OverrideDefinitions
 from tests.integration_tests.run_tests import run_tests
 
+from torchtitan.experiments.graph_trainer.llama3 import (
+    config_registry as llama3_recipes,
+)
+
+# TODO: Move these tests to config recipes, matching the main trainer integration
+# tests, then remove the legacy shell-fragment overrides.
+
 # TODO: JIT mode tests are disabled due to an upstream PyTorch
 # partitioner regression ("Node tangents_2 was invalid, but is output")
 # triggered by the full DTensor change (#2149). Re-enable once the
 # partitioner issue is resolved.
 _JIT_DISABLED = True
 
+# TODO: Re-enable after regional_inductor can trace the CP load balancer's
+# index-rearrange constants; it currently raises a FunctionalTensor error.
+_FLEX_CP_INDUCTOR_DISABLED = True
+
 
 def _build_llama3_tests() -> list[OverrideDefinitions]:
     """Llama3-based integration tests (run on default A10 machines)."""
     return [
+        OverrideDefinitions(
+            configs=[llama3_recipes.graph_trainer_llama3_debugmodel_sdc_replay],
+            test_descr="GraphTrainer SDC replay",
+            test_name="sdc_replay",
+            ngpu=1,
+            skip_rocm_test=True,
+        ),
         # === JIT mode tests ===
         OverrideDefinitions(
             [
@@ -57,7 +75,7 @@ def _build_llama3_tests() -> list[OverrideDefinitions]:
                     "--config graph_trainer_llama3_debugmodel",
                     "--compile.mode jit",
                     "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.enable_async_tensor_parallel",
+                    "--compile.enable_async_tensor_parallel",
                 ],
             ],
             "JIT 2D async TP",
@@ -67,21 +85,27 @@ def _build_llama3_tests() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module graph_trainer.llama3",
                     "--config graph_trainer_llama3_debugmodel",
                     "--compile.mode jit",
                     "--checkpoint.enable",
                     "--parallelism.pipeline_parallel_degree 2",
+                    "--parallelism.num_pp_microbatches 8",
+                    "--training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--parallelism.data_parallel_shard_degree 2",
                     "--parallelism.tensor_parallel_degree 2",
                 ],
                 [
+                    "--training.disable_cuda_graphs",
                     "--module graph_trainer.llama3",
                     "--config graph_trainer_llama3_debugmodel",
                     "--compile.mode jit",
                     "--training.steps 20",
                     "--checkpoint.enable",
                     "--parallelism.pipeline_parallel_degree 2",
+                    "--parallelism.num_pp_microbatches 8",
+                    "--training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--parallelism.data_parallel_shard_degree 2",
                     "--parallelism.tensor_parallel_degree 2",
                 ],
@@ -178,22 +202,13 @@ def _build_llama3_tests() -> list[OverrideDefinitions]:
         # === aot_fx_trace mode tests ===
         # Note: aot_fx_trace applies cudagraph by default, so skip_rocm_test=True.
         #
-        # Uses the SDPA backend: the default FlexAttention + CP +
-        # regional_inductor combination is not yet supported — the CP load
-        # balancer injects an index-rearrange constant (torch
-        # _context_parallel/_attention.py qkv_rearrange_indices) that
-        # regional_inductor's make_fx re-trace cannot lift ("Attempting to use
-        # FunctionalTensor on its own"). SDPA has native CP support and no such
-        # constant, so it exercises the CP graph path. cudagraph is disabled
-        # here: CUDA-graph replay of the coalesced FSDP collectives fails under
-        # CP with "CUDA error: invalid argument".
-        # TODO: re-test on FlexAttention once flex + CP + regional_inductor is
-        # supported upstream.
+        # Disable cudagraph: replaying coalesced FSDP collectives with CP fails
+        # with "CUDA error: invalid argument".
         OverrideDefinitions(
             [
                 [
                     "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel_sdpa",
+                    "--config graph_trainer_llama3_debugmodel",
                     "--compile.mode aot_fx_trace",
                     "--compile.disable_passes cudagraph_pass",
                     "--parallelism.data_parallel_shard_degree 2",
@@ -205,6 +220,7 @@ def _build_llama3_tests() -> list[OverrideDefinitions]:
             "aot_fx_trace_llama3_fsdp_tp_cp",
             ngpu=8,
             skip_rocm_test=True,
+            disabled=_FLEX_CP_INDUCTOR_DISABLED,
         ),
         # async_tp test lives in graph_trainer_h100 suite (needs NVLink).
         OverrideDefinitions(
@@ -258,11 +274,17 @@ def _build_llama3_tests() -> list[OverrideDefinitions]:
 def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
     """DeepSeek-v3-based integration tests (require H100 machines)."""
     ep_overlap_flex_tests = [
+        # TODO(#4342): Remove transformer-level chunking. After the model batch
+        # dimension was folded into the token dimension, splitting `layers.*`
+        # in half cuts the packed token stream mid-document, so neither chunk
+        # has full attention context. This variant aborts at step 1 with a
+        # non-finite loss.
         (
             "regional",
             "batch",
             "layers.*",
             "transformer_batch",
+            True,
         ),
         (
             "regional",
@@ -276,11 +298,16 @@ def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
             "layers.*.moe",
             "moe_seq",
         ),
+        # TODO(#4342): Remove transformer-level chunking, as above. Under full
+        # Inductor the mid-document split surfaces earlier than the non-finite
+        # loss: this variant aborts before step 1 on a Triton index-out-of-
+        # bounds assertion.
         (
             "full",
             "batch",
             "layers.*",
             "transformer_batch",
+            True,
         ),
         (
             "full",
@@ -355,12 +382,33 @@ def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
             disabled=_JIT_DISABLED,
         ),
         # === aot_fx_trace mode tests ===
-        # Note: cudagraph is auto-skipped for DSv3 because MoE load-balancing
-        # introduces CUDA→CPU transfers incompatible with CUDA graph capture.
+        # Note: standard DSv3 MoE load-balancing introduces CUDA-to-CPU
+        # transfers incompatible with CUDA graph capture, so this fused test
+        # explicitly disables the cudagraph pass.
         #
-        # TODO: FSDP+TP+CP+EP is disabled: tracing fails with "aten.add.Tensor
-        # got mixed torch.Tensor and DTensor" — a separate CP+EP issue,
-        # unrelated to the empty_strided shadow-node fix. Re-enable once fixed.
+        # TODO: Re-enable FSDP bucketing when its stable topological sort
+        # supports the fused MLA Q kernel's mutating custom-op boundary.
+        OverrideDefinitions(
+            [
+                [
+                    "--module graph_trainer.deepseek_v3",
+                    "--config graph_trainer_deepseek_v3_debugmodel",
+                    "--compile.mode aot_fx_trace",
+                    "--compile.disable_passes "
+                    "joint_transformer_block_bucketing_reordering_pass,"
+                    "cudagraph_pass",
+                    "--override.imports torchtitan.overrides.fused_mla.fused_mla,"
+                    "torchtitan.overrides.fused_swiglu.fused_swiglu",
+                    "--parallelism.data_parallel_shard_degree 2",
+                    "--parallelism.tensor_parallel_degree 2",
+                ],
+            ],
+            "aot_fx_trace deepseek_v3 fused MLA+SwiGLU FSDP+TP",
+            "aot_fx_trace_deepseek_v3_fused_mla_swiglu_fsdp_tp",
+            ngpu=4,
+        ),
+        # TODO: Re-enable after fixing the separate CP+EP mixed Tensor/DTensor
+        # failure, in addition to the graph_trainer CP backend issue.
         OverrideDefinitions(
             [
                 [
@@ -421,6 +469,7 @@ def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
             OverrideDefinitions(
                 [
                     [
+                        "--training.disable_cuda_graphs",
                         "--module graph_trainer.deepseek_v3",
                         "--config graph_trainer_deepseek_v3_debugmodel",
                         "--compile.mode aot_fx_trace",
@@ -446,11 +495,14 @@ def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module graph_trainer.deepseek_v3",
                     "--config graph_trainer_deepseek_v3_debugmodel",
                     "--compile.mode aot_fx_trace",
                     "--compile.inductor_compilation full",
                     "--parallelism.pipeline_parallel_degree 2",
+                    "--parallelism.num_pp_microbatches 8",
+                    "--training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--parallelism.pipeline_parallel_schedule Interleaved1F1B",
                     "--parallelism.data_parallel_shard_degree 4",
                     "--parallelism.expert_parallel_degree 2",
@@ -463,11 +515,14 @@ def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module graph_trainer.deepseek_v3",
                     "--config graph_trainer_deepseek_v3_debugmodel",
                     "--compile.mode aot_fx_trace",
                     "--compile.inductor_compilation full",
                     "--parallelism.pipeline_parallel_degree 2",
+                    "--parallelism.num_pp_microbatches 8",
+                    "--training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--parallelism.pipeline_parallel_schedule ZBVZeroBubble",
                     "--parallelism.data_parallel_shard_degree 4",
                     "--parallelism.expert_parallel_degree 2",
@@ -480,11 +535,14 @@ def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module graph_trainer.deepseek_v3",
                     "--config graph_trainer_deepseek_v3_debugmodel",
                     "--compile.mode aot_fx_trace",
                     "--compile.inductor_compilation full",
                     "--parallelism.pipeline_parallel_degree 2",
+                    "--parallelism.num_pp_microbatches 8",
+                    "--training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--parallelism.pipeline_parallel_schedule DualPipeV",
                     "--parallelism.data_parallel_shard_degree 4",
                     "--parallelism.expert_parallel_degree 2",
@@ -533,20 +591,8 @@ def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
 def _build_qwen3_tests() -> list[OverrideDefinitions]:
     """Qwen3-based integration tests (dense + MoE)."""
     return [
-        # TODO: Disabled — this uses the default FlexAttention backend, and
-        # FlexAttention + CP + regional_inductor is unsupported: the CP load
-        # balancer injects an index-rearrange constant (torch
-        # _context_parallel/_attention.py qkv_idx_restore) that
-        # regional_inductor's make_fx re-trace cannot lift ("Attempting to use
-        # FunctionalTensor on its own"). This is the same upstream issue noted
-        # for the llama3 CP test above, which works around it with an SDPA
-        # config. To re-enable, add a qwen3 SDPA debug config and switch to it
-        # (mirroring aot_fx_trace_llama3_fsdp_tp_cp), or wait for flex + CP +
-        # regional_inductor support upstream.
-        #
-        # cudagraph is also disabled here (kept for when this is re-enabled):
-        # CUDA-graph replay of the coalesced FSDP collectives fails under
-        # context parallelism with "CUDA error: invalid argument".
+        # Disable cudagraph: replaying coalesced FSDP collectives with CP fails
+        # with "CUDA error: invalid argument".
         OverrideDefinitions(
             [
                 [
@@ -562,11 +608,12 @@ def _build_qwen3_tests() -> list[OverrideDefinitions]:
             "aot_fx_trace qwen3 FSDP+TP+CP",
             "aot_fx_trace_qwen3_fsdp_tp_cp",
             ngpu=8,
-            disabled=True,
+            disabled=_FLEX_CP_INDUCTOR_DISABLED,
         ),
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module graph_trainer.qwen3",
                     "--config graph_trainer_qwen3_debugmodel_moe",
                     "--compile.mode aot_fx_trace",
@@ -582,14 +629,52 @@ def _build_qwen3_tests() -> list[OverrideDefinitions]:
     ]
 
 
+def _build_muse_glimmer_tests() -> list[OverrideDefinitions]:
+    """MuseGlimmer integration tests."""
+    return [
+        OverrideDefinitions(
+            [
+                [
+                    "--module graph_trainer.muse_glimmer",
+                    "--config graph_trainer_muse_glimmer_debugmodel",
+                    "--compile.mode aot_fx_trace",
+                    "--parallelism.data_parallel_shard_degree 8",
+                ],
+            ],
+            "aot_fx_trace muse_glimmer FSDP",
+            "aot_fx_trace_muse_glimmer_fsdp",
+            ngpu=8,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module graph_trainer.muse_glimmer",
+                    "--config graph_trainer_muse_glimmer_debugmodel",
+                    "--compile.mode aot_fx_trace",
+                    "--parallelism.data_parallel_shard_degree 4",
+                    "--parallelism.tensor_parallel_degree 2",
+                ],
+            ],
+            "aot_fx_trace muse_glimmer FSDP+TP",
+            "aot_fx_trace_muse_glimmer_fsdp_tp",
+            ngpu=8,
+        ),
+    ]
+
+
 def build_graph_trainer_test_list() -> list[OverrideDefinitions]:
-    """All graph_trainer integration tests (Llama3 + DeepSeek-v3 + Qwen3)."""
-    return _build_llama3_tests() + _build_deepseek_v3_tests() + _build_qwen3_tests()
+    """All graph_trainer integration tests."""
+    return (
+        _build_llama3_tests()
+        + _build_deepseek_v3_tests()
+        + _build_qwen3_tests()
+        + _build_muse_glimmer_tests()
+    )
 
 
 def build_graph_trainer_default_test_list() -> list[OverrideDefinitions]:
-    """Llama3 tests only (for default A10 machines)."""
-    return _build_llama3_tests()
+    """Dense-model tests for default A10 machines."""
+    return _build_llama3_tests() + _build_muse_glimmer_tests()
 
 
 def _build_async_tp_tests() -> list[OverrideDefinitions]:
@@ -601,9 +686,9 @@ def _build_async_tp_tests() -> list[OverrideDefinitions]:
                     "--module graph_trainer.llama3",
                     "--config graph_trainer_llama3_8b",
                     "--compile.mode aot_fx_trace",
-                    "--parallelism.enable_async_tensor_parallel",
-                    "--training.local_batch_size 2",
-                    "--training.seq_len 512",
+                    "--compile.enable_async_tensor_parallel",
+                    "--training.num_tokens_per_microbatch_per_dp_rank 1024",
+                    "--training.max_context_length 512",
                     "--parallelism.data_parallel_shard_degree 4",
                     "--parallelism.tensor_parallel_degree 2",
                     "--hf_assets_path ./tests/assets/tokenizer",

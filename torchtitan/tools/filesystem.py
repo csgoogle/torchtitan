@@ -14,9 +14,9 @@ identical.
 
 from __future__ import annotations
 
-import os as os
+import os
 import posixpath
-import shutil as shutil
+import shutil
 
 
 def is_remote(path: str | os.PathLike) -> bool:

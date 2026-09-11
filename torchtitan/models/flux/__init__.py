@@ -16,7 +16,6 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .flux_datasets import FluxDataLoader
 from .model.autoencoder import AutoEncoder
 from .model.hf_embedder import FluxEmbedder
 from .model.layers import (
@@ -35,7 +34,6 @@ from .parallelize import parallelize_flux
 
 __all__ = [
     "FluxModel",
-    "FluxDataLoader",
     "flux_configs",
     "parallelize_flux",
 ]
@@ -554,18 +552,31 @@ def _flux_debug() -> FluxModel.Config:
     )
 
 
+# The default lengths are ``_flux_seq_len(img_size, max_t5_encoding_len)`` for
+# the img_size / T5 length each shipped trainer config uses.
 flux_configs = {
-    "flux-dev": _flux_dev,
-    "flux-schnell": _flux_schnell,
-    "flux-debug": _flux_debug,
+    "flux-dev": (_flux_dev, 768),
+    "flux-schnell": (_flux_schnell, 512),
+    "flux-debug": (_flux_debug, 512),
 }
 
 
 def model_registry(
     flavor: str,
     converters: list[ModelConfigConverter.Config] | None = None,
+    *,
+    seq_len: int | None = None,
 ) -> ModelSpec:
-    config = flux_configs[flavor]()
+    # Flux has no RoPE cache to size, so seq_len only reports the context
+    # length (latent patches + T5 encodings) on the ModelSpec.
+    get_config, max_context_len = flux_configs[flavor]
+    context_len = seq_len or max_context_len
+    if context_len > max_context_len:
+        raise ValueError(
+            f"Requested seq_len {context_len} exceeds max context length "
+            f"{max_context_len} for flavor {flavor}"
+        )
+    config = get_config()
     if converters is not None:
         validate_converter_order(converters)
         for c in converters:
@@ -574,6 +585,7 @@ def model_registry(
         name="flux",
         flavor=flavor,
         model=config,
+        max_context_length=context_len,
         parallelize_fn=parallelize_flux,
         pipelining_fn=None,
         post_optimizer_build_fn=None,

@@ -8,7 +8,7 @@
 
 Groups the pieces that make the vLLM generator match the trainer op-for-op under
 batch-invariant mode: a model-config converter that pins FlexAttention kernel
-options, plus two runtime patches (bmm and the v2 logprob kernel).
+options, plus a runtime patch for the v2 logprob kernel.
 """
 
 import logging
@@ -54,32 +54,6 @@ class BatchInvariantFlexConverter(ModelConfigConverter):
         return model_config
 
 
-_batch_invariant_bmm_lib: torch.library.Library | None = None
-
-
-def patch_bmm_for_batch_invariance() -> None:
-    """Override ``aten::bmm`` with vLLM's batch-invariant bmm kernel.
-
-    torchtitan's batch-invariant mode (``batch_invariant_ops``, applied by
-    ``set_batch_invariance``) overrides ``mm``/``addmm``/``_log_softmax``/
-    ``mean.dim`` but not ``bmm``. The MoE router gate (3-D activation @ 2-D
-    weight) lowers to ``aten::bmm`` in the generator but ``aten::mm`` in the
-    trainer, so without this the generator's gate scores drift from the
-    trainer's and flip top-k expert routing, breaking on-policy logprob parity.
-
-    TODO: Investigate how to drop bmm batch invariant patch in generator.
-    """
-    global _batch_invariant_bmm_lib
-    if _batch_invariant_bmm_lib is not None:
-        return
-    from vllm.model_executor.layers.batch_invariant import bmm_batch_invariant
-
-    _batch_invariant_bmm_lib = torch.library.Library("aten", "IMPL")
-    _batch_invariant_bmm_lib.impl("bmm", bmm_batch_invariant, "CUDA")
-    # pyrefly: ignore[bad-assignment]
-    torch.bmm = bmm_batch_invariant
-
-
 def force_logprobs_fn_for_batch_invariance() -> None:
     """Make vLLM's v2 logprob path dispatch.
 
@@ -110,21 +84,18 @@ def force_logprobs_fn_for_batch_invariance() -> None:
         """
         # vLLM gives token_ids [N, K]. SamplingParams(logprobs=0) makes real
         # requests K=1, but we can't assert that: vLLM's kernel warmup probes
-        # this patched fn with K>1 (e.g. K=6), so we must handle any K. Map the
-        # N positions to one sequence (B=1, S=N) and reuse the trainer's
-        # compute_logprobs (one token per position) once per column.
+        # this patched fn with K>1 (e.g. K=6), so we must handle any K. Reuse
+        # the trainer's compute_logprobs once per column.
         #
         # NOTE: each element of token_ids is scored independently, after the
         # whole generated sequence is marterialized. We iterate column-by-column
         # purely because torchtitan's compute_logprobs takes one token id per
         # position; it is not a cross-column/cross-position dependency.
-        logits = logits.unsqueeze(0)  # [1, N, V]  (B=1, S=N)
         token_ids = token_ids.to(torch.int64)
         per_column = [
-            compute_logprobs(logits, token_ids[:, k].unsqueeze(0))  # [1, N]
-            for k in range(token_ids.shape[1])
+            compute_logprobs(logits, token_ids[:, k]) for k in range(token_ids.shape[1])
         ]
-        return torch.stack(per_column, dim=-1).squeeze(0)  # [N, K]
+        return torch.stack(per_column, dim=-1)  # [N, K]
 
     vllm_logprob.compute_token_logprobs = generator_compute_token_logprobs
     logger.info(
