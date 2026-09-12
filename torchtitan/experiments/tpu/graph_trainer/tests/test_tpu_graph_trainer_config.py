@@ -231,7 +231,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
 
     self.assertEqual(config.optimizer.implementation, "fused")
-    self.assertTrue(config.tpu_config.enable_fused_optimizer)
     self.assertTrue(config.splash_attention_kernel.use_vmap_bwd)
     self.assertFalse(
         config.splash_attention_kernel.sa_use_document_aware_block_skipping
@@ -273,10 +272,14 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         )
     )
 
-  def test_dense_recipe_does_not_enable_fused_adamw_on_tpu(self) -> None:
-    config = qwen3_8b()
+  def test_optimizer_implementation_cli_override_is_authoritative(self) -> None:
+    config = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3",
+        "--config=qwen3_8b",
+        "--optimizer.implementation=fused",
+    ])
 
-    self.assertFalse(config.tpu_config.enable_fused_optimizer)
+    self.assertEqual(config.optimizer.implementation, "fused")
 
   def test_qwen3_30b_fsdp_profile_explicitly_uses_zero2(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_profile()

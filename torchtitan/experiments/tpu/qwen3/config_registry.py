@@ -75,7 +75,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -142,7 +142,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
           decay_ratio=0.8,
@@ -218,7 +218,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
           decay_ratio=0.8,
@@ -298,7 +298,7 @@ def qwen3_8b() -> TPUTrainerConfig:
       model_spec=model_spec,
       # Keep the established dense optimizer path until native fused AdamW has
       # a dedicated long-convergence validation for this recipe.
-      optimizer=default_adamw(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=600,
           decay_ratio=0.8,
@@ -367,6 +367,7 @@ def qwen3_8b() -> TPUTrainerConfig:
 def qwen3_moe_30b() -> TPUTrainerConfig:
   """TPU specialization of the global-aux Qwen3 30B recipe."""
   cfg = TPUTrainerConfig.derive_from(qwen3_30b_a3b_global_aux())
+  cfg.optimizer.implementation = "foreach"
   cfg.loss = CrossEntropyLoss.Config()
   cfg.model_spec = model_registry(
       "30B-A3B-global-aux",
@@ -443,7 +444,6 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
       compile_mode="aot_fx_trace",
       graph_trainer_memory_policy="full",
       enable_graph_trainer_remat_schedule=True,
-      enable_fused_optimizer=True,
       compile_optimizer=False,
       optimizer_in_graph=False,
   )

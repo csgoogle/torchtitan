@@ -173,7 +173,7 @@ register_train_spec(
         parallelize_fn=parallelize_deepseekv3,
         pipelining_fn=pipeline_llm,
         loss_config=loss.ChunkedLossWrapper.Config(),
-        optimizer_config=default_adamw(lr=8e-4),
+        optimizer_config=default_adamw(lr=8e-4, implementation="foreach"),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
         dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         validator_config=Validator.Config(enable=True),

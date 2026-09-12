@@ -37,7 +37,7 @@ register_train_spec(
         parallelize_fn=parallelize_flux,
         pipelining_fn=None,
         loss_config=MSELoss.Config(),
-        optimizer_config=default_adamw(lr=1e-4),
+        optimizer_config=default_adamw(lr=1e-4, implementation="foreach"),
         lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
         dataloader_config=FluxDataLoader.Config(),
         validator_config=FluxValidator.Config(enable=True),

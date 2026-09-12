@@ -67,9 +67,6 @@ class TPUConfig:
   use_graph_trainer: bool = False
   # Whether to compile the optimizer step into the joint fwd+loss+bwd graph.
   optimizer_in_graph: bool = False
-  # Opt in to TorchTPU's native fused optimizer kernels. Keep this disabled by
-  # default so existing TPU recipes retain their established foreach numerics.
-  enable_fused_optimizer: bool = False
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"

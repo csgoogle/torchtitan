@@ -136,7 +136,7 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
       dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
           dataset="c4_test"
       ),
-      optimizer=optimizer.default_adamw(lr=8e-4),
+      optimizer=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
@@ -163,7 +163,7 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
       dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
           dataset="c4_test"
       ),
-      optimizer=optimizer.default_adamw(lr=8e-4),
+      optimizer=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
           decay_ratio=0.8,
@@ -190,7 +190,7 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
       dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
           dataset="c4_test"
       ),
-      optimizer=optimizer.default_adamw(lr=6e-4),
+      optimizer=optimizer.default_adamw(lr=6e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
           decay_ratio=0.8,
@@ -217,7 +217,7 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
       dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
           dataset="c4_test"
       ),
-      optimizer=optimizer.default_adamw(lr=5e-4),
+      optimizer=optimizer.default_adamw(lr=5e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
           decay_ratio=0.8,
@@ -244,7 +244,7 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
       dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
           dataset="c4_test"
       ),
-      optimizer=optimizer.default_adamw(lr=4e-4),
+      optimizer=optimizer.default_adamw(lr=4e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
           decay_ratio=0.8,
@@ -271,7 +271,7 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
       dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
           dataset="c4_test"
       ),
-      optimizer=optimizer.default_adamw(lr=3e-4),
+      optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
           decay_ratio=0.8,
@@ -298,7 +298,7 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
           dataset="c4_test"
       ),
-      optimizer=optimizer.default_adamw(lr=3e-4),
+      optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=100,
           decay_ratio=0.8,

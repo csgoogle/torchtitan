@@ -30,7 +30,7 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
       metrics=MetricsProcessor.Config(log_freq=1),
       model_spec=model_registry("debugmodel", attn_backend="sdpa"),
       dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-      optimizer=default_adamw(lr=8e-4),
+      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,

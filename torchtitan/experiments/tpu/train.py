@@ -31,7 +31,6 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
-from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 import torchtitan.train
 
@@ -120,16 +119,6 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   rank = int(os.getenv("RANK", "0"))
   if rank == 0:
     init_logger()
-
-  if (
-      utils.device_type == "tpu"
-      and train_config.optimizer.implementation == "fused"
-      and not train_config.tpu_config.enable_fused_optimizer
-  ):
-    logger.warning(
-        "Fused optimizer is not enabled for this TPU recipe, changing to foreach."
-    )
-    train_config.optimizer.implementation = "foreach"
 
   profiler_workaround.init(train_config)
 
