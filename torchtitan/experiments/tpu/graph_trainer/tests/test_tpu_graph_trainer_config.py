@@ -16,6 +16,7 @@ from torch import nn
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.config import apply_overrides
 from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.graph_trainer import llama3 as llama3_gt
 from torchtitan.experiments.graph_trainer import qwen3 as qwen3_gt
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
 from torchtitan.experiments.tpu.graph_trainer.config import (
@@ -30,6 +31,14 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as tpu_qwen3_graph_registry,
 )
+from torchtitan.experiments.tpu.llama3.config_registry import (
+    llama3_1b,
+    llama3_8b,
+    llama3_70b,
+    llama3_405b,
+    llama3_debugmodel,
+    sft_llama3_8b_metamath,
+)
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.overrides.bf16_rope import (
     TpuActivationDtypeCosSinRoPE,
@@ -37,6 +46,9 @@ from torchtitan.experiments.tpu.overrides.bf16_rope import (
 from torchtitan.experiments.tpu.overrides.fused_loss import (
     FusedLossLinearWrapper,
     fused_loss_lm_head,
+)
+from torchtitan.experiments.tpu.overrides.real_rope import (
+    TpuRealArithmeticComplexRoPE,
 )
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
@@ -46,7 +58,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_profile,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
-from torchtitan.models.common import Linear
+from torchtitan.models.common import ComplexRoPE, Linear
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
@@ -252,6 +264,35 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_moe_30b_fsdp_only_full_ac_profile()
 
     self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
+
+  @parameterized.parameters(
+      llama3_debugmodel,
+      llama3_1b,
+      llama3_8b,
+      llama3_70b,
+      llama3_405b,
+      sft_llama3_8b_metamath,
+  )
+  def test_llama3_recipe_overrides_complex_rope(self, recipe) -> None:
+    """A recipe without it cannot run its decoder loop as a `scan`."""
+    graph_config = to_tpu_graph_trainer_config(
+        recipe(),
+        llama3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    self.assertIn(
+        "torchtitan.experiments.tpu.overrides.real_rope",
+        graph_config.override.imports,
+    )
+    apply_overrides(graph_config.override, graph_config)
+    assert graph_config.model_spec is not None
+    with torch.device("meta"):
+      model = graph_config.model_spec.model.build()
+    ropes = [m for m in model.modules() if isinstance(m, ComplexRoPE)]
+    self.assertNotEmpty(ropes)
+    for rope in ropes:
+      self.assertIsInstance(rope, TpuRealArithmeticComplexRoPE)
 
   @parameterized.parameters(qwen3_8b, qwen3_moe_30b_fsdp_only_full_ac_profile)
   def test_pallas_loss_recipe_overrides_lm_head(self, recipe) -> None:

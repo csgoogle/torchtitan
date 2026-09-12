@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
 from functools import partial
+import os
 from typing import cast
 from torch import nn
 from torchtitan.components.checkpoint import CheckpointManager
@@ -14,18 +14,20 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, default_adamw
 from torchtitan.components.validate import Validator
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
     CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
-import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.qkv import TpuPackedQKVConverter
+import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
+from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuTokenDispatcherConverter,
@@ -37,7 +39,6 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
@@ -425,6 +426,9 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
       fsdp_reshard_after_forward="never",
   )
   assert cfg.model_spec is not None
+  cfg.model_spec.model = (
+      TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
+  )
   for _, experts, _, _ in cfg.model_spec.model.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
     experts.use_pallas_paired_grouped_mm = True
