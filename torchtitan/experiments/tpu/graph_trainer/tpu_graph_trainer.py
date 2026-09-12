@@ -42,8 +42,15 @@ from torchtitan.experiments.tpu.compiled_optimizers.functional import (
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
+from torchtitan.experiments.tpu.graph_trainer.graph_split import (
+    GraphSplitter,
+)
 from torchtitan.experiments.tpu.graph_trainer.mfu_benchmark import MfuBenchmark
-from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import register as register_tpu_pipeline
+from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
+    PASS_PIPELINE_REGISTRY,
+    construct_tpu_transform_passes,
+    register as register_tpu_pipeline,
+)
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.tools.logging import logger
 
@@ -142,6 +149,10 @@ class TpuGraphTrainer(GraphTrainer):
 
         self._optimizer_compile = (
             _optimizer_compile_enabled(config, tpu_extra) and not self._optimizer_in_graph
+        )
+        self._graph_splitter = GraphSplitter.from_trainer_config(
+            config,
+            optimizer_in_graph=self._optimizer_in_graph,
         )
         if self._optimizer_compile:
             apply_compiled_optimizer(self)
@@ -322,10 +333,6 @@ class TpuGraphTrainer(GraphTrainer):
         from torchtitan.experiments.graph_trainer.remove_noop_passes import (
             remove_parameter_gradient_markers_pass,
         )
-        from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
-            PASS_PIPELINE_REGISTRY,
-        )
-
         if self._traced_step is None:
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
@@ -349,8 +356,16 @@ class TpuGraphTrainer(GraphTrainer):
                         extra_kwargs,
                     )
             if self.config.compile.enable_passes:
-                pipeline_fn = PASS_PIPELINE_REGISTRY["tpu"]
-                passes = pipeline_fn(self._traced_step, self.config)
+                if self._graph_splitter.enabled:
+                    # Remat and FSDP transforms annotate the joint graph and must
+                    # run before partitioning. The terminal compiler is omitted
+                    # here because each child graph is compiled independently below.
+                    passes = construct_tpu_transform_passes(
+                        self._traced_step, self.config
+                    )
+                else:
+                    pipeline_fn = PASS_PIPELINE_REGISTRY["tpu"]
+                    passes = pipeline_fn(self._traced_step, self.config)
                 self._traced_step.gm = apply_graph_passes(
                     self._traced_step.gm,
                     self._traced_step.example_inputs,
@@ -360,6 +375,10 @@ class TpuGraphTrainer(GraphTrainer):
             else:
                 self._traced_step.gm = remove_parameter_gradient_markers_pass(
                     self._traced_step.gm, self._traced_step.example_inputs
+                )
+            if self._graph_splitter.enabled:
+                self._traced_step.gm = self._graph_splitter.split_and_compile(
+                    self._traced_step
                 )
         with self.train_context():
             outputs = run_traced(self._traced_step, module=model)(
@@ -397,10 +416,6 @@ class TpuGraphTrainer(GraphTrainer):
             minimal_fx_tracer,
         )
         from torchtitan.experiments.graph_trainer.passes import apply_graph_passes
-        from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
-            PASS_PIPELINE_REGISTRY,
-        )
-
         assert len(self.model_parts) == 1
         model = self.model_parts[0]
 

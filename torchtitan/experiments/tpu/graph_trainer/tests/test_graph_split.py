@@ -1,0 +1,514 @@
+from types import SimpleNamespace
+from unittest import mock
+
+from absl.testing import absltest
+import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from torch import nn
+from torch.testing._internal.distributed.fake_pg import FakeStore
+
+from torchtitan.experiments.graph_trainer.common_utils import (
+    _get_layer_id,
+    annotate_module_fqns,
+)
+from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    minimal_fx_tracer,
+    run_traced,
+)
+from torchtitan.experiments.graph_trainer.memory_policy import (
+    _full_memory_policy_pass,
+)
+from torchtitan.experiments.graph_trainer.selective_activation_remat import (
+    selective_activation_remat_pass,
+)
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    data_parallel,
+    MixedPrecisionPolicy,
+)
+from torchtitan.experiments.tpu.graph_trainer import graph_split as graph_split_lib
+from torchtitan.experiments.tpu.graph_trainer.graph_split import (
+    split_backward_graph_by_layer,
+    split_forward_graph_by_layer,
+    split_forward_backward_graph,
+)
+
+
+class _ToyTransformer(nn.Module):
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__()
+    self.layers = nn.ModuleList(
+        nn.Linear(8, 8, bias=False) for _ in range(n_layers)
+    )
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    inputs = torch.sin(inputs)
+    for layer in self.layers:
+      inputs = torch.relu(layer(inputs))
+    return inputs
+
+
+class _BufferMutatingToyTransformer(_ToyTransformer):
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__(n_layers)
+    self.register_buffer("counters", torch.zeros(n_layers))
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    for layer_id, layer in enumerate(self.layers):
+      with torch.no_grad():
+        self.counters[layer_id].add_(inputs.detach().sum())
+      inputs = torch.relu(layer(inputs))
+    return inputs
+
+
+class GraphSplitTest(absltest.TestCase):
+
+  def _build_toy_model(self, n_layers: int) -> _ToyTransformer:
+    """Build the shared prefix-plus-transformer-layer test model."""
+    model = _ToyTransformer(n_layers)
+    annotate_module_fqns(model)
+    return model
+
+  def _trace_toy_model(
+      self,
+      *,
+      model: nn.Module,
+      inputs: torch.Tensor,
+      gradient_epilogue: bool = False,
+      use_shape_scalar: bool = False,
+  ):
+    """Trace loss and explicit gradients for the shared test model."""
+
+    def step(inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+      loss = model(inputs).float().sum()
+      gradients = torch.autograd.grad(
+          loss, (*tuple(model.parameters()), inputs)
+      )
+      if gradient_epilogue:
+        gradients = tuple(
+            torch.ops.aten.alias.default(gradient) for gradient in gradients
+        )
+      if use_shape_scalar:
+        gradients = tuple(gradient * inputs.shape[0] for gradient in gradients)
+      return (loss, *gradients)
+
+    return minimal_fx_tracer(step, module=model)(inputs)
+
+  def _apply_passes_and_split(
+      self,
+      traced,
+      *,
+      fsdp_reshard_after_forward: str,
+  ):
+    """Apply full remat, then split the real joint trace at fwd/bwd."""
+    _full_memory_policy_pass(
+        traced.gm,
+        config=SimpleNamespace(
+            parallelism=SimpleNamespace(
+                fsdp_reshard_after_forward=fsdp_reshard_after_forward,
+                pipeline_parallel_degree=1,
+            )
+        ),
+    )
+    selective_activation_remat_pass(traced.gm)
+    return split_forward_backward_graph(traced.gm, traced.example_inputs)
+
+  def _trace_simple_fsdp(
+      self,
+      *,
+      n_layers: int,
+      reduce_dtype: torch.dtype = torch.float32,
+      fsdp_reshard_after_forward: str = "always",
+  ):
+    """Trace the shared model through real SimpleFSDP with fake collectives."""
+
+    self.assertFalse(dist.is_initialized())
+    dist.init_process_group(
+        "fake", store=FakeStore(), rank=0, world_size=2
+    )
+    try:
+      mesh = DeviceMesh("cpu", [0, 1])
+      with torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True):
+        model = self._build_toy_model(n_layers)
+        model = data_parallel(
+            model,
+            device_mesh=mesh,
+            mode="fully_shard",
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=reduce_dtype,
+            ),
+        )
+        inputs = torch.randn(
+            2, 8, dtype=torch.bfloat16, requires_grad=True
+        )
+
+        traced = self._trace_toy_model(model=model, inputs=inputs)
+    finally:
+      dist.destroy_process_group()
+
+    return self._apply_passes_and_split(
+        traced,
+        fsdp_reshard_after_forward=fsdp_reshard_after_forward,
+    )
+
+  def _assert_collective_chains_are_atomic(
+      self,
+      gm: torch.fx.GraphModule,
+      partition_map: dict[torch.fx.Node, int],
+  ) -> None:
+    chains = graph_split_lib._collect_collective_chains(gm)
+    self.assertNotEmpty(chains)
+    for launch, nodes in chains.items():
+      self.assertEqual(
+          {partition_map[node] for node in nodes},
+          {partition_map[launch]},
+          f"collective chain rooted at {launch.name} was split",
+      )
+
+  def test_forward_backward_split_preserves_values_mutations_and_ordering(self):
+    """Preserve values and forward mutations while ordering forward first.
+
+    The traced result is ``(loss, parameter gradients..., input gradient)``.
+    Splitting must preserve every value, keep autograd work in backward, and
+    enqueue all forward children before any backward collective can run.
+    """
+    model = self._build_toy_model(n_layers=2)
+    inputs = torch.randn(6, 8, requires_grad=True)
+    traced = self._trace_toy_model(model=model, inputs=inputs)
+    expected = run_traced(traced, module=model)(inputs)
+
+    split = self._apply_passes_and_split(
+        traced,
+        fsdp_reshard_after_forward="never",
+    )
+    self.assertTrue(
+        all(
+            not node.meta.get("autograd_backward", False)
+            for node in split.forward_graph.graph.nodes
+        )
+    )
+    self.assertNotEmpty(
+        [
+            node
+            for node in split.backward_graph.graph.nodes
+            if node.meta.get("autograd_backward", False)
+        ]
+    )
+    backward = split_backward_graph_by_layer(
+        split.backward_graph,
+        n_layers=2,
+    )
+    self.assertEqual(
+        backward.collective_layer_to_partition,
+        {"ag": {}, "rs": {}},
+    )
+    with self.assertRaisesRegex(
+        ValueError, "requires AG and RS ownership for every layer"
+    ):
+      split_backward_graph_by_layer(
+          split.backward_graph,
+          n_layers=2,
+          pipeline_collectives=True,
+      )
+    split.backward_graph = backward.module
+    split.module.backward_graph = backward.module
+    traced.gm = split.module
+    with mock.patch.object(
+        graph_split_lib, "_enqueue_forward_graph_outputs"
+    ) as enqueue:
+      actual = run_traced(traced, module=model)(inputs)
+
+    self.assertLen(actual, len(expected))
+    output_names = (
+        "loss",
+        *(f"parameter gradient {i}" for i, _ in enumerate(model.parameters())),
+        "input gradient",
+    )
+    for name, expected_value, actual_value in zip(
+        output_names, expected, actual, strict=True
+    ):
+      with self.subTest(output=name):
+        torch.testing.assert_close(actual_value, expected_value)
+    self.assertLen(output_names, len(actual))
+    enqueue.assert_called_once()
+    enqueued_outputs = enqueue.call_args.args[0]
+    self.assertLen(
+        enqueued_outputs,
+        split.module.num_direct_forward_outputs + len(split.residual_nodes),
+    )
+    self.assertIs(enqueued_outputs[0], actual[0])
+
+    # Side-effect-only writes have no users in the joint graph. They must still
+    # become ignored forward outputs so each layer's persistent buffer updates.
+    mutating_model = _BufferMutatingToyTransformer(n_layers=2)
+    annotate_module_fqns(mutating_model)
+    mutating_inputs = torch.randn(6, 8, requires_grad=True)
+    mutating_trace = self._trace_toy_model(
+        model=mutating_model,
+        inputs=mutating_inputs,
+    )
+    joint_mutations = [
+        node
+        for node in mutating_trace.gm.graph.nodes
+        if graph_split_lib.is_mutation_node(node)
+    ]
+    self.assertLen(joint_mutations, 2)
+    self.assertTrue(all(not node.users for node in joint_mutations))
+    initial_counters = mutating_model.counters.clone()
+    run_traced(mutating_trace, module=mutating_model)(mutating_inputs)
+    expected_counters = mutating_model.counters.clone()
+    mutating_model.counters.copy_(initial_counters)
+
+    mutating_split = self._apply_passes_and_split(
+        mutating_trace,
+        fsdp_reshard_after_forward="never",
+    )
+    self.assertLen(
+        [
+            node
+            for node in mutating_split.forward_graph.graph.nodes
+            if graph_split_lib.is_mutation_node(node)
+        ],
+        2,
+    )
+    mutating_trace.gm = mutating_split.module
+    run_traced(mutating_trace, module=mutating_model)(mutating_inputs)
+    torch.testing.assert_close(mutating_model.counters, expected_counters)
+
+  def test_forward_backward_boundary_edge_cases(self):
+    """Keep gradient epilogues and dynamic scalar uses on the backward side."""
+    model = self._build_toy_model(n_layers=2)
+    with self.subTest("untagged gradient epilogue stays in backward"):
+      inputs = torch.randn(2, 8, requires_grad=True)
+      traced = self._trace_toy_model(
+          model=model,
+          inputs=inputs,
+          gradient_epilogue=True,
+      )
+      split = self._apply_passes_and_split(
+          traced,
+          fsdp_reshard_after_forward="never",
+      )
+      aliases = [
+          node
+          for node in traced.gm.graph.nodes
+          if node.op == "call_function"
+          and node.target is torch.ops.aten.alias.default
+      ]
+      backward_names = {
+          node.name for node in split.backward_graph.graph.nodes
+      }
+      self.assertNotEmpty(aliases)
+      self.assertTrue(
+          all(alias.name in backward_names for alias in aliases),
+      )
+
+    with self.subTest("dynamic scalar is recomputed instead of saved"):
+      inputs = torch.randn(2, 8, requires_grad=True)
+      torch._dynamo.mark_dynamic(inputs, 0)
+      traced = self._trace_toy_model(
+          model=model,
+          inputs=inputs,
+          use_shape_scalar=True,
+      )
+      split = self._apply_passes_and_split(
+          traced,
+          fsdp_reshard_after_forward="never",
+      )
+      size_nodes = [
+          node
+          for node in traced.gm.graph.nodes
+          if node.target is torch.ops.aten.sym_size.int
+      ]
+      self.assertLen(size_nodes, 1)
+      self.assertNotIn(size_nodes[0], split.residual_nodes)
+      self.assertIn(
+          size_nodes[0].name,
+          {node.name for node in split.backward_graph.graph.nodes},
+      )
+
+    with self.subTest("unclassified forward mutation fails closed"):
+      late_mutation_model = self._build_toy_model(n_layers=2)
+      late_mutation_model.register_buffer("counter", torch.zeros(()))
+      inputs = torch.randn(2, 8, requires_grad=True)
+
+      def step(inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        loss = late_mutation_model(inputs).sum()
+        with torch.no_grad():
+          late_mutation_model.counter.add_(inputs.detach().sum())
+        return (loss, *torch.autograd.grad(loss, inputs))
+
+      traced = minimal_fx_tracer(step, module=late_mutation_model)(inputs)
+      with self.assertRaisesRegex(
+          ValueError, "would discard forward mutation nodes"
+      ):
+        split_forward_backward_graph(traced.gm, traced.example_inputs)
+
+  def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
+    """Check forward, by-layer, and pipelined four-layer layouts.
+
+    Forward visits ``L0 -> L1 -> L2 -> L3``; backward visits the layers in
+    reverse. ``AGn``, layer ``Ln`` compute, ``RSn``, and every collective's
+    launch/getitem/wait chain must retain the ownership shown below.
+    """
+    split = self._trace_simple_fsdp(n_layers=4)
+    forward = split.forward_graph
+    backward = split.backward_graph
+    self.assertFalse(
+        any("fsdp_bucket" in node.meta for node in backward.graph.nodes)
+    )
+
+    forward_scenarios = (
+        # [prefix,L0,L1] [L2,L3]
+        (2, False, {0: 0, 1: 0, 2: 1, 3: 1}),
+        # [prefix] [L0] [L1] [L2] [L3]
+        (1, True, {0: 1, 1: 2, 2: 3, 3: 4}),
+    )
+    for layers_per_executable, isolate_prefix, expected in forward_scenarios:
+      with self.subTest(
+          direction="forward",
+          layers_per_executable=layers_per_executable,
+          isolate_prefix=isolate_prefix,
+      ):
+        chunked = split_forward_graph_by_layer(
+            forward,
+            layers_per_executable,
+            isolate_prefix=isolate_prefix,
+        )
+        self.assertEqual(chunked.layer_to_partition, expected)
+
+    by_layer_one = (1, 2, 3, 4)
+    by_layer_three = (1, 1, 1, 2)
+    backward_scenarios = (
+        # [AG3] [AG2,C3] [AG1,RS3,C2] ... [RS0]
+        (
+            "staggered-one-layer",
+            1,
+            True,
+            (2, 3, 4, 5),
+            (1, 2, 3, 4),
+            (3, 4, 5, 6),
+        ),
+        # Coalesce pairs of compute stages while preserving pipeline fill/drain.
+        (
+            "staggered-two-layers",
+            2,
+            True,
+            (2, 2, 3, 3),
+            (1, 2, 2, 3),
+            (2, 3, 3, 4),
+        ),
+        # By-layer mode keeps each AG/compute/RS chain in one executable.
+        (
+            "by-layer-one-layer",
+            1,
+            False,
+            by_layer_one,
+            by_layer_one,
+            by_layer_one,
+        ),
+        # Width three accepts a partial final group for L0.
+        (
+            "by-layer-three-layers",
+            3,
+            False,
+            by_layer_three,
+            by_layer_three,
+            by_layer_three,
+        ),
+    )
+    for name, width, pipeline, compute, ag, rs in backward_scenarios:
+      with self.subTest(name):
+        chunked = split_backward_graph_by_layer(
+            backward,
+            n_layers=4,
+            layers_per_executable=width,
+            pipeline_collectives=pipeline,
+        )
+        layer_ids = (3, 2, 1, 0)
+        self.assertEqual(
+            chunked.layer_to_partition,
+            dict(zip(layer_ids, compute, strict=True)),
+        )
+        self.assertEqual(
+            chunked.collective_layer_to_partition["ag"],
+            dict(zip(layer_ids, ag, strict=True)),
+        )
+        self.assertEqual(
+            chunked.collective_layer_to_partition["rs"],
+            dict(zip(layer_ids, rs, strict=True)),
+        )
+        self._assert_collective_chains_are_atomic(
+            backward, chunked.partition_map
+        )
+
+    # A real Zero2-like trace has RS but no backward AG ownership.
+    zero2_backward = self._trace_simple_fsdp(
+        n_layers=2,
+        fsdp_reshard_after_forward="never",
+    ).backward_graph
+    zero2_like = split_backward_graph_by_layer(
+        zero2_backward,
+        n_layers=2,
+    )
+    self.assertEmpty(zero2_like.collective_layer_to_partition["ag"])
+    self.assertEqual(
+        set(zero2_like.collective_layer_to_partition["rs"]),
+        {0, 1},
+    )
+    self.assertEqual(
+        zero2_like.collective_layer_to_partition["rs"],
+        zero2_like.layer_to_partition,
+    )
+    self._assert_collective_chains_are_atomic(
+        zero2_backward, zero2_like.partition_map
+    )
+    with self.assertRaisesRegex(
+        ValueError, "requires AG and RS ownership for every layer"
+    ):
+      split_backward_graph_by_layer(
+          zero2_backward,
+          n_layers=2,
+          pipeline_collectives=True,
+      )
+
+    # Missing layer ownership must fail instead of silently cutting by position.
+    for node in backward.graph.nodes:
+      node.meta.pop("custom", None)
+    with self.assertRaisesRegex(ValueError, "compute metadata for every layer"):
+      split_backward_graph_by_layer(backward, n_layers=4)
+
+  def test_backward_fsdp_pipeline_keeps_bf16_reduce_cast_with_wait(self):
+    """Keep ``dW -> RS(BF16) -> wait -> cast(FP32)`` in one executable."""
+    gm = self._trace_simple_fsdp(
+        n_layers=2,
+        reduce_dtype=torch.bfloat16,
+    ).backward_graph
+
+    chunked = split_backward_graph_by_layer(
+        gm,
+        n_layers=2,
+        pipeline_collectives=True,
+    )
+
+    reduce_casts = [
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target is torch.ops.aten._to_copy.default
+        and len(node.all_input_nodes) == 1
+        and graph_split_lib.is_wait_tensor(node.all_input_nodes[0])
+    ]
+    self.assertLen(reduce_casts, 2)
+    for cast in reduce_casts:
+      wait = cast.all_input_nodes[0]
+      self.assertEqual(
+          chunked.partition_map[cast], chunked.partition_map[wait]
+      )
+
+
+if __name__ == "__main__":
+  absltest.main()

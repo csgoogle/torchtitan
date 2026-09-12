@@ -11,11 +11,13 @@ from __future__ import annotations
 from collections import Counter
 import functools
 import logging
-import os
+import operator
 import time
 from typing import Any, Callable
 
 import torch
+from torch._dynamo.utils import detect_fake_mode
+from torch.utils import _pytree
 
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     schedule_fsdp_comms_to_dense_regions_pass,
@@ -37,9 +39,225 @@ def _import_static_compiler():
     return StaticCompiler
 
 
+def _optimization_barrier_fake(
+    inputs: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    outputs = []
+    for value in inputs:
+        output = torch.empty_strided(
+            value.shape,
+            value.stride(),
+            dtype=value.dtype,
+            device=value.device,
+            requires_grad=value.requires_grad,
+        )
+        if value.storage_offset():
+            output = output.as_strided(
+                value.shape,
+                value.stride(),
+                value.storage_offset(),
+            )
+        outputs.append(output)
+    return outputs
+
+
+def _ensure_optimization_barrier_fake() -> None:
+    # Temporary compatibility shim for TorchTPU 0.0.42.1. The upstream fix is
+    # https://github.com/google-pytorch/torch_tpu/pull/2562.
+    op_name = "tpu::optimization_barrier"
+    if torch._C._dispatch_has_kernel_for_dispatch_key(op_name, "Meta"):
+        return
+    torch.library.register_fake(op_name, _optimization_barrier_fake)
+
+
+def _tensor_storage_id(value: Any) -> int | None:
+    if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
+        return None
+    return value.untyped_storage()._cdata
+
+
+def _submodule_outputs(
+    submodule: torch.fx.GraphModule,
+) -> tuple[torch.fx.Node, ...]:
+    output = next(node for node in submodule.graph.nodes if node.op == "output")
+    return tuple(
+        value
+        for value in _pytree.tree_leaves(output.args[0])
+        if isinstance(value, torch.fx.Node)
+    )
+
+
+def _producer_output_storage(
+    parent: torch.fx.GraphModule,
+    source: torch.fx.Node,
+) -> int | None:
+    """Resolve a parent-graph value to the storage produced by a split child.
+
+    ``split_module`` represents a child output as either its ``call_module``
+    node (one output) or ``getitem(call_module, index)`` (multiple outputs).
+    Follow that reference into the child GraphModule and read the fake tensor
+    storage ID from the corresponding output. Values that are not child
+    boundaries, or whose output cannot be identified exactly, return ``None``.
+    """
+    producer = source
+    output_index = 0
+    if (
+        source.op == "call_function"
+        and source.target is operator.getitem
+        and len(source.args) == 2
+        and isinstance(source.args[0], torch.fx.Node)
+        and isinstance(source.args[1], int)
+    ):
+        producer = source.args[0]
+        output_index = source.args[1]
+    if producer.op != "call_module":
+        return None
+
+    outputs = _submodule_outputs(parent.get_submodule(str(producer.target)))
+    if source is producer and len(outputs) != 1:
+        return None
+    if output_index < 0 or output_index >= len(outputs):
+        return None
+    return _tensor_storage_id(outputs[output_index].meta.get("val"))
+
+
+def _donatable_input_positions(
+    parent: torch.fx.GraphModule,
+    call: torch.fx.Node,
+    last_use_by_storage: dict[int, int],
+    node_order: dict[torch.fx.Node, int],
+    protected_storages: set[int],
+) -> tuple[int, ...]:
+    """Select child inputs whose storage is dead after this parent-graph call.
+
+    Safety is computed over the whole parent before this function is called:
+    ``last_use_by_storage`` records the final parent node that consumes each
+    split-boundary storage. An input position is donatable only when this call
+    is that final consumer, the storage appears once in the call arguments, it
+    is not an original graph input or constant, and the child does not return
+    an alias of it. XLA may then reuse the input buffer for this child because
+    no later child or graph output can observe its previous contents.
+    """
+    child = parent.get_submodule(str(call.target))
+    output_storages = {
+        storage
+        for output in _submodule_outputs(child)
+        if (storage := _tensor_storage_id(output.meta.get("val"))) is not None
+    }
+    candidates = []
+    for position, source in enumerate(call.args):
+        if not isinstance(source, torch.fx.Node):
+            continue
+        storage = _producer_output_storage(parent, source)
+        if (
+            storage is None
+            or last_use_by_storage.get(storage) != node_order[call]
+        ):
+            continue
+        candidates.append((position, storage))
+
+    storage_counts = Counter(storage for _, storage in candidates)
+    return tuple(
+        position
+        for position, storage in candidates
+        if storage_counts[storage] == 1
+        and storage not in protected_storages
+        and storage not in output_storages
+    )
+
+
+def _annotate_internal_donations(gm: torch.fx.GraphModule) -> None:
+    """Annotate safe last-use donation between children of a split graph.
+
+    An internal boundary is a tensor produced by one ``call_module`` child and
+    passed to another. The analysis first resolves boundary aliases by fake
+    tensor storage ID, then scans the complete parent graph to find each
+    storage's final consumer. At that consumer, a boundary is donated only if
+    it is uniquely referenced, is not an original input or constant, and is
+    not also returned by the consuming child. Missing alias metadata disables
+    donation for the graph rather than guessing.
+    """
+    calls = [node for node in gm.graph.nodes if node.op == "call_module"]
+    submodules = [gm.get_submodule(str(call.target)) for call in calls]
+    for submodule in submodules:
+        submodule.meta.pop("tpu_donated_input_positions", None)
+
+    protected_nodes = [
+        node
+        for node in gm.graph.nodes
+        if node.op in ("placeholder", "get_attr")
+    ]
+    boundary_outputs = [
+        output
+        for submodule in submodules
+        for output in _submodule_outputs(submodule)
+    ]
+    missing_values = [
+        node.name
+        for node in (*protected_nodes, *boundary_outputs)
+        if "tensor_meta" in node.meta
+        and not isinstance(node.meta.get("val"), torch.Tensor)
+    ]
+    missing_values.extend(
+        node.name for node in boundary_outputs if "val" not in node.meta
+    )
+    if missing_values:
+        logger.warning(
+            "Disabling TPU split boundary donation: tensor metadata lacks "
+            "values for %s",
+            missing_values,
+        )
+        return
+
+    node_order = {node: index for index, node in enumerate(gm.graph.nodes)}
+    last_use_by_storage: dict[int, int] = {}
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target is operator.getitem:
+            continue
+        for source in node.all_input_nodes:
+            storage = _producer_output_storage(gm, source)
+            if storage is not None:
+                last_use_by_storage[storage] = node_order[node]
+
+    protected_storages = {
+        storage
+        for node in protected_nodes
+        if (storage := _tensor_storage_id(node.meta.get("val"))) is not None
+    }
+
+    donated_count = 0
+    donated_bytes = 0
+    for call, submodule in zip(calls, submodules, strict=True):
+        positions = _donatable_input_positions(
+            gm,
+            call,
+            last_use_by_storage,
+            node_order,
+            protected_storages,
+        )
+        # _SubmodCompiler deep-copies children; GraphModule.meta is preserved.
+        submodule.meta["tpu_donated_input_positions"] = positions
+        placeholders = [
+            node for node in submodule.graph.nodes if node.op == "placeholder"
+        ]
+        for position in positions:
+            value = placeholders[position].meta.get("val")
+            if isinstance(value, torch.Tensor):
+                donated_bytes += value.numel() * value.element_size()
+        donated_count += len(positions)
+    logger.info(
+        "TPU split boundary donation: %d child inputs (%d aggregate bytes)",
+        donated_count,
+        donated_bytes,
+    )
+
+
 def tpu_backend_compile_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple,
+    *,
+    is_fwd: bool = True,
+    donated_input_positions: tuple[int, ...] = (),
 ) -> torch.fx.GraphModule:
     """Terminal pass in the TPU graph pipeline: lowers gm into a static XLA binary.
 
@@ -97,7 +315,21 @@ def tpu_backend_compile_pass(
 
     t0 = time.time()
     logger.info("[tpu_backend_pass] StaticCompiler(gm, example_inputs) ...")
-    executable = StaticCompiler()(gm, list(example_inputs))
+    donated_positions = set(donated_input_positions)
+    donated_inputs = []
+    tensor_index = 0
+    for position, value in enumerate(example_inputs):
+        if not isinstance(value, torch.Tensor):
+            continue
+        if position in donated_positions:
+            donated_inputs.append(tensor_index)
+        tensor_index += 1
+    compiler_kwargs = {"is_fwd": is_fwd}
+    if donated_inputs:
+        # Added in TorchTPU PR #2800. Keep this keyword conditional so the
+        # default no-donation path also works with older TorchTPU builds.
+        compiler_kwargs["donated_inputs"] = donated_inputs
+    executable = StaticCompiler()(gm, list(example_inputs), **compiler_kwargs)
     elapsed = time.time() - t0
     logger.info(
         f"[tpu_backend_pass] StaticCompiler ready in {elapsed:.1f}s "
@@ -120,11 +352,72 @@ def tpu_backend_compile_pass(
     return gm
 
 
-def construct_tpu_pass_pipeline(
+def tpu_backend_compile_partitioned_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+    *,
+    is_fwd: bool = True,
+    donate_internal_buffers: bool = False,
+) -> torch.fx.GraphModule:
+    """Discover child inputs and compile each split GraphModule independently."""
+    # TorchTPU is an optional dependency, so importing its private split helper
+    # at module load time would break host-only TorchTitan tests.
+    from torch_tpu._internal.compile.split_compiler import _SubmodCompiler
+
+    _ensure_optimization_barrier_fake()
+    fake_mode = detect_fake_mode(example_inputs)
+    if fake_mode is None:
+        fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
+
+    if donate_internal_buffers:
+        _annotate_internal_donations(gm)
+
+    def compile_submodule(
+        submodule: torch.fx.GraphModule,
+        submodule_inputs: list[torch.Tensor],
+    ) -> torch.fx.GraphModule:
+        return tpu_backend_compile_pass(
+            submodule,
+            tuple(submodule_inputs),
+            is_fwd=is_fwd,
+            donated_input_positions=(
+                tuple(submodule.meta.get("tpu_donated_input_positions", ()))
+                if donate_internal_buffers
+                else ()
+            ),
+        )
+
+    compiler = _SubmodCompiler(gm, compile_submodule, fake_mode)
+    # ProcessGroups can cross split-module boundaries as opaque inputs. The
+    # FakeTensor dispatch cache compares inputs while propagating each child's
+    # output shapes, but torchbind ProcessGroups do not implement equality.
+    # This setting is scoped to child-output propagation and does not alter
+    # graph tracing or TorchTPU executable caches.
+    cache_was_enabled = fake_mode.cache_enabled
+    fake_mode.cache_enabled = False
+    # Match TorchTPU's SplitCompiler: fake execution must not fire user saved-
+    # tensor pack/unpack hooks that are intended to run once at runtime.
+    with (
+        torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
+    ):
+        try:
+            compiler.run(*example_inputs)
+        finally:
+            fake_mode.cache_enabled = cache_was_enabled
+    gm.recompile()
+    return gm
+
+
+def construct_tpu_transform_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
 ) -> list[Callable]:
-    """Build the pass list for the 'tpu' pipeline."""
+    """Build transforms that must run on the complete joint FX graph.
+
+    Graph splitting consumes remat and FSDP metadata produced here, so these
+    transforms run once before partitioning. Compilation is deliberately absent:
+    split mode compiles each resulting child graph independently.
+    """
     passes: list[Callable] = [remove_parameter_gradient_markers_pass]
 
     memory_policy = getattr(config.compile, "memory_policy", "none")
@@ -205,8 +498,18 @@ def construct_tpu_pass_pipeline(
                 )
             )
 
-    passes.append(tpu_backend_compile_pass)
     return passes
+
+
+def construct_tpu_pass_pipeline(
+    traced_result: "TracedResult",
+    config: "GraphTrainer.Config",
+) -> list[Callable]:
+    """Build the normal unsplit pipeline: joint transforms, then compilation."""
+    return [
+        *construct_tpu_transform_passes(traced_result, config),
+        tpu_backend_compile_pass,
+    ]
 
 
 # Global registry dict so both construct_tpu_pass_pipeline and PASS_PIPELINE_REGISTRY["tpu"] work
@@ -222,6 +525,8 @@ def register() -> None:
 
 __all__ = [
     "tpu_backend_compile_pass",
+    "tpu_backend_compile_partitioned_pass",
+    "construct_tpu_transform_passes",
     "construct_tpu_pass_pipeline",
     "register",
     "PASS_PIPELINE_REGISTRY",
