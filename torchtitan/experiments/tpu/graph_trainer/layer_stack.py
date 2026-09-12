@@ -106,7 +106,7 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
                 "per-layer buffers cannot be shared across layers. Stacking "
                 "does not support MoE load balancing "
                 "(https://github.com/google-pytorch/torchtitan/issues/391); "
-                "drop --tpu-config.use-stacked-layers, or set "
+                "drop --tpu-config.graph-trainer.use-stacked-layers, or set "
                 "load_balance_coeff to None."
             )
         got = spec(layer)

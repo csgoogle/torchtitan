@@ -18,6 +18,9 @@ BackwardPartitionMode = Literal[
 
 @dataclasses.dataclass
 class GraphSplitterConfig:
+  # Split the GraphTrainer joint FX graph into separately compiled forward and
+  # backward modules. All finer splitting is nested under this boundary.
+  enabled: bool = False
   # Maximum number of complete transformer layers assigned to one forward
   # executable. -1 keeps forward as one executable.
   forward_layers_per_executable: int = -1
@@ -45,31 +48,12 @@ class GraphSplitterConfig:
 
 
 @dataclasses.dataclass
-class TPUConfig:
-  use_simple_fsdp: bool = False
-  compile_mode: str = "layer"
-  apply_rope_complex_workaround: bool = False
-  use_jax_profiler: bool = False
-  # For GraphTrainer, partition the transformed joint FX graph into separately
-  # compiled forward and backward modules. All finer splitting is nested under
-  # this boundary. Other TPU trainers still use this flag for their older eager
-  # forward/backward synchronization path; this PR does not replace those paths.
-  # GraphTrainer splitting requires graph_trainer_fsdp_schedule="none",
-  # optimizer_in_graph=False, and no serialized precompiled FX artifact;
-  # TorchTPU's normal XLA/Tier-2 cache remains supported.
-  use_graph_split: bool = False
-  graph_split: GraphSplitterConfig = dataclasses.field(
-      default_factory=GraphSplitterConfig
-  )
-  # Compile AdamW step into its own separate FX graph.
-  compile_optimizer: bool = False
-  # Run via TpuGraphTrainer (joint fwd+loss+bwd aot_fx_trace and FX-graph SAC passes).
-  use_graph_trainer: bool = False
-  # Whether to compile the optimizer step into the joint fwd+loss+bwd graph.
+class TpuGraphTrainerOptions:
+  # Compile the optimizer into the joint forward, loss, and backward graph.
   optimizer_in_graph: bool = False
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
-  graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  memory_policy: GraphTrainerMemoryPolicy = "default"
   # Store each decoder layer's weights as a row of one stacked tensor instead
   # of n_layers separate tensors. Storage only -- the layers still run one at a
   # time. Groundwork for running them as a single scan.
@@ -80,18 +64,38 @@ class TPUConfig:
   # https://github.com/google-pytorch/torchtitan/issues/389
   use_stacked_layers: bool = False
   # Keep rematerialized layer workspaces local in the XLA schedule.
-  enable_graph_trainer_remat_schedule: bool = False
+  remat_schedule: bool = False
   # TPU SimpleFSDP scheduling for GraphTrainer rematerialization. ``prefetch``
   # preserves recomputed all-gathers and places them in preceding dense compute;
   # ``interleave`` also fences each next all-gather on prior reduce-scatter
   # completion, bounding memory more tightly at the cost of AG/RS concurrency.
-  # TODO: Move this and the other graph_trainer_* options into a dedicated
-  # GraphTrainer TPU config once that nested config exists.
-  graph_trainer_fsdp_schedule: GraphTrainerFSDPSchedule = "none"
+  fsdp_schedule: GraphTrainerFSDPSchedule = "none"
   # Release layer L's recomputed parameters at backward layer L+N. N=1 is the
   # lowest-memory useful prefetch and the best measured real-model policy;
   # larger values expose more AGs for overlap but increase parameter lifetime.
-  graph_trainer_fsdp_prefetch_distance: int = 1
+  fsdp_prefetch_distance: int = 1
+  graph_split: GraphSplitterConfig = dataclasses.field(
+      default_factory=GraphSplitterConfig
+  )
+
+
+@dataclasses.dataclass
+class TPUConfig:
+  use_simple_fsdp: bool = False
+  compile_mode: str = "layer"
+  apply_rope_complex_workaround: bool = False
+  use_jax_profiler: bool = False
+  # Insert an eager synchronization boundary between forward and backward in
+  # regular TPU trainers. GraphTrainer FX splitting is configured separately in
+  # graph_trainer.graph_split.
+  use_graph_split: bool = False
+  # Compile AdamW step into its own separate FX graph.
+  compile_optimizer: bool = False
+  # Run via TpuGraphTrainer (joint fwd+loss+bwd aot_fx_trace and FX-graph SAC passes).
+  use_graph_trainer: bool = False
+  graph_trainer: TpuGraphTrainerOptions = dataclasses.field(
+      default_factory=TpuGraphTrainerOptions
+  )
   # Emit one aggregate MFU measurement after the configured start log step
   # through the end of training. Both boundaries must be metric log steps.
   enable_mfu_benchmark: bool = False
@@ -274,9 +278,12 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
     # Only the graph trainer builds its model through
     # `to_tpu_graph_trainer_config`, which is what applies the stacking rewrite.
     # Anywhere else the flag would be accepted and then do nothing.
-    if self.tpu_config.use_stacked_layers and not self.tpu_config.use_graph_trainer:
+    if (
+        self.tpu_config.graph_trainer.use_stacked_layers
+        and not self.tpu_config.use_graph_trainer
+    ):
       raise ValueError(
-          "--tpu-config.use-stacked-layers needs "
+          "--tpu-config.graph-trainer.use-stacked-layers needs "
           "--tpu-config.use-graph-trainer; no other lane applies it."
       )
     # Set the default location of dump_folder. Allow the runtime CLI

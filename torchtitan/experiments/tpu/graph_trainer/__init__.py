@@ -8,7 +8,6 @@
 
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
-    TpuGraphTrainerConfig,
 )
 
-__all__ = ["TpuGraphTrainer", "TpuGraphTrainerConfig"]
+__all__ = ["TpuGraphTrainer"]

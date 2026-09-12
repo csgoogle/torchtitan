@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -55,37 +55,6 @@ from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.tools.logging import logger
 
 
-@dataclass
-class TpuGraphTrainerConfig:
-    """Subset of job/TPU config carried forward into TpuGraphTrainer."""
-
-    device: str = "tpu"
-    attention_backend: str = "sdpa-no-scale"
-    moe_enabled: bool = False
-    moe_padded_dispatcher: bool = False
-    moe_capacity_factor: float = 1.25
-    ep_degree: int = 1
-    optimizer_in_graph: bool = False
-    optimizer_compile: bool = False
-    compile_mode: str = "none"
-    enable_mfu_benchmark: bool = False
-    mfu_benchmark_start_step: int = 5
-    mfu_benchmark_final_step: int = 0
-    job_config: Optional[TPUTrainerConfig] = None
-
-
-def _optimizer_in_graph_enabled(config, tpu_extra) -> bool:
-    if tpu_extra is not None and getattr(tpu_extra, "optimizer_in_graph", False):
-        return True
-    return bool(getattr(config.compile, "optimizer_in_graph", False))
-
-
-def _optimizer_compile_enabled(config, tpu_extra) -> bool:
-    if tpu_extra is not None and getattr(tpu_extra, "optimizer_compile", False):
-        return True
-    return bool(getattr(config.compile, "optimizer_compile", False))
-
-
 class TpuGraphTrainer(GraphTrainer):
     """Branched specialization of GraphTrainer for TPU/PJRT execution.
 
@@ -111,7 +80,7 @@ class TpuGraphTrainer(GraphTrainer):
     class Config(GraphTrainer.Config, TPUTrainerConfig):
         pass
 
-    def __init__(self, config, *, tpu_extra: Optional[TpuGraphTrainerConfig] = None) -> None:
+    def __init__(self, config) -> None:
         """Override of GraphTrainer.__init__ adding TPU pipeline registration, Pallas loss, and opt-in-graph setup."""
         if isinstance(config.loss, ChunkedLossWrapper.Config):
             raise ValueError(
@@ -135,34 +104,32 @@ class TpuGraphTrainer(GraphTrainer):
             for group in opt.param_groups:
                 group["capturable"] = True
 
-        self._tpu_extra = tpu_extra
-        if tpu_extra is not None and tpu_extra.device == "tpu":
-            _apply_tpu_moe_post_init(self.model_parts, tpu_extra)
+        _apply_tpu_moe_post_init(self.model_parts, config)
 
         # Only dump weight/buffer statistics when debug logging is explicitly enabled per review comment.
         if logger.isEnabledFor(logging.DEBUG):
             _dump_weight_stats(self.model_parts)
 
-        self._optimizer_in_graph = _optimizer_in_graph_enabled(config, tpu_extra)
+        self._optimizer_in_graph = (
+            config.tpu_config.graph_trainer.optimizer_in_graph
+        )
         if self._optimizer_in_graph:
             self._opt_state_registered = False
 
         self._optimizer_compile = (
-            _optimizer_compile_enabled(config, tpu_extra) and not self._optimizer_in_graph
+            config.tpu_config.compile_optimizer
+            and not self._optimizer_in_graph
         )
-        self._graph_splitter = GraphSplitter.from_trainer_config(
-            config,
-            optimizer_in_graph=self._optimizer_in_graph,
-        )
+        self._graph_splitter = GraphSplitter.from_trainer_config(config)
         if self._optimizer_compile:
             apply_compiled_optimizer(self)
 
         self._mfu_benchmark = None
-        if tpu_extra is not None and tpu_extra.enable_mfu_benchmark:
+        if config.tpu_config.enable_mfu_benchmark:
             self._mfu_benchmark = MfuBenchmark(
                 self.metrics_processor,
-                start_step=tpu_extra.mfu_benchmark_start_step,
-                final_step=tpu_extra.mfu_benchmark_final_step,
+                start_step=config.tpu_config.mfu_benchmark_start_step,
+                final_step=config.training.steps,
             )
 
     def train_step(
@@ -680,8 +647,7 @@ def _dump_weight_stats(model_parts) -> None:
   logger.debug("[debug_weights] === end ===")
 
 
-def _apply_tpu_moe_post_init(model_parts, tpu_extra: TpuGraphTrainerConfig) -> None:
+def _apply_tpu_moe_post_init(model_parts, config) -> None:
     """Apply our own experiments/tpu/workarounds.py patches post-super().__init__."""
     for model in model_parts:
-        if tpu_extra.job_config is not None:
-            workarounds.apply_patches(model, tpu_extra.job_config)
+        workarounds.apply_patches(model, config)

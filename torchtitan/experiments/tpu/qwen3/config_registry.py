@@ -36,6 +36,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     LossKernelConfig,
     SplashAttentionKernelConfig,
     TPUConfig,
+    TpuGraphTrainerOptions,
     TPUTrainerConfig,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
@@ -334,8 +335,10 @@ def qwen3_8b() -> TPUTrainerConfig:
           use_graph_trainer=True,
           compile_mode="aot_fx_trace",
           compile_optimizer=True,
-          optimizer_in_graph=True,
-          graph_trainer_memory_policy="default",
+          graph_trainer=TpuGraphTrainerOptions(
+              optimizer_in_graph=True,
+              memory_policy="default",
+          ),
       ),
       compile=CompileConfig(
           enable=True,
@@ -388,7 +391,7 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
   cfg.tpu_config = TPUConfig(
       use_graph_trainer=True,
       compile_mode="aot_fx_trace",
-      graph_trainer_memory_policy="full",
+      graph_trainer=TpuGraphTrainerOptions(memory_policy="full"),
   )
   cfg.compile = CompileConfig(
       enable=True,
@@ -442,10 +445,11 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   cfg.tpu_config = TPUConfig(
       use_graph_trainer=True,
       compile_mode="aot_fx_trace",
-      graph_trainer_memory_policy="full",
-      enable_graph_trainer_remat_schedule=True,
       compile_optimizer=False,
-      optimizer_in_graph=False,
+      graph_trainer=TpuGraphTrainerOptions(
+          memory_policy="full",
+          remat_schedule=True,
+      ),
   )
   cfg.optimizer.implementation = "fused"
   cfg.compile = CompileConfig(

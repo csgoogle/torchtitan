@@ -18,7 +18,7 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 
 - **Devices vs chips**: an ironwood chip exposes two TensorCores, and torchtitan runs one process per core. `tpu7x-4x4x4` is therefore 128 devices on 64 chips, run as 16 hosts x 8 processes. 
 - **SparseCore Offloading**: This configuration achieves high MFU by utilizing SparseCore collective offloading for FSDP via explicit `LIBTPU_INIT_ARGS`.
-- **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--tpu_config.compile_optimizer` and `--tpu_config.optimizer_in_graph`.
+- **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--tpu_config.compile_optimizer` and `--tpu_config.graph_trainer.optimizer_in_graph`.
 - **Splash Attention**: Splash Attention block sizes are manually tuned to 1024 across the board for optimal tile sizing.
 
 ## Training Command
@@ -75,7 +75,7 @@ xpk workload create \
     --tpu_config.use_graph_trainer \
     --tpu_config.compile_mode=aot_fx_trace \
     --tpu_config.compile_optimizer \
-    --tpu_config.optimizer_in_graph"
+    --tpu_config.graph_trainer.optimizer_in_graph"
 ```
 
 ## Expected Metrics

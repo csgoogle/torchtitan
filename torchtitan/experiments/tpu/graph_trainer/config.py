@@ -28,7 +28,7 @@ def to_tpu_graph_trainer_config(
     target_cls: type[ConfigT],
 ) -> ConfigT:
   """Convert a TPU recipe and propagate its TPU-only GraphTrainer settings."""
-  memory_policy = train_config.tpu_config.graph_trainer_memory_policy
+  memory_policy = train_config.tpu_config.graph_trainer.memory_policy
   if memory_policy == "sac_and_offload":
     raise ValueError(
         "TPU GraphTrainer does not support memory_policy='sac_and_offload'"
@@ -37,14 +37,14 @@ def to_tpu_graph_trainer_config(
       train_config, model_registry, target_cls=target_cls
   )
   graph_config.compile.memory_policy = memory_policy
-  if train_config.tpu_config.use_stacked_layers:
+  if train_config.tpu_config.graph_trainer.use_stacked_layers:
     # Expert parallelism shards `moe.experts` on a mesh of its own. A stack is
     # one tensor sharded once, so there is nowhere to put that. Refusing MoE
     # already covers every model that can set this; the check is here so the
     # flag gets named instead of failing somewhere further in.
     if train_config.parallelism.expert_parallel_degree > 1:
       raise ValueError(
-          "--tpu-config.use-stacked-layers cannot be combined with "
+          "--tpu-config.graph-trainer.use-stacked-layers cannot be combined with "
           "--parallelism.expert-parallel-degree > 1 "
           "(https://github.com/google-pytorch/torchtitan/issues/395)."
       )
@@ -65,7 +65,8 @@ def to_tpu_graph_trainer_config(
     # makes, rather than leaving it to the ordering comment above.
     if not builds_layer_loop(graph_config.model_spec.model):
       raise AssertionError(
-          "--tpu-config.use-stacked-layers did not survive config conversion"
+        "--tpu-config.graph-trainer.use-stacked-layers did not survive "
+        "config conversion"
       )
   return graph_config
 

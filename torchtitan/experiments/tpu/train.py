@@ -10,7 +10,7 @@ import argparse
 import functools
 import json
 import tempfile
-from typing import Any, List, Optional, Sequence, Tuple, cast
+from typing import List, Optional, Sequence, Tuple
 
 from absl import flags
 from absl.flags import argparse_flags
@@ -152,7 +152,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
           f" (current mode: {train_config.tpu_config.compile_mode}). This may"
           " lead to severe HBM fragmentation and stack reservation OOMs."
       )
-    from torchtitan.experiments.tpu.graph_trainer import TpuGraphTrainer, TpuGraphTrainerConfig
+    from torchtitan.experiments.tpu.graph_trainer import TpuGraphTrainer
 
     if model_name == "qwen3":
       from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
@@ -171,44 +171,8 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
         train_config, gt_registry, target_cls=TpuGraphTrainer.Config
     )
 
-    splash_obj = cast(Any, getattr(train_config, "splash_attention_kernel", None))
-    moe_obj = cast(Any, getattr(train_config, "moe", getattr(train_config, "redacted", None)))
-    tpu_extra = TpuGraphTrainerConfig(
-        device="tpu",
-        attention_backend=getattr(
-            splash_obj,
-            "sa_attention_backend",
-            "splash"
-            if getattr(splash_obj, "use_splash_attention_kernel", False)
-            else "sdpa-no-scale",
-        )
-        if splash_obj is not None
-        else "sdpa-no-scale",
-        moe_enabled=getattr(moe_obj, "enabled", False)
-        if moe_obj is not None
-        else False,
-        moe_padded_dispatcher=getattr(moe_obj, "padded_dispatcher", False)
-        if moe_obj is not None
-        else False,
-        moe_capacity_factor=getattr(moe_obj, "capacity_factor", 1.25)
-        if moe_obj is not None
-        else 1.25,
-        ep_degree=getattr(
-            train_config.parallelism,
-            "expert_parallel_degree",
-            getattr(train_config.parallelism, "ep", 1),
-        ),
-        optimizer_in_graph=train_config.tpu_config.optimizer_in_graph,
-        optimizer_compile=train_config.tpu_config.compile_optimizer,
-        compile_mode=train_config.tpu_config.compile_mode,
-        enable_mfu_benchmark=train_config.tpu_config.enable_mfu_benchmark,
-        mfu_benchmark_start_step=train_config.tpu_config.mfu_benchmark_start_step,
-        mfu_benchmark_final_step=train_config.training.steps,
-        job_config=train_config,
-    )
-
     def trainer_cls(cfg):
-      return TpuGraphTrainer(gt_cfg, tpu_extra=tpu_extra)
+      return TpuGraphTrainer(gt_cfg)
   else:
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
       if train_config.tpu_config.compile_mode == "fullgraph":
@@ -218,11 +182,10 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
             "but does NOT capture the optimizer step right inside the graph.",
             train_config.tpu_config.compile_mode,
         )
-      if getattr(train_config.compile, "optimizer_in_graph", False) or getattr(
-          train_config.tpu_config, "optimizer_in_graph", False
-      ):
+      if train_config.tpu_config.graph_trainer.optimizer_in_graph:
         logger.warning(
-            "`optimizer_in_graph` (`--compile.optimizer-in-graph` or `--tpu-config.optimizer-in-graph`) "
+            "`optimizer_in_graph` "
+            "(`--tpu-config.graph-trainer.optimizer-in-graph`) "
             "is set while running on regular Trainer (`use_graph_trainer=False`). "
             "Regular Trainer does not support optimizer-in-graph (capturing `optimizer.step()` inside the graph). "
             "To enable joint fwd+bwd+optimizer compilation, you must use `--tpu-config.use-graph-trainer`."

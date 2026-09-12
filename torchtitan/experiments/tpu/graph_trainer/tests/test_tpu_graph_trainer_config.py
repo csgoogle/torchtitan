@@ -22,6 +22,7 @@ from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Mo
 from torchtitan.experiments.tpu.graph_trainer.config import (
     to_tpu_graph_trainer_config,
 )
+from torchtitan.experiments.tpu.graph_trainer.graph_split import GraphSplitter
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     construct_tpu_pass_pipeline,
 )
@@ -58,7 +59,11 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
 )
-from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+    TPUConfig,
+    TPUTrainerConfig,
+    TpuGraphTrainerOptions,
+)
 from torchtitan.models.common import ComplexRoPE, Linear
 
 
@@ -97,7 +102,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     recipe applied is already gone by this point.
     """
     config = qwen3_8b()
-    config.tpu_config.use_stacked_layers = stacked
+    config.tpu_config.graph_trainer.use_stacked_layers = stacked
     graph_config = self._qwen3_graph_config(config)
 
     plain = self._qwen3_graph_config(qwen3_8b()).model_spec.model
@@ -123,7 +128,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     aux-loss mutual exclusion first.
     """
     config = qwen3_moe_30b()
-    config.tpu_config.use_stacked_layers = True
+    config.tpu_config.graph_trainer.use_stacked_layers = True
     # The recipe runs expert parallel, which is refused on its own; turn it off
     # so this reaches the MoE check.
     config.parallelism.expert_parallel_degree = 1
@@ -133,7 +138,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
   def test_stacking_refuses_expert_parallelism(self) -> None:
     config = qwen3_8b()
-    config.tpu_config.use_stacked_layers = True
+    config.tpu_config.graph_trainer.use_stacked_layers = True
     config.parallelism.expert_parallel_degree = 2
 
     with self.assertRaisesRegex(ValueError, "expert-parallel-degree"):
@@ -144,8 +149,24 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     silently accepted."""
     with self.assertRaisesRegex(ValueError, "use-graph-trainer"):
       TPUTrainerConfig(
-          tpu_config=TPUConfig(use_stacked_layers=True, use_graph_trainer=False)
+          tpu_config=TPUConfig(
+              use_graph_trainer=False,
+              graph_trainer=TpuGraphTrainerOptions(use_stacked_layers=True),
+          )
       )
+
+  def test_cli_stacked_layers_is_nested(self) -> None:
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_debugmodel",
+            "--tpu_config.use_graph_trainer",
+            "--tpu_config.graph_trainer.use_stacked_layers",
+        ]),
+    )
+
+    self.assertTrue(config.tpu_config.graph_trainer.use_stacked_layers)
 
   @parameterized.parameters("default", "full", "eager")
   def test_cli_memory_policy_is_propagated(self, policy: str) -> None:
@@ -154,7 +175,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         ConfigManager().parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            f"--tpu_config.graph_trainer_memory_policy={policy}",
+            f"--tpu_config.graph_trainer.memory_policy={policy}",
         ]),
     )
     graph_config = to_tpu_graph_trainer_config(
@@ -163,7 +184,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         target_cls=TpuGraphTrainer.Config,
     )
 
-    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, policy)
+    self.assertEqual(config.tpu_config.graph_trainer.memory_policy, policy)
     self.assertEqual(graph_config.compile.memory_policy, policy)
 
   def test_unsupported_memory_policy_is_rejected_during_conversion(self) -> None:
@@ -172,12 +193,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         ConfigManager().parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            "--tpu_config.graph_trainer_memory_policy=sac_and_offload",
+            "--tpu_config.graph_trainer.memory_policy=sac_and_offload",
         ]),
     )
 
     self.assertEqual(
-        config.tpu_config.graph_trainer_memory_policy,
+        config.tpu_config.graph_trainer.memory_policy,
         "sac_and_offload",
     )
     with self.assertRaisesRegex(ValueError, "does not support"):
@@ -193,7 +214,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         ConfigManager().parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            "--tpu_config.enable_graph_trainer_remat_schedule",
+            "--tpu_config.graph_trainer.remat_schedule",
         ]),
     )
 
@@ -204,7 +225,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertTrue(
-        graph_config.tpu_config.enable_graph_trainer_remat_schedule
+        graph_config.tpu_config.graph_trainer.remat_schedule
     )
 
   def test_cli_fsdp_schedule_is_propagated(self) -> None:
@@ -213,7 +234,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         ConfigManager().parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            "--tpu_config.graph_trainer_fsdp_schedule=interleave",
+            "--tpu_config.graph_trainer.fsdp_schedule=interleave",
         ]),
     )
 
@@ -224,7 +245,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertEqual(
-        graph_config.tpu_config.graph_trainer_fsdp_schedule,
+        graph_config.tpu_config.graph_trainer.fsdp_schedule,
         "interleave",
     )
 
@@ -234,7 +255,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         ConfigManager().parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            "--tpu_config.graph_trainer_fsdp_prefetch_distance=2",
+            "--tpu_config.graph_trainer.fsdp_prefetch_distance=2",
         ]),
     )
 
@@ -245,7 +266,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertEqual(
-        graph_config.tpu_config.graph_trainer_fsdp_prefetch_distance,
+        graph_config.tpu_config.graph_trainer.fsdp_prefetch_distance,
         2,
     )
 
@@ -255,9 +276,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         ConfigManager().parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            "--tpu_config.use_graph_split",
-            "--tpu_config.graph_split.backward_partition_mode=by_layer",
-            "--tpu_config.graph_split.backward_layers_per_executable=2",
+            "--tpu_config.graph_trainer.graph_split.enabled",
+            "--tpu_config.graph_trainer.graph_split.backward_partition_mode=by_layer",
+            "--tpu_config.graph_trainer.graph_split.backward_layers_per_executable=2",
         ]),
     )
 
@@ -267,21 +288,51 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         target_cls=TpuGraphTrainer.Config,
     )
 
+    split_config = graph_config.tpu_config.graph_trainer.graph_split
+    self.assertTrue(split_config.enabled)
     self.assertEqual(
-        graph_config.tpu_config.graph_split.backward_partition_mode,
+        split_config.backward_partition_mode,
         "by_layer",
     )
     self.assertEqual(
-        graph_config.tpu_config.graph_split.backward_layers_per_executable,
+        split_config.backward_layers_per_executable,
         2,
     )
+
+  def test_cli_optimizer_options_preserve_distinct_ownership(self) -> None:
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_debugmodel",
+            "--tpu_config.compile_optimizer",
+            "--tpu_config.graph_trainer.optimizer_in_graph",
+        ]),
+    )
+
+    self.assertTrue(config.tpu_config.compile_optimizer)
+    self.assertTrue(config.tpu_config.graph_trainer.optimizer_in_graph)
+
+  def test_regular_trainer_graph_split_does_not_enable_fx_splitter(self) -> None:
+    config = qwen3_8b()
+    config.tpu_config.use_graph_split = True
+
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    splitter = GraphSplitter.from_trainer_config(graph_config)
+
+    self.assertTrue(graph_config.tpu_config.use_graph_split)
+    self.assertFalse(splitter.enabled)
 
   def test_qwen3_8b_explicitly_uses_default_graph_policy(self) -> None:
     config = qwen3_8b()
 
     self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
     self.assertEqual(
-        config.tpu_config.graph_trainer_memory_policy,
+        config.tpu_config.graph_trainer.memory_policy,
         "default",
     )
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "never")
@@ -351,7 +402,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_qwen3_30b_fsdp_profile_explicitly_uses_zero2(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_profile()
 
-    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
+    self.assertEqual(config.tpu_config.graph_trainer.memory_policy, "full")
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "never")
 
   def test_qwen3_moe_fsdp_uses_pallas_cross_entropy(self) -> None:
@@ -477,10 +528,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
   def test_remat_schedule_supports_optimizer_in_graph(self) -> None:
     config = qwen3_8b()
-    config.tpu_config.enable_graph_trainer_remat_schedule = True
-    config.tpu_config.graph_trainer_fsdp_schedule = "interleave"
-    config.tpu_config.graph_trainer_fsdp_prefetch_distance = 2
-    config.tpu_config.optimizer_in_graph = True
+    config.tpu_config.graph_trainer.remat_schedule = True
+    config.tpu_config.graph_trainer.fsdp_schedule = "interleave"
+    config.tpu_config.graph_trainer.fsdp_prefetch_distance = 2
+    config.tpu_config.graph_trainer.optimizer_in_graph = True
     graph_config = to_tpu_graph_trainer_config(
         config,
         qwen3_gt.model_registry,
@@ -525,8 +576,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       has_interleave: bool,
   ) -> None:
     config = qwen3_8b()
-    config.tpu_config.enable_graph_trainer_remat_schedule = True
-    config.tpu_config.graph_trainer_fsdp_schedule = schedule
+    config.tpu_config.graph_trainer.remat_schedule = True
+    config.tpu_config.graph_trainer.fsdp_schedule = schedule
     graph_config = to_tpu_graph_trainer_config(
         config,
         qwen3_gt.model_registry,
@@ -555,7 +606,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
   def test_fsdp_schedule_requires_rematerialization(self) -> None:
     config = qwen3_8b()
-    config.tpu_config.graph_trainer_fsdp_schedule = "interleave"
+    config.tpu_config.graph_trainer.fsdp_schedule = "interleave"
     graph_config = to_tpu_graph_trainer_config(
         config,
         qwen3_gt.model_registry,

@@ -178,7 +178,8 @@ class OptimizerStateTest(unittest.TestCase):
     The consequence is silent rather than loud:
     ``_unflatten_optim_state_dict`` treats an FQN that is absent from the
     checkpoint as "this parameter has no state" rather than as an error. So
-    flipping ``--tpu-config.use-stacked-layers`` between a save and a resume
+    flipping ``--tpu-config.graph-trainer.use-stacked-layers`` between a save
+    and a resume
     restores every weight correctly and restarts Adam from zero for every
     layer parameter, with nothing in the logs to say so. Parameters outside
     the layers (embeddings, output, the final norm) keep their moments,

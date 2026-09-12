@@ -41,7 +41,7 @@ class TpuGraphTrainerDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--tpu_config.use_simple_fsdp",
-              "--tpu_config.use_stacked_layers",
+              "--tpu_config.graph_trainer.use_stacked_layers",
           ],
       ),
       dict(
@@ -62,7 +62,7 @@ class TpuGraphTrainerDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--tpu_config.use_simple_fsdp",
-              "--tpu_config.use_stacked_layers",
+              "--tpu_config.graph_trainer.use_stacked_layers",
           ],
       ),
   ])

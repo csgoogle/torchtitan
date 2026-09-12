@@ -421,13 +421,15 @@ def construct_tpu_transform_passes(
     passes: list[Callable] = [remove_parameter_gradient_markers_pass]
 
     memory_policy = getattr(config.compile, "memory_policy", "none")
-    fsdp_schedule = config.tpu_config.graph_trainer_fsdp_schedule
+    graph_trainer = config.tpu_config.graph_trainer
+    fsdp_schedule = graph_trainer.fsdp_schedule
     if fsdp_schedule != "none" and (
         memory_policy in (None, "none")
-        or not config.tpu_config.enable_graph_trainer_remat_schedule
+        or not graph_trainer.remat_schedule
     ):
         raise ValueError(
-            "graph_trainer_fsdp_schedule requires GraphTrainer rematerialization"
+            "graph_trainer.fsdp_schedule requires GraphTrainer "
+            "rematerialization"
         )
 
     if memory_policy and memory_policy != "none":
@@ -443,7 +445,7 @@ def construct_tpu_transform_passes(
         # This pass pipeline is constructed only by TpuGraphTrainer. Do not
         # gate on use_graph_trainer here: compile_mode="aot_fx_trace" also
         # selects TpuGraphTrainer without setting that legacy selector.
-        if config.tpu_config.enable_graph_trainer_remat_schedule:
+        if graph_trainer.remat_schedule:
             passes.append(
                 functools.partial(
                     apply_tpu_remat_schedule,
@@ -456,7 +458,7 @@ def construct_tpu_transform_passes(
                         apply_tpu_remat_fsdp_all_gather_schedule,
                         num_static_inputs=traced_result.num_static_inputs,
                         prefetch_distance=(
-                            config.tpu_config.graph_trainer_fsdp_prefetch_distance
+                            graph_trainer.fsdp_prefetch_distance
                         ),
                     )
                 )

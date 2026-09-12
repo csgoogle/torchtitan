@@ -6,12 +6,13 @@
 
 """Split a GraphTrainer joint FX graph into independently compiled modules.
 
-``use_graph_split`` first divides the mandatory joint graph into forward and
-backward GraphModules connected by explicit residual tensors. The forward graph
-can then be divided into sequential layer ranges. The backward graph can remain
-whole, group adjacent layer computations with their FSDP collectives, or form
-staggered all-gather/compute/reduce-scatter pipeline stages. These subdivisions
-are therefore always nested under the forward/backward split.
+``graph_trainer.graph_split.enabled`` first divides the mandatory joint graph
+into forward and backward GraphModules connected by explicit residual tensors.
+The forward graph can then be divided into sequential layer ranges. The
+backward graph can remain whole, group adjacent layer computations with their
+FSDP collectives, or form staggered all-gather/compute/reduce-scatter pipeline
+stages. These subdivisions are therefore always nested under the
+forward/backward split.
 
 Each rematerialization region is one transformer layer. Combining regions in
 one executable changes only the compiler scheduling scope; it preserves the
@@ -180,11 +181,10 @@ class GraphSplitter:
   def from_trainer_config(
       cls,
       config: "TPUTrainerConfig",
-      *,
-      optimizer_in_graph: bool,
   ) -> "GraphSplitter":
-    enabled = bool(config.tpu_config.use_graph_split)
-    split_config = config.tpu_config.graph_split
+    graph_trainer = config.tpu_config.graph_trainer
+    split_config = graph_trainer.graph_split
+    enabled = split_config.enabled
     if split_config.forward_layers_per_executable == 0 or (
         split_config.forward_layers_per_executable < -1
     ):
@@ -204,15 +204,17 @@ class GraphSplitter:
           "backward_layers_per_executable must be at least 1"
       )
     if split_config.backward_partition_mode != "none" and not enabled:
-      raise ValueError("backward_partition_mode requires use_graph_split")
-    if enabled and config.tpu_config.graph_trainer_fsdp_schedule != "none":
+      raise ValueError(
+          "backward_partition_mode requires graph_split.enabled"
+      )
+    if enabled and graph_trainer.fsdp_schedule != "none":
       raise ValueError(
           "Graph splitting does not currently compose with "
-          "graph_trainer_fsdp_schedule"
+          "graph_trainer.fsdp_schedule"
       )
     # Optimizer-in-graph needs a third explicit phase rather than treating its
     # state reads, mutations, and parameter updates as backward.
-    if enabled and optimizer_in_graph:
+    if enabled and graph_trainer.optimizer_in_graph:
       raise ValueError(
           "TPU GraphTrainer graph split does not support optimizer_in_graph"
       )
