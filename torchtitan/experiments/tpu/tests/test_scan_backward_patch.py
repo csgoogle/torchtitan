@@ -1,17 +1,24 @@
 """Unit tests for the reverse-by-index scan backward.
 
-The patch is measured -- it is what took llama3-70B from an OOM at 98.43 G to a
-61.24 GiB run -- but that evidence lives in a cluster log, so these tests state
-the three properties a reader of the diff would otherwise have to take on faith:
-the backward stops calling `aten.flip`, the gradients do not change when it
-does, and the upstream method this file forks from is still the one upstream
-has.
+The patch is measured -- it is what turned an OOM into a run with room to spare
+-- but that evidence lives in a cluster log, so these tests state the
+properties a reader of the diff would otherwise have to take on faith: the
+backward stops calling `aten.flip`, the gradients do not change when it does,
+an upstream edit that leaves the reversal alone keeps working, and one that
+does not fails loudly instead of quietly reverting to copies.
 
-Everything here runs under `torch.compile`, on `--device`. Never eagerly: an
-eager scan never materialises its stacks, so an eager test passes without
-exercising the thing the patch changes.
+The torch-bump tests build their fake upstream by editing torch's own
+`call_backward` source and exec'ing it back into `scan.py`'s namespace, which
+is where a real bump's method would live and what the patch swaps under.
+
+Everything runs under `torch.compile`, on `--device`. Never eagerly: an eager
+scan never materialises its stacks, so an eager test passes without exercising
+the thing the patch changes.
 """
 
+import inspect
+import sys
+import textwrap
 import types
 
 from absl.testing import absltest
@@ -24,6 +31,9 @@ from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import scan_backward_patch
 from torchtitan.experiments.tpu import workarounds
+
+
+_SCAN_MODULE = sys.modules["torch._higher_order_ops.scan"]
 
 
 def _body(carry, x):
@@ -58,6 +68,12 @@ class ScanBackwardPatchTest(base_device_test.BaseAcceleratorDeviceTest):
     super().setUp()
     self._unpatched = ScanAutogradImpl.call_backward
     self.addCleanup(setattr, ScanAutogradImpl, "call_backward", self._unpatched)
+    self.addCleanup(
+        setattr,
+        scan_backward_patch,
+        "_UPSTREAM_CALL_BACKWARD",
+        scan_backward_patch._UPSTREAM_CALL_BACKWARD,
+    )
     self.addCleanup(torch._dynamo.reset)
     # The TPU backend is the one that matters -- `aot_eager` is the stand-in
     # when this file runs on the CPU lane.
@@ -81,18 +97,131 @@ class ScanBackwardPatchTest(base_device_test.BaseAcceleratorDeviceTest):
       grads = torch.autograd.grad(loss, (init, xs))
     return [g.cpu() for g in grads], [op for op in recorder.ops if "flip" in op]
 
-  def test_the_upstream_copy_is_still_current(self):
-    """The canary. When torch moves, this fails before a 70B run OOMs."""
-    self.assertEqual(
-        scan_backward_patch._digest(self._unpatched),
-        scan_backward_patch._UPSTREAM_DIGEST,
-        "torch's ScanAutogradImpl.call_backward has changed. Either the"
-        " upstream fix landed -- delete scan_backward_patch.py -- or it moved"
-        " under us and the copy needs refreshing. Until then scan reverses by"
-        " torch.flip and roughly doubles its peak.",
+  def _install_fake_bump(self, *replacements):
+    """Installs an edited copy of torch's `call_backward` as if torch had.
+
+    Exec'd into `scan.py`'s real globals, not a copy, because that is where a
+    bump's method would resolve `torch` and `scan_op` from -- the two names
+    the patch swaps.
+    """
+    src = textwrap.dedent(
+        inspect.getsource(scan_backward_patch._UPSTREAM_CALL_BACKWARD)
+    )
+    for old, new in replacements:
+      self.assertIn(old, src, "the fake bump did not match upstream's source")
+      src = src.replace(old, new)
+    exec(compile(src, "<fake torch bump>", "exec"), _SCAN_MODULE.__dict__)  # pylint: disable=exec-used
+    bumped = _SCAN_MODULE.__dict__.pop("call_backward")
+    ScanAutogradImpl.call_backward = bumped
+    scan_backward_patch._UPSTREAM_CALL_BACKWARD = bumped
+
+  def test_it_removes_the_flips_and_leaves_the_gradients_alone(self):
+    before, flips_before = self._backward()
+    # Asserted, not assumed: without this the next assertion passes for any
+    # reason at all, including the test no longer reaching a scan.
+    self.assertNotEqual(
+        flips_before, [], "unpatched torch did not flip -- test is vacuous"
     )
 
-  def test_it_refuses_to_install_over_a_changed_upstream(self):
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    after, flips_after = self._backward()
+
+    self.assertEqual(flips_after, [], "the backward still reverses by copy")
+    for name, b, a in zip(("init", "xs"), before, after):
+      torch.testing.assert_close(a, b, msg=f"{name} gradient changed")
+
+  def test_it_launches_its_scan_with_torch_s_own_names(self):
+    """A scan of ours has to be traced as the real HOP, not as the stand-in.
+
+    `scan.py` labels the node it emits with whatever `scan_op` names at that
+    moment, and passes downstream find their scans by
+    `node.target is torch.ops.higher_order.scan`. A node labelled with the
+    stand-in still runs, so nothing fails -- activation offloading just
+    offloads nothing and the run quietly spends the memory it meant to save.
+    """
+    torchs_own = (_SCAN_MODULE.torch, _SCAN_MODULE.scan_op)
+    inner = scan_backward_patch._scan_over_descending_index
+    seen = []
+
+    def recording(*args, **kwargs):
+      seen.append((_SCAN_MODULE.torch, _SCAN_MODULE.scan_op))
+      return inner(*args, **kwargs)
+
+    self.addCleanup(
+        setattr, scan_backward_patch, "_scan_over_descending_index", inner
+    )
+    scan_backward_patch._scan_over_descending_index = recording
+
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    self._backward()
+
+    self.assertNotEmpty(seen, "the rewrite never ran -- test is vacuous")
+    for names in seen:
+      self.assertEqual(
+          names, torchs_own, "the scan was launched with the stand-ins in place"
+      )
+
+  def test_it_absorbs_an_upstream_change_that_is_not_the_reversal(self):
+    """The reason this shims two names instead of forking the method.
+
+    Upstream owns everything either side of the flip and the scan; a torch
+    bump is free to edit any of it. Here it renames a local and adds a
+    statement to the step body, and the patch carries on.
+    """
+    expected, _ = self._backward()
+    self._install_fake_bump(
+        (
+            "n_carry = len(self.init)",
+            "# an upstream comment\n    n_carry_renamed = len(self.init)",
+        ),
+        (
+            "grad_fw_outputs[:n_carry], grad_fw_outputs[n_carry:]",
+            "grad_fw_outputs[:n_carry_renamed], grad_fw_outputs[n_carry_renamed:]",
+        ),
+        (
+            "        grad_fw_outputs = (*grad_carry, *grad_y)",
+            "        grad_carry = [c + 0.0 for c in grad_carry]\n"
+            "        grad_fw_outputs = (*grad_carry, *grad_y)",
+        ),
+    )
+
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    grads, flips = self._backward()
+
+    self.assertEqual(flips, [], "the backward still reverses by copy")
+    for name, want, got in zip(("init", "xs"), expected, grads):
+      torch.testing.assert_close(got, want, msg=f"{name} gradient changed")
+
+  def test_it_raises_rather_than_reverse_by_copy(self):
+    """The canary, and the one case that cannot be absorbed.
+
+    When upstream stops reversing by flip the rewrite no longer applies, and
+    running on is an OOM with no obvious cause. Fail there instead.
+    """
+    self._install_fake_bump(
+        (
+            "[torch.flip(x, (0,)) for x in pytree.tree_flatten(bw_xs)[0]]",
+            "pytree.tree_flatten(bw_xs)[0]",
+        ),
+        ("*[torch.flip(elem, (0,)) for elem in grad_xs],", "*grad_xs,"),
+    )
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+
+    with self.assertRaisesRegex(Exception, "no longer reverses"):
+      self._backward()
+
+  def test_it_refuses_to_install_when_the_source_says_the_fix_landed(self):
+    """Same break, caught at startup instead of one compile later."""
+
+    def no_longer_flips(self, *grad_fw_outputs):
+      return scan_op(None, None, None)  # noqa: F821  # pylint: disable=undefined-variable
+
+    ScanAutogradImpl.call_backward = no_longer_flips
+    scan_backward_patch._UPSTREAM_CALL_BACKWARD = no_longer_flips
+    self.assertFalse(scan_backward_patch.apply_scan_reverse_backward_patch())
+    self.assertIs(ScanAutogradImpl.call_backward, no_longer_flips)
+
+  def test_it_refuses_to_install_over_someone_else(self):
     def not_the_method(self, *grad_fw_outputs):
       raise AssertionError("unreachable")
 
@@ -120,21 +249,6 @@ class ScanBackwardPatchTest(base_device_test.BaseAcceleratorDeviceTest):
         tpu_config=types.SimpleNamespace(use_scan_layers=False)
     )
     workarounds.apply_patches(torch.nn.Identity(), scan_off)
-
-  def test_it_removes_the_flips_and_leaves_the_gradients_alone(self):
-    before, flips_before = self._backward()
-    # Asserted, not assumed: without this the next assertion passes for any
-    # reason at all, including the test no longer reaching a scan.
-    self.assertNotEqual(
-        flips_before, [], "unpatched torch did not flip -- test is vacuous"
-    )
-
-    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
-    after, flips_after = self._backward()
-
-    self.assertEqual(flips_after, [], "the backward still reverses by copy")
-    for name, b, a in zip(("init", "xs"), before, after):
-      torch.testing.assert_close(a, b, msg=f"{name} gradient changed")
 
 
 if __name__ == "__main__":
