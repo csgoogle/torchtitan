@@ -55,15 +55,31 @@ def _config(registry=model_registry):
     return config
 
 
-def _build(*, stacked: bool, param_dtype: str = "float32", config=None):
+def _build(
+    *,
+    stacked: bool,
+    param_dtype: str = "float32",
+    config=None,
+    device: str | torch.device = "cpu",
+    world_size: int = 1,
+):
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
     ``stacked`` picks the converter, exactly as ``to_tpu_graph_trainer_config``
     does -- the model arrives from ``build()`` already stacked, and
     ``apply_simple_fsdp`` is given the same arguments either way.
+
+    ``device`` and ``world_size`` exist for ``test_layer_stack_distributed``,
+    which builds the same two models on a real mesh.
     """
     parallel_dims = ParallelDims(
-        dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1
+        dp_replicate=1,
+        dp_shard=world_size,
+        cp=1,
+        tp=1,
+        pp=1,
+        ep=1,
+        world_size=world_size,
     )
     training = TrainingConfig(
         mixed_precision_param=param_dtype, mixed_precision_reduce="float32"
@@ -76,7 +92,7 @@ def _build(*, stacked: bool, param_dtype: str = "float32", config=None):
         parallel_dims=parallel_dims,
         training=training,
     )
-    model.to_empty(device="cpu")
+    model.to_empty(device=device)
     torch.manual_seed(SEED)
     model.init_weights()
     return model
