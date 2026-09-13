@@ -10,12 +10,16 @@
 Drifting from one to the other silently changes what an existing checkpoint
 means, so the parity test compares against the complex multiply itself rather
 than against the other RoPE.
+
+That parity is asserted bit for bit, which is a claim about the arithmetic the
+accelerator performs, so these run on the accelerator rather than on CPU.
 """
 
 from absl.testing import absltest
 import torch
 from torch._higher_order_ops.scan import scan
 
+from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu.overrides.real_rope import (
     TpuRealArithmeticComplexRoPE,
     tpu_real_arithmetic_complex_rope,
@@ -48,17 +52,19 @@ def _scan_rope_backward(apply_rotary_emb):
   return weight.grad
 
 
-class TpuRealArithmeticComplexRoPETest(absltest.TestCase):
+class TpuRealArithmeticComplexRoPETest(base_device_test.BaseAcceleratorDeviceTest):
 
   def setUp(self):
     super().setUp()
     torch.manual_seed(42)
     head_dim = 64
     shape = (2, 16, 4, head_dim)
-    self.query = torch.randn(*shape)
-    self.key = torch.randn(*shape)
+    device = self.accelerator_device
+    self.query = torch.randn(*shape, device=device)
+    self.key = torch.randn(*shape, device=device)
     self.rope_cache = torch.polar(
-        torch.ones(16, head_dim // 2), torch.randn(16, head_dim // 2)
+        torch.ones(16, head_dim // 2, device=device),
+        torch.randn(16, head_dim // 2, device=device),
     ).view(1, 16, 1, head_dim // 2)
 
   def _complex_reference(self, x):
