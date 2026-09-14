@@ -21,7 +21,13 @@ from torchtitan.models.common.decoder import Decoder
 from torchtitan.protocols.module import ModuleDict
 
 
-__all__ = ["TpuLayerLoop", "model_subclass", "runs_layer_loop", "tpu_model_class"]
+__all__ = [
+    "TpuLayerLoop",
+    "builds_layer_loop",
+    "model_subclass",
+    "runs_layer_loop",
+    "tpu_model_class",
+]
 
 
 class TpuLayerLoop(ModuleDict):
@@ -81,6 +87,14 @@ def _forward(
 def runs_layer_loop(model: torch.nn.Module) -> bool:
     """Whether ``model`` hands its layers to ``model.layers`` to run."""
     return type(model).forward is _forward
+
+
+def builds_layer_loop(model_config: Decoder.Config) -> bool:
+    """Whether ``model_config.build()`` would satisfy :func:`runs_layer_loop`.
+
+    Lets a caller check the rewrite landed without building the model.
+    """
+    return model_config._owner.forward is _forward
 
 
 def model_subclass(model_cls: type, config_cls: type, name: str, **body) -> type:

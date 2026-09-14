@@ -18,6 +18,7 @@ import torch
 from torchtitan.config import derive
 from torchtitan.experiments.tpu.layer_loop import (
     _forward,
+    builds_layer_loop,
     runs_layer_loop,
     TpuLayerLoop,
     tpu_model_class,
@@ -222,6 +223,10 @@ class ConfigRewriteTest(absltest.TestCase):
     model = converted.build()
     self.assertIsInstance(model, Llama3Model)
     self.assertTrue(runs_layer_loop(model))
+    # The same answer off the config alone, for callers that check the rewrite
+    # landed before anything is built.
+    self.assertTrue(builds_layer_loop(converted))
+    self.assertFalse(builds_layer_loop(stock))
 
   def test_rewrite_keeps_an_earlier_root_config_replacement(self) -> None:
     """qwen3's TPU registry swaps the root config to override FLOP accounting."""

@@ -14,6 +14,7 @@ from torchtitan.experiments.graph_trainer.configs import to_graph_trainer_config
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
+from torchtitan.experiments.tpu.layer_loop import builds_layer_loop
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -58,6 +59,14 @@ def to_tpu_graph_trainer_config(
         graph_config.model_spec,
         model=with_tpu_stacked_layers(graph_config.model_spec.model),
     )
+    # The rewrite is only a config edit, so anything added after it that
+    # rebuilds `model_spec` from a fixed class drops it again -- and an
+    # unstacked run looks entirely normal. Check the promise this function
+    # makes, rather than leaving it to the ordering comment above.
+    if not builds_layer_loop(graph_config.model_spec.model):
+      raise AssertionError(
+          "--tpu-config.use-stacked-layers did not survive config conversion"
+      )
   return graph_config
 
 
