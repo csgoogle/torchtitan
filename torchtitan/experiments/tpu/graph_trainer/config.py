@@ -37,27 +37,30 @@ def to_tpu_graph_trainer_config(
       train_config, model_registry, target_cls=target_cls
   )
   graph_config.compile.memory_policy = memory_policy
-  if train_config.tpu_config.use_stacked_layers:
+  if train_config.tpu_config.use_scan_layers:
     # Expert parallelism shards `moe.experts` on a mesh of its own. A stack is
     # one tensor sharded once, so there is nowhere to put that. Refusing MoE
     # already covers every model that can set this; the check is here so the
     # flag gets named instead of failing somewhere further in.
     if train_config.parallelism.expert_parallel_degree > 1:
       raise ValueError(
-          "--tpu-config.use-stacked-layers cannot be combined with "
+          "--tpu-config.use-scan-layers cannot be combined with "
           "--parallelism.expert-parallel-degree > 1 "
           "(https://github.com/google-pytorch/torchtitan/issues/395)."
       )
-    # Stacking is a property of the model, so it is expressed as a config
-    # rewrite: the recipe gets put on a model class that stacks itself on
-    # construction, and nothing in the parallelize path has to know about it.
+    # Scanning is a property of the model, so it is expressed as a config
+    # rewrite: the recipe gets put on a model class that stacks its layer
+    # weights on construction and runs them as one scan, and nothing in the
+    # parallelize path has to know about it.
     #
     # The rewrite happens here rather than in the recipe because the
     # GraphTrainer model spec built above comes from a fixed class in the
     # graph-trainer registry, which discards whatever the recipe had set.
     graph_config.model_spec = dataclasses.replace(
         graph_config.model_spec,
-        model=with_tpu_stacked_layers(graph_config.model_spec.model),
+        model=with_tpu_stacked_layers(
+            graph_config.model_spec.model, use_scan=True
+        ),
     )
     # The rewrite is only a config edit, so anything added after it that
     # rebuilds `model_spec` from a fixed class drops it again -- and an
