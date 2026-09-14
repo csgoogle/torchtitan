@@ -20,7 +20,7 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 - **SparseCore Offloading**: This configuration achieves high MFU by utilizing
   SparseCore collective offloading for FSDP, requested through the config's
   `--libtpu-init-flags` and exported before PJRT initialization.
-- **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--tpu_config.compile_optimizer` and `--tpu_config.optimizer_in_graph`.
+- **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--compile.optimizer_in_graph`.
 - **Splash Attention**: Q/K/V layouts and backward tiles are tuned for this
   model and topology.
 
@@ -66,10 +66,7 @@ xpk workload create \
     --splash_attention_kernel.sa_block_kv_dkv_compute=1024 \
     --splash_attention_kernel.sa_block_q_dq=1024 \
     --splash_attention_kernel.sa_block_kv_dq=1024 \
-    --tpu_config.use_graph_trainer \
-    --tpu_config.compile_mode=aot_fx_trace \
-    --tpu_config.compile_optimizer \
-    --tpu_config.optimizer_in_graph \
+    --compile.optimizer_in_graph \
     --libtpu-init-flags='xla_tpu_dvfs_p_state=7 xla_tpu_scoped_vmem_limit_kib=65472 xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_latency_hiding_layer_scheduler=true xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false'"
 ```
 

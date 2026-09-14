@@ -4,13 +4,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""TPU GraphTrainer config conversion."""
+"""Configuration and validation owned by TPU GraphTrainer."""
 
 import dataclasses
-from collections.abc import Callable
-from typing import TypeVar
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal
 
-from torchtitan.experiments.graph_trainer.configs import to_graph_trainer_config
+from torchtitan.experiments.graph_trainer.configs import (
+    GraphTrainerCompileConfig,
+    GraphTrainerMemoryPolicy,
+)
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
@@ -18,26 +21,101 @@ from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
 )
 from torchtitan.experiments.tpu.layer_loop import builds_layer_loop
-from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
-from torchtitan.protocols.model_spec import ModelSpec
+
+if TYPE_CHECKING:
+  from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+      TpuGraphTrainer,
+  )
 
 
-ConfigT = TypeVar("ConfigT")
+GraphTrainerFSDPSchedule = Literal["none", "prefetch", "interleave"]
+BackwardPartitionMode = Literal["none", "by_layer", "fsdp_pipeline"]
+TpuGraphTrainerMemoryPolicy = Literal[
+    GraphTrainerMemoryPolicy, "full_and_offload", "full_and_scan_offload"
+]
 
 
-def _validate_fsdp_allreduce_slice(
-    train_config: TPUTrainerConfig,
-) -> None:
-  patterns = train_config.tpu_config.fsdp_allreduce_slice_parameter_patterns
+@dataclass(kw_only=True, slots=True)
+class GraphSplitterConfig:
+  """Partition a joint forward/backward trace into TPU executables.
+
+  Splitting is disabled by default. When ``enabled`` is false, all other
+  fields in this config are ignored. When enabled with
+  ``backward_partition_mode='none'``, GraphSplitter still makes separate
+  top-level forward and backward executables; the mode only controls finer
+  subdivision of the backward executable.
+
+  GraphSplitter and ``fsdp_schedule`` are alternative scheduling strategies
+  and cannot currently be enabled together.
+  """
+
+  enabled: bool = False
+  # Maximum number of complete transformer layers assigned to one forward
+  # executable. -1 keeps forward as one executable.
+  forward_layers_per_executable: int = -1
+  # Assign non-layer work before the first transformer layer to its own partition.
+  forward_isolate_prefix: bool = False
+  # Backward subdivision applied after the top-level forward/backward split.
+  # ``by_layer`` groups adjacent layer backward computations and co-locates any
+  # attributable FSDP collective chains with their layer. ``fsdp_pipeline``
+  # instead moves each layer's AG earlier and RS later to form overlap stages.
+  backward_partition_mode: BackwardPartitionMode = "none"
+  # Maximum number of complete transformer layers assigned to one backward
+  # executable. Grouping layers widens the compiler scheduling window without
+  # changing activation-checkpoint boundaries.
+  backward_layers_per_executable: int = 1
+  # Reuse dead internal split-boundary buffers through XLA input donation.
+  # This remains False until TorchTPU includes donation in its compilation
+  # cache key (torch_tpu#3614).
+  donate_internal_buffers: bool = False
+  # Number of complete backward child executables by which to advance each H2D
+  # reload pair relative to its first consumer.
+  cpu_offload_prefetch_executables: int = 0
+
+
+@dataclass(kw_only=True, slots=True)
+class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
+  """Compilation and graph-transformation policy for TPU GraphTrainer."""
+
+  backend: str = "tpu"
+  pass_pipeline: str = "tpu"
+  memory_policy: TpuGraphTrainerMemoryPolicy = "default"
+  # Compile the optimizer step into the joint forward/loss/backward graph.
+  optimizer_in_graph: bool = False
+  # Stack decoder-layer parameters and execute the layers with one scan.
+  # Checkpoint keys remain per-layer; optimizer checkpoint names change.
+  use_scan_layers: bool = False
+  # Run TPU's post-rematerialization scheduling pass. This does not select the
+  # memory policy: ``memory_policy`` decides what is saved, recomputed, or
+  # offloaded. This flag only reorders already-rematerialized layer work so its
+  # workspace stays local. It therefore has no effect with no memory policy.
+  remat_schedule: bool = False
+  # Schedule recomputed SimpleFSDP collectives around dense backward compute.
+  # ``prefetch`` preserves recomputed all-gathers and places them in preceding
+  # dense compute. ``interleave`` additionally fences each next all-gather on
+  # the prior reduce-scatter, reducing memory at the cost of AG/RS concurrency.
+  # This requires remat_schedule and does not compose with GraphSplitter.
+  fsdp_schedule: GraphTrainerFSDPSchedule = "none"
+  # Release layer L's recomputed parameters at backward layer L+N.
+  fsdp_prefetch_distance: int = 1
+  graph_split: GraphSplitterConfig = field(default_factory=GraphSplitterConfig)
+  # Lower selected FSDP gradient reduce-scatters as all-reduce plus rank-local
+  # slice. Patterns match parameter FQNs; an empty tuple disables the rewrite.
+  fsdp_allreduce_slice_parameter_patterns: tuple[str, ...] = ()
+  fsdp_allreduce_slice_max_input_bytes: int = 0
+
+
+def _validate_fsdp_allreduce_slice(config: "TpuGraphTrainer.Config") -> None:
+  patterns = config.compile.fsdp_allreduce_slice_parameter_patterns
   if not patterns:
     return
 
-  if train_config.tpu_config.fsdp_allreduce_slice_max_input_bytes <= 0:
+  if config.compile.fsdp_allreduce_slice_max_input_bytes <= 0:
     raise ValueError(
         "fsdp all-reduce-plus-slice requires a positive maximum input size"
     )
 
-  parallelism = train_config.parallelism
+  parallelism = config.parallelism
   if not parallelism.use_simple_fsdp:
     raise ValueError("fsdp all-reduce-plus-slice requires SimpleFSDP")
   if (
@@ -47,90 +125,83 @@ def _validate_fsdp_allreduce_slice(
       or parallelism.context_parallel_degree != 1
       or parallelism.pipeline_parallel_degree != 1
       or parallelism.expert_parallel_degree != 1
-    ):
+  ):
     raise ValueError(
         "fsdp all-reduce-plus-slice currently requires full-world FSDP "
         "with DP-replicate/TP/CP/PP/EP degrees all equal to 1"
     )
-  if train_config.training.mixed_precision_reduce != "float32":
+  if config.training.mixed_precision_reduce != "float32":
     raise ValueError(
         "fsdp all-reduce-plus-slice currently requires FP32 FSDP reductions"
     )
 
 
-def to_tpu_graph_trainer_config(
-    train_config: TPUTrainerConfig,
-    model_registry: Callable[[str], ModelSpec],
-    target_cls: type[ConfigT],
-) -> ConfigT:
-  """Convert a TPU recipe and propagate its TPU-only GraphTrainer settings."""
-  tpu_config = train_config.tpu_config
-  _validate_fsdp_allreduce_slice(train_config)
+def apply_tpu_graph_trainer_model_transforms(
+    config: "TpuGraphTrainer.Config",
+) -> None:
+  """Validate TPU graph options and apply CLI-selected model transforms.
+
+  Recipes construct the final ``TpuGraphTrainer.Config`` before CLI parsing,
+  but scan is itself a model-class choice and the CLI value is only known
+  afterward. TpuGraphTrainer calls this once, before its base class builds the
+  model, so ``compile.use_scan_layers`` can select the scanned model class.
+  """
+  _validate_fsdp_allreduce_slice(config)
+
+  compile_config = config.compile
+  if compile_config.optimizer_in_graph and config.tpu_config.compile_grad_norm:
+    raise ValueError(
+        "compile_grad_norm cannot be combined with optimizer_in_graph"
+    )
   if (
-      train_config.parallelism.fsdp_reshard_after_forward == "always"
-      and not tpu_config.use_scan_layers
-      and not tpu_config.use_graph_split
-      and tpu_config.graph_trainer_fsdp_schedule == "none"
+      config.parallelism.fsdp_reshard_after_forward == "always"
+      and not compile_config.use_scan_layers
+      and not compile_config.graph_split.enabled
+      and compile_config.fsdp_schedule == "none"
   ):
     raise ValueError(
-        "GraphTrainer ZeRO-3 requires use_graph_split, use_scan_layers, or "
-        "graph_trainer_fsdp_schedule='prefetch'/'interleave'; without one, "
-        "XLA can merge forward and recomputed all-gathers and retain full "
-        "parameters through backward."
+        "TPU GraphTrainer ZeRO-3 requires compile.use_scan_layers, "
+        "compile.graph_split.enabled, or compile.fsdp_schedule="
+        "'prefetch'/'interleave'; without one, XLA can merge forward and "
+        "recomputed all-gathers and retain full parameters through backward."
     )
-  memory_policy = tpu_config.graph_trainer_memory_policy
-  budget = tpu_config.graph_trainer_cpu_offload_budget_gb
+
+  memory_policy = compile_config.memory_policy
   if (
-      tpu_config.use_scan_layers
+      compile_config.use_scan_layers
       and memory_policy.endswith("_and_offload")
       and memory_policy != "full_and_scan_offload"
   ):
     raise ValueError(
         f"generic offload policy {memory_policy!r} is unsupported with scan; "
-        "use the scan-specific 'full_and_scan_offload' policy from PR #374"
+        "use the scan-specific 'full_and_scan_offload' policy"
     )
-  if budget < 0:
+  if compile_config.cpu_offload_budget_gb < 0:
     raise ValueError("CPU-offload budget must be nonnegative")
-  graph_config = to_graph_trainer_config(
-      train_config, model_registry, target_cls=target_cls
-  )
-  graph_config.compile.memory_policy = memory_policy
-  graph_config.compile.cpu_offload_budget_gb = budget
-  if tpu_config.use_scan_layers:
-    check_scan_parallelism(train_config.parallelism)
-    # Expert parallelism shards `moe.experts` on a mesh of its own. A stack is
-    # one tensor sharded once, so there is nowhere to put that. Refusing MoE
-    # already covers every model that can set this; the check is here so the
-    # flag gets named instead of failing somewhere further in.
-    if train_config.parallelism.expert_parallel_degree > 1:
-      raise ValueError(
-          "--tpu-config.use-scan-layers cannot be combined with "
-          "--parallelism.expert-parallel-degree > 1 "
-          "(https://github.com/google-pytorch/torchtitan/issues/395)."
-      )
-    # Scanning is a property of the model, so it is expressed as a config
-    # rewrite: the recipe gets put on a model class that stacks its layer
-    # weights on construction and runs them as one scan, and nothing in the
-    # parallelize path has to know about it.
-    #
-    # The rewrite happens here rather than in the recipe because the
-    # GraphTrainer model spec built above comes from a fixed class in the
-    # graph-trainer registry, which discards whatever the recipe had set.
-    graph_config.model_spec = dataclasses.replace(
-        graph_config.model_spec,
-        model=with_tpu_stacked_layers(
-            graph_config.model_spec.model, use_scan=True
-        ),
+
+  if not compile_config.use_scan_layers:
+    return
+
+  check_scan_parallelism(config.parallelism)
+  if config.parallelism.expert_parallel_degree > 1:
+    raise ValueError(
+        "--compile.use-scan-layers cannot be combined with "
+        "--parallelism.expert-parallel-degree > 1 "
+        "(https://github.com/google-pytorch/torchtitan/issues/395)."
     )
-    # The rewrite is only a config edit, so anything added after it that
-    # rebuilds `model_spec` from a fixed class drops it again -- and an
-    # unstacked run looks entirely normal. Check the promise this function
-    # makes, rather than leaving it to the ordering comment above.
-    if not builds_layer_loop(graph_config.model_spec.model):
-      raise AssertionError(
-          "--tpu-config.use-scan-layers did not survive config conversion"
-      )
-  return graph_config
+  assert config.model_spec is not None
+  config.model_spec = dataclasses.replace(
+      config.model_spec,
+      model=with_tpu_stacked_layers(config.model_spec.model, use_scan=True),
+  )
+  if not builds_layer_loop(config.model_spec.model):
+    raise AssertionError("--compile.use-scan-layers did not produce a scan")
 
 
-__all__ = ["to_tpu_graph_trainer_config"]
+__all__ = [
+    "GraphSplitterConfig",
+    "GraphTrainerFSDPSchedule",
+    "TpuGraphTrainerCompileConfig",
+    "TpuGraphTrainerMemoryPolicy",
+    "apply_tpu_graph_trainer_model_transforms",
+]

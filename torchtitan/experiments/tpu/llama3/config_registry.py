@@ -5,10 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer, default_adamw
+from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
@@ -21,6 +21,18 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
     TPUTrainerConfig,
+)
+from torchtitan.experiments.graph_trainer.llama3 import (
+    model_registry as graph_trainer_model_registry,
+)
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    TpuGraphTrainerCompileConfig,
+)
+from torchtitan.experiments.tpu.graph_trainer.recipe import (
+    to_tpu_graph_trainer_config,
+)
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+    TpuGraphTrainer,
 )
 from torchtitan.hf_datasets.text_datasets import (
     ChatDataLoader,
@@ -43,20 +55,24 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
   config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
-def _on_scan_lane(config: TPUTrainerConfig) -> TPUTrainerConfig:
+def _on_scan_lane(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
   """Move a recipe onto the graph trainer with scanned layers and host offload.
 
   Offload is not optional above 8B: without it the scan bodies keep every
   layer's input live and 405B does not compile.
   """
-  config.tpu_config.use_graph_trainer = True
-  config.tpu_config.compile_mode = "aot_fx_trace"
-  config.tpu_config.use_scan_layers = True
-  config.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  graph_config = to_tpu_graph_trainer_config(
+      config, graph_trainer_model_registry
+  )
+  graph_config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      memory_policy="full_and_scan_offload",
+      use_scan_layers=True,
+  )
   # bf16 Adam moments halve the optimizer state, which is 12.7 GiB at 405B and
   # the difference between sequence 8192 fitting and not.
-  config.optimizer.implementation = "fused_opt_states_bf16"
-  return config
+  graph_config.optimizer.implementation = "fused_opt_states_bf16"
+  return graph_config
 
 
 def llama3_debugmodel() -> TPUTrainerConfig:
@@ -97,6 +113,15 @@ def llama3_debugmodel() -> TPUTrainerConfig:
       ),
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  return config
+
+
+def graph_trainer_llama3_debugmodel() -> TpuGraphTrainer.Config:
+  """Llama3 debug model using TPU GraphTrainer."""
+  config = to_tpu_graph_trainer_config(
+      llama3_debugmodel(), graph_trainer_model_registry
+  )
+  config.compile = TpuGraphTrainerCompileConfig(enable=True)
   return config
 
 
@@ -426,16 +451,16 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
   return config
 
 
-def llama3_8b_scan() -> TPUTrainerConfig:
+def llama3_8b_scan() -> TpuGraphTrainer.Config:
   """Llama3 8B on the scan lane."""
   return _on_scan_lane(llama3_8b())
 
 
-def llama3_70b_scan() -> TPUTrainerConfig:
+def llama3_70b_scan() -> TpuGraphTrainer.Config:
   """Llama3 70B on the scan lane."""
   return _on_scan_lane(llama3_70b())
 
 
-def llama3_405b_scan() -> TPUTrainerConfig:
+def llama3_405b_scan() -> TpuGraphTrainer.Config:
   """Llama3 405B on the scan lane. Layerwise does not compile at this size."""
   return _on_scan_lane(llama3_405b())

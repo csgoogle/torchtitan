@@ -5,18 +5,27 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer, default_adamw
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.components.optimizer import default_adamw
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.experiments.tpu.tpu_job_config import (
-    SplashAttentionKernelConfig,
-    TPUTrainerConfig,
+from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.experiments.graph_trainer.deepseek_v3 import (
+    model_registry as graph_trainer_model_registry,
+)
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    TpuGraphTrainerCompileConfig,
+)
+from torchtitan.experiments.tpu.graph_trainer.recipe import (
+    to_tpu_graph_trainer_config,
+)
+from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+    TpuGraphTrainer,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.deepseek_v3.config_registry import model_registry
@@ -51,3 +60,12 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
       ),
       activation_checkpoint=SelectiveAC.Config(),
   )
+
+
+def graph_trainer_deepseek_v3_debugmodel() -> TpuGraphTrainer.Config:
+  """DeepSeek-v3 debug model using TPU GraphTrainer."""
+  config = to_tpu_graph_trainer_config(
+      deepseek_v3_debugmodel(), graph_trainer_model_registry
+  )
+  config.compile = TpuGraphTrainerCompileConfig(enable=True)
+  return config

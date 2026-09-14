@@ -20,13 +20,15 @@ Note there are 2 ways of compiling the optimizer graph on TPU:
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
 import torch
+from torch import nn
 
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer import (
@@ -35,16 +37,16 @@ from torchtitan.components.optimizer import (
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu import workarounds
-from torchtitan.experiments.tpu.compiled_optimizers.functional import (
-    functional_adamw_step,
-    update_model_and_optstate_buffers,
-)
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
 from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     GraphSplitter,
+)
+from torchtitan.experiments.tpu.graph_trainer.config import (
+    TpuGraphTrainerCompileConfig,
+    apply_tpu_graph_trainer_model_transforms,
 )
 from torchtitan.experiments.tpu.graph_trainer.mfu_benchmark import MfuBenchmark
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
@@ -54,37 +56,6 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.tools.logging import logger
-
-
-@dataclass
-class TpuGraphTrainerConfig:
-    """Subset of job/TPU config carried forward into TpuGraphTrainer."""
-
-    device: str = "tpu"
-    attention_backend: str = "sdpa-no-scale"
-    moe_enabled: bool = False
-    moe_padded_dispatcher: bool = False
-    moe_capacity_factor: float = 1.25
-    ep_degree: int = 1
-    optimizer_in_graph: bool = False
-    optimizer_compile: bool = False
-    compile_mode: str = "none"
-    enable_mfu_benchmark: bool = False
-    mfu_benchmark_start_step: int = 5
-    mfu_benchmark_final_step: int = 0
-    job_config: Optional[TPUTrainerConfig] = None
-
-
-def _optimizer_in_graph_enabled(config, tpu_extra) -> bool:
-    if tpu_extra is not None and getattr(tpu_extra, "optimizer_in_graph", False):
-        return True
-    return bool(getattr(config.compile, "optimizer_in_graph", False))
-
-
-def _optimizer_compile_enabled(config, tpu_extra) -> bool:
-    if tpu_extra is not None and getattr(tpu_extra, "optimizer_compile", False):
-        return True
-    return bool(getattr(config.compile, "optimizer_compile", False))
 
 
 class TpuGraphTrainer(GraphTrainer):
@@ -110,9 +81,11 @@ class TpuGraphTrainer(GraphTrainer):
 
     @dataclass(kw_only=True, slots=True)
     class Config(GraphTrainer.Config, TPUTrainerConfig):
-        pass
+        compile: TpuGraphTrainerCompileConfig = field(
+            default_factory=TpuGraphTrainerCompileConfig
+        )
 
-    def __init__(self, config, *, tpu_extra: Optional[TpuGraphTrainerConfig] = None) -> None:
+    def __init__(self, config: Config) -> None:
         """Override of GraphTrainer.__init__ adding TPU pipeline registration, Pallas loss, and opt-in-graph setup."""
         if isinstance(config.loss, ChunkedLossWrapper.Config):
             raise ValueError(
@@ -120,6 +93,19 @@ class TpuGraphTrainer(GraphTrainer):
                 "FX unrolls its loop and defeats bounded-memory execution; use "
                 "CrossEntropyLoss or PallasCrossEntropyLoss"
             )
+        apply_tpu_graph_trainer_model_transforms(config)
+        assert config.model_spec is not None
+        parallelize_fn = config.model_spec.parallelize_fn
+        assert parallelize_fn is not None
+
+        def tpu_graph_parallelize(model, *args, **kwargs):
+            workarounds.apply_patches(model, config)
+            kwargs.pop("tpu_compile_mode", None)
+            return parallelize_fn(model, *args, **kwargs)
+
+        config.model_spec = dataclasses.replace(
+            config.model_spec, parallelize_fn=tpu_graph_parallelize
+        )
         # Ensure the 'tpu' pass pipeline is registered before GraphTrainer traces/compiles
         register_tpu_pipeline()
 
@@ -136,13 +122,14 @@ class TpuGraphTrainer(GraphTrainer):
             for group in opt.param_groups:
                 group["capturable"] = True
 
-        self._tpu_extra = tpu_extra
-        self._optimizer_in_graph = _optimizer_in_graph_enabled(config, tpu_extra)
+        self._optimizer_in_graph = config.compile.optimizer_in_graph
+        if self._optimizer_in_graph and config.tpu_config.compile_grad_norm:
+            raise ValueError(
+                "compile_grad_norm cannot be combined with optimizer_in_graph"
+            )
         self._compiled_grad_norm = (
             CompiledGradNorm() if config.tpu_config.compile_grad_norm else None
         )
-        if tpu_extra is not None and tpu_extra.device == "tpu":
-            _apply_tpu_moe_post_init(self.model_parts, tpu_extra)
 
         # Only dump weight/buffer statistics when debug logging is explicitly enabled per review comment.
         if logger.isEnabledFor(logging.DEBUG):
@@ -152,7 +139,7 @@ class TpuGraphTrainer(GraphTrainer):
             self._opt_state_registered = False
 
         self._optimizer_compile = (
-            _optimizer_compile_enabled(config, tpu_extra) and not self._optimizer_in_graph
+            config.tpu_config.compile_optimizer and not self._optimizer_in_graph
         )
         self._graph_splitter = GraphSplitter.from_trainer_config(
             config,
@@ -162,11 +149,11 @@ class TpuGraphTrainer(GraphTrainer):
             apply_compiled_optimizer(self)
 
         self._mfu_benchmark = None
-        if tpu_extra is not None and tpu_extra.enable_mfu_benchmark:
+        if config.tpu_config.enable_mfu_benchmark:
             self._mfu_benchmark = MfuBenchmark(
                 self.metrics_processor,
-                start_step=tpu_extra.mfu_benchmark_start_step,
-                final_step=tpu_extra.mfu_benchmark_final_step,
+                start_step=config.tpu_config.mfu_benchmark_start_step,
+                final_step=config.training.steps,
             )
 
     def train_step(
@@ -691,10 +678,3 @@ def _dump_weight_stats(model_parts) -> None:
       except Exception as e:
         logger.debug(f"[debug_weights]   buf {name}: <error {type(e).__name__}: {e}>")
   logger.debug("[debug_weights] === end ===")
-
-
-def _apply_tpu_moe_post_init(model_parts, tpu_extra: TpuGraphTrainerConfig) -> None:
-    """Apply our own experiments/tpu/workarounds.py patches post-super().__init__."""
-    for model in model_parts:
-        if tpu_extra.job_config is not None:
-            workarounds.apply_patches(model, tpu_extra.job_config)

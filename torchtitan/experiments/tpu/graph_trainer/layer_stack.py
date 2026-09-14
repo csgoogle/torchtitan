@@ -396,7 +396,7 @@ class LayerStack:
             )
         if use_scan:
             # Logged because a recipe would otherwise believe its own setting:
-            # `graph_trainer_memory_policy` tags joint-graph nodes, and the
+            # `compile.memory_policy` tags joint-graph nodes, and the
             # body's are not in it. Only `LayerStack.run`'s budget reaches them,
             # and it must be 0.0 or the in-body gather is saved instead of
             # recomputed.
