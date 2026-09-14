@@ -17,6 +17,7 @@ import socket
 import tempfile
 import unittest
 
+from absl.testing import absltest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
@@ -211,4 +212,4 @@ class OptimizerStateTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    absltest.main()
