@@ -445,6 +445,8 @@ def apply_simple_fsdp(
 
     For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
     on the EDP mesh when expert parallelism is enabled.
+
+    A submodule can carry ``_fsdp_shard_dim`` to be sharded on a different axis.
     """
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
@@ -489,6 +491,19 @@ def apply_simple_fsdp(
                 mp_policy=mp_policy,
                 shard_dim=experts_shard_dim,
             )
+
+    # A submodule carrying `_fsdp_shard_dim` is sharded on that axis instead of
+    # the default -- layer stacking sets it, because dim 0 of a stack is the
+    # layer axis. Separate walk, run first: one walk can only use one axis, and
+    # `data_parallel` skips a module it has already sharded.
+    for sub in [m for m in model.modules() if hasattr(m, "_fsdp_shard_dim")]:
+        data_parallel(
+            sub,
+            dp_mesh,
+            dp_mode,
+            mp_policy=mp_policy,
+            shard_dim=sub._fsdp_shard_dim,
+        )
 
     model = data_parallel(
         model,

@@ -15,11 +15,13 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 
+from torchtitan.config import derive
 from torchtitan.experiments.tpu.layer_loop import (
     _forward,
+    builds_layer_loop,
     runs_layer_loop,
     TpuLayerLoop,
-    with_tpu_layer_loop,
+    tpu_model_class,
 )
 from torchtitan.models.common import Linear
 from torchtitan.models.common.decoder import Decoder
@@ -40,6 +42,11 @@ def _stock_config():
   return config
 
 
+def _convert(config):
+  """What a caller does: put the recipe on the layer-loop model class."""
+  return derive(config, tpu_model_class(type(config)).Config)
+
+
 def _recast(config, cls):
   """Re-class a config, the way `MaxTextQwen3Config.from_qwen3` does."""
   # Shallow: `dataclasses.asdict` would flatten the nested configs.
@@ -48,7 +55,7 @@ def _recast(config, cls):
 
 
 def _tpu_model():
-  model = with_tpu_layer_loop(_stock_config()).build()
+  model = _convert(_stock_config()).build()
   torch.manual_seed(0)
   model.init_states()
   model.eval()
@@ -205,17 +212,21 @@ class ConfigRewriteTest(absltest.TestCase):
 
   def test_rewrite_swaps_the_model_class_and_keeps_every_field(self) -> None:
     stock = _stock_config()
-    converted = with_tpu_layer_loop(stock)
+    converted = _convert(stock)
 
     self.assertEqual(type(converted)._owner.__name__, "TpuLlama3Model")
     for f in dataclasses.fields(stock):
       self.assertEqual(getattr(converted, f.name), getattr(stock, f.name), f.name)
     # One class per config class, so rewriting twice is a no-op.
-    self.assertIs(type(with_tpu_layer_loop(converted)), type(converted))
+    self.assertIs(type(_convert(converted)), type(converted))
 
     model = converted.build()
     self.assertIsInstance(model, Llama3Model)
     self.assertTrue(runs_layer_loop(model))
+    # The same answer off the config alone, for callers that check the rewrite
+    # landed before anything is built.
+    self.assertTrue(builds_layer_loop(converted))
+    self.assertFalse(builds_layer_loop(stock))
 
   def test_rewrite_keeps_an_earlier_root_config_replacement(self) -> None:
     """qwen3's TPU registry swaps the root config to override FLOP accounting."""
@@ -226,7 +237,7 @@ class ConfigRewriteTest(absltest.TestCase):
       def get_nparams_and_flops(self, *args, **kwargs):
         return (0, 0)
 
-    converted = with_tpu_layer_loop(_recast(_stock_config(), CustomFlopsConfig))
+    converted = _convert(_recast(_stock_config(), CustomFlopsConfig))
 
     self.assertIsInstance(converted, CustomFlopsConfig)
     self.assertEqual(converted.get_nparams_and_flops(), (0, 0))
@@ -243,7 +254,7 @@ class ConfigRewriteTest(absltest.TestCase):
   def test_rewrite_rejects_what_it_cannot_convert(self) -> None:
     """A non-decoder root, and a model whose own `forward` it would shadow."""
     with self.assertRaisesRegex(TypeError, "stock forward"):
-      with_tpu_layer_loop(Linear.Config(in_features=4, out_features=4))
+      _convert(Linear.Config(in_features=4, out_features=4))
 
     class ForwardOwningModel(Llama3Model):
 
@@ -255,7 +266,7 @@ class ConfigRewriteTest(absltest.TestCase):
         raise AssertionError("never called")
 
     with self.assertRaisesRegex(TypeError, "stock forward"):
-      with_tpu_layer_loop(_recast(_stock_config(), ForwardOwningModel.Config))
+      _convert(_recast(_stock_config(), ForwardOwningModel.Config))
 
 
 if __name__ == "__main__":

@@ -3,9 +3,9 @@
 ``Decoder.forward`` loops over the layers inline, so running them any other way
 -- as one ``scan``, or with a gather or an offload around each layer -- means
 owning that loop. :class:`TpuLayerLoop` is ``model.layers`` as a container that
-runs its own layers, and :func:`with_tpu_layer_loop` puts the model on a
-subclass whose ``forward`` calls it. Recipes that skip the rewrite are
-untouched. Design: google-pytorch/torchtitan#380.
+runs its own layers, and :func:`tpu_model_class` builds the model subclass whose
+``forward`` calls it. Recipes that skip the rewrite are untouched.
+Design: google-pytorch/torchtitan#380.
 """
 
 import functools
@@ -13,7 +13,6 @@ from dataclasses import dataclass
 
 import torch
 
-from torchtitan.config import derive
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     segment_ids_from_positions,
@@ -22,7 +21,13 @@ from torchtitan.models.common.decoder import Decoder
 from torchtitan.protocols.module import ModuleDict
 
 
-__all__ = ["TpuLayerLoop", "runs_layer_loop", "with_tpu_layer_loop"]
+__all__ = [
+    "TpuLayerLoop",
+    "builds_layer_loop",
+    "model_subclass",
+    "runs_layer_loop",
+    "tpu_model_class",
+]
 
 
 class TpuLayerLoop(ModuleDict):
@@ -84,18 +89,40 @@ def runs_layer_loop(model: torch.nn.Module) -> bool:
     return type(model).forward is _forward
 
 
+def builds_layer_loop(model_config: Decoder.Config) -> bool:
+    """Whether ``model_config.build()`` would satisfy :func:`runs_layer_loop`.
+
+    Lets a caller check the rewrite landed without building the model.
+    """
+    return model_config._owner.forward is _forward
+
+
+def model_subclass(model_cls: type, config_cls: type, name: str, **body) -> type:
+    """Subclasses ``model_cls``, giving the subclass a ``Config`` of its own.
+
+    ``build()`` instantiates ``Config._owner``, so a rewrite needs both halves.
+    ``config_cls`` is passed in rather than read off ``model_cls`` because the
+    recipe may have substituted one (qwen3 does, for FLOP accounting).
+    """
+    subclass_config = dataclass(kw_only=True, slots=True)(
+        type("Config", (config_cls,), {"__qualname__": f"{name}.Config"})
+    )
+    return type(name, (model_cls,), {**body, "Config": subclass_config})
+
+
 @functools.cache
-def _tpu_model_class(config_cls: type) -> type:
+def tpu_model_class(config_cls: type) -> type:
     """Builds the ``Tpu<Model>`` subclass whose ``forward`` is ``_forward``.
 
     ``config_cls`` is a model's nested ``Config``, and ``Config._owner`` the
-    model class that declares it -- the class to subclass, and the one
-    ``build()`` instantiates, so the subclass needs a ``Config`` of its own.
+    model class that declares it.
 
-    Written with ``type`` because neither base is known here: the model class
-    differs per family and per trainer, and the ``Config`` base has to be the
-    one the recipe ended up with (qwen3 substitutes its own, for FLOP
-    accounting). One class per config class, cached.
+    Put the recipe on the new ``Config`` with ``derive``. Do it last: any later
+    rewrite that rebuilds the root config from a fixed class undoes this one,
+    which is also why it cannot go on a recipe -- ``experiments/tpu/train.py``
+    rebuilds ``model_spec`` from the graph-trainer registry.
+
+    One class per config class, cached.
     """
     model_cls = config_cls._owner
     if model_cls.forward is _forward:
@@ -104,25 +131,6 @@ def _tpu_model_class(config_cls: type) -> type:
         raise TypeError(
             f"{model_cls.__name__} is not a Decoder running the stock forward"
         )
-
-    name = f"Tpu{model_cls.__name__}"
-    tpu_config_cls = dataclass(kw_only=True, slots=True)(
-        type("Config", (config_cls,), {"__qualname__": f"{name}.Config"})
+    return model_subclass(
+        model_cls, config_cls, f"Tpu{model_cls.__name__}", forward=_forward
     )
-    return type(name, (model_cls,), {"forward": _forward, "Config": tpu_config_cls})
-
-
-def with_tpu_layer_loop(model_config: Decoder.Config) -> Decoder.Config:
-    """Puts ``model_config`` on a model that runs its layers container.
-
-    Every other field is carried over unchanged, and the model still loops
-    exactly as ``Decoder`` did until something puts a :class:`TpuLayerLoop` in
-    ``model.layers``.
-
-    Applied by ``to_tpu_graph_trainer_config`` (``graph_trainer/config.py``)
-    when stacked or scanned layers are on, and applied last: any rewrite that
-    rebuilds the root config from a fixed class undoes this one, which is also
-    why it cannot go on a recipe -- ``experiments/tpu/train.py`` rebuilds
-    ``model_spec`` from the graph-trainer registry.
-    """
-    return derive(model_config, _tpu_model_class(type(model_config)).Config)
