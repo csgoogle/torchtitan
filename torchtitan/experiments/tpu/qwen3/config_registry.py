@@ -320,6 +320,7 @@ def qwen3_8b() -> TPUTrainerConfig:
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
+          enable_tpu_topo_mesh=True,
           # The current best-performing benchmark recipe uses Zero-2. Keep it
           # explicit while Zero-3 memory/overlap policy is tuned separately.
           fsdp_reshard_after_forward="never",
@@ -346,12 +347,15 @@ def qwen3_8b() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          sa_q_layout="SEQ_MINOR",
+          sa_k_layout="SEQ_MINOR",
+          sa_v_layout="HEAD_DIM_MINOR",
           sa_block_q=1024,
           sa_block_kv=1024,
           sa_block_dkv=1024,
-          sa_block_kv_compute=1024,
-          sa_block_q_dkv=1024,
-          sa_block_kv_dkv=1024,
+          sa_block_kv_compute=512,
+          sa_block_q_dkv=2048,
+          sa_block_kv_dkv=2048,
           sa_block_kv_dkv_compute=1024,
           sa_block_q_dq=1024,
           sa_block_kv_dq=1024,
@@ -364,6 +368,33 @@ def qwen3_8b() -> TPUTrainerConfig:
   )
   _enable_pallas_cross_entropy(config)
   return config
+
+
+def qwen3_8b_zero3() -> TPUTrainerConfig:
+  """Qwen3 8B GraphTrainer recipe retaining sharded parameters after forward."""
+  cfg = qwen3_8b()
+  cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.tpu_config.graph_trainer_memory_policy = "full"
+  cfg.tpu_config.enable_graph_trainer_remat_schedule = True
+  cfg.tpu_config.graph_trainer_fsdp_schedule = "interleave"
+  cfg.splash_attention_kernel.use_vmap_bwd = True
+  cfg.splash_attention_kernel.sa_use_document_aware_block_skipping = False
+  return cfg
+
+
+def qwen3_8b_maxtext_parity() -> TPUTrainerConfig:
+  """Qwen3 8B recipe matching currently available MaxText policies.
+
+  MaxText keeps parameters sharded across its FSDP axis and rematerializes the
+  layer body, which is operationally closest to Zero-3. Relative to the tuned
+  Zero-3 recipe, this also rotates Q/K and reduces FSDP gradients in BF16.
+  Layer scan is intentionally omitted, so this matches numerical and kernel
+  policy but not the loop representation.
+  """
+  cfg = qwen3_8b_zero3()
+  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
+  return cfg
 
 
 def qwen3_moe_30b() -> TPUTrainerConfig:

@@ -64,11 +64,24 @@ def to_tpu_graph_trainer_config(
     target_cls: type[ConfigT],
 ) -> ConfigT:
   """Convert a TPU recipe and propagate its TPU-only GraphTrainer settings."""
+  tpu_config = train_config.tpu_config
   _validate_fsdp_allreduce_slice(train_config)
-  memory_policy = train_config.tpu_config.graph_trainer_memory_policy
-  budget = train_config.tpu_config.graph_trainer_cpu_offload_budget_gb
   if (
-      train_config.tpu_config.use_scan_layers
+      train_config.parallelism.fsdp_reshard_after_forward == "always"
+      and not tpu_config.use_scan_layers
+      and not tpu_config.use_graph_split
+      and tpu_config.graph_trainer_fsdp_schedule == "none"
+  ):
+    raise ValueError(
+        "GraphTrainer ZeRO-3 requires use_graph_split, use_scan_layers, or "
+        "graph_trainer_fsdp_schedule='prefetch'/'interleave'; without one, "
+        "XLA can merge forward and recomputed all-gathers and retain full "
+        "parameters through backward."
+    )
+  memory_policy = tpu_config.graph_trainer_memory_policy
+  budget = tpu_config.graph_trainer_cpu_offload_budget_gb
+  if (
+      tpu_config.use_scan_layers
       and memory_policy.endswith("_and_offload")
       and memory_policy != "full_and_scan_offload"
   ):
@@ -83,7 +96,7 @@ def to_tpu_graph_trainer_config(
   )
   graph_config.compile.memory_policy = memory_policy
   graph_config.compile.cpu_offload_budget_gb = budget
-  if train_config.tpu_config.use_scan_layers:
+  if tpu_config.use_scan_layers:
     check_scan_parallelism(train_config.parallelism)
     # Expert parallelism shards `moe.experts` on a mesh of its own. A stack is
     # one tensor sharded once, so there is nowhere to put that. Refusing MoE
