@@ -394,6 +394,16 @@ class LayerStack:
                 "layers container, so stacking them would have no effect; the "
                 "model config has to go through `tpu_model_class` first."
             )
+        if use_scan:
+            # Logged because a recipe would otherwise believe its own setting:
+            # `graph_trainer_memory_policy` tags joint-graph nodes, and the
+            # body's are not in it. Only `LayerStack.run`'s budget reaches them,
+            # and it must be 0.0 or the in-body gather is saved instead of
+            # recomputed.
+            logger.info(
+                "Decoder layers run as a scan: the body is fully "
+                "activation-checkpointed, whatever the memory policy asks for"
+            )
         # The container holds the same layer modules, so `self.layers` keeps
         # working and is deliberately not repointed at it.
         model.layers = StackedLayers(model.layers, self, use_scan=use_scan)
@@ -499,7 +509,7 @@ class LayerStack:
             # It costs a full recompute of the body. Tagging just the gather
             # would be cheaper, but that tag lives in `node.meta["custom"]`,
             # which the body's re-trace drops before it reaches any node inside
-            # the scan.
+            # the scan. Switch once the meta survives.
             #
             # The patch is process-global, so it has to be a window; it closes
             # when this call returns. `test_layer_stack.py` checks both halves.
