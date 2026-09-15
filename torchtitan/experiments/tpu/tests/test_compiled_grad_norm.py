@@ -124,7 +124,8 @@ def _run_clip_parity(
   )
   traced_graphs = []
 
-  def capture_graph(gm, _example_inputs):
+  def capture_graph(gm, _example_inputs, *, is_fwd):
+    assert is_fwd is True
     traced_graphs.append(gm)
     return gm
 
@@ -138,7 +139,8 @@ def _run_clip_parity(
       else contextlib.nullcontext()
   )
   with compile_pass:
-    candidate_norm = grad_norm.CompiledGradNorm().clip_grad_norm_(
+    compiled_norm = grad_norm.CompiledGradNorm()
+    candidate_norm = compiled_norm.clip_grad_norm_(
         candidate,
         max_norm,
     )
@@ -155,6 +157,17 @@ def _run_clip_parity(
         candidate_parameter.grad.to_local(),
         reference_parameter.grad.to_local(),
     )
+
+  candidate[0].grad = candidate[0].grad.redistribute(
+      mesh,
+      [Replicate(), Shard(0)],
+  )
+  try:
+    compiled_norm.clip_grad_norm_(candidate, max_norm)
+  except ValueError as error:
+    assert "gradient metadata changed" in str(error)
+  else:
+    raise AssertionError("changed DTensor placements were not rejected")
 
 
 class CompiledGradNormDistributedTest(

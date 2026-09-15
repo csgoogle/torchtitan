@@ -10,7 +10,8 @@ from collections.abc import Callable
 from typing import cast
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Placement
 
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
@@ -20,6 +21,26 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     tpu_backend_compile_pass,
 )
 from torchtitan.tools.logging import logger
+
+
+GradSignature = tuple[
+    tuple[
+        torch.Size,
+        torch.dtype,
+        DeviceMesh | None,
+        tuple[Placement, ...] | None,
+    ],
+    ...,
+]
+
+
+def _grad_signature(grads: list[torch.Tensor]) -> GradSignature:
+  return tuple(
+      (grad.shape, grad.dtype, grad.device_mesh, grad.placements)
+      if isinstance(grad, DTensor)
+      else (grad.shape, grad.dtype, None, None)
+      for grad in grads
+  )
 
 
 def global_grad_norm(grads: list[torch.Tensor]) -> torch.Tensor:
@@ -42,6 +63,7 @@ class CompiledGradNorm:
 
   def __init__(self) -> None:
     self._runner: Callable[[list[torch.Tensor]], torch.Tensor] | None = None
+    self._signature: GradSignature | None = None
 
   @torch.no_grad()
   def clip_grad_norm_(
@@ -53,6 +75,7 @@ class CompiledGradNorm:
         list[torch.Tensor],
         [parameter.grad for parameter in parameters if parameter.grad is not None],
     )
+    signature = _grad_signature(grads)
     if self._runner is None:
       if not grads:
         raise ValueError("compile_grad_norm requires at least one gradient")
@@ -63,10 +86,21 @@ class CompiledGradNorm:
           len(grads),
       )
       traced = minimal_fx_tracer(global_grad_norm)(grads)
-      traced.gm = tpu_backend_compile_pass(traced.gm, traced.example_inputs)
+      # This is a standalone graph; is_fwd avoids backward-only AC marking and
+      # selects the forward debug-dump bucket.
+      traced.gm = tpu_backend_compile_pass(
+          traced.gm,
+          traced.example_inputs,
+          is_fwd=True,
+      )
       self._runner = run_traced(traced, _validate_runtime=True)
-    # run_traced rejects a changed pytree rather than trying to retrace a
-    # collective independently on ranks that might have diverged.
+      self._signature = signature
+    elif signature != self._signature:
+      raise ValueError(
+          "gradient metadata changed after compiling the gradient norm: "
+          f"trace-time {self._signature}, runtime {signature}"
+      )
+    # Do not retrace a collective independently on ranks that might diverge.
     total_norm = self._runner(grads)
 
     # Compile the collective-heavy reduction, but leave clipping as one
