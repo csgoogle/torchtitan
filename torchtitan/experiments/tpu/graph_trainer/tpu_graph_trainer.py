@@ -42,6 +42,7 @@ from torchtitan.experiments.tpu.compiled_optimizers.functional import (
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
+from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
 from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     GraphSplitter,
 )
@@ -136,6 +137,10 @@ class TpuGraphTrainer(GraphTrainer):
                 group["capturable"] = True
 
         self._tpu_extra = tpu_extra
+        self._optimizer_in_graph = _optimizer_in_graph_enabled(config, tpu_extra)
+        self._compiled_grad_norm = (
+            CompiledGradNorm() if config.tpu_config.compile_grad_norm else None
+        )
         if tpu_extra is not None and tpu_extra.device == "tpu":
             _apply_tpu_moe_post_init(self.model_parts, tpu_extra)
 
@@ -143,7 +148,6 @@ class TpuGraphTrainer(GraphTrainer):
         if logger.isEnabledFor(logging.DEBUG):
             _dump_weight_stats(self.model_parts)
 
-        self._optimizer_in_graph = _optimizer_in_graph_enabled(config, tpu_extra)
         if self._optimizer_in_graph:
             self._opt_state_registered = False
 
@@ -399,6 +403,15 @@ class TpuGraphTrainer(GraphTrainer):
                 param.grad = grad
 
         return loss
+
+    def _clip_grad_norm(self) -> torch.Tensor:
+        if self._compiled_grad_norm is None:
+            return super()._clip_grad_norm()
+        parameters = [p for m in self.model_parts for p in m.parameters()]
+        return self._compiled_grad_norm.clip_grad_norm_(
+            parameters,
+            self.config.training.max_norm,
+        )
 
     def _fwd_bwd_adamw_step(
         self,

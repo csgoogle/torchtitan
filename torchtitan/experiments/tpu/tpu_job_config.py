@@ -64,6 +64,8 @@ class TPUConfig:
   )
   # Compile AdamW step into its own separate FX graph.
   compile_optimizer: bool = False
+  # Compile the DTensor-aware global gradient norm as a separate static graph.
+  compile_grad_norm: bool = False
   # Run via TpuGraphTrainer (joint fwd+loss+bwd aot_fx_trace and FX-graph SAC passes).
   use_graph_trainer: bool = False
   # Whether to compile the optimizer step into the joint fwd+loss+bwd graph.
@@ -285,6 +287,21 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()
+    if self.tpu_config.compile_grad_norm:
+      if self.tpu_config.optimizer_in_graph:
+        raise ValueError(
+            "compile_grad_norm cannot be combined with optimizer_in_graph"
+        )
+      # PP needs an additional reduction across stages, which each own only a
+      # subset of the parameters. EP mixes dense and expert gradients on
+      # different meshes, so upstream computes their norms separately before
+      # combining the scalar results. Both can be supported by tracing those
+      # extra reductions; the current compiled path handles one gradient list.
+      if (
+          self.parallelism.expert_parallel_degree > 1
+          or self.parallelism.pipeline_parallel_degree > 1
+      ):
+        raise ValueError("compile_grad_norm currently requires EP1 and PP1")
     # Only the graph trainer builds its model through
     # `to_tpu_graph_trainer_config`, which is what applies the scan rewrite.
     # Anywhere else the flag would be accepted and then do nothing.

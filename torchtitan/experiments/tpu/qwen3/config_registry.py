@@ -252,6 +252,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
           use_graph_split=True,
           use_jax_profiler=True,
           compile_mode="layer",
+          compile_grad_norm=True,
       ),
       compile=CompileConfig(
           enable=True,
@@ -445,6 +446,7 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
       compile_mode="aot_fx_trace",
       graph_trainer_memory_policy="full",
       enable_graph_trainer_remat_schedule=True,
+      compile_grad_norm=True,
       compile_optimizer=False,
       optimizer_in_graph=False,
   )
