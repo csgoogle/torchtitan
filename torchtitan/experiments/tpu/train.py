@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 from torchtitan.config.configurable import Configurable
 from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_applied
 from torchtitan.experiments.tpu import gmain
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
 import torchtitan.experiments.tpu.redacted  # trigger model registration
@@ -277,6 +278,14 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
 
   try:
     trainer = trainer_cls(train_config)
+    # Asked of the built model rather than wrapped around `parallelize_fn`:
+    # the graph trainer -- the only lane scan runs on -- builds its own config
+    # and its own parallelize_fn, so a wrapper on the one patched above is
+    # never called.
+    for part in trainer.model_parts:
+      check_scan_was_applied(
+          part, use_scan_layers=train_config.tpu_config.use_scan_layers
+      )
     train_config.maybe_log()
 
     if train_config.checkpoint.create_seed_checkpoint:

@@ -14,6 +14,9 @@ from torchtitan.experiments.graph_trainer.configs import to_graph_trainer_config
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
+from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
+    check_scan_parallelism,
+)
 from torchtitan.experiments.tpu.layer_loop import builds_layer_loop
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.protocols.model_spec import ModelSpec
@@ -38,6 +41,7 @@ def to_tpu_graph_trainer_config(
   )
   graph_config.compile.memory_policy = memory_policy
   if train_config.tpu_config.use_scan_layers:
+    check_scan_parallelism(train_config.parallelism)
     # Expert parallelism shards `moe.experts` on a mesh of its own. A stack is
     # one tensor sharded once, so there is nowhere to put that. Refusing MoE
     # already covers every model that can set this; the check is here so the
@@ -68,7 +72,7 @@ def to_tpu_graph_trainer_config(
     # makes, rather than leaving it to the ordering comment above.
     if not builds_layer_loop(graph_config.model_spec.model):
       raise AssertionError(
-          "--tpu-config.use-stacked-layers did not survive config conversion"
+          "--tpu-config.use-scan-layers did not survive config conversion"
       )
   return graph_config
 
