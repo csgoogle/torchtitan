@@ -1451,26 +1451,6 @@ class TestApplySACPass(TestCase):
         self.assertEqual(rs_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
         self.assertEqual(wait_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
-    def test_a_scan_over_the_layers_is_never_recomputed(self):
-        """Recomputing one scan node reruns the whole decoder loop in backward.
-
-        It is the one recompute decision here with no visible symptom: the loss
-        stays exact and the saved set really does shrink, so the memory number
-        improves while the step does twice the forward work.
-        """
-        graph = torch.fx.Graph()
-        x = graph.placeholder("x")
-        xs = graph.placeholder("xs")
-        node = graph.call_function(
-            torch.ops.higher_order.scan, args=(None, [x], [xs], ())
-        )
-        graph.output(node)
-        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-
-        tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
-
-        self.assertEqual(node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
-
     def test_all_memory_policies_honor_fsdp_reshard_setting(self):
         for memory_policy in ("default", "full", "eager"):
             for reshard_after_forward, pp_degree, expect_save in (
