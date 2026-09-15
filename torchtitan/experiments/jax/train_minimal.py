@@ -19,6 +19,7 @@ from absl import app, flags
 import jax
 import torchtitan.config
 from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.jax import jax_job_config
 from torchtitan.experiments.jax import trainer as jax_trainer
 from torchtitan.experiments.jax import utils as jax_utils
@@ -63,6 +64,9 @@ def _maybe_init_jax_distributed():
 
 def main_train_loop(job_config: Any):
   torchtitan.tools.logging.init_logger()
+
+  # Must apply XLA and libtpu flags before the JAX backend is initialized.
+  tpu_flags.apply_init_flags(job_config)
 
   # Must run before any jax.devices() / jit call so the TPU runtime starts
   # with the full multi-host mesh instead of a single-host slice.

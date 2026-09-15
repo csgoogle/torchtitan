@@ -16,7 +16,8 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ## Notes
 
 - **Master weights are float32** (config_registry default). Compute runs in bf16 via `mixed_precision_param=bfloat16`.
-- VMEM tuning: `--xla_tpu_scoped_vmem_limit_kib=131072`.
+- VMEM tuning: `--libtpu-init-flags=xla_tpu_scoped_vmem_limit_kib=131072`, a
+  libtpu init flag the config exports before PJRT initialization.
 - Dataset: `c4_test` (synthetic/test dataset).
 - Tokenizer: `tests/assets/tokenizer`.
 - Model configuration used is `llama3_8b` from `config_registry.py`.
@@ -45,7 +46,6 @@ xpk workload create \
   --zone="$ZONE" \
   --base-docker-image="us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest" \
   --script-dir="$SCRIPT_DIR" \
-  --env="LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=131072" \
   --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
   --command="torchrun \
@@ -67,7 +67,8 @@ xpk workload create \
     --splash_attention_kernel.use_splash_attention_kernel \
     --splash_attention_kernel.sa_block_kv_compute=2048 \
     --loss_kernel.use_loss_kernel \
-    --tpu_config.eager_mode=DEFER_AND_FUSE"
+    --tpu_config.eager_mode=DEFER_AND_FUSE \
+    --libtpu-init-flags=xla_tpu_scoped_vmem_limit_kib=131072"
 ```
 
 ## Expected Metrics

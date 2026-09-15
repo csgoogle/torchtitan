@@ -17,7 +17,9 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ## Notes
 
 - **Devices vs chips**: an ironwood chip exposes two TensorCores, and torchtitan runs one process per core. `tpu7x-16` is therefore 16 devices on 8 chips, run as 2 hosts x 8 processes. 
-- **SparseCore Offloading**: This configuration achieves high MFU by utilizing SparseCore collective offloading for FSDP via explicit `LIBTPU_INIT_ARGS`.
+- **SparseCore Offloading**: This configuration achieves high MFU by utilizing
+  SparseCore collective offloading for FSDP, requested through the config's
+  `--libtpu-init-flags` and exported before PJRT initialization.
 - **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--tpu_config.compile_optimizer` and `--tpu_config.optimizer_in_graph`.
 - **Splash Attention**: Splash Attention block sizes are manually tuned to 1024 across the board for optimal tile sizing.
 
@@ -25,13 +27,6 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 
 ```bash
 export WORKLOAD_NAME="qwen3-8b-tpu7x16-$(date +%Y%m%d-%H%M%S)"
-
-export LIBTPU_INIT_ARGS="\
---xla_tpu_dvfs_p_state=7 \
---xla_tpu_scoped_vmem_limit_kib=65472 \
---xla_tpu_enable_sparse_core_collective_aggregator=true \
---xla_tpu_enable_latency_hiding_layer_scheduler=true \
---xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false"
 
 xpk workload create \
   --workload="$WORKLOAD_NAME" \
@@ -42,8 +37,6 @@ xpk workload create \
   --project="$PROJECT_ID" \
   --base-docker-image="$TORCHTITAN_IMAGE" \
   --script-dir="$SCRIPT_DIR" \
-  --env="LIBTPU_INIT_ARGS=$LIBTPU_INIT_ARGS" \
-  --env="TORCH_TPU_INTERNAL_XLA_OPTIONS=xla_tpu_scoped_vmem_limit_kib=65472" \
   --env="PYTHONUNBUFFERED=1" \
   --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
@@ -75,7 +68,8 @@ xpk workload create \
     --tpu_config.use_graph_trainer \
     --tpu_config.compile_mode=aot_fx_trace \
     --tpu_config.compile_optimizer \
-    --tpu_config.optimizer_in_graph"
+    --tpu_config.optimizer_in_graph \
+    --libtpu-init-flags='xla_tpu_dvfs_p_state=7 xla_tpu_scoped_vmem_limit_kib=65472 xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_latency_hiding_layer_scheduler=true xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false'"
 ```
 
 ## Expected Metrics

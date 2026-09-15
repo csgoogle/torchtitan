@@ -11,6 +11,7 @@ from absl.flags import argparse_flags
 import torch.multiprocessing as mp
 import torchtitan.config
 from torchtitan.experiments.tpu import distributed_utils as tpu_distributed_utils
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.tools import utils
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 
@@ -24,6 +25,10 @@ def _start_trainer(config: tpu_job_config_module.TPUTrainerConfig):
   global global_start_trainer_func  # pylint: disable=global-variable-not-assigned
   is_tpu = utils.device_type == "tpu"
   if is_tpu:
+    # Render the config's XLA / libtpu flags into the environment before the
+    # first TPU device use below: libtpu and the XLA compiler read them while
+    # the PJRT client is created, and torch_tpu memoizes them from then on.
+    tpu_flags.apply_init_flags(config)
     # Populates TORCH_TPU_SLICEBUILDER_ADDRESSES / TORCH_TPU_TOPOLOGY before any
     # TPU device is created. gmain does not spawn, so this is the per-worker
     # call the Cloud/GKE path requires: it derives the configuration from the

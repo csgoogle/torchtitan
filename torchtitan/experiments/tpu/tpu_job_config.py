@@ -5,6 +5,7 @@ from typing import Literal
 
 import torchtitan.config
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerMemoryPolicy
+from torchtitan.experiments.tpu import tpu_flags
 import torchtitan.trainer
 
 
@@ -215,6 +216,18 @@ class LossKernelConfig:
 # torchax) live on the subclasses below.
 @dataclasses.dataclass(kw_only=True, slots=True)
 class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
+  xla_flags: tpu_flags.FlagMap = dataclasses.field(
+      default_factory=tpu_flags.FlagMap
+  )
+  libtpu_init_flags: tpu_flags.FlagMap = dataclasses.field(
+      default_factory=tpu_flags.FlagMap
+  )
+  extra_xla_flags: tpu_flags.FlagMap = dataclasses.field(
+      default_factory=tpu_flags.FlagMap
+  )
+  extra_libtpu_init_flags: tpu_flags.FlagMap = dataclasses.field(
+      default_factory=tpu_flags.FlagMap
+  )
   redacted: redactedConfig = dataclasses.field(default_factory=redactedConfig)
   redacted: redactedConfig = dataclasses.field(
       default_factory=redactedConfig

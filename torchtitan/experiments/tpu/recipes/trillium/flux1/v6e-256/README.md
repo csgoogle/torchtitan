@@ -21,12 +21,6 @@ export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 
-export LIBTPU_INIT_ARGS='--xla_tpu_enable_sparse_core_collective_aggregator=true \
-    --xla_tpu_enable_sparse_core_offload_queuing_in_lhs=true \
-    --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true \
-    --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true \
-    --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true'
-
 xpk workload create \
 --workload="$WORKLOAD_NAME" \
 --cluster="$CLUSTER_NAME" \
@@ -35,7 +29,6 @@ xpk workload create \
 --tpu-type="v6e-256" \
 --num-slices=1 \
 --docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
---env LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS" \
 --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
 --command "\
     torchrun \
@@ -58,6 +51,7 @@ xpk workload create \
     --splash-attention-kernel.use-splash-attention-kernel \
     --compile.enable \
     --compile.backend=tpu \
+    --libtpu-init-flags='xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_sparse_core_offload_queuing_in_lhs=true xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true' \
     activation-checkpoint:full \
     --activation-checkpoint.no-preserve-rng-state"
 ```
@@ -72,12 +66,6 @@ xpk workload create \
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 
-export LIBTPU_INIT_ARGS='--xla_tpu_enable_sparse_core_collective_aggregator=true \
-    --xla_tpu_enable_sparse_core_offload_queuing_in_lhs=true \
-    --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true \
-    --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true \
-    --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true'
-
 xpk workload create \
 --workload="$WORKLOAD_NAME" \
 --cluster="$CLUSTER_NAME" \
@@ -86,7 +74,6 @@ xpk workload create \
 --tpu-type="v6e-256" \
 --num-slices=1 \
 --docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
---env LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS" \
 --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
 --command "\
     torchrun \
@@ -109,6 +96,7 @@ xpk workload create \
     --splash-attention-kernel.use-splash-attention-kernel \
     --compile.enable \
     --compile.backend=tpu \
+    --libtpu-init-flags='xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_sparse_core_offload_queuing_in_lhs=true xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=true xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=true xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true' \
     activation-checkpoint:full \
     --activation-checkpoint.no-preserve-rng-state"
 ```

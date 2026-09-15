@@ -21,7 +21,8 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
   processes. Throughput and MFU below are per device (per core); MFU is measured against
   the per-core bf16 peak of 1,153.5 TFLOP/s (half of the 2,307 TFLOP/s chip peak).
 - **Master weights are float32** (config_registry default). Compute runs in bf16 via `mixed_precision_param=bfloat16`.
-- VMEM tuning: `--xla_tpu_scoped_vmem_limit_kib=131072`.
+- VMEM tuning: `--libtpu-init-flags=xla_tpu_scoped_vmem_limit_kib=131072`, a
+  libtpu init flag the config exports before PJRT initialization.
 - Dataset: `c4_test` (synthetic/test dataset).
 - Tokenizer: `tests/assets/tokenizer`.
 - Model configuration used is `llama3_70b` from [`llama3/config_registry.py`](../../../../llama3/config_registry.py).
@@ -56,7 +57,6 @@ xpk workload create \
   --no-use-parallel-containers \
   --base-docker-image="us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest" \
   --script-dir="$SCRIPT_DIR" \
-  --env="LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=131072" \
   --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
   --command="torchrun \
@@ -72,7 +72,8 @@ xpk workload create \
     --dataloader.dataset_path=tests/assets/c4_test \
     --training.steps=20 \
     --training.local_batch_size=4 \
-    --parallelism.enable_tpu_topo_mesh"
+    --parallelism.enable_tpu_topo_mesh \
+    --libtpu-init-flags=xla_tpu_scoped_vmem_limit_kib=131072"
 ```
 
 ## Expected Metrics

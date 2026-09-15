@@ -18,7 +18,9 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ## Notes
 
 - **Model Configuration**: `reg_trainer_qwen3_8b` from `config_registry.py`.
-- **Memory/Barrier Tuning**: `LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_scoped_vmem_limit_kib=65536"`
+- **Memory/Barrier Tuning**: `--libtpu-init-flags='xla_tpu_use_enhanced_launch_barrier=false xla_tpu_scoped_vmem_limit_kib=65536'`. These are libtpu init flags,
+  carried by the torchtitan config and exported before PJRT initialization
+  rather than set by the launcher.
 - **Dataset**: `c4_test` (synthetic/test dataset)
 
 ## Training Configuration Details
@@ -43,7 +45,6 @@ xpk workload create \
   --zone="$ZONE" \
   --base-docker-image="us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest" \
   --script-dir="$SCRIPT_DIR" \
-  --env="LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_scoped_vmem_limit_kib=65536" \
   --env="PYTHONUNBUFFERED=1" \
   --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
@@ -75,7 +76,8 @@ xpk workload create \
     --loss_kernel.use_loss_kernel \
     --tpu_config.eager_mode=DEFER_AND_FUSE \
     --tpu_config.use_graph_split \
-    --tpu_config.compile_mode=layer"
+    --tpu_config.compile_mode=layer \
+    --libtpu-init-flags='xla_tpu_use_enhanced_launch_barrier=false xla_tpu_scoped_vmem_limit_kib=65536'"
 ```
 
 ## Expected Metrics
