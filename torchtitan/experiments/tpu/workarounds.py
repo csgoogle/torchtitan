@@ -575,25 +575,6 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   # Enable CPU safe histc workaround.
   use_cpu_safe_histc_patch()
 
-  # scan's autograd backward reverses its stacks with torch.flip, which
-  # materializes a second copy of every one. Only installed when something is
-  # actually going to scan.
-  if getattr(
-      getattr(job_config, "tpu_config", None), "use_scan_layers", False
-  ):
-    from torchtitan.experiments.tpu.scan_backward_patch import (  # pylint: disable=g-import-not-at-top
-        apply_scan_reverse_backward_patch,
-    )
-
-    # Fatal, not a warning. The run asked for scan, and the failure the patch
-    # prevents is a large-model OOM at some later step -- a much worse way to
-    # learn that a torch bump moved the copied source out from under us.
-    if not apply_scan_reverse_backward_patch():
-      raise RuntimeError(
-          "--tpu-config.use-scan-layers needs the scan backward patch and it"
-          " did not install; the warning above says which case this is."
-      )
-
   # Splash Attention Patch
   if hasattr(job_config, "splash_attention_kernel"):
     sa_config = job_config.splash_attention_kernel

@@ -570,6 +570,20 @@ def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
     stacks. That's the storage change without the loop change, which is what the
     reshard and checkpoint tests compare against.
     """
+    if use_scan:
+        # Here because every scanning model comes through here. Without the
+        # patch the backward reverses by copy and OOMs some steps later, so
+        # fail at build time instead.
+        from torchtitan.experiments.tpu.scan_backward_patch import (  # pylint: disable=g-import-not-at-top
+            apply_scan_reverse_backward_patch,
+        )
+
+        if not apply_scan_reverse_backward_patch():
+            raise RuntimeError(
+                "scanned decoder layers need the scan backward patch and it did"
+                " not install; the warning above says which case this is."
+            )
+
     holder = LayerStackHolder()
     setattr(model, STACK_ATTR, holder)
     stack = LayerStack(model.layers, holder)

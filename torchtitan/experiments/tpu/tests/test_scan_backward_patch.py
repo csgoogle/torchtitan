@@ -19,7 +19,6 @@ the thing the patch changes.
 import inspect
 import sys
 import textwrap
-import types
 
 from absl.testing import absltest
 import torch
@@ -30,7 +29,6 @@ import torch.utils._pytree as pytree
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import scan_backward_patch
-from torchtitan.experiments.tpu import workarounds
 
 
 _SCAN_MODULE = sys.modules["torch._higher_order_ops.scan"]
@@ -229,26 +227,41 @@ class ScanBackwardPatchTest(base_device_test.BaseAcceleratorDeviceTest):
     self.assertFalse(scan_backward_patch.apply_scan_reverse_backward_patch())
     self.assertIs(ScanAutogradImpl.call_backward, not_the_method)
 
-  def test_a_scan_run_refuses_to_start_without_the_patch(self):
-    """Refusing to install is a warning; refusing with `--use-scan-layers` is
-    not. Without the patch that run reverses by copy and OOMs later, which is
-    a far worse place to find out."""
+  def test_it_raises_when_a_flip_is_added_before_the_scan(self):
+    """A flip this skips has to be one the scan below undoes.
 
-    def not_the_method(self, *grad_fw_outputs):
-      raise AssertionError("unreachable")
-
-    ScanAutogradImpl.call_backward = not_the_method
-    scan_on = types.SimpleNamespace(
-        tpu_config=types.SimpleNamespace(use_scan_layers=True)
+    An unrelated pre-scan flip would otherwise be swallowed: nobody performs
+    it, and the gradients are quietly wrong.
+    """
+    self._install_fake_bump(
+        (
+            "flat_grads = scan_op(",
+            "_unrelated = torch.flip(torch.zeros(2, 2), (0,))\n"
+            "    flat_grads = scan_op(",
+        ),
     )
-    with self.assertRaises(RuntimeError):
-      workarounds.apply_patches(torch.nn.Identity(), scan_on)
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
 
-    # ... and a run that never asked for scan is unaffected.
-    scan_off = types.SimpleNamespace(
-        tpu_config=types.SimpleNamespace(use_scan_layers=False)
+    with self.assertRaisesRegex(Exception, "no longer reverses"):
+      self._backward()
+
+  def test_it_does_not_swallow_a_flip_added_after_the_scan(self):
+    """Same gap on the output side.
+
+    Here a bump also reverses the carry gradients, which our scan did not
+    write, so that flip has to actually happen.
+    """
+    self._install_fake_bump(
+        ("*grad_init,", "*[torch.flip(g, (0,)) for g in grad_init],"),
     )
-    workarounds.apply_patches(torch.nn.Identity(), scan_off)
+    expected, _ = self._backward()
+
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    grads, flips = self._backward()
+
+    self.assertNotEqual(flips, [], "the added flip was swallowed")
+    for name, want, got in zip(("init", "xs"), expected, grads):
+      torch.testing.assert_close(got, want, msg=f"{name} gradient changed")
 
 
 if __name__ == "__main__":

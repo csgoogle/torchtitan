@@ -137,6 +137,7 @@ class _ReverseByIndex:
 
     def __init__(self):
         self.skipped: dict[int, torch.Tensor] = {}
+        self.written_in_order: dict[int, torch.Tensor] = {}
         self.reversed_by_index = False
         self._real: tuple = ()
 
@@ -177,9 +178,11 @@ class _ReverseByIndex:
         if not isinstance(x, torch.Tensor) or tuple(dims) != (0,):
             return torch.flip(x, dims)
         if self.reversed_by_index:
-            # The output flip. The scan below wrote every row where it
-            # belongs, so the stacks already come out in order.
-            return x
+            # Only the stacks our own scan wrote come out in order. Anything
+            # else gets the flip it asked for, so an added one is not swallowed.
+            if id(x) in self.written_in_order:
+                return x
+            return torch.flip(x, dims)
         # The input flip. Hand back the original and remember it; the
         # `scan_op` just below wants the stack unreversed. Keyed by id, with the
         # tensor as the value, so nothing this is keyed on can be collected and
@@ -190,17 +193,24 @@ class _ReverseByIndex:
     def scan_op(self, combine_gm, init, xs, additional_inputs=(), **kwargs):
         # `mutated_arg_indices` numbers the step's arguments, and the rewrite
         # renumbers them, so leave a scan that carries any of those alone.
+        #
+        # Equality, not subset: a skipped flip that is not one of these stacks
+        # is one nobody performed, so fall through and let the caller raise.
         if (
             not kwargs.get("mutated_arg_indices")
             and self.skipped
-            and all(id(x) in self.skipped for x in xs)
+            and set(self.skipped) == {id(x) for x in xs}
         ):
             self.skipped.clear()
             self.reversed_by_index = True
             with self._paused():
-                return _scan_over_descending_index(
+                out = _scan_over_descending_index(
                     combine_gm, init, xs, additional_inputs
                 )
+            # The tail is the gradient stacks. Held by value so an id cannot
+            # be reused out from under us.
+            self.written_in_order = {id(t): t for t in out[len(init) :]}
+            return out
         # Some other scan -- a nested one traced out of the step body, say.
         with self._paused():
             return scan_op(combine_gm, init, xs, additional_inputs, **kwargs)
