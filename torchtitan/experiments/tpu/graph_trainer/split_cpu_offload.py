@@ -212,17 +212,17 @@ def thread_host_offload_donors(
     tuple[int, ...],
     tuple[torch.Tensor, ...],
 ]:
-  """Add recurrent pinned-host donor inputs before layer partitioning.
+  """Add graph inputs for persistent host-offload buffers.
 
-  The prior step's host buffers are runtime state, so they do not yet appear in
-  the current step's acyclic FX graph. For every forward D2H result, add one
-  graph input, feed it to the completion node, and mark it for forced donation.
-  The subsequent ``split_module`` call then derives the owning child's input
-  and the parent call signature directly from this dataflow.
+  Process the complete forward graph before optional layer partitioning to
+  identify D2H completion nodes inserted by the offload pass and add one
+  same-shaped host-buffer placeholder for each. If the graph is subsequently
+  split, ``split_module`` automatically wires those inputs to the owning child
+  modules from this dataflow.
 
-  The returned specs and output positions let ``SplitForwardBackwardModule``
-  initialize the host slots once and feed each step's completed D2H outputs
-  back as the next step's donor inputs.
+  The placeholders represent cross-step state, so the returned specs and output
+  positions let ``SplitForwardBackwardModule`` initialize the host buffers once
+  and feed each step's completed D2H outputs back as the next step's donors.
   """
   output = next(
       node for node in forward.graph.nodes if node.op == "output"
