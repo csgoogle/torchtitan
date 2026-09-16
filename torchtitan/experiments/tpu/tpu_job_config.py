@@ -15,6 +15,11 @@ BackwardPartitionMode = Literal[
     "by_layer",
     "fsdp_pipeline",
 ]
+# This policy is registered by the TPU-only tpu_memory_policy module, so keep
+# its CLI/config type out of the shared GraphTrainer policy Literal.
+TpuGraphTrainerMemoryPolicy = Literal[
+    GraphTrainerMemoryPolicy, "full_and_offload"
+]
 
 
 @dataclasses.dataclass
@@ -76,7 +81,7 @@ class TPUConfig:
   optimizer_in_graph: bool = False
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
-  graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  graph_trainer_memory_policy: TpuGraphTrainerMemoryPolicy = "default"
   # CPU-offload controls propagated into GraphTrainer's compile config.
   graph_trainer_cpu_offload_budget_gb: float = 100.0
   # Run the decoder layers as a single scan instead of a Python loop, so the

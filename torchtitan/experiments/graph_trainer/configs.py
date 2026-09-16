@@ -20,11 +20,7 @@ from torchtitan.trainer import Trainer
 EpOverlapChunkDim = Literal["batch", "seq"]
 EpOverlapChunkStrategy = Literal["eager", "graph"]
 GraphTrainerMemoryPolicy = Literal[
-    "default",
-    "full",
-    "eager",
-    "sac_and_offload",
-    "full_and_offload",
+    "default", "full", "eager", "sac_and_offload"
 ]
 
 TRANSFORMER_BLOCK_FQN = "layers.*"
@@ -112,8 +108,6 @@ class GraphTrainerCompileConfig(CompileConfig):
         sac_and_offload: SAC + CPU offload — apply default SAC first,
             then offload surviving MUST_SAVE activations to CPU within
             the cpu_offload_budget_gb budget.
-        full_and_offload: full recompute + CPU offload — retain only layer
-            boundaries, then offload eligible saved boundaries within budget.
     """
 
     pass_pipeline: str = "default"

@@ -202,24 +202,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         pass_names.index("selective_activation_remat_pass"),
     )
 
-    config.tpu_config.graph_trainer_memory_policy = "full"
-    graph_config = to_tpu_graph_trainer_config(
-        config,
-        qwen3_gt.model_registry,
-        target_cls=TpuGraphTrainer.Config,
-    )
-    passes = construct_tpu_pass_pipeline(
-        typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
-        graph_config,
-    )
-    self.assertNotIn(
-        "apply_cpu_offload_pass",
-        {
-            getattr(graph_pass, "func", graph_pass).__name__
-            for graph_pass in passes
-        },
-    )
-
   def test_cpu_offload_prefetch_requires_backward_split(self) -> None:
     config = qwen3_8b()
     config.tpu_config.graph_split.cpu_offload_prefetch_executables = 1

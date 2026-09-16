@@ -126,10 +126,7 @@ class GraphTrainer(Trainer):
         # Lazy state for aot_fx_trace mode
         self._traced_step: TracedResult | None = None
 
-        if self.config.compile.memory_policy in (
-            "sac_and_offload",
-            "full_and_offload",
-        ):
+        if self.config.compile.memory_policy == "sac_and_offload":
             from torch._functorch._activation_offloading.offload_ops import (
                 pinned_memory_pool,
             )
