@@ -55,12 +55,11 @@ from torchtitan.experiments.graph_trainer.graph_pp.utils import (
     is_mutation_node,
 )
 from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
-    HostDonorSpec,
-    assign_ao_transfer_partitions,
-    initialize_pinned_host_buffer,
-    is_ao_transfer,
-    move_forward_offloads_to_partition_entry,
-    thread_host_offload_donors,
+  HostDonorSpec,
+  initialize_pinned_host_buffer,
+  is_ao_transfer,
+  place_ao_transfer_pairs,
+  thread_host_offload_donors,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     tpu_backend_compile_partitioned_pass,
@@ -659,8 +658,7 @@ def split_forward_graph_by_layer(
   if spmd_safe_depth:
     raise ValueError("Unbalanced TPU SPMD safe-region entry")
 
-  assign_ao_transfer_partitions(gm, partition_map)
-  move_forward_offloads_to_partition_entry(gm, partition_map)
+  place_ao_transfer_pairs(gm, partition_map)
 
   chunked = _materialize_partitioned_graph(
       gm, partition_map, layer_nodes
@@ -851,7 +849,7 @@ def split_backward_graph_by_layer(
           default=0,
       )
 
-  assign_ao_transfer_partitions(
+  place_ao_transfer_pairs(
       gm,
       partition_map,
       backward_prefetch_executables=cpu_offload_prefetch_executables,

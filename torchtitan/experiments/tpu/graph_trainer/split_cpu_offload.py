@@ -102,20 +102,21 @@ def _ao_transfer_partition(
   )
 
 
-def assign_ao_transfer_partitions(
+def place_ao_transfer_pairs(
     gm: torch.fx.GraphModule,
     partition_map: dict[torch.fx.Node, int],
     *,
     backward_prefetch_executables: int = 0,
 ) -> None:
-  """Assign each AO copy/completion pair atomically to one child executable.
+  """Place each AO copy/completion pair in one child executable.
 
   ``apply_cpu_offload_pass`` inserts an ``offload`` or ``reload`` producer and
   exactly one ``wait_tensor`` consumer. This pass validates that pair while the
   complete graph is still available, computes its executable from real tensor
-  consumers, and assigns both nodes together. The construction guarantees that
-  ``split_module`` cannot place an executable-local async descriptor across a
-  child boundary.
+  consumers, and assigns both nodes together. It also moves each forward D2H
+  start immediately before the first ordinary node in its assigned partition.
+  Partition assignment alone chooses child ownership but does not change FX
+  order, which still reflects the generic pre-partition offload rewrite.
 
   Forward D2H pairs stay with the source storage's final consumer. Backward H2D
   pairs move ``backward_prefetch_executables`` complete child executables ahead
@@ -170,12 +171,6 @@ def assign_ao_transfer_partitions(
           f"AO completion {node.name!r} has no matching transfer producer"
       )
 
-
-def move_forward_offloads_to_partition_entry(
-    gm: torch.fx.GraphModule,
-    partition_map: dict[torch.fx.Node, int],
-) -> None:
-  """Move D2H starts to the entry of the child containing their wait."""
   nodes = list(gm.graph.nodes)
   node_order = {node: index for index, node in enumerate(nodes)}
   first_node_by_partition: dict[int, torch.fx.Node] = {}
