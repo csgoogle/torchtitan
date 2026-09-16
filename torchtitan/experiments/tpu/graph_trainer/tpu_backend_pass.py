@@ -479,7 +479,12 @@ def tpu_backend_compile_partitioned_pass(
     def compile_submodule(
         submodule: torch.fx.GraphModule,
         submodule_inputs: list[torch.Tensor],
+        *,
+        module_name: str | None = None,
     ) -> torch.fx.GraphModule:
+        # Newer TorchTPU passes this diagnostic name to the callback, while
+        # the canonical build calls it with only the module and inputs.
+        del module_name
         return tpu_backend_compile_pass(
             submodule,
             tuple(submodule_inputs),
