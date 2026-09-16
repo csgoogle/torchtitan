@@ -20,6 +20,7 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -49,6 +50,53 @@ from torchtitan.tools.profiler import Profiler
 
 _FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
 _BF16_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.bf16_rope"
+
+
+# The two copy flags are the validated addition needed to compose activation
+# D2H with input donation: region analysis removes the conservative alias
+# snapshot, and keeping copies off SparseCore avoids contention with FSDP
+# collectives.
+_Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
+    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+    {
+        "xla_tpu_dot_dot_fusion": False,
+        "xla_tpu_nested_dot_fusion": False,
+        "xla_tpu_rwb_fusion": False,
+        "xla_tpu_enable_offloading_copy_to_sparsecore": False,
+        "xla_tpu_copy_insertion_use_region_analysis": True,
+        "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
+    },
+)
+
+# Additional scheduler flags used by the measured MaxText-parity run. The
+# ordinary activation transfers are generic kCopy operations; the run left
+# xla_max_concurrent_host_copy at its default. In particular,
+# xla_tpu_host_transfer_overlap_limit applies to DS/DUS host transfers and is
+# retained here for reproduction, not because it enables ordinary-copy
+# overlap.
+_Q235_COMPILED_OFFLOAD_MAXTEXT_FLAGS = tpu_flags.merge_flags(
+    _Q235_COMPILED_OFFLOAD_FLAGS,
+    {
+        "xla_tpu_scheduler_percent_shared_memory_limit": 100,
+        "xla_tpu_enable_diagnostic_coordinator": False,
+        "tpu_log_allocations_on_oom": True,
+        "xla_tpu_enable_sparse_core_collective_offload_all_gather": True,
+        "xla_tpu_enable_sparse_core_collective_offload_all_reduce": True,
+        "xla_tpu_use_single_sparse_core_for_all_gather_offload": True,
+        "xla_tpu_enable_all_experimental_scheduler_features": True,
+        "xla_tpu_enable_scheduler_memory_pressure_tracking": True,
+        "xla_tpu_pipeline_memory_host_transfers": True,
+        "xla_tpu_host_transfer_overlap_limit": 24,
+        "xla_tpu_aggressive_opt_barrier_removal": "ENABLED",
+        "xla_lhs_prioritize_async_depth_over_stall": "ENABLED",
+        "xla_tpu_enable_ag_backward_pipelining": True,
+        "xla_should_allow_loop_variant_parameter_in_chain": "ENABLED",
+        "xla_should_add_loop_invariant_op_in_chain": "ENABLED",
+        "xla_max_concurrent_host_send_recv": 100,
+        "xla_latency_hiding_scheduler_rerun": 2,
+    },
+)
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
@@ -575,6 +623,58 @@ def qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   cfg.tpu_config.optimizer_in_graph = False
   cfg.hf_assets_path = "./assets/hf/Qwen3-235B-A22B"
   cfg.metrics.log_freq = 1
+  return cfg
+
+
+def qwen3_moe_235b_fsdp_compiled_offload() -> TPUTrainerConfig:
+  """FP32-reduction Q235 recipe with compiled activation CPU offload.
+
+  This is the landing-policy counterpart of the BF16 MaxText-parity recipe
+  below. It keeps one layer in each split executable and reuses both internal
+  device buffers and the prior step's pinned-host activation buffers.
+  """
+  cfg = qwen3_moe_235b_fsdp_only()
+  cfg.tpu_config.graph_trainer_memory_policy = "full_and_offload"
+  cfg.tpu_config.graph_trainer_cpu_offload_defer_n_layers = 1
+  # x_i is first reloaded while rematerializing layer i+1. A distance of one
+  # therefore reaches the consumer executable; two reaches the preceding
+  # executable and makes the H2D copy overlappable. The measured BF16 arm paid
+  # 0.96 GiB for that extra live boundary and removed 1.31 s of exposed H2D.
+  cfg.tpu_config.graph_trainer_cpu_offload_prefetch_n_layers = 2
+  cfg.tpu_config.graph_trainer_cpu_offload_budget_gb = 100.0
+  cfg.tpu_config.graph_split.forward_layers_per_executable = 1
+  # Current ``by_layer`` is the direct successor of the ``sequential`` mode
+  # used by the measured schedule: one complete backward layer per
+  # independently compiled child.
+  cfg.tpu_config.graph_split.backward_partition_mode = "by_layer"
+  cfg.tpu_config.graph_split.backward_layers_per_executable = 1
+  cfg.tpu_config.graph_split.donate_internal_buffers = True
+  cfg.tpu_config.graph_split.donate_host_offload_buffers = True
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      _Q235_COMPILED_OFFLOAD_FLAGS,
+  )
+  return cfg
+
+
+def qwen3_moe_235b_fsdp_compiled_offload_maxtext() -> TPUTrainerConfig:
+  """MaxText-numerics variant of the Q235 compiled-offload recipe."""
+  cfg = qwen3_moe_235b_fsdp_compiled_offload()
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      _Q235_COMPILED_OFFLOAD_MAXTEXT_FLAGS,
+  )
+  cfg.training.mixed_precision_reduce = "bfloat16"
+  if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
+    cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
+  assert cfg.model_spec is not None
+  dispatchers = list(
+      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+  )
+  if not dispatchers:
+    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
+  for _, dispatcher, _, _ in dispatchers:
+    dispatcher.fuse_route_score_backward = True
   return cfg
 
 
