@@ -6,9 +6,7 @@
 
 """CPU-offload support for independently compiled TPU graph children."""
 
-import operator
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,26 +23,10 @@ class HostDonorSpec:
   dtype: torch.dtype
 
 
-def _initialize_pinned_host_buffer(source: torch.Tensor) -> torch.Tensor:
+def initialize_pinned_host_buffer(source: torch.Tensor) -> torch.Tensor:
+  """Create one pinned-host tensor through the normal AO D2H operation."""
   host = torch.ops.ao.offload.default(source)
   return torch.ops.ao.wait_tensor.default(host, source, source)
-
-
-def compile_host_donor_initializer() -> Callable[[torch.Tensor], torch.Tensor]:
-  """Compile the one-time device-to-pinned-host donor initializer."""
-  from torch_tpu._internal.compile.compiler import StaticCompiler
-
-  def backend(
-      gm: torch.fx.GraphModule,
-      example_inputs: list[torch.Tensor],
-  ) -> Callable:
-    return StaticCompiler()(gm, example_inputs, is_fwd=True)
-
-  return torch.compile(
-      _initialize_pinned_host_buffer,
-      backend=backend,
-      fullgraph=True,
-  )
 
 
 def is_ao_transfer(
@@ -66,90 +48,127 @@ def _first_downstream_partition(
 ) -> int:
   pending = deque(node.users)
   visited: set[torch.fx.Node] = set()
+  partitions = []
   while pending:
     user = pending.popleft()
     if user in visited:
       continue
     visited.add(user)
     if not is_ao_transfer(user) and user in partition_map:
-      return partition_map[user]
+      partitions.append(partition_map[user])
+      continue
     pending.extend(user.users)
-  return -1
+  return min(partitions, default=-1)
 
 
-def _first_scheduled_partition(
-    node: torch.fx.Node,
+def _preceding_partition(
+    partition: int,
     partition_map: dict[torch.fx.Node, int],
+    distance: int,
 ) -> int:
-  found = False
-  for candidate in node.graph.nodes:
-    if candidate is node:
-      found = True
-      continue
-    if not found or is_ao_transfer(candidate):
-      continue
-    if candidate in partition_map:
-      return partition_map[candidate]
-  return -1
+  partitions = sorted(set(partition_map.values()))
+  index = partitions.index(partition)
+  return partitions[max(0, index - distance)]
 
 
 def _ao_transfer_partition(
-    node: torch.fx.Node,
+    producer: torch.fx.Node,
+    wait: torch.fx.Node,
     partition_map: dict[torch.fx.Node, int],
+    backward_prefetch_executables: int,
 ) -> int:
-  """Keep each asynchronous AO copy and its wait in one executable.
+  """Choose one executable for an asynchronous AO copy/completion pair.
 
   Forward D2H belongs to the partition containing its final device-storage
-  consumer. Backward H2D belongs where the generic prefetch pass scheduled its
-  reload in FX order. In both cases the ready tensor, rather than the runtime's
-  executable-local async descriptor, may cross the next split boundary.
+  consumer. Backward H2D starts the configured number of complete child
+  executables before the partition containing its first consumer. In both
+  cases only the completed tensor may cross a child boundary; XLA's async
+  start/done state remains local to the executable that created it.
   """
-  if is_ao_transfer(node, "offload"):
-    waits = [
-        user
-        for user in node.users
-        if is_ao_transfer(user, "wait_tensor")
-        and user.args
-        and user.args[0] is node
-    ]
-    if waits:
-      return _ao_transfer_partition(waits[0], partition_map)
-
-  if is_ao_transfer(node, "wait_tensor") and not _is_backward_node(node):
-    if len(node.args) > 2 and isinstance(node.args[2], torch.fx.Node):
-      partition = partition_map.get(node.args[2], -1)
+  if is_ao_transfer(producer, "offload"):
+    if len(wait.args) > 2 and isinstance(wait.args[2], torch.fx.Node):
+      partition = partition_map.get(wait.args[2], -1)
       if partition >= 0:
         return partition
+    return _first_downstream_partition(wait, partition_map)
 
-  if is_ao_transfer(node, "reload") and _is_backward_node(node):
-    partition = _first_scheduled_partition(node, partition_map)
-    if partition >= 0:
-      return partition
-
-  if is_ao_transfer(node, "wait_tensor") and _is_backward_node(node):
-    producer = node.args[0] if node.args else None
-    if isinstance(producer, torch.fx.Node) and is_ao_transfer(
-        producer, "reload"
-    ):
-      return _ao_transfer_partition(producer, partition_map)
-
-  return _first_downstream_partition(node, partition_map)
+  consumer_partition = _first_downstream_partition(wait, partition_map)
+  if consumer_partition < 0:
+    return consumer_partition
+  return _preceding_partition(
+      consumer_partition,
+      partition_map,
+      backward_prefetch_executables,
+  )
 
 
 def assign_ao_transfer_partitions(
     gm: torch.fx.GraphModule,
     partition_map: dict[torch.fx.Node, int],
+    *,
+    backward_prefetch_executables: int = 0,
 ) -> None:
-  """Assign AO pairs without carrying an async descriptor across children."""
-  for node in gm.graph.nodes:
-    if not is_ao_transfer(node):
-      continue
-    partition = _ao_transfer_partition(node, partition_map)
+  """Assign each AO copy/completion pair atomically to one child executable.
+
+  ``apply_cpu_offload_pass`` inserts an ``offload`` or ``reload`` producer and
+  exactly one ``wait_tensor`` consumer. This pass validates that pair while the
+  complete graph is still available, computes its executable from real tensor
+  consumers, and assigns both nodes together. The construction guarantees that
+  ``split_module`` cannot place an executable-local async descriptor across a
+  child boundary.
+
+  Forward D2H pairs stay with the source storage's final consumer. Backward H2D
+  pairs move ``backward_prefetch_executables`` complete child executables ahead
+  of their first consumer: zero means the consumer child, one means the child
+  executed immediately before it.
+  """
+  if backward_prefetch_executables < 0:
+    raise ValueError("backward_prefetch_executables must be nonnegative")
+
+  producers = [
+      node
+      for node in gm.graph.nodes
+      if is_ao_transfer(node, "offload") or is_ao_transfer(node, "reload")
+  ]
+  paired_waits: set[torch.fx.Node] = set()
+  for producer in producers:
+    waits = [
+        user
+        for user in producer.users
+        if is_ao_transfer(user, "wait_tensor")
+        and user.args
+        and user.args[0] is producer
+    ]
+    if len(waits) != 1:
+      raise ValueError(
+          f"AO transfer {producer.name!r} must have exactly one completion; "
+          f"found {len(waits)}"
+      )
+    wait = waits[0]
+    if wait in paired_waits:
+      raise ValueError(f"AO completion {wait.name!r} has multiple producers")
+    partition = _ao_transfer_partition(
+        producer,
+        wait,
+        partition_map,
+        backward_prefetch_executables,
+    )
     if partition < 0:
       raise ValueError(
-          f"Cannot assign AO transfer {node.name!r} to a split partition"
+          f"Cannot assign AO transfer pair {producer.name!r}/{wait.name!r} "
+          "to a split partition"
       )
-    partition_map[node] = partition
+    partition_map[producer] = partition
+    partition_map[wait] = partition
+    paired_waits.add(wait)
+
+  for node in gm.graph.nodes:
+    if not is_ao_transfer(node, "wait_tensor"):
+      continue
+    if node not in paired_waits:
+      raise ValueError(
+          f"AO completion {node.name!r} has no matching transfer producer"
+      )
 
 
 def move_forward_offloads_to_partition_entry(
@@ -188,49 +207,6 @@ def move_forward_offloads_to_partition_entry(
     gm.recompile()
 
 
-def validate_ao_transfer_pairs(
-    chunked_gm: torch.fx.GraphModule,
-    graph_name: str,
-) -> None:
-  """Reject async activation copies whose wait crossed a child boundary."""
-  for child_name, child in chunked_gm.named_children():
-    if not isinstance(child, torch.fx.GraphModule):
-      continue
-    child_nodes = set(child.graph.nodes)
-    producers = [
-        node
-        for node in child_nodes
-        if is_ao_transfer(node, "offload")
-        or is_ao_transfer(node, "reload")
-    ]
-    waits = [
-        node for node in child_nodes if is_ao_transfer(node, "wait_tensor")
-    ]
-    for wait in waits:
-      producer = wait.args[0] if wait.args else None
-      if not (
-          isinstance(producer, torch.fx.Node)
-          and producer in child_nodes
-          and (
-              is_ao_transfer(producer, "offload")
-              or is_ao_transfer(producer, "reload")
-          )
-      ):
-        raise ValueError(
-            f"TPU {graph_name} child {child_name!r} contains AO wait "
-            f"{wait.name!r} without its async-copy producer"
-        )
-    for producer in producers:
-      if not any(
-          is_ao_transfer(user, "wait_tensor") and user in child_nodes
-          for user in producer.users
-      ):
-        raise ValueError(
-            f"TPU {graph_name} child {child_name!r} contains AO producer "
-            f"{producer.name!r} without its wait"
-        )
-
-
 def _as_tuple(value: Any) -> tuple[Any, ...]:
   if isinstance(value, tuple):
     return value
@@ -239,79 +215,45 @@ def _as_tuple(value: Any) -> tuple[Any, ...]:
   return (value,)
 
 
-def _child_output_source(
-    parent: torch.fx.GraphModule,
-    value: torch.fx.Node,
-) -> tuple[torch.fx.Node, torch.fx.GraphModule, int] | None:
-  call = value
-  output_index = 0
-  if (
-      value.op == "call_function"
-      and value.target is operator.getitem
-      and len(value.args) == 2
-      and isinstance(value.args[0], torch.fx.Node)
-      and isinstance(value.args[1], int)
-  ):
-    call = value.args[0]
-    output_index = value.args[1]
-  if call.op != "call_module":
-    return None
-  child = parent.get_submodule(str(call.target))
-  if not isinstance(child, torch.fx.GraphModule):
-    return None
-  child_output = next(
-      node for node in child.graph.nodes if node.op == "output"
-  )
-  outputs = _as_tuple(child_output.args[0])
-  if value is call and len(outputs) != 1:
-    return None
-  if output_index < 0 or output_index >= len(outputs):
-    return None
-  if not isinstance(outputs[output_index], torch.fx.Node):
-    return None
-  return call, child, output_index
-
-
 def thread_host_offload_donors(
-    parent: torch.fx.GraphModule,
+    forward: torch.fx.GraphModule,
 ) -> tuple[
     tuple[HostDonorSpec, ...],
     tuple[int, ...],
     tuple[torch.Tensor, ...],
 ]:
-  """Thread previous pinned-host outputs into D2H children for donation."""
-  parent_output = next(
-      node for node in parent.graph.nodes if node.op == "output"
+  """Add recurrent pinned-host donor inputs before layer partitioning.
+
+  The prior step's host buffers are runtime state, so they do not yet appear in
+  the current step's acyclic FX graph. For every forward D2H result, add one
+  graph input, feed it to the completion node, and mark it for forced donation.
+  The subsequent ``split_module`` call then derives the owning child's input
+  and the parent call signature directly from this dataflow.
+
+  The returned specs and output positions let ``SplitForwardBackwardModule``
+  initialize the host slots once and feed each step's completed D2H outputs
+  back as the next step's donor inputs.
+  """
+  output = next(
+      node for node in forward.graph.nodes if node.op == "output"
   )
-  parent_outputs = _as_tuple(parent_output.args[0])
-  first_parent_op = next(
-      node for node in parent.graph.nodes if node.op != "placeholder"
+  outputs = _as_tuple(output.args[0])
+  first_op = next(
+      node for node in forward.graph.nodes if node.op != "placeholder"
   )
   specs = []
   output_positions = []
   examples = []
   total_bytes = 0
-  wired_outputs: set[tuple[torch.fx.Node, int]] = set()
+  wired_outputs: set[torch.fx.Node] = set()
 
-  for parent_output_position, value in enumerate(parent_outputs):
-    if not isinstance(value, torch.fx.Node):
+  for output_position, offload_wait in enumerate(outputs):
+    if not isinstance(offload_wait, torch.fx.Node):
       continue
-    resolved = _child_output_source(parent, value)
-    if resolved is None:
-      continue
-    call, child, child_output_position = resolved
-    key = (call, child_output_position)
-    if key in wired_outputs:
-      continue
-    child_output = next(
-        node for node in child.graph.nodes if node.op == "output"
-    )
-    child_outputs = _as_tuple(child_output.args[0])
-    offload_wait = child_outputs[child_output_position]
     if not (
-        isinstance(offload_wait, torch.fx.Node)
-        and is_ao_transfer(offload_wait, "wait_tensor")
+        is_ao_transfer(offload_wait, "wait_tensor")
         and not _is_backward_node(offload_wait)
+        and offload_wait not in wired_outputs
     ):
       continue
     value_meta = offload_wait.meta.get("val")
@@ -322,23 +264,15 @@ def thread_host_offload_donors(
       continue
 
     donor_index = len(specs)
-    first_child_op = next(
-        node for node in child.graph.nodes if node.op != "placeholder"
-    )
-    with child.graph.inserting_before(first_child_op):
-      child_donor = child.graph.placeholder(f"host_donor_{donor_index}")
-    child_donor.meta = dict(offload_wait.meta)
-    child_donor.meta["tpu_force_donate"] = True
+    with forward.graph.inserting_before(first_op):
+      donor = forward.graph.placeholder(f"host_donor_{donor_index}")
+    donor.meta = dict(offload_wait.meta)
+    donor.meta["tpu_force_donate"] = True
     wait_args = list(offload_wait.args)
     while len(wait_args) < 3:
       wait_args.append(None)
-    wait_args[1] = child_donor
+    wait_args[1] = donor
     offload_wait.args = tuple(wait_args)
-
-    with parent.graph.inserting_before(first_parent_op):
-      parent_donor = parent.graph.placeholder(f"host_donor_{donor_index}")
-    parent_donor.meta = dict(child_donor.meta)
-    call.args = (*call.args, parent_donor)
 
     specs.append(
         HostDonorSpec(
@@ -347,17 +281,13 @@ def thread_host_offload_donors(
             dtype=value_meta.dtype,
         )
     )
-    output_positions.append(parent_output_position)
+    output_positions.append(output_position)
     examples.append(value_meta)
     total_bytes += value_meta.numel() * value_meta.element_size()
-    wired_outputs.add(key)
+    wired_outputs.add(offload_wait)
 
-  for child in parent.children():
-    if isinstance(child, torch.fx.GraphModule):
-      child.graph.lint()
-      child.recompile()
-  parent.graph.lint()
-  parent.recompile()
+  forward.graph.lint()
+  forward.recompile()
   logger.info(
       "Threaded %d pinned-host outputs as recurrent donated inputs (%.2f GiB)",
       len(specs),

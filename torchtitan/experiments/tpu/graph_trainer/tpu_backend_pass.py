@@ -19,11 +19,20 @@ import torch
 from torch._dynamo.utils import detect_fake_mode
 from torch.utils import _pytree
 
+from torchtitan.experiments.graph_trainer.cpu_offload import (
+    apply_cpu_offload_pass,
+)
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     schedule_fsdp_comms_to_dense_regions_pass,
 )
+from torchtitan.experiments.graph_trainer.memory_policy import (
+    tag_with_memory_policy_pass,
+)
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
+)
+from torchtitan.experiments.graph_trainer.selective_activation_remat import (
+    selective_activation_remat_pass,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_fsdp_rs_deadline_schedule,
@@ -492,14 +501,6 @@ def construct_tpu_transform_passes(
         )
 
     if memory_policy and memory_policy != "none":
-        from torchtitan.experiments.graph_trainer.cpu_offload import (
-            apply_cpu_offload_pass,
-        )
-        from torchtitan.experiments.graph_trainer.passes import (
-            selective_activation_remat_pass,
-            tag_with_memory_policy_pass,
-        )
-
         passes.append(
             functools.partial(tag_with_memory_policy_pass, config=config)
         )
@@ -511,7 +512,14 @@ def construct_tpu_transform_passes(
         passes.append(
             functools.partial(
                 apply_cpu_offload_pass,
-                prefetch_lookahead=config.compile.cpu_offload_prefetch_n_layers,
+                # Split mode places complete H2D pairs by executable after
+                # partition ownership is known. Keep the generic pre-split
+                # rewrite at the first consumer in that mode.
+                prefetch_lookahead=(
+                    0
+                    if config.tpu_config.use_graph_split
+                    else config.compile.cpu_offload_prefetch_n_layers
+                ),
                 defer_n_layers=config.compile.cpu_offload_defer_n_layers,
             )
         )

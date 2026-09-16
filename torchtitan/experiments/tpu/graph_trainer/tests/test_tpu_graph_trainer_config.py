@@ -175,8 +175,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_cpu_offload_controls_are_propagated(self) -> None:
     config = qwen3_8b()
     config.tpu_config.graph_trainer_memory_policy = "full_and_offload"
-    config.tpu_config.graph_trainer_cpu_offload_prefetch_n_layers = 2
-    config.tpu_config.graph_trainer_cpu_offload_defer_n_layers = 3
     config.tpu_config.graph_trainer_cpu_offload_budget_gb = 4.5
 
     graph_config = to_tpu_graph_trainer_config(
@@ -186,8 +184,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertEqual(graph_config.compile.memory_policy, "full_and_offload")
-    self.assertEqual(graph_config.compile.cpu_offload_prefetch_n_layers, 2)
-    self.assertEqual(graph_config.compile.cpu_offload_defer_n_layers, 3)
     self.assertEqual(graph_config.compile.cpu_offload_budget_gb, 4.5)
     passes = construct_tpu_pass_pipeline(
         typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
@@ -224,11 +220,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         },
     )
 
-  def test_host_donation_requires_split_offload(self) -> None:
+  def test_cpu_offload_prefetch_requires_backward_split(self) -> None:
     config = qwen3_8b()
-    config.tpu_config.graph_split.donate_host_offload_buffers = True
+    config.tpu_config.graph_split.cpu_offload_prefetch_executables = 1
 
-    with self.assertRaisesRegex(ValueError, "requires a split forward graph"):
+    with self.assertRaisesRegex(ValueError, "requires a split backward graph"):
       GraphSplitter.from_trainer_config(
           self._qwen3_graph_config(config),
           optimizer_in_graph=False,
@@ -236,42 +232,38 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     config.tpu_config.use_graph_split = True
     config.tpu_config.graph_split.forward_layers_per_executable = 1
-    with self.assertRaisesRegex(ValueError, "CPU-offload memory policy"):
+    with self.assertRaisesRegex(ValueError, "requires a split backward graph"):
       GraphSplitter.from_trainer_config(
           self._qwen3_graph_config(config),
           optimizer_in_graph=False,
       )
 
-    config.tpu_config.graph_trainer_memory_policy = "full_and_offload"
+    config.tpu_config.graph_split.backward_partition_mode = "by_layer"
     splitter = GraphSplitter.from_trainer_config(
         self._qwen3_graph_config(config),
         optimizer_in_graph=False,
     )
     self.assertTrue(splitter.enabled)
 
-  @parameterized.named_parameters(
-      ("negative_prefetch", "prefetch", -1),
-      ("negative_defer", "defer", -1),
-      ("negative_budget", "budget", -0.1),
-  )
-  def test_invalid_cpu_offload_controls_are_rejected(
-      self,
-      field: str,
-      value: float,
-  ) -> None:
+  def test_negative_cpu_offload_budget_is_rejected(self) -> None:
     config = qwen3_8b()
-    setattr(
-        config.tpu_config,
-        f"graph_trainer_cpu_offload_{field}"
-        + ("_n_layers" if field != "budget" else "_gb"),
-        value,
-    )
+    config.tpu_config.graph_trainer_cpu_offload_budget_gb = -0.1
 
     with self.assertRaisesRegex(ValueError, "must be nonnegative"):
       to_tpu_graph_trainer_config(
           config,
           qwen3_gt.model_registry,
           target_cls=TpuGraphTrainer.Config,
+      )
+
+  def test_negative_cpu_offload_executable_prefetch_is_rejected(self) -> None:
+    config = qwen3_8b()
+    config.tpu_config.graph_split.cpu_offload_prefetch_executables = -1
+
+    with self.assertRaisesRegex(ValueError, "must be nonnegative"):
+      GraphSplitter.from_trainer_config(
+          self._qwen3_graph_config(config),
+          optimizer_in_graph=False,
       )
 
   def test_cli_remat_schedule_is_propagated(self) -> None:

@@ -38,14 +38,15 @@ class GraphSplitterConfig:
   # or repeating recompute, so it is intentionally outside this splitter.
   backward_layers_per_executable: int = 1
   # Reuse dead internal split-boundary buffers through XLA input donation.
-  # This should default to True: last-use donation is preferable and is safe
-  # unless reusable-buffer identification is wrong. It remains False until
-  # TorchTPU includes donation in its compilation cache key (torch_tpu#3614).
-  # Original graph inputs and forward-saved tensors are never candidates.
-  donate_internal_buffers: bool = False
-  # Reuse pinned-host activation buffers across steps by threading the previous
-  # D2H outputs back into their producing children as donated inputs.
-  donate_host_offload_buffers: bool = False
+  # Original graph inputs and forward-saved tensors are never candidates. This
+  # remains configurable for controlled ablations until all supported runtimes
+  # can make it unconditional.
+  donate_internal_buffers: bool = True
+  # Number of complete backward child executables by which to advance each H2D
+  # reload pair relative to its first consumer. Zero keeps the pair in the
+  # consumer child; one places it in the immediately preceding child and carries
+  # only the completed device tensor across the boundary.
+  cpu_offload_prefetch_executables: int = 0
 
 
 @dataclasses.dataclass
@@ -77,8 +78,6 @@ class TPUConfig:
   # tracing eager activation-checkpoint wrappers.
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
   # CPU-offload controls propagated into GraphTrainer's compile config.
-  graph_trainer_cpu_offload_prefetch_n_layers: int = 1
-  graph_trainer_cpu_offload_defer_n_layers: int = 1
   graph_trainer_cpu_offload_budget_gb: float = 100.0
   # Run the decoder layers as a single scan instead of a Python loop, so the
   # compiler sees one loop body rather than n_layers copies of it. Each layer's

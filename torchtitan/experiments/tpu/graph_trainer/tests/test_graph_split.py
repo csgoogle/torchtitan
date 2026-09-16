@@ -398,6 +398,9 @@ class GraphSplitTest(absltest.TestCase):
         defer_n_layers=0,
     )
     split = split_forward_backward_graph(gm, (inputs,))
+    donor_specs, donor_output_positions, donor_examples = (
+        thread_host_offload_donors(split.forward_graph)
+    )
     forward = split_forward_graph_by_layer(split.forward_graph, 1)
     backward = split_backward_graph_by_layer(
         split.backward_graph,
@@ -440,9 +443,6 @@ class GraphSplitTest(absltest.TestCase):
               )
           )
 
-    donor_specs, donor_output_positions, donor_examples = (
-        thread_host_offload_donors(forward.module)
-    )
     self.assertLen(donor_specs, 1)
     self.assertLen(donor_output_positions, 1)
     self.assertLen(donor_examples, 1)
@@ -471,36 +471,37 @@ class GraphSplitTest(absltest.TestCase):
     ]
     self.assertLen(donor_waits, 1)
 
-  def test_cpu_reload_prefetch_uses_its_scheduled_backward_child(self):
-    """Carry a ready tensor across children, not an async-copy descriptor."""
-    gm, inputs = self._build_cpu_offload_graph()
-    apply_cpu_offload_pass(
-        gm,
-        prefetch_lookahead=1,
-        defer_n_layers=0,
-    )
-    split = split_forward_backward_graph(gm, (inputs,))
-    backward = split_backward_graph_by_layer(
-        split.backward_graph,
-        n_layers=2,
-    )
+  def test_cpu_reload_prefetch_distance_counts_executables(self):
+    """Zero uses the consumer child; one uses its immediate predecessor."""
+    for distance in (0, 1):
+      with self.subTest(distance=distance):
+        gm, inputs = self._build_cpu_offload_graph()
+        apply_cpu_offload_pass(
+            gm,
+            prefetch_lookahead=0,
+            defer_n_layers=0,
+        )
+        split = split_forward_backward_graph(gm, (inputs,))
+        backward = split_backward_graph_by_layer(
+            split.backward_graph,
+            n_layers=2,
+            cpu_offload_prefetch_executables=distance,
+        )
 
-    reload_0 = next(
-        node
-        for node in split.backward_graph.graph.nodes
-        if node.target == torch.ops.ao.reload.default
-        and _get_layer_id(node) == 0
-    )
-    wait_0 = next(
-        user
-        for user in reload_0.users
-        if user.target == torch.ops.ao.wait_tensor.default
-    )
-    prior_partition = backward.layer_to_partition[1]
-    consumer_partition = backward.layer_to_partition[0]
-    self.assertNotEqual(prior_partition, consumer_partition)
-    self.assertEqual(backward.partition_map[reload_0], prior_partition)
-    self.assertEqual(backward.partition_map[wait_0], prior_partition)
+        reload_0 = next(
+            node
+            for node in split.backward_graph.graph.nodes
+            if node.target == torch.ops.ao.reload.default
+            and _get_layer_id(node) == 0
+        )
+        wait_0 = next(
+            user
+            for user in reload_0.users
+            if user.target == torch.ops.ao.wait_tensor.default
+        )
+        expected_partition = backward.layer_to_partition[distance]
+        self.assertEqual(backward.partition_map[reload_0], expected_partition)
+        self.assertEqual(backward.partition_map[wait_0], expected_partition)
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.
