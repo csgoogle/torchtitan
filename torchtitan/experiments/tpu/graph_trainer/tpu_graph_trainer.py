@@ -52,6 +52,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     construct_tpu_transform_passes,
     register as register_tpu_pipeline,
 )
+from torchtitan.experiments.tpu.valid_tokens import loss_with_global_valid_token_sum
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.tools.logging import logger
 
@@ -138,6 +139,26 @@ class TpuGraphTrainer(GraphTrainer):
 
         self._tpu_extra = tpu_extra
         self._optimizer_in_graph = _optimizer_in_graph_enabled(config, tpu_extra)
+        self._reduce_valid_tokens_in_loss = (
+            config.tpu_config.reduce_valid_tokens_in_loss
+        )
+        if self._reduce_valid_tokens_in_loss:
+            if self._optimizer_in_graph:
+                raise ValueError(
+                    "reduce_valid_tokens_in_loss does not support optimizer_in_graph"
+                )
+            if self.parallel_dims.pp_enabled:
+                raise ValueError(
+                    "reduce_valid_tokens_in_loss does not support pipeline parallelism"
+                )
+            if self.gradient_accumulation_steps != 1:
+                raise ValueError(
+                    "reduce_valid_tokens_in_loss requires one microbatch"
+                )
+            if self.config.compile.precompile_artifact_dir:
+                raise ValueError(
+                    "reduce_valid_tokens_in_loss does not support precompiled FX artifacts"
+                )
         self._compiled_grad_norm = (
             CompiledGradNorm() if config.tpu_config.compile_grad_norm else None
         )
@@ -179,6 +200,31 @@ class TpuGraphTrainer(GraphTrainer):
             self._train_step_optimizer_in_graph(data_iterator)
         if self._mfu_benchmark is not None:
             self._mfu_benchmark.record(self.step, self.ntokens_seen)
+
+    def _prepare_valid_tokens_for_loss(
+        self, local_valid_tokens: torch.Tensor
+    ) -> float | torch.Tensor:
+        if not self._reduce_valid_tokens_in_loss:
+            return super()._prepare_valid_tokens_for_loss(local_valid_tokens)
+        return local_valid_tokens.to(self.device)
+
+    def _materialize_global_valid_tokens_for_metrics(
+        self,
+        local_valid_tokens: torch.Tensor,
+        valid_tokens_for_loss: float | torch.Tensor,
+    ) -> float:
+        if not self._reduce_valid_tokens_in_loss:
+            return super()._materialize_global_valid_tokens_for_metrics(
+                local_valid_tokens, valid_tokens_for_loss
+            )
+        from torchtitan.distributed import utils as dist_utils
+
+        if self.parallel_dims.dp_enabled:
+            return dist_utils.dist_sum(
+                local_valid_tokens.to(self.device),
+                self.parallel_dims.get_mesh("batch"),
+            )
+        return float(local_valid_tokens.item())
 
     def _register_optimizer_buffers(self) -> None:
         """TPU/PJRT addition: registers persistent optstate buffers when optimizer_in_graph is enabled."""
@@ -341,9 +387,17 @@ class TpuGraphTrainer(GraphTrainer):
             if self.config.compile.precompile_artifact_dir:
                 self._load_precompiled_fx_trace(model)
             else:
+                loss_fn = self.loss_fn
+                if self._reduce_valid_tokens_in_loss:
+                    loss_fn = loss_with_global_valid_token_sum(
+                        loss_fn,
+                        self.parallel_dims.get_mesh("batch")
+                        if self.parallel_dims.dp_enabled
+                        else None,
+                    )
                 fwd_bwd_fn = make_fwd_bwd_step(
                     model,
-                    self.loss_fn,
+                    loss_fn,
                     collect_moe_routing_metrics=self._collect_moe_routing_metrics,
                 )
                 maybe_register_blockmask_pytree_node()

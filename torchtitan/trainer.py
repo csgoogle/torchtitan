@@ -762,6 +762,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
 
+    def _prepare_valid_tokens_for_loss(
+        self, local_valid_tokens: torch.Tensor
+    ) -> float | torch.Tensor:
+        if self.parallel_dims.dp_enabled:
+            return dist_utils.dist_sum(
+                local_valid_tokens.to(self.device),
+                self.parallel_dims.get_mesh("batch"),
+            )
+        return float(local_valid_tokens.item())
+
+    def _materialize_global_valid_tokens_for_metrics(
+        self,
+        local_valid_tokens: torch.Tensor,
+        valid_tokens_for_loss: float | torch.Tensor,
+    ) -> float:
+        del local_valid_tokens
+        if isinstance(valid_tokens_for_loss, torch.Tensor):
+            return float(valid_tokens_for_loss.item())
+        return valid_tokens_for_loss
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -783,15 +803,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 microbatches.append((input_dict, labels))
         sl.log_trace_scalar({"local_valid_tokens": int(local_valid_tokens)})
 
-        # All-reduce to get global token count across DP ranks
-        # Move to GPU for distributed communication
-        if parallel_dims.dp_enabled:
-            batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(
-                local_valid_tokens.to(self.device), batch_mesh
-            )
-        else:
-            global_valid_tokens = float(local_valid_tokens.item())
+        valid_tokens_for_loss = self._prepare_valid_tokens_for_loss(
+            local_valid_tokens
+        )
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
@@ -805,7 +819,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
-                global_valid_tokens=global_valid_tokens,
+                global_valid_tokens=valid_tokens_for_loss,
             )
             accumulated_losses.append(loss.detach())
 
@@ -823,6 +837,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             return
 
         with sl.log_trace_span("collect_dist_metrics"):
+
+            global_valid_tokens = self._materialize_global_valid_tokens_for_metrics(
+                local_valid_tokens, valid_tokens_for_loss
+            )
 
             sl.log_trace_scalar({"global_valid_tokens": int(global_valid_tokens)})
 

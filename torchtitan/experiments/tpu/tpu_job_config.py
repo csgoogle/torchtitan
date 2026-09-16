@@ -74,6 +74,9 @@ class TPUConfig:
   # largest validated full-gradient payload.
   fsdp_allreduce_slice_parameter_patterns: tuple[str, ...] = ()
   fsdp_allreduce_slice_max_input_bytes: int = 0
+  # Move the global valid-token SUM into the traced loss graph, avoiding a
+  # separate pre-forward synchronization on the common one-microbatch path.
+  reduce_valid_tokens_in_loss: bool = False
   # Run via TpuGraphTrainer (joint fwd+loss+bwd aot_fx_trace and FX-graph SAC passes).
   use_graph_trainer: bool = False
   # Whether to compile the optimizer step into the joint fwd+loss+bwd graph.
