@@ -66,7 +66,7 @@ DISABLED_TESTS = {
     # TODO: ModuleNotFoundError: No module named 'internal'
     "torchtitan.experiments.tpu.tests.test_profiler",
     # TODO: add copybara handling for this test
-    "torchtitan.experiments.tpu.kernels.tests.test_kernel_name_determinism",
+    "torchtitan.experiments.tpu.kernels.tests.test_kernel_name_determinism_distributed",
     # TODO: SyntaxError: invalid syntax (from jaxtyping)
     "torchtitan.experiments.tpu.redacted.tests.test_train_minimal_distributed",
     # TODO: Unknown command line flag 'device'
@@ -204,6 +204,13 @@ def discover_tests():
             continue
 
         category = classify_test(tree)
+        if category == "distributed" and not path.name.endswith("_distributed.py"):
+            sys.exit(
+                f"Error: Test '{relative}' is classified as distributed (inherits from "
+                "BaseDistributedDeviceTest) but its filename does not end with '_distributed.py'. "
+                "Please rename it to end with '_distributed.py'."
+            )
+
         if category == "cpu":
             # Categorize tests without a `__main__` entry point to run under pytest.
             if _is_pytest_only(relative) or not has_main_block(tree):

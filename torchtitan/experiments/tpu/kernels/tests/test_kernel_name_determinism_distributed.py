@@ -9,8 +9,6 @@ import torch.multiprocessing as mp
 from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss
 from torchtitan.experiments.tpu.kernels import splash_attention
 
-from internal.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
-
 _TIMEOUT_SECONDS = 120
 
 
@@ -117,4 +115,4 @@ class KernelNameDeterminismTest(absltest.TestCase):
 
 if __name__ == "__main__":
   mp.set_start_method("spawn")
-  g3_multiprocessing.handle_test_main(absltest.main)
+  absltest.main()
