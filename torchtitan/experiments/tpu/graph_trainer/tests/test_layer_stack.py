@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch import nn
 from torch._functorch import config as functorch_config, partitioners
+from torch._higher_order_ops.scan import ScanAutogradImpl
 from torch.distributed.tensor import DTensor, Shard
 
 from torchtitan.components.optimizer import default_adamw, OptimizersContainer
@@ -32,6 +33,10 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
+
+# Imported here so it is not first imported under the mocked `call_backward`
+# below: it captures that method at import time.
+from torchtitan.experiments.tpu import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
 from torchtitan.experiments.tpu.layer_loop import tpu_model_class
 from torchtitan.models.llama3 import model_registry
 from torchtitan.models.qwen3 import model_registry as qwen3_registry
@@ -241,6 +246,19 @@ class TestLayerStack(unittest.TestCase):
         torch.testing.assert_close(
             scanned(tokens), plain(tokens), rtol=1e-5, atol=1e-6
         )
+
+    def test_building_a_scan_refuses_without_the_backward_patch(self):
+        """Failing to install is a warning; building a scan without it is not --
+        that run reverses by copy and OOMs some steps later."""
+
+        def not_the_method(self, *grad_fw_outputs):
+            raise AssertionError("unreachable")
+
+        with patch.object(ScanAutogradImpl, "call_backward", not_the_method):
+            with self.assertRaises(RuntimeError):
+                _build(stacked=True, scan=True)
+            # ... and a model that never asked for scan is unaffected.
+            _build(stacked=True)
 
     def test_the_body_recomputes_its_gather_in_backward(self):
         """The in-body gather is worth nothing unless backward redoes it.
