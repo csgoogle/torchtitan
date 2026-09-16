@@ -52,48 +52,89 @@ _FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
 _BF16_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.bf16_rope"
 
 
-# The two copy flags are the validated addition needed to compose activation
-# D2H with input donation: region analysis removes the conservative alias
-# snapshot, and keeping copies off SparseCore avoids contention with FSDP
-# collectives.
+# Compiler policy shared by the FP32 and MaxText-parity offload recipes.
 _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
+    # Aggregate SparseCore collectives and enable layer-level latency hiding so
+    # FSDP communication can be scheduled alongside independent layer compute.
     tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    # Use both SparseCores for reduce-scatter in the by-layer FSDP schedule.
     tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
     {
+        # These three fusion disables are the validated workaround for a
+        # deterministic libtpu crash while compiling Q235 layer executables.
         "xla_tpu_dot_dot_fusion": False,
+        # Disable nested-dot fusion as the second part of that workaround.
         "xla_tpu_nested_dot_fusion": False,
+        # Disable RWB fusion as the third part of that workaround.
         "xla_tpu_rwb_fusion": False,
+        # Keep activation host copies off SparseCore, where they would contend
+        # with the FSDP collectives above. This does not itself create overlap.
         "xla_tpu_enable_offloading_copy_to_sparsecore": False,
+        # Prove the true copy/overwrite ordering across donated aliases. This
+        # removes the defensive activation snapshot that otherwise blocks D2H.
         "xla_tpu_copy_insertion_use_region_analysis": True,
+        # Let region analysis inspect the large Q235 layer regions instead of
+        # declining because its search budget is too small.
         "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
     },
 )
 
-# Additional scheduler flags used by the measured MaxText-parity run. The
-# ordinary activation transfers are generic kCopy operations; the run left
-# xla_max_concurrent_host_copy at its default. In particular,
-# xla_tpu_host_transfer_overlap_limit applies to DS/DUS host transfers and is
-# retained here for reproduction, not because it enables ordinary-copy
-# overlap.
+# Additional MaxText host-offload scheduler policy. Flags marked parity-only
+# reproduce that policy but are not individually credited with this recipe's
+# ordinary-copy overlap; those transfers use generic kCopy and leave
+# xla_max_concurrent_host_copy at its default.
 _Q235_COMPILED_OFFLOAD_MAXTEXT_FLAGS = tpu_flags.merge_flags(
     _Q235_COMPILED_OFFLOAD_FLAGS,
     {
+        # Allow LHS to use the full shared-memory budget when evaluating
+        # overlap schedules; the normal compiler default is 95%.
         "xla_tpu_scheduler_percent_shared_memory_limit": 100,
+        # Disable libtpu's distributed diagnostic coordinator for the measured
+        # 512-rank launch; this is operational and does not change model math.
         "xla_tpu_enable_diagnostic_coordinator": False,
+        # Print the failed allocation and available/reserved bytes if this
+        # near-capacity recipe OOMs; observability only.
         "tpu_log_allocations_on_oom": True,
+        # Execute eligible FSDP all-gathers on SparseCore so TensorCore work can
+        # overlap them.
         "xla_tpu_enable_sparse_core_collective_offload_all_gather": True,
+        # Execute eligible FSDP all-reduces on SparseCore for the same reason.
         "xla_tpu_enable_sparse_core_collective_offload_all_reduce": True,
+        # Select the one-SparseCore implementation for each offloaded
+        # all-gather, matching the measured collective schedule.
         "xla_tpu_use_single_sparse_core_for_all_gather_offload": True,
+        # Enable MaxText's umbrella set of experimental scheduler heuristics;
+        # its individual contribution was not isolated in this recipe.
         "xla_tpu_enable_all_experimental_scheduler_features": True,
+        # Include live-buffer pressure in scheduler choices so overlap does not
+        # ignore this batch-16 recipe's tight HBM margin.
         "xla_tpu_enable_scheduler_memory_pressure_tracking": True,
+        # Run the host-transfer pipelining path for eligible sliced/loop-carried
+        # transfers. Ordinary split-child copies are asyncified separately.
         "xla_tpu_pipeline_memory_host_transfers": True,
+        # Cap concurrent TPU dynamic-slice/update host transfers at 24. This
+        # does not govern the ordinary kCopy transfers used by this recipe.
         "xla_tpu_host_transfer_overlap_limit": 24,
+        # Remove optimization barriers aggressively before scheduling so they
+        # do not fence otherwise independent asynchronous work.
         "xla_tpu_aggressive_opt_barrier_removal": "ENABLED",
+        # Prefer maintaining asynchronous pipeline depth over minimizing the
+        # scheduler's immediate stall estimate.
         "xla_lhs_prioritize_async_depth_over_stall": "ENABLED",
+        # Permit backward all-gather pipelining for HLO shapes where the
+        # collective pipeliner finds a legal candidate.
         "xla_tpu_enable_ag_backward_pipelining": True,
+        # Let the collective pipeliner follow loop-variant parameters when
+        # building a candidate chain; parity-only for split entry computations.
         "xla_should_allow_loop_variant_parameter_in_chain": "ENABLED",
+        # Let that chain also include loop-invariant operands; likewise only
+        # relevant if an eligible while/scan is present.
         "xla_should_add_loop_invariant_op_in_chain": "ENABLED",
+        # Raise host send/recv concurrency for MaxText parity. It does not
+        # control the generic kCopy activation transfers.
         "xla_max_concurrent_host_send_recv": 100,
+        # Rerun latency-hiding scheduling after SparseCore assignment so the
+        # final scheduler sees the selected collective resources.
         "xla_latency_hiding_scheduler_rerun": 2,
     },
 )
@@ -597,6 +638,11 @@ def qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  # The tokenizer/model vocabulary has 151,936 real classes, which is not
+  # divisible by FSDP-512. Pad the physical embedding and LM-head matrices to
+  # 152,064 (= 297 rows/rank), while keeping vocab_size as the logical size.
+  # Token IDs never address the padded rows, and the loss/logit paths below
+  # remove those rows before softmax so they cannot change model semantics.
   model_config.tok_embeddings.num_embeddings = 152064
   model_config.lm_head.out_features = 152064
   assert isinstance(cfg.loss, PallasCrossEntropyLoss.Config)
@@ -616,7 +662,6 @@ def qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   cfg.tpu_config.graph_split.forward_isolate_prefix = True
   cfg.tpu_config.graph_split.backward_partition_mode = "fsdp_pipeline"
   cfg.tpu_config.graph_split.backward_layers_per_executable = 1
-  cfg.tpu_config.graph_split.donate_internal_buffers = False
   cfg.tpu_config.enable_graph_trainer_remat_schedule = False
   cfg.tpu_config.graph_trainer_fsdp_schedule = "none"
   cfg.tpu_config.compile_optimizer = False
@@ -630,26 +675,21 @@ def qwen3_moe_235b_fsdp_compiled_offload() -> TPUTrainerConfig:
   """FP32-reduction Q235 recipe with compiled activation CPU offload.
 
   This is the landing-policy counterpart of the BF16 MaxText-parity recipe
-  below. It keeps one layer in each split executable and reuses both internal
-  device buffers and the prior step's pinned-host activation buffers.
+  below. It keeps one layer in each split executable and reuses the prior
+  step's pinned-host activation buffers.
   """
   cfg = qwen3_moe_235b_fsdp_only()
   cfg.tpu_config.graph_trainer_memory_policy = "full_and_offload"
-  cfg.tpu_config.graph_trainer_cpu_offload_defer_n_layers = 1
-  # x_i is first reloaded while rematerializing layer i+1. A distance of one
-  # therefore reaches the consumer executable; two reaches the preceding
-  # executable and makes the H2D copy overlappable. The measured BF16 arm paid
-  # 0.96 GiB for that extra live boundary and removed 1.31 s of exposed H2D.
-  cfg.tpu_config.graph_trainer_cpu_offload_prefetch_n_layers = 2
-  cfg.tpu_config.graph_trainer_cpu_offload_budget_gb = 100.0
   cfg.tpu_config.graph_split.forward_layers_per_executable = 1
   # Current ``by_layer`` is the direct successor of the ``sequential`` mode
   # used by the measured schedule: one complete backward layer per
   # independently compiled child.
   cfg.tpu_config.graph_split.backward_partition_mode = "by_layer"
   cfg.tpu_config.graph_split.backward_layers_per_executable = 1
-  cfg.tpu_config.graph_split.donate_internal_buffers = True
-  cfg.tpu_config.graph_split.donate_host_offload_buffers = True
+  # Issue each H2D pair in the child immediately before its consumer. This
+  # removed 1.31 s of exposed H2D in the measured BF16 arm at a 0.96-GiB HBM
+  # cost from carrying the completed activation across one child boundary.
+  cfg.tpu_config.graph_split.cpu_offload_prefetch_executables = 1
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       _Q235_COMPILED_OFFLOAD_FLAGS,

@@ -293,6 +293,10 @@ class Decoder(BaseModel):
         if self._skip_lm_head:
             return h
         output = self.lm_head(h) if self.lm_head is not None else h
+        # Some distributed recipes pad the physical LM-head width so every
+        # rank owns the same number of rows. Public logits must still contain
+        # only real tokenizer classes; the fused-loss path applies the same
+        # logical-vocabulary trim directly to the LM-head weight.
         if (
             isinstance(output, torch.Tensor)
             and output.shape[-1] != self.config.vocab_size

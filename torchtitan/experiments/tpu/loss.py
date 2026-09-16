@@ -32,7 +32,9 @@ def pallas_cross_entropy_loss(
   operands to the fused kernel, which performs the projection, softmax, and
   cross entropy together. It also flattens TorchTitan's batched shapes to the
   token-major shapes required by Tokamax and rejects incompatible Mosaic tiles
-  instead of silently switching kernels.
+  instead of silently switching kernels. ``logical_vocab_size`` trims a
+  physically padded LM-head matrix before softmax; without that trim, padding
+  rows would become extra classes and change both the loss and gradients.
   """
   if not isinstance(pred, tuple) or len(pred) != 2:
     raise ValueError("Pallas loss requires (x, weights) as input")
@@ -115,6 +117,9 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
     b_block_size: int = 1024
     h_block_size: int = 512
     v_block_size: int = 2048
+    # Number of real tokenizer classes when the physical LM head is padded for
+    # even FSDP sharding. None means the full physical width is semantically
+    # part of the vocabulary.
     logical_vocab_size: int | None = None
 
   def __init__(
