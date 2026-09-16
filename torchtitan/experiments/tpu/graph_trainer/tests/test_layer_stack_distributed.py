@@ -8,6 +8,7 @@ repeated here on ``--device``, across ``--num_devices`` ranks, with the stacks
 actually sharded.
 """
 
+from absl import logging
 from absl.testing import absltest
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -76,7 +77,8 @@ def a_replicated_stack_still_sums_its_gradient(device, rank, world_size):
     on its own microbatch's gradient, silently.
     """
     if world_size == 1:
-        return  # Nothing to downgrade, and nothing to sum.
+        logging.warning("skipped: one rank, nothing to downgrade or sum")
+        return
     mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
     holder = nn.Module()
     # Dim 1 is 1, so there is no way to split it across the ranks.
@@ -109,7 +111,8 @@ def a_sharded_stack_gathers_and_reduces_like_unrolled(device, rank, world_size):
     anything on a real mesh.
     """
     if world_size == 1:
-        return  # Both collectives are the identity.
+        logging.warning("skipped: one rank, both collectives are the identity")
+        return
     mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
     holder = nn.Module()
     # Two layers, and a dim 1 the mesh splits evenly.
@@ -166,7 +169,8 @@ def a_doubly_replicated_stack_sums_on_both_axes(device, rank, world_size):
     the two halves of the mesh hold different weights and nothing says so.
     """
     if world_size < 4 or world_size % 2:
-        return  # No room for two axes.
+        logging.warning("skipped: hybrid_shard needs an even mesh of at least 4")
+        return
     shard_degree = world_size // 2
     mesh = init_device_mesh(
         device.type,
@@ -213,7 +217,8 @@ def a_hybrid_sharded_stack_sums_over_both_axes(device, rank, world_size):
     on gradients that are `1/dp_replicate` of the truth.
     """
     if world_size < 4 or world_size % 2:
-        return  # No room for two axes.
+        logging.warning("skipped: hybrid_shard needs an even mesh of at least 4")
+        return
     shard_degree = world_size // 2
     mesh = init_device_mesh(
         device.type,
@@ -261,7 +266,8 @@ def an_unevenly_sharded_stack_is_refused(device, rank, world_size):
     """
     del rank
     if world_size == 1:
-        return  # Every size divides by one.
+        logging.warning("skipped: one rank, every size divides by one")
+        return
     mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
     holder = nn.Module()
     # Above the mesh size, so it is sharded rather than downgraded, and one row
@@ -289,7 +295,8 @@ def an_unevenly_sharded_hybrid_stack_is_refused(device, rank, world_size):
     """
     del rank
     if world_size < 4 or world_size % 2:
-        return  # No room for two axes.
+        logging.warning("skipped: hybrid_shard needs an even mesh of at least 4")
+        return
     shard_degree = world_size // 2
     mesh = init_device_mesh(
         device.type,

@@ -121,6 +121,7 @@ class TpuGraphTrainerDistributedTest(
           testcase_name="llama3_simple_fsdp_scan_layers_hsdp",
           module="torchtitan.experiments.tpu.llama3",
           config="llama3_debugmodel",
+          # Unset, so FSDP gets the remaining num_devices / 2.
           data_parallel_shard_degree=None,
           tensor_parallel_degree=1,
           data_parallel_replicate_degree=2,
