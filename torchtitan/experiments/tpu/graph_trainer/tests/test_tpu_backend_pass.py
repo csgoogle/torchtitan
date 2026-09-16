@@ -309,6 +309,52 @@ class PartitionDonationTest(absltest.TestCase):
         compiler_instance.call_args.kwargs["donated_inputs"], [0, 1]
     )
 
+  def test_direct_compile_restores_pinned_host_reload_input(self):
+    graph = torch.fx.Graph()
+    host = graph.placeholder("host")
+    host.meta["val"] = torch.empty_strided((2, 3), (3, 1))
+    reload_node = graph.call_function(
+        torch.ops.ao.reload.default,
+        args=(host, torch.device("cpu"), [2, 3], [3, 1]),
+    )
+    reload_node.meta["val"] = torch.empty_strided((2, 3), (3, 1))
+    graph.output((reload_node,))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    executable = mock.Mock(return_value=(torch.randn(2, 3),))
+    compiler_instance = mock.Mock(return_value=executable)
+    compiler = mock.Mock(return_value=compiler_instance)
+    real_empty_strided = torch.empty_strided
+
+    def make_test_tensor(*args, **kwargs):
+      kwargs["device"] = "cpu"
+      return real_empty_strided(*args, **kwargs)
+
+    with (
+        mock.patch.object(
+            tpu_backend_pass, "_import_static_compiler", return_value=compiler
+        ),
+        mock.patch.object(
+            tpu_backend_pass.torch._subclasses.fake_tensor,
+            "FakeTensorMode",
+            return_value=mock.MagicMock(),
+        ),
+        mock.patch.object(
+            tpu_backend_pass.torch,
+            "empty_strided",
+            side_effect=make_test_tensor,
+        ),
+    ):
+      tpu_backend_pass.tpu_backend_compile_pass(
+          gm,
+          (torch.randn(2, 3),),
+          is_fwd=False,
+      )
+
+    compile_inputs = compiler_instance.call_args.args[1]
+    self.assertEqual(len(compile_inputs), 1)
+    self.assertTrue(compile_inputs[0]._is_pinned_host)
+
   def test_legacy_static_compiler_works_when_donation_is_disabled(self):
     gm = make_fx(lambda x: (x.sin(),))(torch.randn(2, 3))
     executable = mock.Mock(return_value=(torch.randn(2, 3),))

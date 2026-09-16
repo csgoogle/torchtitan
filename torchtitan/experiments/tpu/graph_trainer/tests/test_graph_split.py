@@ -422,6 +422,16 @@ class GraphSplitTest(absltest.TestCase):
     self.assertTrue(
         all(target not in ao_targets for target in targets(backward.module))
     )
+    forward_child_targets = set().union(
+        *(targets(child) for child in forward.module.children())
+    )
+    backward_child_targets = set().union(
+        *(targets(child) for child in backward.module.children())
+    )
+    self.assertIn(torch.ops.ao.offload.default, forward_child_targets)
+    self.assertNotIn(torch.ops.ao.reload.default, forward_child_targets)
+    self.assertIn(torch.ops.ao.reload.default, backward_child_targets)
+    self.assertNotIn(torch.ops.ao.offload.default, backward_child_targets)
     for parent in (forward.module, backward.module):
       for child in parent.children():
         child_nodes = set(child.graph.nodes)
@@ -442,6 +452,13 @@ class GraphSplitTest(absltest.TestCase):
     self.assertLen(donor_specs, 1)
     self.assertLen(donor_output_positions, 1)
     self.assertLen(donor_examples, 1)
+    split.module.forward_graph = forward.module
+    split.module.host_donor_specs = donor_specs
+    with self.assertRaisesRegex(RuntimeError, "compiled TPU forward program"):
+      split.module._initialize_host_donors(split.forward_example_inputs)
+    forward.module._tpu_executable = object()
+    with self.assertRaisesRegex(RuntimeError, "without a TPU input"):
+      split.module._initialize_host_donors(split.forward_example_inputs)
     parent_donors = [
         node
         for node in forward.module.graph.nodes
@@ -497,6 +514,51 @@ class GraphSplitTest(absltest.TestCase):
         expected_partition = backward.layer_to_partition[1 + distance]
         self.assertEqual(backward.partition_map[reload_0], expected_partition)
         self.assertEqual(backward.partition_map[wait_0], expected_partition)
+
+  def test_unsplit_forward_still_donates_persistent_host_slot(self):
+    """The default forward setting must not fall back to per-step mappings."""
+    traced = self._trace_cpu_offload_graph()
+    splitter = graph_split_lib.GraphSplitter(
+        enabled=True,
+        config=SimpleNamespace(
+            forward_layers_per_executable=-1,
+            forward_isolate_prefix=False,
+            backward_partition_mode="none",
+            backward_layers_per_executable=1,
+            cpu_offload_prefetch_executables=0,
+            donate_internal_buffers=False,
+        ),
+        n_layers=3,
+    )
+
+    with (
+        mock.patch.object(
+            graph_split_lib, "tpu_backend_compile_pass"
+        ) as compile_pass,
+        mock.patch.object(
+            graph_split_lib, "tpu_backend_compile_partitioned_pass"
+        ) as compile_partitioned,
+    ):
+      module = splitter.split_and_compile(traced)
+
+    compile_partitioned.assert_not_called()
+    self.assertEqual(compile_pass.call_count, 2)
+    forward_call = compile_pass.call_args_list[0]
+    original_input_count = len(traced.example_inputs)
+    self.assertEqual(
+        forward_call.kwargs["donated_input_positions"],
+        (original_input_count,),
+    )
+    self.assertLen(forward_call.args[1], original_input_count + 1)
+    self.assertLen(module.host_donor_specs, 1)
+    self.assertLen(module.host_donor_output_positions, 1)
+    self.assertTrue(
+        any(
+            node.op == "placeholder"
+            and node.meta.get("tpu_force_donate", False)
+            for node in module.forward_graph.graph.nodes
+        )
+    )
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.

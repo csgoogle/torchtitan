@@ -134,11 +134,21 @@ class SplitForwardBackwardModule(nn.Module):
     """Create one persistent pinned-host tensor per offloaded activation.
 
     ``host_donor_specs`` describes the slots; ``flat_program_inputs`` is scanned
-    only to select their TPU device. TorchTPU does not currently expose a direct
-    pinned-host tensor allocator, so each slot is created through AO D2H,
-    producing a TPU tensor backed by PJRT pinned-host memory. Materializing one
-    at a time bounds the temporary device storage to one activation.
+    only to select their TPU device. An ordinary pinned CPU tensor is not a TPU
+    tensor backed by PJRT pinned-host memory. TorchTPU does not currently expose
+    a direct allocator for the latter, so each slot is created through AO D2H.
+    Materializing one at a time bounds temporary device storage to one
+    activation.
     """
+    children = tuple(self.forward_graph.children())
+    directly_compiled = hasattr(self.forward_graph, "_tpu_executable")
+    children_compiled = bool(children) and all(
+        hasattr(child, "_tpu_executable") for child in children
+    )
+    if not directly_compiled and not children_compiled:
+      raise RuntimeError(
+          "Host-donor threading requires a compiled TPU forward program"
+      )
     device = next(
         (
             value.device
@@ -314,10 +324,19 @@ class GraphSplitter:
 
     split = split_forward_backward_graph(traced.gm, traced.example_inputs)
 
+    # Host-slot recurrence belongs to the top-level forward signature, whether
+    # that program is compiled whole or subdivided into layer children.
+    donor_specs, donor_output_positions, donor_examples = (
+        thread_host_offload_donors(split.forward_graph)
+    )
+    split.module.host_donor_specs = donor_specs
+    split.module.host_donor_output_positions = donor_output_positions
+    forward_example_inputs = (*split.forward_example_inputs, *donor_examples)
+    donor_input_positions = tuple(
+        range(len(split.forward_example_inputs), len(forward_example_inputs))
+    )
+
     if self.config.forward_layers_per_executable > 0:
-      donor_specs, donor_output_positions, donor_examples = (
-          thread_host_offload_donors(split.forward_graph)
-      )
       forward = split_forward_graph_by_layer(
           split.forward_graph,
           self.config.forward_layers_per_executable,
@@ -325,9 +344,6 @@ class GraphSplitter:
       )
       split.forward_graph = forward.module
       split.module.forward_graph = forward.module
-      split.module.host_donor_specs = donor_specs
-      split.module.host_donor_output_positions = donor_output_positions
-      forward_example_inputs = (*split.forward_example_inputs, *donor_examples)
       tpu_backend_compile_partitioned_pass(
           forward.module,
           forward_example_inputs,
@@ -336,7 +352,8 @@ class GraphSplitter:
     else:
       tpu_backend_compile_pass(
           split.forward_graph,
-          split.forward_example_inputs,
+          forward_example_inputs,
+          donated_input_positions=donor_input_positions,
       )
 
     mode = self.config.backward_partition_mode

@@ -151,6 +151,17 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           tpu_config=TPUConfig(use_scan_layers=True, use_graph_trainer=False)
       )
 
+  @parameterized.parameters("sac_and_offload", "full_and_offload")
+  def test_scanning_rejects_generic_offload_policy(self, policy: str) -> None:
+    config = qwen3_8b()
+    config.tpu_config.use_scan_layers = True
+    config.tpu_config.graph_trainer_memory_policy = typing.cast(
+        typing.Any, policy
+    )
+
+    with self.assertRaisesRegex(ValueError, "full_and_scan_offload"):
+      self._qwen3_graph_config(config)
+
   @parameterized.parameters(
       "default", "full", "eager", "sac_and_offload", "full_and_offload"
   )

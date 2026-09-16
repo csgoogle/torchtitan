@@ -33,6 +33,15 @@ def to_tpu_graph_trainer_config(
   """Convert a TPU recipe and propagate its TPU-only GraphTrainer settings."""
   memory_policy = train_config.tpu_config.graph_trainer_memory_policy
   budget = train_config.tpu_config.graph_trainer_cpu_offload_budget_gb
+  if (
+      train_config.tpu_config.use_scan_layers
+      and memory_policy.endswith("_and_offload")
+      and memory_policy != "full_and_scan_offload"
+  ):
+    raise ValueError(
+        f"generic offload policy {memory_policy!r} is unsupported with scan; "
+        "use the scan-specific 'full_and_scan_offload' policy from PR #374"
+    )
   if budget < 0:
     raise ValueError("CPU-offload budget must be nonnegative")
   graph_config = to_graph_trainer_config(

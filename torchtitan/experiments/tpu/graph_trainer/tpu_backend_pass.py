@@ -307,6 +307,8 @@ def tpu_backend_compile_pass(
     """
     StaticCompiler = _import_static_compiler()
 
+    example_inputs = _restore_pinned_host_compile_inputs(gm, example_inputs)
+
     # Only iterate over nodes and count op/collective statistics when debug logging is enabled.
     if logger.isEnabledFor(logging.DEBUG):
         op_counter: Counter = Counter()
@@ -390,6 +392,68 @@ def tpu_backend_compile_pass(
     return gm
 
 
+def _restore_pinned_host_compile_inputs(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+) -> tuple:
+    """Represent AO host inputs as TPU tensors in PJRT pinned-host memory.
+
+    Forward/backward separation and ``split_module`` propagate an AO host
+    output as a CPU fake tensor. Its runtime value is instead a TPU tensor
+    backed by PJRT pinned-host memory. StaticCompiler reads that placement from
+    a TPU fake tensor's ``_is_pinned_host`` marker, so reconstruct the compiler
+    input for both whole and partitioned graphs.
+    """
+    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+    pinned_positions = []
+    for index, placeholder in enumerate(placeholders):
+        metadata_value = placeholder.meta.get("val")
+        reload_consumer = any(
+            user.op == "call_function"
+            and user.target is torch.ops.ao.reload.default
+            and user.args
+            and user.args[0] is placeholder
+            for user in placeholder.users
+        )
+        if (
+            isinstance(metadata_value, torch.Tensor)
+            and metadata_value.device.type == "cpu"
+            and (placeholder.meta.get("tpu_force_donate") or reload_consumer)
+        ):
+            pinned_positions.append(index)
+
+    if not pinned_positions:
+        return example_inputs
+    if len(placeholders) != len(example_inputs):
+        raise ValueError(
+            "TPU graph input count does not match its placeholders: "
+            f"{len(example_inputs)} != {len(placeholders)}"
+        )
+
+    fake_mode = detect_fake_mode(example_inputs)
+    if fake_mode is None:
+        fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
+    compile_inputs = list(example_inputs)
+    with fake_mode:
+        for index in pinned_positions:
+            value = compile_inputs[index]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(
+                    "TPU pinned-host graph input must have a Tensor example: "
+                    f"position {index} is {type(value).__name__}"
+                )
+            pinned_value = torch.empty_strided(
+                value.shape,
+                value.stride(),
+                dtype=value.dtype,
+                device="tpu",
+                requires_grad=value.requires_grad,
+            )
+            pinned_value._is_pinned_host = True
+            compile_inputs[index] = pinned_value
+    return tuple(compile_inputs)
+
+
 def tpu_backend_compile_partitioned_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple,
@@ -412,56 +476,13 @@ def tpu_backend_compile_partitioned_pass(
         donate_internal_buffers=donate_internal_buffers,
     )
 
-    def _pinned_host_compile_inputs(
-        submodule: torch.fx.GraphModule,
-        submodule_inputs: list[torch.Tensor],
-    ) -> list[torch.Tensor]:
-        """Restore TPU pinned-host placement lost at a split boundary.
-
-        Split propagation represents an AO host output as a CPU fake tensor,
-        while its runtime value is a TPU tensor backed by PJRT pinned-host
-        memory. StaticCompiler reads placement from a TPU fake tensor's
-        ``_is_pinned_host`` marker, so reconstruct that representation here.
-        """
-        placeholders = [
-            node for node in submodule.graph.nodes if node.op == "placeholder"
-        ]
-        if len(placeholders) != len(submodule_inputs):
-            raise ValueError(
-                "TPU split child input count does not match its placeholders: "
-                f"{len(submodule_inputs)} != {len(placeholders)}"
-            )
-
-        compile_inputs = list(submodule_inputs)
-        for index, (placeholder, value) in enumerate(
-            zip(placeholders, submodule_inputs, strict=True)
-        ):
-            metadata_value = placeholder.meta.get("val")
-            if not (
-                isinstance(value, torch.Tensor)
-                and isinstance(metadata_value, torch.Tensor)
-                and metadata_value.device.type == "cpu"
-            ):
-                continue
-            with fake_mode:
-                pinned_value = torch.empty_strided(
-                    value.shape,
-                    value.stride(),
-                    dtype=value.dtype,
-                    device="tpu",
-                    requires_grad=value.requires_grad,
-                )
-            pinned_value._is_pinned_host = True
-            compile_inputs[index] = pinned_value
-        return compile_inputs
-
     def compile_submodule(
         submodule: torch.fx.GraphModule,
         submodule_inputs: list[torch.Tensor],
     ) -> torch.fx.GraphModule:
         return tpu_backend_compile_pass(
             submodule,
-            tuple(_pinned_host_compile_inputs(submodule, submodule_inputs)),
+            tuple(submodule_inputs),
             is_fwd=is_fwd,
             donated_input_positions=tuple(
                 submodule.meta.get("tpu_donated_input_positions", ())

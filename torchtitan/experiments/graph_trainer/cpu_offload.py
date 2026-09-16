@@ -438,8 +438,8 @@ def apply_cpu_offload_pass(
         example_inputs: Example inputs (unused, required by graph pass interface).
         prefetch_lookahead: Move ao.reload nodes this many layers earlier in
             the backward graph to overlap H2D with compute.
-        defer_n_layers: Defer forward wait_tensor ops this many layers past
-            the last consumer to overlap D2H with compute.
+        defer_n_layers: Place each forward wait at least this many regions
+            after its source, but never before the final alias consumer.
 
     Returns:
         The transformed GraphModule with offload/reload ops inserted.
@@ -637,11 +637,12 @@ def defer_offload_waits(
     wait_offload_map: dict[Node, Node],
     n_layers: int = 1,
 ) -> int:
-    """Defer each forward wait_tensor N regions past the last consumer.
+    """Place each forward wait at a legal, overlap-friendly region.
 
     Each forward wait_tensor synchronizes the D2H transfer and frees GPU
-    storage. Deferring it past the last consumer gives extra compute
-    to overlap with the D2H copy.
+    storage. The target is the later of N regions after the offloaded tensor's
+    source and the final consumer of any alias, which gives the D2H copy
+    independent compute to overlap without freeing live storage.
 
     Regions are contiguous groups of forward compute nodes with the same
     layer_id. Non-layer segments (embeddings, lm_head, loss) form their
@@ -650,7 +651,7 @@ def defer_offload_waits(
     Args:
         gm: The GraphModule containing the full fwd+bwd graph.
         wait_offload_map: Mapping from offloaded node to its wait_tensor node.
-        n_layers: Number of regions to defer past the last consumer.
+        n_layers: Minimum number of regions between the source and the wait.
 
     Returns the number of wait nodes deferred.
     """

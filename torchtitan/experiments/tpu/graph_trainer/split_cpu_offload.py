@@ -261,6 +261,9 @@ def thread_host_offload_donors(
     wait_args = list(offload_wait.args)
     while len(wait_args) < 3:
       wait_args.append(None)
+    # TPU-only dataflow hook: TorchTPU ignores wait_tensor's keepalive value,
+    # while split_module uses this edge to thread the donated host input into
+    # the child. PyTorch's non-TPU implementation instead frees keepalive.
     wait_args[1] = donor
     offload_wait.args = tuple(wait_args)
 
