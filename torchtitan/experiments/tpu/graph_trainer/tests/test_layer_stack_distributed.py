@@ -8,6 +8,7 @@ repeated here on ``--device``, across ``--num_devices`` ranks, with the stacks
 actually sharded.
 """
 
+from absl import logging
 from absl.testing import absltest
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -76,7 +77,8 @@ def a_replicated_stack_still_sums_its_gradient(device, rank, world_size):
     on its own microbatch's gradient, silently.
     """
     if world_size == 1:
-        return  # Nothing to downgrade, and nothing to sum.
+        logging.warning("skipped: one rank, nothing to downgrade or sum")
+        return
     mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
     holder = nn.Module()
     # Dim 1 is 1, so there is no way to split it across the ranks.
@@ -109,7 +111,8 @@ def a_sharded_stack_gathers_and_reduces_like_unrolled(device, rank, world_size):
     anything on a real mesh.
     """
     if world_size == 1:
-        return  # Both collectives are the identity.
+        logging.warning("skipped: one rank, both collectives are the identity")
+        return
     mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
     holder = nn.Module()
     # Two layers, and a dim 1 the mesh splits evenly.
@@ -155,6 +158,104 @@ def a_sharded_stack_gathers_and_reduces_like_unrolled(device, rank, world_size):
     torch.testing.assert_close(got_shard.grad, want_shard.grad, rtol=0, atol=0)
 
 
+def a_doubly_replicated_stack_sums_on_both_axes(device, rank, world_size):
+    """A stack too narrow to shard is `Partial` on both axes, not one.
+
+    `data_parallel` downgrades the shard placement to `Replicate` when dim 1 is
+    below the shard degree -- a norm weight on any wide mesh, so this is the
+    common case and not a corner. Under `hybrid_shard` that leaves the weight
+    replicated twice over and a gradient owing a sum to each axis. Sum only the
+    shard axis and each replicate peer keeps its own microbatch's gradient, so
+    the two halves of the mesh hold different weights and nothing says so.
+    """
+    if world_size < 4 or world_size % 2:
+        logging.warning("skipped: hybrid_shard needs an even mesh of at least 4")
+        return
+    shard_degree = world_size // 2
+    mesh = init_device_mesh(
+        device.type,
+        (2, shard_degree),
+        mesh_dim_names=("dp_replicate", "dp_shard"),
+    )
+    holder = nn.Module()
+    # Dim 1 is 1, so there is no way to split it across the shard axis.
+    holder.register_parameter(
+        "narrow", nn.Parameter(torch.randn(2, 1, 4, device=device))
+    )
+    data_parallel(holder, mesh, "hybrid_shard", shard_dim=1)
+
+    param = holder._parameters["narrow"]
+    assert param.placements == (Replicate(), Replicate()), param.placements
+
+    # Unrolled: replicated already, so SimpleFSDP's only contribution is asking
+    # for the sum on both axes on the way back.
+    want_local = param.to_local().detach().clone().requires_grad_(True)
+    want = DTensor.from_local(
+        want_local, mesh, (Replicate(), Replicate())
+    ).to_local(grad_placements=[Partial(), Partial()])[0]
+
+    # Scanned: what the body computes for the same row.
+    got_local = param.to_local().detach().clone().requires_grad_(True)
+    got = funcol.wait_tensor(
+        gather_slice(got_local[0], plan_stacked_gathers(holder)["narrow"])
+    )
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    # Scaling by the rank makes an unsummed gradient visibly this rank's own.
+    for gathered in (want, got):
+        (gathered.sum() * (rank + 1)).backward()
+    torch.testing.assert_close(got_local.grad, want_local.grad, rtol=0, atol=0)
+
+
+def a_hybrid_sharded_stack_sums_over_both_axes(device, rank, world_size):
+    """Under ``hybrid_shard`` the gradient owes a sum on two axes, not one.
+
+    The shard axis contributes the reduce-scatter the 1-D path already does.
+    The replicate axis contributes an all-reduce on top, because every rank in
+    it computed the same weight's gradient from a different microbatch. Drop
+    that second sum and the run still trains and still reports a falling loss,
+    on gradients that are `1/dp_replicate` of the truth.
+    """
+    if world_size < 4 or world_size % 2:
+        logging.warning("skipped: hybrid_shard needs an even mesh of at least 4")
+        return
+    shard_degree = world_size // 2
+    mesh = init_device_mesh(
+        device.type,
+        (2, shard_degree),
+        mesh_dim_names=("dp_replicate", "dp_shard"),
+    )
+    holder = nn.Module()
+    # Dim 1 divides by the shard axis but not by the whole mesh, which is the
+    # case a plan that reads `mesh.size()` instead of the shard degree refuses.
+    holder.register_parameter(
+        "wide", nn.Parameter(torch.randn(2, shard_degree, 4, device=device))
+    )
+    data_parallel(holder, mesh, "hybrid_shard", shard_dim=1)
+
+    param = holder._parameters["wide"]
+    assert param.placements == (Replicate(), Shard(1)), param.placements
+
+    # Unrolled: the weight SimpleFSDP hands layer 0, straight off the DTensor.
+    want_shard = param.to_local().detach().clone().requires_grad_(True)
+    want = (
+        DTensor.from_local(want_shard, mesh, (Replicate(), Shard(1)))
+        .redistribute(placements=[Replicate(), Replicate()])
+        .to_local(grad_placements=[Partial(), Partial()])[0]
+    )
+
+    # Scanned: what the body computes for the same row.
+    got_shard = param.to_local().detach().clone().requires_grad_(True)
+    got = funcol.wait_tensor(
+        gather_slice(got_shard[0], plan_stacked_gathers(holder)["wide"])
+    )
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    # Scaling by the rank makes an unsummed gradient visibly this rank's own.
+    for gathered in (want, got):
+        (gathered.sum() * (rank + 1)).backward()
+    torch.testing.assert_close(got_shard.grad, want_shard.grad, rtol=0, atol=0)
+
 def an_unevenly_sharded_stack_is_refused(device, rank, world_size):
     """A stack the mesh cannot split evenly must fail while the plan is built.
 
@@ -165,7 +266,8 @@ def an_unevenly_sharded_stack_is_refused(device, rank, world_size):
     """
     del rank
     if world_size == 1:
-        return  # Every size divides by one.
+        logging.warning("skipped: one rank, every size divides by one")
+        return
     mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
     holder = nn.Module()
     # Above the mesh size, so it is sharded rather than downgraded, and one row
@@ -183,6 +285,40 @@ def an_unevenly_sharded_stack_is_refused(device, rank, world_size):
     else:
         raise AssertionError("an unevenly sharded stack was planned")
 
+
+def an_unevenly_sharded_hybrid_stack_is_refused(device, rank, world_size):
+    """The 1-D refusal has to survive the second mesh axis.
+
+    Only the last axis shards the tensor, so only its degree decides whether the
+    shards come out equal. A plan that asks the whole mesh instead gets the
+    answer wrong in both directions.
+    """
+    del rank
+    if world_size < 4 or world_size % 2:
+        logging.warning("skipped: hybrid_shard needs an even mesh of at least 4")
+        return
+    shard_degree = world_size // 2
+    mesh = init_device_mesh(
+        device.type,
+        (2, shard_degree),
+        mesh_dim_names=("dp_replicate", "dp_shard"),
+    )
+    holder = nn.Module()
+    # One row too many for the shard axis to split.
+    holder.register_parameter(
+        "uneven", nn.Parameter(torch.zeros(2, shard_degree + 1, 4, device=device))
+    )
+    data_parallel(holder, mesh, "hybrid_shard", shard_dim=1)
+
+    assert holder._parameters["uneven"].placements == (Replicate(), Shard(1))
+    try:
+        plan_stacked_gathers(holder)
+    except ValueError as err:
+        # The degree it names has to be the shard axis, not the whole mesh:
+        # asking the mesh refuses sizes that shard fine.
+        assert "uneven" in str(err) and f"{shard_degree} ranks" in str(err), err
+    else:
+        raise AssertionError("an unevenly sharded hybrid stack was planned")
 
 class TestLayerStackDistributed(
     base_distributed_device_test.BaseDistributedDeviceTest
@@ -212,6 +348,15 @@ class TestLayerStackDistributed(
 
     def test_an_unevenly_sharded_stack_is_refused(self):
         self._on_devices(an_unevenly_sharded_stack_is_refused)
+
+    def test_a_hybrid_sharded_stack_sums_over_both_axes(self):
+        self._on_devices(a_hybrid_sharded_stack_sums_over_both_axes)
+
+    def test_a_doubly_replicated_stack_sums_on_both_axes(self):
+        self._on_devices(a_doubly_replicated_stack_sums_on_both_axes)
+
+    def test_an_unevenly_sharded_hybrid_stack_is_refused(self):
+        self._on_devices(an_unevenly_sharded_hybrid_stack_is_refused)
 
 
 if __name__ == "__main__":

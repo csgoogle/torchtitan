@@ -92,6 +92,10 @@ class TpuGraphTrainerDistributedTest(
 ):
   """Tests the distributed training setup under TpuGraphTrainer."""
 
+  # The `hsdp` case is not about a model. It leaves
+  # `data_parallel_shard_degree` unset so torchtitan fills it from what
+  # replicate leaves -- the mesh is 2-D for any even device count, which is the
+  # only shape the in-body gather has to tell apart from a 1-D one.
   @parameterized.named_parameters([
       dict(
           testcase_name="qwen3_simple_fsdp",
@@ -111,6 +115,19 @@ class TpuGraphTrainerDistributedTest(
           tensor_parallel_degree=1,
           args=[
               "--tpu_config.use_simple_fsdp",
+          ],
+      ),
+      dict(
+          testcase_name="llama3_simple_fsdp_scan_layers_hsdp",
+          module="torchtitan.experiments.tpu.llama3",
+          config="llama3_debugmodel",
+          # Unset, so FSDP gets the remaining num_devices / 2.
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=1,
+          data_parallel_replicate_degree=2,
+          args=[
+              "--tpu_config.use_simple_fsdp",
+              "--tpu_config.use_scan_layers",
           ],
       ),
   ])
