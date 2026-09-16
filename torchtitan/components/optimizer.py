@@ -9,11 +9,12 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, cast, Generic, Literal, overload, Protocol, TypeVar
+from typing import Annotated, Any, cast, Generic, Literal, overload, Protocol, TypeVar
 
 import torch
 import torch.distributed.tensor
 import torch.nn as nn
+import tyro
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import Replicate
@@ -118,7 +119,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        param_groups: list[ParamGroupConfig] = field(default_factory=list)
+        param_groups: Annotated[
+            list[ParamGroupConfig], tyro.conf.Suppress
+        ] = field(default_factory=list)
         """Per-parameter-group optimizer configurations. Each entry specifies a
         regex pattern and a self-contained optimizer setup.
         Patterns are checked in order; first match wins."""
