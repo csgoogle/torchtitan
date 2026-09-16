@@ -28,7 +28,7 @@ import operator
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 from torch import nn
@@ -53,6 +53,15 @@ from torchtitan.experiments.graph_trainer.graph_pp.partition import (
 )
 from torchtitan.experiments.graph_trainer.graph_pp.utils import (
     is_mutation_node,
+)
+from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
+    HostDonorSpec,
+    assign_ao_transfer_partitions,
+    compile_host_donor_initializer,
+    is_ao_transfer,
+    move_forward_offloads_to_partition_entry,
+    thread_host_offload_donors,
+    validate_ao_transfer_pairs,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     tpu_backend_compile_partitioned_pass,
@@ -99,6 +108,8 @@ class SplitForwardBackwardModule(nn.Module):
       num_direct_forward_outputs: int,
       num_residual_outputs: int,
       num_outputs: int,
+      host_donor_specs: tuple[HostDonorSpec, ...] = (),
+      host_donor_output_positions: tuple[int, ...] = (),
   ) -> None:
     super().__init__()
     self.forward_graph = forward_graph
@@ -109,9 +120,56 @@ class SplitForwardBackwardModule(nn.Module):
     self.num_direct_forward_outputs = num_direct_forward_outputs
     self.num_residual_outputs = num_residual_outputs
     self.num_outputs = num_outputs
+    self.host_donor_specs = host_donor_specs
+    self.host_donor_output_positions = host_donor_output_positions
+    self._host_donors: tuple[torch.Tensor, ...] | None = None
+    self._host_donor_initializer: Callable | None = None
+
+  def _initialize_host_donors(
+      self,
+      flat_inputs: tuple[Any, ...],
+  ) -> tuple[torch.Tensor, ...]:
+    device = next(
+        (
+            value.device
+            for value in flat_inputs
+            if isinstance(value, torch.Tensor) and value.device.type == "tpu"
+        ),
+        None,
+    )
+    if device is None:
+      raise RuntimeError("Cannot initialize host donors without a TPU input")
+    if self._host_donor_initializer is None:
+      self._host_donor_initializer = compile_host_donor_initializer()
+
+    from torch_tpu._internal.sync import synchronize
+
+    donors = []
+    for spec in self.host_donor_specs:
+      source = torch.empty_strided(
+          spec.shape,
+          spec.stride,
+          dtype=spec.dtype,
+          device=device,
+      )
+      donor = self._host_donor_initializer(source)
+      # Bound temporary HBM usage while constructing the persistent host pool.
+      synchronize([donor], wait=True)
+      donors.append(donor)
+      del source
+    logger.info(
+        "Initialized %d persistent pinned-host activation donor buffers",
+        len(donors),
+    )
+    return tuple(donors)
 
   def forward(self, *flat_inputs: Any) -> tuple[Any, ...]:
-    forward_outputs = _as_tuple(self.forward_graph(*flat_inputs))
+    if self.host_donor_specs and self._host_donors is None:
+      self._host_donors = self._initialize_host_donors(flat_inputs)
+    donor_inputs = self._host_donors or ()
+    forward_outputs = _as_tuple(
+        self.forward_graph(*flat_inputs, *donor_inputs)
+    )
     direct_forward_outputs = forward_outputs[
         : self.num_direct_forward_outputs
     ]
@@ -130,6 +188,11 @@ class SplitForwardBackwardModule(nn.Module):
     backward_outputs = _as_tuple(
         self.backward_graph(*flat_inputs, *residuals)
     )
+    if self.host_donor_output_positions:
+      self._host_donors = tuple(
+          forward_outputs[position]
+          for position in self.host_donor_output_positions
+      )
 
     outputs = [None] * self.num_outputs
     positioned_outputs = chain(
@@ -205,6 +268,18 @@ class GraphSplitter:
       )
     if split_config.backward_partition_mode != "none" and not enabled:
       raise ValueError("backward_partition_mode requires use_graph_split")
+    if split_config.donate_host_offload_buffers:
+      if not enabled or split_config.forward_layers_per_executable < 1:
+        raise ValueError(
+            "donate_host_offload_buffers requires a split forward graph"
+        )
+      if config.tpu_config.graph_trainer_memory_policy not in (
+          "sac_and_offload",
+          "full_and_offload",
+      ):
+        raise ValueError(
+            "donate_host_offload_buffers requires a CPU-offload memory policy"
+        )
     if enabled and config.tpu_config.graph_trainer_fsdp_schedule != "none":
       raise ValueError(
           "Graph splitting does not currently compose with "
@@ -244,9 +319,17 @@ class GraphSplitter:
       )
       split.forward_graph = forward.module
       split.module.forward_graph = forward.module
+      forward_example_inputs = split.forward_example_inputs
+      if self.config.donate_host_offload_buffers:
+        donor_specs, donor_output_positions, donor_examples = (
+            thread_host_offload_donors(forward.module)
+        )
+        split.module.host_donor_specs = donor_specs
+        split.module.host_donor_output_positions = donor_output_positions
+        forward_example_inputs = (*forward_example_inputs, *donor_examples)
       tpu_backend_compile_partitioned_pass(
           forward.module,
-          split.forward_example_inputs,
+          forward_example_inputs,
           donate_internal_buffers=self.config.donate_internal_buffers,
       )
     else:
@@ -489,7 +572,10 @@ def split_forward_graph_by_layer(
     )
 
   body_nodes = _body_nodes(gm)
-  node_layer_ids, layer_nodes = _group_nodes_by_layer(body_nodes)
+  ao_nodes = {node for node in body_nodes if is_ao_transfer(node)}
+  node_layer_ids, layer_nodes = _group_nodes_by_layer(
+      body_nodes, excluded=ao_nodes
+  )
   layer_ids = sorted(layer_nodes)
   if not layer_ids:
     raise ValueError("Cannot split forward: no layer metadata was found")
@@ -500,7 +586,8 @@ def split_forward_graph_by_layer(
       if node_layer_ids[node] >= 0
   )
   has_prefix = isolate_prefix and any(
-      node.op == "call_function" for node in body_nodes[:first_layer_index]
+      node.op == "call_function" and not is_ao_transfer(node)
+      for node in body_nodes[:first_layer_index]
   )
   partition_offset = int(has_prefix)
   layer_to_target = {
@@ -521,6 +608,8 @@ def split_forward_graph_by_layer(
   pending_collectives: dict[torch.fx.Node, int] = {}
   spmd_safe_depth = 0
   for node in body_nodes:
+    if node in ao_nodes:
+      continue
     layer_id = node_layer_ids[node]
     starts_layer = layer_id >= 0 and layer_id != current_layer_id
     if starts_layer:
@@ -566,9 +655,13 @@ def split_forward_graph_by_layer(
   if spmd_safe_depth:
     raise ValueError("Unbalanced TPU SPMD safe-region entry")
 
+  assign_ao_transfer_partitions(gm, partition_map)
+  move_forward_offloads_to_partition_entry(gm, partition_map)
+
   chunked = _materialize_partitioned_graph(
       gm, partition_map, layer_nodes
   )
+  validate_ao_transfer_pairs(chunked.module, "forward")
   target_count = (
       len(layer_ids) + layers_per_executable - 1
   ) // layers_per_executable + partition_offset
@@ -660,12 +753,13 @@ def split_backward_graph_by_layer(
     )
 
   body_nodes = _body_nodes(gm)
+  ao_nodes = {node for node in body_nodes if is_ao_transfer(node)}
   collective_chains = _collect_collective_chains(gm)
   collective_nodes: set[torch.fx.Node] = set().union(
       *collective_chains.values()
   )
   _, layer_nodes = _group_nodes_by_layer(
-      body_nodes, excluded=collective_nodes
+      body_nodes, excluded=collective_nodes | ao_nodes
   )
   expected_layers = set(range(n_layers))
   if set(layer_nodes) != expected_layers:
@@ -741,7 +835,7 @@ def split_backward_graph_by_layer(
         f"layer {layer_id}",
     )
   for node in body_nodes:
-    if node not in partition_map:
+    if node not in partition_map and node not in ao_nodes:
       partition_map[node] = max(
           (
               partition_map[input_node]
@@ -751,6 +845,7 @@ def split_backward_graph_by_layer(
           default=0,
       )
 
+  assign_ao_transfer_partitions(gm, partition_map)
   _validate_backward_partitions(partition_map, collective_chains)
   chunked = _materialize_partitioned_graph(
       gm,
@@ -758,6 +853,7 @@ def split_backward_graph_by_layer(
       layer_nodes,
       raw_collective_partitions,
   )
+  validate_ao_transfer_pairs(chunked.module, "backward")
   logger.info(
       "Split TPU backward into %d executables with at most %d layers each "
       "(pipeline_collectives=%s): compute=%s collectives=%s",

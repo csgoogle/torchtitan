@@ -444,6 +444,11 @@ def apply_cpu_offload_pass(
     Returns:
         The transformed GraphModule with offload/reload ops inserted.
     """
+    if prefetch_lookahead < 0:
+        raise ValueError("prefetch_lookahead must be nonnegative")
+    if defer_n_layers < 0:
+        raise ValueError("defer_n_layers must be nonnegative")
+
     # 1. Build position index for ordering queries.
     node_to_index: dict[Node, int] = {n: i for i, n in enumerate(gm.graph.nodes)}
 
@@ -595,11 +600,12 @@ def apply_cpu_offload_pass(
         )
         total_bytes += _tensor_bytes(val)
 
-    # 4b. Defer forward waits to maximize D2H/compute overlap.
-    if defer_n_layers > 0:
-        deferred = defer_offload_waits(gm, wait_offload_map, defer_n_layers)
-    else:
-        deferred = 0
+    # 4b. Move every forward wait to at least its final storage consumer.
+    # Even zero requested overlap needs this pass: the wait was initially
+    # inserted beside the offload but carries a dependency on that later
+    # consumer, which would otherwise leave the FX graph out of topological
+    # order.
+    deferred = defer_offload_waits(gm, wait_offload_map, defer_n_layers)
 
     # 5. Per-group backward reload prefetch.
     if prefetch_lookahead > 0:

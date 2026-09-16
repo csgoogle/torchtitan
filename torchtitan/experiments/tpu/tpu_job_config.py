@@ -43,6 +43,9 @@ class GraphSplitterConfig:
   # TorchTPU includes donation in its compilation cache key (torch_tpu#3614).
   # Original graph inputs and forward-saved tensors are never candidates.
   donate_internal_buffers: bool = False
+  # Reuse pinned-host activation buffers across steps by threading the previous
+  # D2H outputs back into their producing children as donated inputs.
+  donate_host_offload_buffers: bool = False
 
 
 @dataclasses.dataclass
@@ -73,6 +76,10 @@ class TPUConfig:
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
   graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  # CPU-offload controls propagated into GraphTrainer's compile config.
+  graph_trainer_cpu_offload_prefetch_n_layers: int = 1
+  graph_trainer_cpu_offload_defer_n_layers: int = 1
+  graph_trainer_cpu_offload_budget_gb: float = 100.0
   # Run the decoder layers as a single scan instead of a Python loop, so the
   # compiler sees one loop body rather than n_layers copies of it. Each layer's
   # weights become a row of one stacked tensor, which is what gives the scan

@@ -45,6 +45,36 @@ class PartitionDonationTest(absltest.TestCase):
         (0, 1),
     )
 
+  def test_forced_donation_does_not_require_internal_inference(self):
+    def fn(x):
+      boundary = x + 1
+      return boundary.sin()
+
+    gm = self._split(
+        fn,
+        (torch.randn(2, 3),),
+        {"add": 0, "sin": 1},
+    )
+    child = list(gm.children())[1]
+    placeholder = next(
+        node for node in child.graph.nodes if node.op == "placeholder"
+    )
+    placeholder.meta["tpu_force_donate"] = True
+    # Forced host donors do not depend on whole-parent alias analysis. Keep
+    # them enabled even if an unrelated boundary lacks fake-tensor metadata.
+    first_child = list(gm.children())[0]
+    first_child_output = next(
+        node for node in first_child.graph.nodes if node.op == "output"
+    )
+    first_child_output.args[0].meta.pop("val", None)
+
+    tpu_backend_pass._annotate_internal_donations(
+        gm,
+        infer_internal_buffers=False,
+    )
+
+    self.assertEqual(child.meta["tpu_donated_input_positions"], (0,))
+
   def test_does_not_donate_view_of_parent_input(self):
     def fn(x):
       boundary = x.view(2, 3)

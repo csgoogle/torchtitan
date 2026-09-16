@@ -32,14 +32,24 @@ def to_tpu_graph_trainer_config(
 ) -> ConfigT:
   """Convert a TPU recipe and propagate its TPU-only GraphTrainer settings."""
   memory_policy = train_config.tpu_config.graph_trainer_memory_policy
-  if memory_policy == "sac_and_offload":
-    raise ValueError(
-        "TPU GraphTrainer does not support memory_policy='sac_and_offload'"
-    )
+  prefetch = (
+      train_config.tpu_config.graph_trainer_cpu_offload_prefetch_n_layers
+  )
+  defer = train_config.tpu_config.graph_trainer_cpu_offload_defer_n_layers
+  budget = train_config.tpu_config.graph_trainer_cpu_offload_budget_gb
+  if prefetch < 0:
+    raise ValueError("CPU-offload prefetch distance must be nonnegative")
+  if defer < 0:
+    raise ValueError("CPU-offload defer distance must be nonnegative")
+  if budget < 0:
+    raise ValueError("CPU-offload budget must be nonnegative")
   graph_config = to_graph_trainer_config(
       train_config, model_registry, target_cls=target_cls
   )
   graph_config.compile.memory_policy = memory_policy
+  graph_config.compile.cpu_offload_prefetch_n_layers = prefetch
+  graph_config.compile.cpu_offload_defer_n_layers = defer
+  graph_config.compile.cpu_offload_budget_gb = budget
   if train_config.tpu_config.use_scan_layers:
     check_scan_parallelism(train_config.parallelism)
     # Expert parallelism shards `moe.experts` on a mesh of its own. A stack is

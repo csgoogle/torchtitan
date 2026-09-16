@@ -363,6 +363,21 @@ def _sac_and_offload_memory_policy_pass(
     return gm
 
 
+@register_memory_policy("full_and_offload")
+def _full_and_offload_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """Full recompute plus CPU offload of saved layer boundaries."""
+    _full_memory_policy_pass(gm, config=config)
+    tag_all_offloadable_activations(
+        gm,
+        cpu_budget_gb=config.compile.cpu_offload_budget_gb,
+    )
+    return gm
+
+
 def tag_with_memory_policy_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple | None = None,
@@ -376,6 +391,7 @@ def tag_with_memory_policy_pass(
         full: full recompute — only layer outputs are saved.
         eager: SAC alternating mm ops between save/recompute.
         sac_and_offload: SAC + CPU offload within budget.
+        full_and_offload: full recompute + CPU offload within budget.
 
     Other memory policies combining SAC and CPU offload can be added
     via ``register_memory_policy`` without modifying this function.
