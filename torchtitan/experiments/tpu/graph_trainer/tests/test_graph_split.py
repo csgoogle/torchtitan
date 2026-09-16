@@ -70,6 +70,21 @@ class _BufferMutatingToyTransformer(_ToyTransformer):
     return inputs
 
 
+class _OffloadToyTransformer(nn.Module):
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__()
+    self.layers = nn.ModuleList(
+        nn.Sequential(nn.Linear(8, 8, bias=False), nn.ReLU())
+        for _ in range(n_layers)
+    )
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    for layer in self.layers:
+      inputs = layer(inputs)
+    return inputs
+
+
 class GraphSplitTest(absltest.TestCase):
 
   def _build_toy_model(self, n_layers: int) -> _ToyTransformer:
@@ -354,57 +369,38 @@ class GraphSplitTest(absltest.TestCase):
       ):
         split_forward_backward_graph(traced.gm, traced.example_inputs)
 
-  def _build_cpu_offload_graph(self) -> tuple[torch.fx.GraphModule, torch.Tensor]:
-    graph = torch.fx.Graph()
-    inputs = torch.empty(512, 8, device="cpu")
-    x = graph.placeholder("x")
-    x.meta["val"] = inputs
-    forward_0 = graph.call_function(torch.ops.aten.neg.default, (x,))
-    forward_0.meta.update({
-        "val": inputs,
-        "custom": {"module_fqn": "layers.0.block"},
-        "recompute": CheckpointPolicy.MUST_CPU_OFFLOAD,
-    })
-    forward_1 = graph.call_function(torch.ops.aten.sin.default, (forward_0,))
-    forward_1.meta.update({
-        "val": inputs,
-        "custom": {"module_fqn": "layers.1.block"},
-    })
-    backward_1 = graph.call_function(
-        torch.ops.aten.mul.Tensor, (forward_1, forward_1)
+  def _trace_cpu_offload_graph(self):
+    model = _OffloadToyTransformer(n_layers=3)
+    annotate_module_fqns(model)
+    inputs = torch.randn(512, 8, requires_grad=True)
+    traced = self._trace_toy_model(model=model, inputs=inputs)
+    layer_0_output = next(
+        node
+        for node in traced.gm.graph.nodes
+        if node.target is torch.ops.aten.relu.default
+        and _get_layer_id(node) == 0
     )
-    backward_1.meta.update({
-        "val": inputs,
-        "custom": {"module_fqn": "layers.1.block"},
-        "autograd_backward": True,
-    })
-    backward_0 = graph.call_function(
-        torch.ops.aten.add.Tensor, (backward_1, forward_0)
-    )
-    backward_0.meta.update({
-        "val": inputs,
-        "custom": {"module_fqn": "layers.0.block"},
-        "autograd_backward": True,
-    })
-    graph.output(backward_0)
-    return torch.fx.GraphModule(torch.nn.Module(), graph), inputs
-
-  def test_cpu_offload_ops_are_compiled_inside_layer_children(self):
-    """Keep each AO copy and wait together instead of in the eager parent."""
-    gm, inputs = self._build_cpu_offload_graph()
+    layer_0_output.meta["recompute"] = CheckpointPolicy.MUST_CPU_OFFLOAD
     apply_cpu_offload_pass(
-        gm,
+        traced.gm,
         prefetch_lookahead=0,
         defer_n_layers=0,
     )
-    split = split_forward_backward_graph(gm, (inputs,))
+    return traced
+
+  def test_cpu_offload_ops_are_compiled_inside_layer_children(self):
+    """Keep each AO copy and wait together instead of in the eager parent."""
+    traced = self._trace_cpu_offload_graph()
+    split = split_forward_backward_graph(
+        traced.gm, traced.example_inputs
+    )
     donor_specs, donor_output_positions, donor_examples = (
         thread_host_offload_donors(split.forward_graph)
     )
     forward = split_forward_graph_by_layer(split.forward_graph, 1)
     backward = split_backward_graph_by_layer(
         split.backward_graph,
-        n_layers=2,
+        n_layers=3,
     )
 
     ao_targets = {
@@ -475,16 +471,13 @@ class GraphSplitTest(absltest.TestCase):
     """Zero uses the consumer child; one uses its immediate predecessor."""
     for distance in (0, 1):
       with self.subTest(distance=distance):
-        gm, inputs = self._build_cpu_offload_graph()
-        apply_cpu_offload_pass(
-            gm,
-            prefetch_lookahead=0,
-            defer_n_layers=0,
+        traced = self._trace_cpu_offload_graph()
+        split = split_forward_backward_graph(
+            traced.gm, traced.example_inputs
         )
-        split = split_forward_backward_graph(gm, (inputs,))
         backward = split_backward_graph_by_layer(
             split.backward_graph,
-            n_layers=2,
+            n_layers=3,
             cpu_offload_prefetch_executables=distance,
         )
 
@@ -499,7 +492,9 @@ class GraphSplitTest(absltest.TestCase):
             for user in reload_0.users
             if user.target == torch.ops.ao.wait_tensor.default
         )
-        expected_partition = backward.layer_to_partition[distance]
+        # Layer 0's output is consumed while recomputing layer 1. In backward
+        # order, layer 2's child immediately precedes that consumer child.
+        expected_partition = backward.layer_to_partition[1 + distance]
         self.assertEqual(backward.partition_map[reload_0], expected_partition)
         self.assertEqual(backward.partition_map[wait_0], expected_partition)
 

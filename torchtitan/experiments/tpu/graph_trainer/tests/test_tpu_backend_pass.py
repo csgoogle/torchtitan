@@ -70,7 +70,7 @@ class PartitionDonationTest(absltest.TestCase):
 
     tpu_backend_pass._annotate_internal_donations(
         gm,
-        infer_internal_buffers=False,
+        donate_internal_buffers=False,
     )
 
     self.assertEqual(child.meta["tpu_donated_input_positions"], (0,))

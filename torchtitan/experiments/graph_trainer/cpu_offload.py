@@ -600,11 +600,9 @@ def apply_cpu_offload_pass(
         )
         total_bytes += _tensor_bytes(val)
 
-    # 4b. Move every forward wait to at least its final storage consumer.
-    # Even zero requested overlap needs this pass: the wait was initially
-    # inserted beside the offload but carries a dependency on that later
-    # consumer, which would otherwise leave the FX graph out of topological
-    # order.
+    # last_use_of_storage is a tensor argument of wait_tensor, so the wait must
+    # follow the node that produces the final aliased use. At zero, move it to
+    # that consumer's region; positive values add regions of overlap.
     deferred = defer_offload_waits(gm, wait_offload_map, defer_n_layers)
 
     # 5. Per-group backward reload prefetch.

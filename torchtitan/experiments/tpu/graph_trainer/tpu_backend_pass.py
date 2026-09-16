@@ -181,7 +181,7 @@ def _donatable_input_positions(
 def _annotate_internal_donations(
     gm: torch.fx.GraphModule,
     *,
-    infer_internal_buffers: bool = True,
+    donate_internal_buffers: bool = True,
 ) -> None:
     """Annotate forced donors and safe last-use boundaries between children.
 
@@ -191,7 +191,9 @@ def _annotate_internal_donations(
     storage's final consumer. At that consumer, a boundary is donated only if
     it is uniquely referenced, is not an original input or constant, and is
     not also returned by the consuming child. Missing alias metadata disables
-    donation for the graph rather than guessing.
+    donation for the graph rather than guessing. Inputs explicitly marked
+    ``tpu_force_donate`` are always included; ``donate_internal_buffers`` gates
+    only inference of additional ordinary device-buffer donors.
     """
     calls = [node for node in gm.graph.nodes if node.op == "call_module"]
     submodules = [gm.get_submodule(str(call.target)) for call in calls]
@@ -202,7 +204,7 @@ def _annotate_internal_donations(
     last_use_by_storage: dict[int, int] = {}
     protected_storages: set[int] = set()
     inference_disabled_due_to_metadata = False
-    if infer_internal_buffers:
+    if donate_internal_buffers:
         protected_nodes = [
             node
             for node in gm.graph.nodes
@@ -228,7 +230,7 @@ def _annotate_internal_donations(
                 "metadata lacks values for %s",
                 missing_values,
             )
-            infer_internal_buffers = False
+            donate_internal_buffers = False
             inference_disabled_due_to_metadata = True
         else:
             node_order = {
@@ -260,7 +262,7 @@ def _annotate_internal_donations(
                 node_order,
                 protected_storages,
             )
-            if infer_internal_buffers
+            if donate_internal_buffers
             else ()
         )
         placeholders = [
@@ -407,14 +409,20 @@ def tpu_backend_compile_partitioned_pass(
 
     _annotate_internal_donations(
         gm,
-        infer_internal_buffers=donate_internal_buffers,
+        donate_internal_buffers=donate_internal_buffers,
     )
 
     def _pinned_host_compile_inputs(
         submodule: torch.fx.GraphModule,
         submodule_inputs: list[torch.Tensor],
     ) -> list[torch.Tensor]:
-        """Preserve AO pinned-host memory spaces during fake propagation."""
+        """Restore TPU pinned-host placement lost at a split boundary.
+
+        Split propagation represents an AO host output as a CPU fake tensor,
+        while its runtime value is a TPU tensor backed by PJRT pinned-host
+        memory. StaticCompiler reads placement from a TPU fake tensor's
+        ``_is_pinned_host`` marker, so reconstruct that representation here.
+        """
         placeholders = [
             node for node in submodule.graph.nodes if node.op == "placeholder"
         ]
@@ -523,7 +531,11 @@ def construct_tpu_transform_passes(
                     if config.tpu_config.use_graph_split
                     else config.compile.cpu_offload_prefetch_n_layers
                 ),
-                defer_n_layers=config.compile.cpu_offload_defer_n_layers,
+                defer_n_layers=(
+                    0
+                    if config.tpu_config.use_graph_split
+                    else config.compile.cpu_offload_defer_n_layers
+                ),
             )
         )
         passes.append(selective_activation_remat_pass)

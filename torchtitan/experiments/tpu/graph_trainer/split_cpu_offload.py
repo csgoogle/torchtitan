@@ -108,20 +108,15 @@ def place_ao_transfer_pairs(
     *,
     backward_prefetch_executables: int = 0,
 ) -> None:
-  """Place each AO copy/completion pair in one child executable.
+  """Place ``(offload, wait)`` and ``(reload, wait)`` pairs in child executables.
 
-  ``apply_cpu_offload_pass`` inserts an ``offload`` or ``reload`` producer and
-  exactly one ``wait_tensor`` consumer. This pass validates that pair while the
-  complete graph is still available, computes its executable from real tensor
-  consumers, and assigns both nodes together. It also moves each forward D2H
-  start immediately before the first ordinary node in its assigned partition.
-  Partition assignment alone chooses child ownership but does not change FX
-  order, which still reflects the generic pre-partition offload rewrite.
-
-  Forward D2H pairs stay with the source storage's final consumer. Backward H2D
-  pairs move ``backward_prefetch_executables`` complete child executables ahead
-  of their first consumer: zero means the consumer child, one means the child
-  executed immediately before it.
+  Each pair is assigned atomically so an executable-local async descriptor
+  never crosses a child boundary. A forward D2H pair belongs to the source
+  storage's final-consumer child. When its inputs are already available, its
+  start moves before that child's ordinary nodes to maximize overlap; the wait
+  remains ordered after the final storage use. A backward H2D pair belongs to
+  the consumer child or ``backward_prefetch_executables`` complete children
+  earlier: zero means the consumer child and one its immediate predecessor.
   """
   if backward_prefetch_executables < 0:
     raise ValueError("backward_prefetch_executables must be nonnegative")

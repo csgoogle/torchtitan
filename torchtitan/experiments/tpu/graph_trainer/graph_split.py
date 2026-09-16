@@ -129,19 +129,20 @@ class SplitForwardBackwardModule(nn.Module):
 
   def _initialize_host_donors(
       self,
-      flat_inputs: tuple[Any, ...],
+      flat_program_inputs: tuple[Any, ...],
   ) -> tuple[torch.Tensor, ...]:
-    """Create persistent pinned-host slots before the first training step.
+    """Create one persistent pinned-host tensor per offloaded activation.
 
-    Each slot is materialized through the same AO D2H path used by the compiled
-    forward children, guaranteeing the memory space expected by their donated
-    inputs. Initializing and synchronizing one slot at a time bounds temporary
-    HBM to one activation rather than the complete host pool.
+    ``host_donor_specs`` describes the slots; ``flat_program_inputs`` is scanned
+    only to select their TPU device. TorchTPU does not currently expose a direct
+    pinned-host tensor allocator, so each slot is created through AO D2H,
+    producing a TPU tensor backed by PJRT pinned-host memory. Materializing one
+    at a time bounds the temporary device storage to one activation.
     """
     device = next(
         (
             value.device
-            for value in flat_inputs
+            for value in flat_program_inputs
             if isinstance(value, torch.Tensor) and value.device.type == "tpu"
         ),
         None,
