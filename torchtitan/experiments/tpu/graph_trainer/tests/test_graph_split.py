@@ -459,6 +459,13 @@ class GraphSplitTest(absltest.TestCase):
     forward.module._tpu_executable = object()
     with self.assertRaisesRegex(RuntimeError, "without a TPU input"):
       split.module._initialize_host_donors(split.forward_example_inputs)
+    del forward.module._tpu_executable
+    for child in forward.module.children():
+      wrapper = torch.nn.Module()
+      wrapper._tpu_executable = object()
+      child.add_module("compiled_child", wrapper)
+    with self.assertRaisesRegex(RuntimeError, "without a TPU input"):
+      split.module._initialize_host_donors(split.forward_example_inputs)
     parent_donors = [
         node
         for node in forward.module.graph.nodes

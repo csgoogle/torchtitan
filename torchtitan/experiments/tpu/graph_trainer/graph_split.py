@@ -143,7 +143,8 @@ class SplitForwardBackwardModule(nn.Module):
     children = tuple(self.forward_graph.children())
     directly_compiled = hasattr(self.forward_graph, "_tpu_executable")
     children_compiled = bool(children) and all(
-        hasattr(child, "_tpu_executable") for child in children
+        any(hasattr(module, "_tpu_executable") for module in child.modules())
+        for child in children
     )
     if not directly_compiled and not children_compiled:
       raise RuntimeError(
