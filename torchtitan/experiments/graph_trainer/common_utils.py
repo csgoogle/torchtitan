@@ -435,6 +435,11 @@ def apply_cp_to_attention(
     apply_cp_to_forward(attention_modules, parallel_dims.get_mesh("cp"))
 
 
+def _select_expert_fsdp_shard_dim(num_experts: int, fsdp_degree: int) -> int:
+    """Use the hidden dimension when the FSDP mesh exceeds expert count."""
+    return 1 if fsdp_degree > num_experts else 0
+
+
 def apply_simple_fsdp(
     model: nn.Module,
     *,
@@ -444,7 +449,9 @@ def apply_simple_fsdp(
     """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
 
     For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
-    on the EDP mesh when expert parallelism is enabled.
+    on the EDP mesh when expert parallelism is enabled. Without EP, expert
+    banks whose expert dimension is smaller than the FSDP degree stay on the
+    same pure-FSDP DP mesh but shard their hidden dimension instead.
 
     A submodule can carry ``_fsdp_shard_dim`` to be sharded on a different axis.
     """
@@ -465,32 +472,53 @@ def apply_simple_fsdp(
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
     )
 
-    if parallel_dims.ep_enabled and isinstance(model, Decoder):
-        edp_mesh_names = (
+    expert_fsdp_mesh = None
+    expert_fsdp_degree = 1
+    if parallel_dims.ep_enabled:
+        expert_mesh_names = (
             ["dp_replicate", "efsdp"]
             if parallel_dims.dp_replicate_enabled
             else ["efsdp"]
         )
-        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
-        assert edp_mesh is not None
+        expert_fsdp_mesh = parallel_dims.get_optional_mesh(expert_mesh_names)
+        assert expert_fsdp_mesh is not None
+        expert_fsdp_degree = (
+            expert_fsdp_mesh["efsdp"].size() * parallel_dims.ep
+        )
+    elif parallel_dims.fsdp_enabled:
+        # Pure FSDP uses the same DP mesh; only the expert tensor's shard
+        # dimension changes when the mesh is wider than its expert dimension.
+        expert_fsdp_mesh = dp_mesh
+        expert_fsdp_degree = parallel_dims.dp_shard * parallel_dims.cp
 
+    experts_sharded_on_dim_1 = 0
+    if expert_fsdp_mesh is not None and isinstance(model, Decoder):
         for _, transformer_block in model.layers.items():
             if not isinstance(transformer_block, TransformerBlock):
                 continue
             moe = getattr(transformer_block, "moe", None)
             if moe is None:
                 continue
-            experts_shard_dim = 0
-            if edp_mesh["efsdp"].size() * parallel_dims.ep > moe.experts.num_experts:
-                experts_shard_dim = 1
+            experts_shard_dim = _select_expert_fsdp_shard_dim(
+                moe.experts.num_experts, expert_fsdp_degree
+            )
+            if not parallel_dims.ep_enabled and experts_shard_dim == 0:
+                continue
+            experts_sharded_on_dim_1 += experts_shard_dim
 
             moe.experts = data_parallel(
                 moe.experts,
-                edp_mesh,
+                expert_fsdp_mesh,
                 dp_mode,
                 mp_policy=mp_policy,
                 shard_dim=experts_shard_dim,
             )
+
+    if experts_sharded_on_dim_1:
+        logger.info(
+            "Applied SimpleFSDP dim-1 sharding to %d MoE expert modules",
+            experts_sharded_on_dim_1,
+        )
 
     # A submodule carrying `_fsdp_shard_dim` is sharded on that axis instead of
     # the default -- layer stacking sets it, because dim 0 of a stack is the

@@ -293,6 +293,11 @@ class Decoder(BaseModel):
         if self._skip_lm_head:
             return h
         output = self.lm_head(h) if self.lm_head is not None else h
+        if (
+            isinstance(output, torch.Tensor)
+            and output.shape[-1] != self.config.vocab_size
+        ):
+            output = output[..., : self.config.vocab_size]
         return output
 
     def _create_flex_attention_mask(
