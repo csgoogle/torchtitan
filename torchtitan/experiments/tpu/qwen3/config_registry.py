@@ -718,6 +718,37 @@ def qwen3_moe_235b_fsdp_compiled_offload_maxtext() -> TPUTrainerConfig:
   return cfg
 
 
+def _configure_qwen3_moe_235b_fsdp_4x4x4(
+    cfg: TPUTrainerConfig,
+) -> None:
+  """Use native Q235 shapes and pure FSDP-128 on a 4x4x4 slice."""
+  assert cfg.model_spec is not None
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  model_config.tok_embeddings.num_embeddings = model_config.vocab_size
+  model_config.lm_head.out_features = model_config.vocab_size
+  cfg.parallelism.data_parallel_shard_degree = 128
+  cfg.training.global_batch_size = 2048
+
+
+def qwen3_moe_235b_fsdp_compiled_offload_4x4x4() -> TPUTrainerConfig:
+  """FP32-reduction Q235 offload recipe for a 4x4x4 TPU7x slice.
+
+  Pure FSDP over 128 ranks divides both the 128 experts and the 151,936-token
+  vocabulary evenly. Keep local batch 16 and use one microbatch per step.
+  """
+  cfg = qwen3_moe_235b_fsdp_compiled_offload()
+  _configure_qwen3_moe_235b_fsdp_4x4x4(cfg)
+  return cfg
+
+
+def qwen3_moe_235b_fsdp_compiled_offload_maxtext_4x4x4(
+) -> TPUTrainerConfig:
+  """MaxText-numerics Q235 offload recipe for a 4x4x4 TPU7x slice."""
+  cfg = qwen3_moe_235b_fsdp_compiled_offload_maxtext()
+  _configure_qwen3_moe_235b_fsdp_4x4x4(cfg)
+  return cfg
+
+
 def qwen3_moe_235b_fsdp_smoke() -> TPUTrainerConfig:
   """Four-layer FSDP512 smoke for the production 235B execution path."""
   cfg = qwen3_moe_235b_fsdp_only()
