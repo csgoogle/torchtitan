@@ -6,8 +6,11 @@ weights and outputs separate while sharing that work in forward and dWeight.
 dInput retains the two-call MegaBlox path and its BF16 rounding order.
 
 The implementation intentionally targets the exact-row, BF16 Qwen TPU path.
-It uses full K and N tiles and requires the total routed-row count to be a
-multiple of ``tile_m``.
+It uses full N tiles and requires the total routed-row count to be a multiple
+of ``tile_m``. The dWeight kernel keeps two ``(K, N)`` FP32 accumulators and
+two BF16 output slabs in VMEM, so at large ``K x N`` (Qwen3-235B: 4096 x 1536
+is 105 MB) it tiles K with ``tgmm_tile_k``; the K slabs are independent, each
+re-reads the dOutput rows once.
 """
 
 import jax
@@ -188,7 +191,7 @@ def _separate_dinput(dout1, dout3, rhs1, rhs3, group_sizes, *, tile_m):
     return grad_lhs1 + grad_lhs3
 
 
-def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m):
+def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
     """Traverse each expert's routed rows once to produce two weight grads.
 
     This follows upstream MegaBlox TGMM's structure: use its group metadata,
@@ -208,6 +211,9 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m):
     groups = group_sizes.shape[0]
     if m % tile_m:
         raise ValueError("The total row count must be divisible by tile_m")
+    tile_k = tile_k or k
+    if tile_k <= 0 or k % tile_k:
+        raise ValueError("tile_k must divide K")
     group_metadata, num_active_tiles = _metadata(
         group_sizes,
         m=m,
@@ -229,6 +235,9 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m):
         acc3,
     ):
         del group_offset
+        # Grid axis 1 walks the K slabs; each slab replays the full row
+        # traversal below with its own accumulator, so nothing here depends
+        # on the slab index except the block specs.
         grid_id = pl.program_id(2)
         group_ids = group_metadata[1]
         group = group_ids[grid_id]
@@ -252,7 +261,7 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m):
                 grid_id=grid_id,
                 group_metadata=group_metadata,
                 tm=tile_m,
-                tn=k,
+                tn=tile_k,
             )
             dout_mask = _get_store_mask(
                 grid_id=grid_id,
@@ -303,20 +312,20 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m):
             out3[...] = acc3[...].astype(jnp.bfloat16)
 
     def lhs_indices(n_i, k_i, grid_id, group_metadata, group_offset):
-        del n_i, k_i, group_offset
-        return group_metadata[2][grid_id], 0
+        del n_i, group_offset
+        return group_metadata[2][grid_id], k_i
 
     def dout_indices(n_i, k_i, grid_id, group_metadata, group_offset):
         del n_i, k_i, group_offset
         return group_metadata[2][grid_id], 0
 
     def out_indices(n_i, k_i, grid_id, group_metadata, group_offset):
-        del n_i, k_i, group_offset
-        return group_metadata[1][grid_id], 0, 0
+        del n_i, group_offset
+        return group_metadata[1][grid_id], k_i, 0
 
-    lhs_spec = pl.BlockSpec((tile_m, k), lhs_indices)
+    lhs_spec = pl.BlockSpec((tile_m, tile_k), lhs_indices)
     dout_spec = pl.BlockSpec((tile_m, n), dout_indices)
-    out_spec = pl.BlockSpec((None, k, n), out_indices)
+    out_spec = pl.BlockSpec((None, tile_k, n), out_indices)
     return pl.pallas_call(
         kernel,
         out_shape=[
@@ -327,10 +336,10 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m):
             num_scalar_prefetch=2,
             in_specs=[lhs_spec, dout_spec, dout_spec],
             out_specs=[out_spec, out_spec],
-            grid=(1, 1, num_active_tiles),
+            grid=(1, k // tile_k, num_active_tiles),
             scratch_shapes=[
-                pltpu.VMEM((k, n), jnp.float32),
-                pltpu.VMEM((k, n), jnp.float32),
+                pltpu.VMEM((tile_k, n), jnp.float32),
+                pltpu.VMEM((tile_k, n), jnp.float32),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -347,8 +356,9 @@ def _paired_grouped_mm_fwd(
     group_sizes: jax.Array,
     tile_m: int,
     tgmm_tile_m: int,
+    tgmm_tile_k: int,
 ) -> tuple[jax.Array, jax.Array]:
-    del tgmm_tile_m
+    del tgmm_tile_m, tgmm_tile_k
     return _paired_forward(lhs, rhs1, rhs3, group_sizes, tile_m=tile_m)
 
 
@@ -362,22 +372,24 @@ def _paired_grouped_mm_bwd(
     group_sizes: jax.Array,
     tile_m: int,
     tgmm_tile_m: int,
+    tgmm_tile_k: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     grad_lhs = _separate_dinput(
         dout1, dout3, rhs1, rhs3, group_sizes, tile_m=tile_m
     )
     grad_rhs1, grad_rhs3 = _paired_dweight(
-        lhs, dout1, dout3, group_sizes, tile_m=tgmm_tile_m
+        lhs, dout1, dout3, group_sizes, tile_m=tgmm_tile_m, tile_k=tgmm_tile_k
     )
     return grad_lhs, grad_rhs1, grad_rhs3
 
 
 def _setup_context(ctx, inputs, output):
     del output
-    lhs, rhs1, rhs3, group_sizes, tile_m, tgmm_tile_m = inputs
+    lhs, rhs1, rhs3, group_sizes, tile_m, tgmm_tile_m, tgmm_tile_k = inputs
     ctx.save_for_backward(lhs, rhs1, rhs3, group_sizes)
     ctx.tile_m = tile_m
     ctx.tgmm_tile_m = tgmm_tile_m
+    ctx.tgmm_tile_k = tgmm_tile_k
 
 
 def _backward(ctx, grad_output1, grad_output3):
@@ -391,8 +403,9 @@ def _backward(ctx, grad_output1, grad_output3):
         group_sizes,
         ctx.tile_m,
         ctx.tgmm_tile_m,
+        ctx.tgmm_tile_k,
     )
-    return grad_lhs, grad_rhs1, grad_rhs3, None, None, None
+    return grad_lhs, grad_rhs1, grad_rhs3, None, None, None, None
 
 
 _paired_grouped_mm_fwd.register_autograd(_backward, setup_context=_setup_context)
@@ -406,18 +419,20 @@ def paired_segment_matmul_pallas_2d(
     *,
     tile_m: int = 1024,
     tgmm_tile_m: int = 128,
+    tgmm_tile_k: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply two equal-shaped expert projections while sharing lhs loads.
 
     ``group_sizes`` must sum exactly to ``lhs.shape[0]``; this kernel does not
-    initialize a capacity-padding tail.
+    initialize a capacity-padding tail. ``tgmm_tile_k`` (0 = full K) tiles the
+    dWeight kernel's K dimension to bound its VMEM footprint.
     """
     if rhs1.shape != rhs3.shape:
         raise ValueError("Paired grouped matmul weights must have equal shapes")
     if group_sizes.dtype != torch.int32:
         group_sizes = group_sizes.to(torch.int32)
     return _paired_grouped_mm_fwd(
-        lhs, rhs1, rhs3, group_sizes, tile_m, tgmm_tile_m
+        lhs, rhs1, rhs3, group_sizes, tile_m, tgmm_tile_m, tgmm_tile_k
     )
 
 
