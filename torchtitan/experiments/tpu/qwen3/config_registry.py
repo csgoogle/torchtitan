@@ -647,6 +647,18 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_235b_hsdp_activation_offload_maxtext() -> TPUTrainerConfig:
+  """MaxText-numerics Q235 offload recipe using 4x128 HSDP.
+
+  Matching the FSDP shard degree to the 128-expert dimension keeps expert
+  weights on their natural shard axis and avoids hidden-axis reconstruction.
+  """
+  cfg = qwen3_moe_235b_fsdp_activation_offload_maxtext()
+  cfg.parallelism.data_parallel_replicate_degree = 4
+  cfg.parallelism.data_parallel_shard_degree = 128
+  return cfg
+
+
 def _configure_qwen3_moe_235b_fsdp_4x4x4(
     cfg: TPUTrainerConfig,
 ) -> None:
