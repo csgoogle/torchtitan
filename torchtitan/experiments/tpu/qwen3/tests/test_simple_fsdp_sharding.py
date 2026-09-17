@@ -9,24 +9,29 @@ from typing import cast
 from unittest import mock
 
 from absl.testing import absltest
-import torch
 from torch import nn
 
 from torchtitan.config import TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
 from torchtitan.experiments.tpu.graph_trainer import qwen3 as graph_trainer_qwen3
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
     configure_qwen_simple_fsdp_expert_shard_dims,
 )
+from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 
 
-def _model() -> nn.Module:
+def _model(*, hidden_dim: int = 8) -> nn.Module:
   model = nn.Module()
   layer = nn.Module()
   layer.moe = nn.Module()
-  layer.moe.experts = nn.Module()
-  layer.moe.experts.weight = nn.Parameter(torch.empty(2, 8, device="meta"))
+  layer.moe.experts = TpuGroupedExperts.Config(
+      dim=8,
+      hidden_dim=hidden_dim,
+      num_experts=2,
+      token_dispatcher=LocalTokenDispatcher.Config(num_experts=2, top_k=1),
+  ).build()
   model.layers = nn.ModuleDict({"0": layer})
   return model
 
@@ -77,13 +82,10 @@ class SimpleFSDPShardingTest(absltest.TestCase):
         1,
     )
 
-  def test_rejects_when_neither_axis_is_divisible(self) -> None:
-    model = _model()
-    model.layers["0"].moe.experts.weight = nn.Parameter(
-        torch.empty(2, 6, device="meta")
-    )
+  def test_rejects_when_hidden_axis_is_not_divisible(self) -> None:
+    model = _model(hidden_dim=6)
 
-    with self.assertRaisesRegex(ValueError, "moe.experts.*dimension 0 or 1"):
+    with self.assertRaisesRegex(ValueError, "moe.experts.*hidden dimension 1"):
       configure_qwen_simple_fsdp_expert_shard_dims(model, _parallel_dims(4))
 
   def test_graph_trainer_configures_experts_before_simple_fsdp(self) -> None:

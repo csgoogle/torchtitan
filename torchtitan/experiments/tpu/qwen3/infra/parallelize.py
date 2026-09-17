@@ -11,6 +11,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
 from torchtitan.experiments.tpu.grouped_experts import (
+    TpuGroupedExperts,
     configure_expert_dweight_output_dtype,
 )
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
@@ -23,39 +24,51 @@ def configure_qwen_simple_fsdp_expert_shard_dims(
 ) -> None:
   """Use a divisible hidden axis for uneven Qwen expert banks under pure FSDP."""
   fsdp_degree = parallel_dims.dp_shard * parallel_dims.cp
-  if fsdp_degree <= 1 or parallel_dims.ep_enabled:
+  if fsdp_degree <= 1:
+    return
+  # With EP, apply_simple_fsdp separately wraps each expert bank on the EDP
+  # mesh and owns its shard-axis selection. This helper only changes the pure
+  # FSDP path used by the Q235 recipes in this file.
+  if parallel_dims.ep_enabled:
     return
 
-  modules = [
+  qwen_expert_modules = [
       (module_fqn, module)
       for module_fqn, module in model.named_modules()
-      if module_fqn.endswith(".moe.experts")
+      if isinstance(module, TpuGroupedExperts)
   ]
 
-  alternate_modules: list[str] = []
-  for module_fqn, module in modules:
+  hidden_axis_modules: list[str] = []
+  for module_fqn, module in qwen_expert_modules:
+    if module.num_experts % fsdp_degree == 0:
+      continue
+
     parameters = list(module.named_parameters(recurse=False))
     if not parameters:
       raise ValueError(f"{module_fqn} has no direct parameters to FSDP-shard")
-    if all(parameter.shape[0] % fsdp_degree == 0 for _, parameter in parameters):
-      continue
     incompatible = [
         f"{name}{tuple(parameter.shape)}"
         for name, parameter in parameters
-        if parameter.ndim < 2 or parameter.shape[1] % fsdp_degree != 0
+        if (
+            parameter.ndim != 3
+            or parameter.shape[0] != module.num_experts
+            or parameter.shape[1] % fsdp_degree != 0
+        )
     ]
     if incompatible:
       raise ValueError(
-          f"Cannot FSDP-shard {module_fqn} on either dimension 0 or 1 over "
-          f"{fsdp_degree} ranks; incompatible parameters: {incompatible}"
+          f"Cannot FSDP-shard {module_fqn} on Qwen's hidden dimension 1 over "
+          f"{fsdp_degree} ranks; incompatible expert parameters: {incompatible}"
       )
+    # This is apply_simple_fsdp's documented per-submodule shard-axis hook,
+    # also used by LayerStackHolder for stacked layer weights.
     setattr(module, "_fsdp_shard_dim", 1)
-    alternate_modules.append(module_fqn)
+    hidden_axis_modules.append(module_fqn)
 
-  if alternate_modules:
+  if hidden_axis_modules:
     logger.info(
         "Using SimpleFSDP dimension 1 for %d uneven Qwen expert modules",
-        len(alternate_modules),
+        len(hidden_axis_modules),
     )
 
 

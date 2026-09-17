@@ -61,13 +61,15 @@ _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
     tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
     {
         # Keep activation host copies off SparseCore, where they would contend
-        # with the FSDP collectives above. This does not itself create overlap.
+        # with the FSDP collectives above. In the isolated A/B this moved MFU
+        # only from 18.425% to 18.448% and did not itself create D2H overlap.
         "xla_tpu_enable_offloading_copy_to_sparsecore": False,
         # Prove the true copy/overwrite ordering across donated aliases. This
-        # removes the defensive activation snapshot that otherwise blocks D2H.
+        # removed the defensive activation snapshot, moved all 93 measured D2H
+        # waits to zero, and improved MFU from 18.528% to 19.490% in the A/B.
         "xla_tpu_copy_insertion_use_region_analysis": True,
-        # Let region analysis inspect the large Q235 layer regions instead of
-        # declining because its search budget is too small.
+        # Use the tested search budget for the large Q235 layer regions. This
+        # value was evaluated together with region analysis, not in isolation.
         "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
     },
 )
@@ -647,6 +649,21 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
   return cfg
 
 
+def _configure_qwen3_moe_235b_fsdp_128(
+    cfg: TPUTrainerConfig,
+    *,
+    replicate_degree: int,
+) -> None:
+  """Use native Q235 shapes on an FSDP-128 mesh."""
+  assert cfg.model_spec is not None
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  model_config.tok_embeddings.num_embeddings = model_config.vocab_size
+  model_config.lm_head.out_features = model_config.vocab_size
+  cfg.parallelism.data_parallel_replicate_degree = replicate_degree
+  cfg.parallelism.data_parallel_shard_degree = 128
+  cfg.training.global_batch_size = 2048 * replicate_degree
+
+
 def qwen3_moe_235b_hsdp_activation_offload_maxtext() -> TPUTrainerConfig:
   """MaxText-numerics Q235 offload recipe using 4x128 HSDP.
 
@@ -654,21 +671,8 @@ def qwen3_moe_235b_hsdp_activation_offload_maxtext() -> TPUTrainerConfig:
   weights on their natural shard axis and avoids hidden-axis reconstruction.
   """
   cfg = qwen3_moe_235b_fsdp_activation_offload_maxtext()
-  cfg.parallelism.data_parallel_replicate_degree = 4
-  cfg.parallelism.data_parallel_shard_degree = 128
+  _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=4)
   return cfg
-
-
-def _configure_qwen3_moe_235b_fsdp_4x4x4(
-    cfg: TPUTrainerConfig,
-) -> None:
-  """Use native Q235 shapes and pure FSDP-128 on a 4x4x4 slice."""
-  assert cfg.model_spec is not None
-  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
-  model_config.tok_embeddings.num_embeddings = model_config.vocab_size
-  model_config.lm_head.out_features = model_config.vocab_size
-  cfg.parallelism.data_parallel_shard_degree = 128
-  cfg.training.global_batch_size = 2048
 
 
 def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TPUTrainerConfig:
@@ -678,7 +682,7 @@ def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TPUTrainerConfig:
   vocabulary evenly. Keep local batch 16 and use one microbatch per step.
   """
   cfg = qwen3_moe_235b_fsdp_activation_offload()
-  _configure_qwen3_moe_235b_fsdp_4x4x4(cfg)
+  _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
   return cfg
 
 
@@ -686,7 +690,7 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4(
 ) -> TPUTrainerConfig:
   """MaxText-numerics Q235 offload recipe for a 4x4x4 TPU7x slice."""
   cfg = qwen3_moe_235b_fsdp_activation_offload_maxtext()
-  _configure_qwen3_moe_235b_fsdp_4x4x4(cfg)
+  _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
   return cfg
 
 
