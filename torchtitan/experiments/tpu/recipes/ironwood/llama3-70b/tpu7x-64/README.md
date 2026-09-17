@@ -36,7 +36,7 @@ Defaults from [`llama3_70b`](../../../../llama3/config_registry.py):
   TransformerBlock separately (`fullgraph=True`) rather than the model as one graph.
 - **Simple FSDP**: Enabled.
 - **Splash Attention**: Enabled with block size 2048.
-- **Loss Kernel**: Enabled.
+- **Loss**: Pallas fused cross-entropy, selected by the recipe.
 - **Activation Checkpointing**: Full.
 
 Overridden on the command line:

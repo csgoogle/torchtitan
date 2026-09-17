@@ -16,11 +16,11 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
     TPUTrainerConfig,
-    LossKernelConfig,
 )
 from torchtitan.hf_datasets.text_datasets import (
     ChatDataLoader,
@@ -34,6 +34,13 @@ from torchtitan.models.llama3.config_registry import model_registry
 # a higher-order op such as `scan`; see `overrides/real_rope.py`. The rewrite is
 # bit-identical and perf-neutral, so every recipe carries it.
 _REAL_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.real_rope"
+_FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
+
+
+def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
+  """Select the fused loss and its pre-construction LM-head override together."""
+  config.loss = PallasCrossEntropyLoss.Config()
+  config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
 def llama3_debugmodel() -> TPUTrainerConfig:
@@ -180,11 +187,9 @@ def llama3_8b() -> TPUTrainerConfig:
           sa_block_q_dq=2048,
           sa_block_kv_dq=2048,
       ),
-      loss_kernel=LossKernelConfig(
-          use_loss_kernel=True,
-      ),
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  _enable_pallas_cross_entropy(config)
   return config
 
 
@@ -250,11 +255,9 @@ def llama3_70b() -> TPUTrainerConfig:
           sa_block_q_dq=2048,
           sa_block_kv_dq=2048,
       ),
-      loss_kernel=LossKernelConfig(
-          use_loss_kernel=True,
-      ),
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  _enable_pallas_cross_entropy(config)
   return config
 
 
@@ -320,11 +323,9 @@ def llama3_405b() -> TPUTrainerConfig:
           sa_block_q_dq=2048,
           sa_block_kv_dq=2048,
       ),
-      loss_kernel=LossKernelConfig(
-          use_loss_kernel=True,
-      ),
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  _enable_pallas_cross_entropy(config)
   return config
 
 
@@ -403,9 +404,7 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
           sa_block_q_dq=2048,
           sa_block_kv_dq=2048,
       ),
-      loss_kernel=LossKernelConfig(
-          use_loss_kernel=True,
-      ),
   )
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
+  _enable_pallas_cross_entropy(config)
   return config

@@ -454,6 +454,29 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
 
   @parameterized.parameters(
+      llama3_8b,
+      llama3_70b,
+      llama3_405b,
+      sft_llama3_8b_metamath,
+  )
+  def test_llama3_recipe_uses_pallas_cross_entropy(self, recipe) -> None:
+    """The fused loss and the LM head that feeds it have to agree.
+
+    Selecting one without the other gives the trainer a tuple it cannot use, or
+    a plain LM head the fused loss cannot read.
+    """
+    config = recipe()
+
+    self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
+    # The legacy flag patches the LM head a second time.
+    self.assertFalse(config.loss_kernel.use_loss_kernel)
+    apply_overrides(config.override, config)
+    assert config.model_spec is not None
+    self.assertIsInstance(
+        config.model_spec.model.lm_head, FusedLossLinearWrapper.Config
+    )
+
+  @parameterized.parameters(
       llama3_debugmodel,
       llama3_1b,
       llama3_8b,
