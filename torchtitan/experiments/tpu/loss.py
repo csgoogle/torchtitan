@@ -23,7 +23,6 @@ def pallas_cross_entropy_loss(
     b_block_size: int = 1024,
     h_block_size: int = 512,
     v_block_size: int = 2048,
-    logical_vocab_size: int | None = None,
 ) -> torch.Tensor:
   """Compute sum-reduced linear cross entropy without materializing logits.
 
@@ -32,22 +31,12 @@ def pallas_cross_entropy_loss(
   operands to the fused kernel, which performs the projection, softmax, and
   cross entropy together. It also flattens TorchTitan's batched shapes to the
   token-major shapes required by Tokamax and rejects incompatible Mosaic tiles
-  instead of silently switching kernels. ``logical_vocab_size`` trims a
-  physically padded LM-head matrix before softmax; without that trim, padding
-  rows would become extra classes and change both the loss and gradients.
+  instead of silently switching kernels.
   """
   if not isinstance(pred, tuple) or len(pred) != 2:
     raise ValueError("Pallas loss requires (x, weights) as input")
 
   x, weights = pred
-  if logical_vocab_size is not None:
-    if logical_vocab_size <= 0 or logical_vocab_size > weights.shape[-1]:
-      raise ValueError(
-          "Pallas loss logical_vocab_size must be positive and no larger "
-          f"than the physical vocabulary ({weights.shape[-1]}), got "
-          f"{logical_vocab_size}"
-      )
-    weights = weights[..., :logical_vocab_size]
   if x.ndim == 3:
     x = x.flatten(0, 1)
   if labels.ndim == 2:
@@ -117,10 +106,6 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
     b_block_size: int = 1024
     h_block_size: int = 512
     v_block_size: int = 2048
-    # Number of real tokenizer classes when the physical LM head is padded for
-    # even FSDP sharding. None means the full physical width is semantically
-    # part of the vocabulary.
-    logical_vocab_size: int | None = None
 
   def __init__(
       self,
@@ -135,7 +120,6 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
         b_block_size=config.b_block_size,
         h_block_size=config.h_block_size,
         v_block_size=config.v_block_size,
-        logical_vocab_size=config.logical_vocab_size,
     )
     self.implementation = config.implementation
     self.b_block_size = config.b_block_size

@@ -25,7 +25,7 @@ from torchtitan.experiments.tpu.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
-    configure_qwen_simple_fsdp_expert_shard_dims,
+    configure_qwen_simple_fsdp_shard_dims,
 )
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -50,7 +50,7 @@ def parallelize_qwen3(
     configure_expert_dweight_output_dtype(
         model, TORCH_DTYPE_MAP[training.mixed_precision_reduce]
     )
-    configure_qwen_simple_fsdp_expert_shard_dims(model, parallel_dims)
+    configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
     return graph_trainer_parallelize_qwen3(
         model,
         training=training,

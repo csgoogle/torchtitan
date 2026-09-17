@@ -17,13 +17,15 @@ from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Mo
 from torchtitan.experiments.tpu.graph_trainer import qwen3 as graph_trainer_qwen3
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
-    configure_qwen_simple_fsdp_expert_shard_dims,
+    configure_qwen_simple_fsdp_shard_dims,
 )
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 
 
-def _model(*, hidden_dim: int = 8) -> nn.Module:
+def _model(*, hidden_dim: int = 8, vocab_size: int = 8) -> nn.Module:
   model = nn.Module()
+  model.tok_embeddings = nn.Embedding(vocab_size, 8)
+  model.lm_head = nn.Linear(8, vocab_size, bias=False)
   layer = nn.Module()
   layer.moe = nn.Module()
   layer.moe.experts = TpuGroupedExperts.Config(
@@ -61,21 +63,21 @@ class SimpleFSDPShardingTest(absltest.TestCase):
   def test_uses_hidden_axis_when_leading_axis_is_uneven(self) -> None:
     model = _model()
 
-    configure_qwen_simple_fsdp_expert_shard_dims(model, _parallel_dims(4))
+    configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
 
     self.assertEqual(model.layers["0"].moe.experts._fsdp_shard_dim, 1)
 
   def test_keeps_default_axis_when_leading_axis_is_even(self) -> None:
     model = _model()
 
-    configure_qwen_simple_fsdp_expert_shard_dims(model, _parallel_dims(2))
+    configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(2))
 
     self.assertFalse(hasattr(model.layers["0"].moe.experts, "_fsdp_shard_dim"))
 
   def test_finds_experts_beneath_layer_wrappers(self) -> None:
     model = _wrapped_model()
 
-    configure_qwen_simple_fsdp_expert_shard_dims(model, _parallel_dims(4))
+    configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
 
     self.assertEqual(
         model.layers["0"].inner.moe.experts._fsdp_shard_dim,
@@ -86,9 +88,17 @@ class SimpleFSDPShardingTest(absltest.TestCase):
     model = _model(hidden_dim=6)
 
     with self.assertRaisesRegex(ValueError, "moe.experts.*hidden dimension 1"):
-      configure_qwen_simple_fsdp_expert_shard_dims(model, _parallel_dims(4))
+      configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
 
-  def test_graph_trainer_configures_experts_before_simple_fsdp(self) -> None:
+  def test_uses_hidden_axis_when_vocabulary_is_uneven(self) -> None:
+    model = _model(vocab_size=6)
+
+    configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
+
+    self.assertEqual(model.tok_embeddings._fsdp_shard_dim, 1)
+    self.assertEqual(model.lm_head._fsdp_shard_dim, 1)
+
+  def test_graph_trainer_configures_shard_dims_before_simple_fsdp(self) -> None:
     model = _model()
     parallel_dims = _parallel_dims(4)
     training = cast(
