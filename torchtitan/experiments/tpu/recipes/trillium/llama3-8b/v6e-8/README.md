@@ -30,7 +30,7 @@ We are running with the following key configurations (explicitly passed as flags
 - **Torch Compile**: Enabled for `model` component.
 - **Simple FSDP**: Enabled.
 - **Splash Attention**: Enabled with block size 2048.
-- **Loss**: Pallas fused cross-entropy, selected by the recipe.
+- **Loss Kernel**: Enabled.
 - **Eager Mode**: `DEFER_AND_FUSE` (for non-compiled parts if any).
 
 ## Training Command

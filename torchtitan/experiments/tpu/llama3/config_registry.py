@@ -43,6 +43,22 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
   config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
+def _on_scan_lane(config: TPUTrainerConfig) -> TPUTrainerConfig:
+  """Move a recipe onto the graph trainer with scanned layers and host offload.
+
+  Offload is not optional above 8B: without it the scan bodies keep every
+  layer's input live and 405B does not compile.
+  """
+  config.tpu_config.use_graph_trainer = True
+  config.tpu_config.compile_mode = "aot_fx_trace"
+  config.tpu_config.use_scan_layers = True
+  config.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  # bf16 Adam moments halve the optimizer state, which is 12.7 GiB at 405B and
+  # the difference between sequence 8192 fitting and not.
+  config.optimizer.implementation = "fused_opt_states_bf16"
+  return config
+
+
 def llama3_debugmodel() -> TPUTrainerConfig:
   """Llama3 debug model configuration for TPU."""
   model_spec = model_registry("debugmodel", attn_backend="sdpa")
@@ -408,3 +424,18 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
   config.override.imports.append(_REAL_ROPE_OVERRIDE)
   _enable_pallas_cross_entropy(config)
   return config
+
+
+def llama3_8b_scan() -> TPUTrainerConfig:
+  """Llama3 8B on the scan lane."""
+  return _on_scan_lane(llama3_8b())
+
+
+def llama3_70b_scan() -> TPUTrainerConfig:
+  """Llama3 70B on the scan lane."""
+  return _on_scan_lane(llama3_70b())
+
+
+def llama3_405b_scan() -> TPUTrainerConfig:
+  """Llama3 405B on the scan lane. Layerwise does not compile at this size."""
+  return _on_scan_lane(llama3_405b())
