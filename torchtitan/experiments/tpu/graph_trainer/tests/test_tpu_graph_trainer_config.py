@@ -36,8 +36,11 @@ from torchtitan.experiments.tpu.layer_loop import runs_layer_loop
 from torchtitan.experiments.tpu.llama3.config_registry import (
     llama3_1b,
     llama3_8b,
+    llama3_8b_scan,
     llama3_70b,
+    llama3_70b_scan,
     llama3_405b,
+    llama3_405b_scan,
     llama3_debugmodel,
     sft_llama3_8b_metamath,
 )
@@ -549,11 +552,60 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
 
   @parameterized.parameters(
-      llama3_debugmodel,
-      llama3_1b,
       llama3_8b,
       llama3_70b,
       llama3_405b,
+      sft_llama3_8b_metamath,
+  )
+  def test_llama3_recipe_uses_pallas_cross_entropy(self, recipe) -> None:
+    """`loss_kernel.use_loss_kernel` is the route that does not survive here.
+
+    It patches `lm_head` a second time, behind the graph trainer's back.
+    """
+    config = recipe()
+
+    self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
+    self.assertFalse(config.loss_kernel.use_loss_kernel)
+
+  @parameterized.parameters(
+      llama3_8b_scan,
+      llama3_70b_scan,
+      llama3_405b_scan,
+  )
+  def test_scan_recipe_sets_the_whole_lane(self, recipe) -> None:
+    """Every field here is load-bearing and silent when missing.
+
+    Without `full_and_scan_offload` 405B does not compile, and f32 Adam moments
+    cost 12.7 GiB that sequence 8192 needs.
+    """
+    config = recipe()
+
+    self.assertTrue(config.tpu_config.use_graph_trainer)
+    self.assertTrue(config.tpu_config.use_scan_layers)
+    self.assertEqual(config.tpu_config.compile_mode, "aot_fx_trace")
+    self.assertEqual(
+        config.tpu_config.graph_trainer_memory_policy, "full_and_scan_offload"
+    )
+    self.assertEqual(config.optimizer.implementation, "fused_opt_states_bf16")
+
+  @parameterized.parameters(
+      llama3_8b,
+      llama3_70b,
+      llama3_405b,
+  )
+  def test_layerwise_recipe_stays_off_the_graph_trainer(self, recipe) -> None:
+    """The production lane is layerwise; adding a `_scan` twin must not move it."""
+    self.assertFalse(recipe().tpu_config.use_graph_trainer)
+
+  @parameterized.parameters(
+      llama3_debugmodel,
+      llama3_1b,
+      llama3_8b,
+      llama3_8b_scan,
+      llama3_70b,
+      llama3_70b_scan,
+      llama3_405b,
+      llama3_405b_scan,
       sft_llama3_8b_metamath,
   )
   def test_llama3_recipe_overrides_complex_rope(self, recipe) -> None:
@@ -577,12 +629,19 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     for rope in ropes:
       self.assertIsInstance(rope, TpuRealArithmeticComplexRoPE)
 
-  @parameterized.parameters(qwen3_8b, qwen3_moe_30b_fsdp_only_full_ac_profile)
-  def test_pallas_loss_recipe_overrides_lm_head(self, recipe) -> None:
+  @parameterized.parameters(
+      (qwen3_8b, qwen3_gt),
+      (qwen3_moe_30b_fsdp_only_full_ac_profile, qwen3_gt),
+      (llama3_8b, llama3_gt),
+      (llama3_70b, llama3_gt),
+      (llama3_405b, llama3_gt),
+      (sft_llama3_8b_metamath, llama3_gt),
+  )
+  def test_pallas_loss_recipe_overrides_lm_head(self, recipe, module) -> None:
     config = recipe()
     graph_config = to_tpu_graph_trainer_config(
         config,
-        qwen3_gt.model_registry,
+        module.model_registry,
         target_cls=TpuGraphTrainer.Config,
     )
 

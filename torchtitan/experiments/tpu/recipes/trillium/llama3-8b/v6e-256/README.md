@@ -66,7 +66,6 @@ xpk workload create \
     --parallelism.use_simple_fsdp \
     --splash_attention_kernel.use_splash_attention_kernel \
     --splash_attention_kernel.sa_block_kv_compute=2048 \
-    --loss_kernel.use_loss_kernel \
     --tpu_config.eager_mode=DEFER_AND_FUSE \
     --libtpu-init-flags=xla_tpu_scoped_vmem_limit_kib=131072"
 ```
