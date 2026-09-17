@@ -60,13 +60,6 @@ _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
     # Use both SparseCores for reduce-scatter in the by-layer FSDP schedule.
     tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
     {
-        # These three fusion disables are the validated workaround for a
-        # deterministic libtpu crash while compiling Q235 layer executables.
-        "xla_tpu_dot_dot_fusion": False,
-        # Disable nested-dot fusion as the second part of that workaround.
-        "xla_tpu_nested_dot_fusion": False,
-        # Disable RWB fusion as the third part of that workaround.
-        "xla_tpu_rwb_fusion": False,
         # Keep activation host copies off SparseCore, where they would contend
         # with the FSDP collectives above. This does not itself create overlap.
         "xla_tpu_enable_offloading_copy_to_sparsecore": False,
@@ -76,66 +69,6 @@ _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
         # Let region analysis inspect the large Q235 layer regions instead of
         # declining because its search budget is too small.
         "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
-    },
-)
-
-# Additional MaxText host-offload scheduler policy. Flags marked parity-only
-# reproduce that policy but are not individually credited with this recipe's
-# ordinary-copy overlap; those transfers use generic kCopy and leave
-# xla_max_concurrent_host_copy at its default.
-_Q235_COMPILED_OFFLOAD_MAXTEXT_FLAGS = tpu_flags.merge_flags(
-    _Q235_COMPILED_OFFLOAD_FLAGS,
-    {
-        # Allow LHS to use the full shared-memory budget when evaluating
-        # overlap schedules; the normal compiler default is 95%.
-        "xla_tpu_scheduler_percent_shared_memory_limit": 100,
-        # Disable libtpu's distributed diagnostic coordinator for the measured
-        # 512-rank launch; this is operational and does not change model math.
-        "xla_tpu_enable_diagnostic_coordinator": False,
-        # Print the failed allocation and available/reserved bytes if this
-        # near-capacity recipe OOMs; observability only.
-        "tpu_log_allocations_on_oom": True,
-        # Execute eligible FSDP all-gathers on SparseCore so TensorCore work can
-        # overlap them.
-        "xla_tpu_enable_sparse_core_collective_offload_all_gather": True,
-        # Execute eligible FSDP all-reduces on SparseCore for the same reason.
-        "xla_tpu_enable_sparse_core_collective_offload_all_reduce": True,
-        # Select the one-SparseCore implementation for each offloaded
-        # all-gather, matching the measured collective schedule.
-        "xla_tpu_use_single_sparse_core_for_all_gather_offload": True,
-        # Enable MaxText's umbrella set of experimental scheduler heuristics;
-        # its individual contribution was not isolated in this recipe.
-        "xla_tpu_enable_all_experimental_scheduler_features": True,
-        # Include live-buffer pressure in scheduler choices so overlap does not
-        # ignore this batch-16 recipe's tight HBM margin.
-        "xla_tpu_enable_scheduler_memory_pressure_tracking": True,
-        # Run the host-transfer pipelining path for eligible sliced/loop-carried
-        # transfers. Ordinary split-child copies are asyncified separately.
-        "xla_tpu_pipeline_memory_host_transfers": True,
-        # Cap concurrent TPU dynamic-slice/update host transfers at 24. This
-        # does not govern the ordinary kCopy transfers used by this recipe.
-        "xla_tpu_host_transfer_overlap_limit": 24,
-        # Remove optimization barriers aggressively before scheduling so they
-        # do not fence otherwise independent asynchronous work.
-        "xla_tpu_aggressive_opt_barrier_removal": "ENABLED",
-        # Prefer maintaining asynchronous pipeline depth over minimizing the
-        # scheduler's immediate stall estimate.
-        "xla_lhs_prioritize_async_depth_over_stall": "ENABLED",
-        # Permit backward all-gather pipelining for HLO shapes where the
-        # collective pipeliner finds a legal candidate.
-        "xla_tpu_enable_ag_backward_pipelining": True,
-        # Let the collective pipeliner follow loop-variant parameters when
-        # building a candidate chain; parity-only for split entry computations.
-        "xla_should_allow_loop_variant_parameter_in_chain": "ENABLED",
-        # Let that chain also include loop-invariant operands; likewise only
-        # relevant if an eligible while/scan is present.
-        "xla_should_add_loop_invariant_op_in_chain": "ENABLED",
-        # Raise host send/recv concurrency for MaxText parity. It does not
-        # control the generic kCopy activation transfers.
-        "xla_max_concurrent_host_send_recv": 100,
-        # Rerun latency-hiding scheduling after SparseCore assignment so the
-        # final scheduler sees the selected collective resources.
-        "xla_latency_hiding_scheduler_rerun": 2,
     },
 )
 
@@ -638,11 +571,9 @@ def qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
-  # The tokenizer/model vocabulary has 151,936 real classes, which is not
-  # divisible by FSDP-512. Pad the physical embedding and LM-head matrices to
-  # 152,064 (= 297 rows/rank), while keeping vocab_size as the logical size.
-  # Token IDs never address the padded rows, and the loss/logit paths below
-  # remove those rows before softmax so they cannot change model semantics.
+  # FSDP-512 cannot shard the 151,936-row vocabulary evenly. Padding the
+  # physical embedding and LM head avoids a large dim-1 initializer program;
+  # the fused loss trims the padding before softmax.
   model_config.tok_embeddings.num_embeddings = 152064
   model_config.lm_head.out_features = 152064
   assert isinstance(cfg.loss, PallasCrossEntropyLoss.Config)
@@ -700,10 +631,6 @@ def qwen3_moe_235b_fsdp_compiled_offload() -> TPUTrainerConfig:
 def qwen3_moe_235b_fsdp_compiled_offload_maxtext() -> TPUTrainerConfig:
   """MaxText-numerics variant of the Q235 compiled-offload recipe."""
   cfg = qwen3_moe_235b_fsdp_compiled_offload()
-  cfg.libtpu_init_flags = tpu_flags.merge_flags(
-      cfg.libtpu_init_flags,
-      _Q235_COMPILED_OFFLOAD_MAXTEXT_FLAGS,
-  )
   cfg.training.mixed_precision_reduce = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)

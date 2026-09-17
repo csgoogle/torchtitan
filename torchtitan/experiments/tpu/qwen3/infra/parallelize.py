@@ -15,6 +15,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
 )
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 
+
 def parallelize_qwen3(
     model: nn.Module,
     *,
@@ -30,7 +31,7 @@ def parallelize_qwen3(
 ) -> nn.Module:
   """Parallelizes the Qwen3 model, optionally applying Simple FSDP.
 
-  This wrapper delegates to the upstream Qwen3 parallelize function. If 
+  This wrapper delegates to the upstream Qwen3 parallelize function. If
   `--parallelism.use_simple_fsdp` is set, it skips upstream Data Parallelism
   and instead applies the TPU-specific Simple FSDP implementation.
   """
@@ -44,6 +45,7 @@ def parallelize_qwen3(
   configure_expert_dweight_output_dtype(model, reduce_dtype)
   if effective_compile_config.enable and hasattr(model, "layers"):
     from torchtitan.models.common.moe import MoE
+
     for layer in model.layers.values():
       has_moe = any(isinstance(m, MoE) for m in layer.modules())
       if not has_moe:
