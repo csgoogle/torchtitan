@@ -182,6 +182,7 @@ def test_graph_trainer_parallelize_configures_dweight_output_dtype():
     )
     model = torch.nn.Sequential(experts)
     training = SimpleNamespace(mixed_precision_reduce="bfloat16")
+    parallel_dims = SimpleNamespace(dp_shard=1, cp=1, ep_enabled=False)
 
     with patch.object(
         graph_trainer_qwen3,
@@ -191,6 +192,7 @@ def test_graph_trainer_parallelize_configures_dweight_output_dtype():
         result = graph_trainer_qwen3.parallelize_qwen3(
             model,
             training=training,
+            parallel_dims=parallel_dims,
             marker="forwarded",
         )
 
@@ -199,6 +201,7 @@ def test_graph_trainer_parallelize_configures_dweight_output_dtype():
     delegate.assert_called_once_with(
         model,
         training=training,
+        parallel_dims=parallel_dims,
         marker="forwarded",
     )
 

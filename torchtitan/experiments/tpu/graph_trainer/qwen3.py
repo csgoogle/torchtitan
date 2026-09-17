@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import torch.nn as nn
 
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.qwen3 import (
     model_registry as graph_trainer_model_registry,
 )
@@ -22,6 +23,9 @@ from torchtitan.experiments.tpu.grouped_experts import (
 )
 from torchtitan.experiments.tpu.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
+)
+from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
+    configure_qwen_simple_fsdp_shard_dims,
 )
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -39,13 +43,20 @@ def parallelize_qwen3(
     model: GraphTrainerQwen3Model,
     *,
     training: TrainingConfig,
+    parallel_dims: ParallelDims,
     **kwargs,
 ) -> nn.Module:
-    """Match unpaired expert dWeight stores to FSDP before setup."""
+    """Apply TPU expert dtype and uneven-FSDP policy before setup."""
     configure_expert_dweight_output_dtype(
         model, TORCH_DTYPE_MAP[training.mixed_precision_reduce]
     )
-    return graph_trainer_parallelize_qwen3(model, training=training, **kwargs)
+    configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
+    return graph_trainer_parallelize_qwen3(
+        model,
+        training=training,
+        parallel_dims=parallel_dims,
+        **kwargs,
+    )
 
 
 def model_registry(flavor: str) -> ModelSpec:

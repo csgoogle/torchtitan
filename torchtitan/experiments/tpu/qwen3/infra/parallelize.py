@@ -7,16 +7,82 @@ import torchtitan.config
 import torchtitan.distributed
 from torchtitan.models.qwen3 import parallelize as dtensor_parallelize
 
-
-from torchtitan.experiments.graph_trainer.simple_fsdp import (
-    MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
-    data_parallel as simple_fsdp_data_parallel,
+from torchtitan.experiments.graph_trainer.common_utils import (
+    apply_simple_fsdp,
 )
 from torchtitan.experiments.tpu.grouped_experts import (
+    TpuGroupedExperts,
     configure_expert_dweight_output_dtype,
 )
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
+
+
+def configure_qwen_simple_fsdp_shard_dims(
+    model: nn.Module,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+) -> None:
+  """Use divisible hidden axes for uneven Qwen parameters under SimpleFSDP."""
+  fsdp_degree = parallel_dims.dp_shard * parallel_dims.cp
+  if fsdp_degree <= 1:
+    return
+
+  hidden_axis_modules: list[str] = []
+  for module_fqn in ("tok_embeddings", "lm_head"):
+    module = getattr(model, module_fqn)
+    weight = module.weight
+    if weight.shape[0] % fsdp_degree == 0:
+      continue
+    if weight.ndim != 2 or weight.shape[1] % fsdp_degree != 0:
+      raise ValueError(
+          f"Cannot FSDP-shard {module_fqn}.weight with shape "
+          f"{tuple(weight.shape)} over {fsdp_degree} ranks"
+      )
+    # This is apply_simple_fsdp's documented per-submodule shard-axis hook,
+    # also used by LayerStackHolder for stacked layer weights.
+    setattr(module, "_fsdp_shard_dim", 1)
+    hidden_axis_modules.append(module_fqn)
+
+  # With EP, apply_simple_fsdp separately wraps each expert bank on the EDP
+  # mesh and owns its shard-axis selection.
+  if not parallel_dims.ep_enabled:
+    qwen_expert_modules = [
+        (module_fqn, module)
+        for module_fqn, module in model.named_modules()
+        if isinstance(module, TpuGroupedExperts)
+    ]
+    for module_fqn, module in qwen_expert_modules:
+      if module.num_experts % fsdp_degree == 0:
+        continue
+
+      parameters = list(module.named_parameters(recurse=False))
+      if not parameters:
+        raise ValueError(f"{module_fqn} has no direct parameters to FSDP-shard")
+      incompatible = [
+          f"{name}{tuple(parameter.shape)}"
+          for name, parameter in parameters
+          if (
+              parameter.ndim != 3
+              or parameter.shape[0] != module.num_experts
+              or parameter.shape[1] % fsdp_degree != 0
+          )
+      ]
+      if incompatible:
+        raise ValueError(
+            f"Cannot FSDP-shard {module_fqn} on Qwen's hidden dimension 1 "
+            f"over {fsdp_degree} ranks; incompatible expert parameters: "
+            f"{incompatible}"
+        )
+      # See the documented apply_simple_fsdp hook above.
+      setattr(module, "_fsdp_shard_dim", 1)
+      hidden_axis_modules.append(module_fqn)
+
+  if hidden_axis_modules:
+    logger.info(
+        "Using SimpleFSDP dimension 1 for %d uneven Qwen modules",
+        len(hidden_axis_modules),
+    )
+
 
 def parallelize_qwen3(
     model: nn.Module,
@@ -33,7 +99,7 @@ def parallelize_qwen3(
 ) -> nn.Module:
   """Parallelizes the Qwen3 model, optionally applying Simple FSDP.
 
-  This wrapper delegates to the upstream Qwen3 parallelize function. If 
+  This wrapper delegates to the upstream Qwen3 parallelize function. If
   `--parallelism.use_simple_fsdp` is set, it skips upstream Data Parallelism
   and instead applies the TPU-specific Simple FSDP implementation.
   """
@@ -47,6 +113,7 @@ def parallelize_qwen3(
   configure_expert_dweight_output_dtype(model, reduce_dtype)
   if effective_compile_config.enable and hasattr(model, "layers"):
     from torchtitan.models.common.moe import MoE
+
     for layer in model.layers.values():
       has_moe = any(isinstance(m, MoE) for m in layer.modules())
       if not has_moe:
@@ -68,23 +135,14 @@ def parallelize_qwen3(
           training=training,
       )
 
-    dp_mesh_names = (
-          ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-      )
-    dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-
-    dp_mode = "hybrid_shard" if parallel_dims.dp_replicate_enabled else "fully_shard"
-    mp_policy = SimpleFSDPMixedPrecisionPolicy(
-          param_dtype=torchtitan.config.TORCH_DTYPE_MAP[training.mixed_precision_param],
-          reduce_dtype=reduce_dtype,
-      )
-    model = simple_fsdp_data_parallel(
-          model,
-          dp_mesh,
-          mode=dp_mode,
-          mp_policy=mp_policy,
-      )
-    logger.info(f"Applied SimpleFSDP ({dp_mode}) to the model")
+    # Configure expert sharding after upstream parallelization has installed
+    # any wrappers, but before SimpleFSDP selects parameter shard dimensions.
+    configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
+    model = apply_simple_fsdp(
+        model,
+        parallel_dims=parallel_dims,
+        training=training,
+    )
   else:
     dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]

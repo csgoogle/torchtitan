@@ -20,6 +20,7 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -49,6 +50,29 @@ from torchtitan.tools.profiler import Profiler
 
 _FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
 _BF16_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.bf16_rope"
+
+
+# Compiler policy shared by the FP32 and MaxText-parity offload recipes.
+_Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
+    # Aggregate SparseCore collectives and enable layer-level latency hiding so
+    # FSDP communication can be scheduled alongside independent layer compute.
+    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    # Use both SparseCores for reduce-scatter in the by-layer FSDP schedule.
+    tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+    {
+        # Keep activation host copies off SparseCore, where they would contend
+        # with the FSDP collectives above. In the isolated A/B this moved MFU
+        # only from 18.425% to 18.448% and did not itself create D2H overlap.
+        "xla_tpu_enable_offloading_copy_to_sparsecore": False,
+        # Prove the true copy/overwrite ordering across donated aliases. This
+        # removed the defensive activation snapshot, moved all 93 measured D2H
+        # waits to zero, and improved MFU from 18.528% to 19.490% in the A/B.
+        "xla_tpu_copy_insertion_use_region_analysis": True,
+        # Use the tested search budget for the large Q235 layer regions. This
+        # value was evaluated together with region analysis, not in isolation.
+        "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
+    },
+)
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
@@ -541,6 +565,137 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
     raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
   for _, dispatcher, _, _ in dispatchers:
     dispatcher.fuse_route_score_backward = True
+  return cfg
+
+
+def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
+  """Build the common Qwen3 235B-A22B FSDP configuration."""
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  cfg.model_spec = model_registry(
+      "235B-A22B",
+      attn_backend="sdpa",
+      converters=[
+          TpuTokenDispatcherConverter.Config(),
+          TpuGroupedExpertsConverter.Config(),
+      ],
+  )
+  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
+  # their divisible hidden axes when the FSDP mesh is wider than dim 0.
+  for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
+    experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 512)
+    experts.use_kernel_native_weight_layout = True
+  cfg.training.local_batch_size = 16
+  cfg.training.global_batch_size = 8192
+  cfg.training.seq_len = 4096
+  cfg.training.steps = 15
+  cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.tpu_config.use_graph_split = True
+  cfg.tpu_config.graph_split.forward_layers_per_executable = 1
+  cfg.tpu_config.graph_split.forward_isolate_prefix = True
+  cfg.tpu_config.graph_split.backward_partition_mode = "fsdp_pipeline"
+  cfg.tpu_config.graph_split.backward_layers_per_executable = 1
+  cfg.tpu_config.enable_graph_trainer_remat_schedule = False
+  cfg.tpu_config.graph_trainer_fsdp_schedule = "none"
+  cfg.tpu_config.compile_optimizer = False
+  cfg.tpu_config.optimizer_in_graph = False
+  cfg.hf_assets_path = "./assets/hf/Qwen3-235B-A22B"
+  cfg.metrics.log_freq = 1
+  return cfg
+
+
+def _qwen3_moe_235b_fsdp_activation_offload() -> TPUTrainerConfig:
+  """Add the common Q235 activation-offload execution policy."""
+  cfg = _qwen3_moe_235b_fsdp_only()
+  cfg.tpu_config.graph_trainer_memory_policy = "full_and_offload"
+  cfg.tpu_config.graph_split.forward_layers_per_executable = 1
+  # Current ``by_layer`` is the direct successor of the ``sequential`` mode
+  # used by the measured schedule: one complete backward layer per
+  # independently compiled child.
+  cfg.tpu_config.graph_split.backward_partition_mode = "by_layer"
+  cfg.tpu_config.graph_split.backward_layers_per_executable = 1
+  # Issue each H2D pair in the child immediately before its consumer. This
+  # removed 1.31 s of exposed H2D in the measured BF16 arm at a 0.96-GiB HBM
+  # cost from carrying the completed activation across one child boundary.
+  cfg.tpu_config.graph_split.cpu_offload_prefetch_executables = 1
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      _Q235_COMPILED_OFFLOAD_FLAGS,
+  )
+  return cfg
+
+
+def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
+  """MaxText-numerics variant of the Q235 activation-offload recipe."""
+  cfg = _qwen3_moe_235b_fsdp_activation_offload()
+  cfg.training.mixed_precision_reduce = "bfloat16"
+  if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
+    cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
+  assert cfg.model_spec is not None
+  dispatchers = list(
+      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+  )
+  if not dispatchers:
+    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
+  for _, dispatcher, _, _ in dispatchers:
+    dispatcher.fuse_route_score_backward = True
+  return cfg
+
+
+def _configure_qwen3_moe_235b_fsdp_128(
+    cfg: TPUTrainerConfig,
+    *,
+    replicate_degree: int,
+) -> None:
+  """Configure an FSDP-128 mesh and its matching global batch size."""
+  cfg.parallelism.data_parallel_replicate_degree = replicate_degree
+  cfg.parallelism.data_parallel_shard_degree = 128
+  cfg.training.global_batch_size = 2048 * replicate_degree
+
+
+def qwen3_moe_235b_hsdp_activation_offload_maxtext() -> TPUTrainerConfig:
+  """MaxText-numerics Q235 offload recipe using 4x128 HSDP.
+
+  Matching the FSDP shard degree to the 128-expert dimension keeps expert
+  weights on their natural shard axis and avoids hidden-axis reconstruction.
+  """
+  cfg = qwen3_moe_235b_fsdp_activation_offload_maxtext()
+  _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=4)
+  return cfg
+
+
+def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TPUTrainerConfig:
+  """FP32-reduction Q235 offload recipe for a 4x4x4 TPU7x slice.
+
+  Pure FSDP over 128 ranks divides both the 128 experts and the 151,936-token
+  vocabulary evenly. Keep local batch 16 and use one microbatch per step.
+  """
+  cfg = _qwen3_moe_235b_fsdp_activation_offload()
+  _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
+  return cfg
+
+
+def qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4(
+) -> TPUTrainerConfig:
+  """MaxText-numerics Q235 offload recipe for a 4x4x4 TPU7x slice."""
+  cfg = qwen3_moe_235b_fsdp_activation_offload_maxtext()
+  _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
+  return cfg
+
+
+def qwen3_moe_235b_fsdp_smoke() -> TPUTrainerConfig:
+  """Four-layer FSDP512 smoke for the production 235B execution path."""
+  cfg = _qwen3_moe_235b_fsdp_only()
+  assert cfg.model_spec is not None
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  model_config.layers = model_config.layers[:4]
+  cfg.training.local_batch_size = 1
+  cfg.training.seq_len = 128
+  cfg.training.steps = 2
+  cfg.tpu_config.enable_mfu_benchmark = False
   return cfg
 
 
