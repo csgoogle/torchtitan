@@ -571,9 +571,11 @@ def qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
-  # FSDP-512 cannot shard the 151,936-row vocabulary evenly. Padding the
-  # physical embedding and LM head avoids a large dim-1 initializer program;
-  # the fused loss trims the padding before softmax.
+  # The 151,936-token vocabulary is not divisible by FSDP-512. A hidden-axis
+  # shard avoids padding but makes the initializer reserve a 3-GiB temporary
+  # and fail at this memory limit, so keep the cheap row sharding by padding
+  # the physical tables to 152,064. The TPU fused loss excludes those 128 rows
+  # from the softmax and leaves the public vocabulary size unchanged.
   model_config.tok_embeddings.num_embeddings = 152064
   model_config.lm_head.out_features = 152064
   assert isinstance(cfg.loss, PallasCrossEntropyLoss.Config)
@@ -602,8 +604,8 @@ def qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_235b_fsdp_compiled_offload() -> TPUTrainerConfig:
-  """FP32-reduction Q235 recipe with compiled activation CPU offload.
+def qwen3_moe_235b_fsdp_activation_offload() -> TPUTrainerConfig:
+  """FP32-reduction Q235 recipe with activation CPU offload.
 
   This is the landing-policy counterpart of the BF16 MaxText-parity recipe
   below. It keeps one layer in each split executable and reuses the prior
@@ -628,9 +630,9 @@ def qwen3_moe_235b_fsdp_compiled_offload() -> TPUTrainerConfig:
   return cfg
 
 
-def qwen3_moe_235b_fsdp_compiled_offload_maxtext() -> TPUTrainerConfig:
-  """MaxText-numerics variant of the Q235 compiled-offload recipe."""
-  cfg = qwen3_moe_235b_fsdp_compiled_offload()
+def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
+  """MaxText-numerics variant of the Q235 activation-offload recipe."""
+  cfg = qwen3_moe_235b_fsdp_activation_offload()
   cfg.training.mixed_precision_reduce = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
@@ -657,21 +659,21 @@ def _configure_qwen3_moe_235b_fsdp_4x4x4(
   cfg.training.global_batch_size = 2048
 
 
-def qwen3_moe_235b_fsdp_compiled_offload_4x4x4() -> TPUTrainerConfig:
+def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TPUTrainerConfig:
   """FP32-reduction Q235 offload recipe for a 4x4x4 TPU7x slice.
 
   Pure FSDP over 128 ranks divides both the 128 experts and the 151,936-token
   vocabulary evenly. Keep local batch 16 and use one microbatch per step.
   """
-  cfg = qwen3_moe_235b_fsdp_compiled_offload()
+  cfg = qwen3_moe_235b_fsdp_activation_offload()
   _configure_qwen3_moe_235b_fsdp_4x4x4(cfg)
   return cfg
 
 
-def qwen3_moe_235b_fsdp_compiled_offload_maxtext_4x4x4(
+def qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4(
 ) -> TPUTrainerConfig:
   """MaxText-numerics Q235 offload recipe for a 4x4x4 TPU7x slice."""
-  cfg = qwen3_moe_235b_fsdp_compiled_offload_maxtext()
+  cfg = qwen3_moe_235b_fsdp_activation_offload_maxtext()
   _configure_qwen3_moe_235b_fsdp_4x4x4(cfg)
   return cfg
 
@@ -686,22 +688,6 @@ def qwen3_moe_235b_fsdp_smoke() -> TPUTrainerConfig:
   cfg.training.seq_len = 128
   cfg.training.steps = 2
   cfg.tpu_config.enable_mfu_benchmark = False
-  return cfg
-
-
-def qwen3_moe_235b_fsdp_pipeline_b8_profile() -> TPUTrainerConfig:
-  """Batch-8 validation and rank-zero profile for the 235B pipeline."""
-  cfg = qwen3_moe_235b_fsdp_only()
-  cfg.training.local_batch_size = 8
-  cfg.training.global_batch_size = 4096
-  cfg.training.steps = 15
-  cfg.profiler = Profiler.Config(
-      enable_profiling=int(os.environ.get("RANK", "0")) == 0,
-      profile_freq=5,
-      profiler_warmup=2,
-      profiler_active=1,
-      profiler_repeat=1,
-  )
   return cfg
 
 

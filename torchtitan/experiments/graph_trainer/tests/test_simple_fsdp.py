@@ -13,10 +13,7 @@ import torch.nn as nn
 
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.experiments.graph_trainer.common_utils import (
-    _select_expert_fsdp_shard_dim,
-    apply_simple_fsdp,
-)
+from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 
 
 class TestApplySimpleFSDPSingleRank(unittest.TestCase):
@@ -34,10 +31,6 @@ class TestApplySimpleFSDPSingleRank(unittest.TestCase):
     def tearDown(self):
         if dist.is_initialized():
             dist.destroy_process_group()
-
-    def test_expert_shard_dim_avoids_fsdp_replication(self):
-        self.assertEqual(_select_expert_fsdp_shard_dim(128, 128), 0)
-        self.assertEqual(_select_expert_fsdp_shard_dim(128, 512), 1)
 
     @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
     def test_param_cast_to_bf16_at_ngpu_1(self):

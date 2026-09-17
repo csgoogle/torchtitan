@@ -14,6 +14,49 @@ from torchtitan.experiments.tpu.grouped_experts import (
     configure_expert_dweight_output_dtype,
 )
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+from torchtitan.tools.logging import logger
+
+
+def configure_qwen_simple_fsdp_expert_shard_dims(
+    model: nn.Module,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+) -> None:
+  """Use a divisible hidden axis for uneven Qwen expert banks under pure FSDP."""
+  fsdp_degree = parallel_dims.dp_shard * parallel_dims.cp
+  if fsdp_degree <= 1 or parallel_dims.ep_enabled:
+    return
+
+  modules = [
+      (module_fqn, module)
+      for module_fqn, module in model.named_modules()
+      if module_fqn.endswith(".moe.experts")
+  ]
+
+  alternate_modules: list[str] = []
+  for module_fqn, module in modules:
+    parameters = list(module.named_parameters(recurse=False))
+    if not parameters:
+      raise ValueError(f"{module_fqn} has no direct parameters to FSDP-shard")
+    if all(parameter.shape[0] % fsdp_degree == 0 for _, parameter in parameters):
+      continue
+    incompatible = [
+        f"{name}{tuple(parameter.shape)}"
+        for name, parameter in parameters
+        if parameter.ndim < 2 or parameter.shape[1] % fsdp_degree != 0
+    ]
+    if incompatible:
+      raise ValueError(
+          f"Cannot FSDP-shard {module_fqn} on either dimension 0 or 1 over "
+          f"{fsdp_degree} ranks; incompatible parameters: {incompatible}"
+      )
+    setattr(module, "_fsdp_shard_dim", 1)
+    alternate_modules.append(module_fqn)
+
+  if alternate_modules:
+    logger.info(
+        "Using SimpleFSDP dimension 1 for %d uneven Qwen expert modules",
+        len(alternate_modules),
+    )
 
 
 def parallelize_qwen3(
@@ -67,6 +110,9 @@ def parallelize_qwen3(
           training=training,
       )
 
+    # Configure expert sharding after upstream parallelization has installed
+    # any wrappers, but before SimpleFSDP selects parameter shard dimensions.
+    configure_qwen_simple_fsdp_expert_shard_dims(model, parallel_dims)
     model = apply_simple_fsdp(
         model,
         parallel_dims=parallel_dims,
