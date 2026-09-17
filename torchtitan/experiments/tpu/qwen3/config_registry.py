@@ -770,6 +770,28 @@ def qwen3_moe_235b_scan_proxy() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_235b_scan_maxtext() -> TPUTrainerConfig:
+  """`qwen3_moe_235b_scan` with MaxText's numerics instead of torchtitan's.
+
+  Three changes, all of them bf16 where torchtitan keeps f32: the gradient
+  reduce, the rotary arithmetic, and the route-score backward. None is
+  bit-preserving, so the base recipe stays the accuracy reference and this one
+  is the speed comparison against MaxText's published Ironwood number.
+  """
+  cfg = qwen3_moe_235b_scan()
+  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
+  assert cfg.model_spec is not None
+  dispatchers = list(
+      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+  )
+  if not dispatchers:
+    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
+  for _, dispatcher, _, _ in dispatchers:
+    dispatcher.fuse_route_score_backward = True
+  return cfg
+
+
 def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
   """Proxy model for Qwen3 30B MoE (4 layers instead of 48) for testing/iterations."""
   cfg = qwen3_moe_30b()

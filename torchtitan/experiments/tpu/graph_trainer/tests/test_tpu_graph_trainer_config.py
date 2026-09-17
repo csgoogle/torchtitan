@@ -65,6 +65,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
     qwen3_moe_235b_scan,
+    qwen3_moe_235b_scan_maxtext,
     qwen3_moe_235b_scan_proxy,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
@@ -578,6 +579,30 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(
         proxy.training.global_batch_size, 32 * proxy.training.local_batch_size
     )
+
+  def test_235b_maxtext_twin_changes_only_the_three_numerics_knobs(self) -> None:
+    base = qwen3_moe_235b_scan()
+    maxtext = qwen3_moe_235b_scan_maxtext()
+
+    self.assertEqual(base.training.mixed_precision_reduce, "float32")
+    self.assertEqual(maxtext.training.mixed_precision_reduce, "bfloat16")
+    self.assertEqual(
+        set(maxtext.override.imports) - set(base.override.imports),
+        {"torchtitan.experiments.tpu.overrides.bf16_rope"},
+    )
+    assert base.model_spec is not None and maxtext.model_spec is not None
+    for config, expected in ((base, False), (maxtext, True)):
+      dispatchers = list(
+          config.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+      )
+      self.assertLen(dispatchers, 94)
+      self.assertTrue(
+          all(d.fuse_route_score_backward is expected for _, d, _, _ in dispatchers)
+      )
+    # Everything the base recipe works around is inherited, not re-derived.
+    self.assertEqual(maxtext.model_spec.flavor, base.model_spec.flavor)
+    self.assertEqual(maxtext.training.local_batch_size, 16)
+    self.assertTrue(maxtext.tpu_config.use_scan_layers)
 
   def test_optimizer_implementation_cli_override_is_authoritative(self) -> None:
     config = ConfigManager().parse_args([
