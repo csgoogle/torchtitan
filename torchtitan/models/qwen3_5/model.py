@@ -11,10 +11,6 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
-from fla.ops.gated_delta_rule import (
-    chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
-    fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule,
-)
 from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental import local_map
@@ -30,9 +26,38 @@ from .sharding import set_qwen35_sharding_config
 from .vision_encoder import Qwen35VisionEncoder
 
 
+def _load_fla_gated_delta_rule(name: str):
+    """Import an FLA gated-delta kernel on first use."""
+    try:
+        import fla.ops.gated_delta_rule as fla_gated_delta_rule  # pylint: disable=g-import-not-at-top
+    except ImportError as e:
+        raise ImportError(
+            f"fla_backend '{name}' requires the 'fla' (flash-linear-attention) "
+            "package, which is not installed. Use fla_backend='torch_native' "
+            "or 'tpu_chunked' to run without it."
+        ) from e
+    return getattr(fla_gated_delta_rule, name)
+
+
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """L2 norm using rsqrt(sum(x²) + eps), not x/max(norm, eps) like F.normalize, to match FLA kernel."""
     return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+
+
+class _ContiguousGrad(torch.autograd.Function):
+    """Ensures backward gradient is contiguous even when forward input is contiguous."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        return grad_output.contiguous()
+
+
+def _ensure_contiguous_grad(x: torch.Tensor) -> torch.Tensor:
+    return _ContiguousGrad.apply(x)
 
 
 def _torch_native_gated_delta(
@@ -169,14 +194,20 @@ class GatedDeltaKernel(Module):
     class Config(Module.Config):
         # "fla_chunked": parallel within chunks, fast for training (default)
         # "fla_fused_recurrent": token-by-token, lower memory for long sequences
+        # "tpu_chunked": chunkwise-parallel in plain torch, for XLA/TPU
         # "torch_native": pure-Python reference, for numerical testing only
         backend: Literal[
-            "fla_chunked", "fla_fused_recurrent", "torch_native"
+            "fla_chunked",
+            "fla_fused_recurrent",
+            "tpu_chunked",
+            "torch_native",
         ] = "fla_chunked"
+        chunk_size: int = 64
 
     def __init__(self, config: Config):
         super().__init__()
         self.backend = config.backend
+        self.chunk_size = config.chunk_size
 
     def forward(
         self,
@@ -186,6 +217,8 @@ class GatedDeltaKernel(Module):
         g: torch.Tensor,
         beta: torch.Tensor,
     ) -> torch.Tensor:
+        q, k, v, g, beta = map(_ensure_contiguous_grad, (q, k, v, g, beta))
+
         # Expand Q/K heads to match V when n_value_heads > n_key_heads
         if q.shape[2] != v.shape[2]:
             assert v.shape[2] % q.shape[2] == 0
@@ -196,31 +229,34 @@ class GatedDeltaKernel(Module):
         if self.backend == "torch_native":
             return _torch_native_gated_delta(q, k, v, g, beta)
 
+        if self.backend == "tpu_chunked":
+            from torchtitan.experiments.tpu.gated_delta import (  # pylint: disable=g-import-not-at-top
+                chunked_gated_delta_rule,
+            )
+            return chunked_gated_delta_rule(
+                q, k, v, g, beta, chunk_size=self.chunk_size
+            )
+
         if self.backend == "fla_chunked":
-            result = _fla_chunk_gated_delta_rule(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                use_qk_l2norm_in_kernel=True,
+            chunk_gated_delta_rule = _load_fla_gated_delta_rule(
+                "chunk_gated_delta_rule"
+            )
+            result = chunk_gated_delta_rule(
+                q, k, v, g, beta, use_qk_l2norm_in_kernel=True
             )
         elif self.backend == "fla_fused_recurrent":
-            result = _fla_fused_recurrent_gated_delta_rule(
-                q,
-                k,
-                v,
-                g,
-                beta=beta,
-                use_qk_l2norm_in_kernel=True,
+            fused_recurrent_gated_delta_rule = _load_fla_gated_delta_rule(
+                "fused_recurrent_gated_delta_rule"
+            )
+            result = fused_recurrent_gated_delta_rule(
+                q, k, v, g, beta=beta, use_qk_l2norm_in_kernel=True
             )
         else:
             raise ValueError(
-                f"Unknown fla_backend '{self.backend}'. "
-                "Valid: 'fla_chunked', 'fla_fused_recurrent', 'torch_native'."
+                f"Unknown backend '{self.backend}'. "
+                "Valid: 'fla_chunked', 'fla_fused_recurrent', 'tpu_chunked', 'torch_native'."
             )
 
-        # FLA kernels return (output, final_state); we only need output
         return result[0]
 
 
@@ -313,7 +349,7 @@ class GatedDeltaNet(Module):
             x = conv_dt(x, w)  # pyrefly: ignore
         else:
             x = conv(x)
-        return F.silu(x).transpose(1, 2)
+        return F.silu(x).transpose(1, 2).contiguous()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bs, seqlen, _ = x.shape
@@ -322,12 +358,18 @@ class GatedDeltaNet(Module):
         #   xq, xk: (bs, seqlen, n_key_heads * key_head_dim)
         #   xv, xz: (bs, seqlen, n_value_heads * value_head_dim)
         #   xa, xb: (bs, seqlen, n_value_heads)
-        xq = self._causal_conv(self.in_proj_q(x), self.conv_q)
-        xk = self._causal_conv(self.in_proj_k(x), self.conv_k)
-        xv = self._causal_conv(self.in_proj_v(x), self.conv_v)
-        xz = self.in_proj_z(x)
-        xa = self.in_proj_a(x)
-        xb = self.in_proj_b(x)
+        xq = self._causal_conv(
+            _ensure_contiguous_grad(self.in_proj_q(x)), self.conv_q
+        )
+        xk = self._causal_conv(
+            _ensure_contiguous_grad(self.in_proj_k(x)), self.conv_k
+        )
+        xv = self._causal_conv(
+            _ensure_contiguous_grad(self.in_proj_v(x)), self.conv_v
+        )
+        xz = _ensure_contiguous_grad(self.in_proj_z(x))
+        xa = _ensure_contiguous_grad(self.in_proj_a(x))
+        xb = _ensure_contiguous_grad(self.in_proj_b(x))
 
         xq = xq.view(bs, seqlen, -1, self.key_head_dim)
         xk = xk.view(bs, seqlen, -1, self.key_head_dim)
@@ -344,7 +386,7 @@ class GatedDeltaNet(Module):
         xz = xz.view(bs, seqlen, -1, self.value_head_dim)
         output = self.norm(output, xz)
 
-        output = output.reshape(bs, seqlen, -1)
+        output = _ensure_contiguous_grad(output.reshape(bs, seqlen, -1))
         return self.out_proj(output)
 
 
@@ -408,10 +450,16 @@ class Qwen35Attention(BaseAttention):
         bs, seqlen, _ = x.shape
 
         # wq is 2x wider: produces query + gate
-        xq_gate = self.wq(x).view(bs, seqlen, -1, self.head_dim * 2)
+        xq_gate = _ensure_contiguous_grad(self.wq(x)).view(
+            bs, seqlen, -1, self.head_dim * 2
+        )
         xq, gate = xq_gate.chunk(2, dim=-1)
-        xk = self.wk(x).view(bs, seqlen, -1, self.head_dim)
-        xv = self.wv(x).view(bs, seqlen, -1, self.head_dim)
+        xk = _ensure_contiguous_grad(self.wk(x)).view(
+            bs, seqlen, -1, self.head_dim
+        )
+        xv = _ensure_contiguous_grad(self.wv(x)).view(
+            bs, seqlen, -1, self.head_dim
+        )
 
         # QK norm (before RoPE)
         xq = self.q_norm(xq)
@@ -436,7 +484,7 @@ class Qwen35Attention(BaseAttention):
 
         # Output gating
         output = output * torch.sigmoid(gate)
-        output = output.view(bs, seqlen, -1)
+        output = _ensure_contiguous_grad(output.reshape(bs, seqlen, -1))
         return self.wo(output)
 
 
@@ -541,7 +589,7 @@ class Qwen35Model(Decoder):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
-        vision_encoder: Qwen35VisionEncoder.Config
+        vision_encoder: Qwen35VisionEncoder.Config | None = None
 
         def update_from_config(
             self,
@@ -594,8 +642,12 @@ class Qwen35Model(Decoder):
     def __init__(self, config: Config):
         super().__init__(config)
 
-        self.vision_encoder = config.vision_encoder.build()
-        self.spatial_merge_size = config.vision_encoder.spatial_merge_size
+        if config.vision_encoder is None:
+            self.vision_encoder = None
+            self.spatial_merge_size = None
+        else:
+            self.vision_encoder = config.vision_encoder.build()
+            self.spatial_merge_size = config.vision_encoder.spatial_merge_size
 
     def _get_vision_positions(
         self,
@@ -704,9 +756,6 @@ class Qwen35Model(Decoder):
         Returns:
             (batch, seq_len, dim) embeddings with vision tokens scattered in
         """
-        image_token_id = special_tokens["image_id"]
-        video_token_id = special_tokens["video_id"]
-
         inputs_embeds = (
             self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         )
@@ -716,7 +765,10 @@ class Qwen35Model(Decoder):
                 pixel_values, grid_thw=grid_thw
             )
             image_positions = self._get_vision_positions(
-                tokens, num_tokens, image_token_id
+                tokens,
+                num_tokens,
+                # pyrefly: ignore [index-error]
+                special_tokens["image_id"],
             )
             if image_positions:
                 inputs_embeds = self._scatter_vision_embeds(
@@ -730,7 +782,10 @@ class Qwen35Model(Decoder):
                 pixel_values_videos, grid_thw=grid_thw_videos
             )
             video_positions = self._get_vision_positions(
-                tokens, num_tokens, video_token_id
+                tokens,
+                num_tokens,
+                # pyrefly: ignore [index-error]
+                special_tokens["video_id"],
             )
             if video_positions:
                 inputs_embeds = self._scatter_vision_embeds(

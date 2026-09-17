@@ -1,0 +1,79 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
+from torchtitan.experiments.graph_trainer.common_utils import (
+    annotate_module_fqns,
+    annotate_moe_ep_regions,
+    apply_cp_to_attention,
+    apply_simple_fsdp,
+)
+from torchtitan.experiments.graph_trainer.compile import apply_compile
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.experiments.graph_trainer.ep_eager_chunk import (
+    maybe_apply_ep_overlap_eager_chunking,
+)
+from torchtitan.experiments.graph_trainer.qwen3_5.model import GraphTrainerQwen35Model
+from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
+
+
+def annotate_qwen3_5(model: GraphTrainerQwen35Model) -> None:
+    """Attach annotations to FX graph nodes for Qwen3.5."""
+    if any(layer.moe is not None for layer in model.config.layers):
+        annotate_moe_ep_regions()
+
+    annotate_module_fqns(model)
+
+
+def parallelize_qwen3_5(
+    model: GraphTrainerQwen35Model,
+    *,
+    parallel_dims: ParallelDims,
+    training: TrainingConfig,
+    parallelism: ParallelismConfig,
+    compile_config: GraphTrainerCompileConfig,
+    ac_config: ActivationCheckpointingConfig,
+    dump_folder: str,
+):
+    """Apply annotation, parallelization, and graph capture to Qwen3.5."""
+    del ac_config
+    assert training.seq_len % parallel_dims.seq_len_divisor == 0, f"""
+        Sequence length {training.seq_len} must be divisible by the product of TP degree
+        ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}), i.e. {parallel_dims.seq_len_divisor}.
+        """
+
+    if parallel_dims.cp_enabled:
+        apply_cp_to_attention(model, parallel_dims)
+
+    annotate_qwen3_5(model)
+
+    if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
+        model.parallelize(parallel_dims)
+
+    configure_moe_aux_loss_reduction(model, parallel_dims)
+
+    if parallel_dims.tp_enabled:
+        maybe_enable_async_tp(
+            parallelism, compile_config, parallel_dims.get_mesh("tp")
+        )
+
+    model = apply_simple_fsdp(
+        model, parallel_dims=parallel_dims, training=training
+    )
+    maybe_apply_ep_overlap_eager_chunking(model, compile_config)
+
+    model = apply_compile(
+        model,
+        compile_config=compile_config,
+        parallelism=parallelism,
+        parallel_dims=parallel_dims,
+        dump_folder=dump_folder,
+    )
+
+    return model

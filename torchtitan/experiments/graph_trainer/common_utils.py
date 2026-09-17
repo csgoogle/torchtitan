@@ -67,7 +67,8 @@ def build_decoder_config_for_backend(
 
     config = config_builder(attn_backend="flex", **builder_kwargs)
     for layer in config.layers:
-        layer.attention.inner_attention = ScaledDotProductAttention.Config()
+        if layer.attention is not None:
+            layer.attention.inner_attention = ScaledDotProductAttention.Config()
     return config
 
 
@@ -370,6 +371,7 @@ def get_default_transformer_block_buckets(
                     [
                         f"layers.{layer_id}.attention_norm",
                         f"layers.{layer_id}.attention",
+                        f"layers.{layer_id}.delta_net",
                         f"layers.{layer_id}.ffn_norm",
                         f"layers.{layer_id}.moe.router",
                         f"layers.{layer_id}.moe.shared_experts",
@@ -431,6 +433,7 @@ def apply_cp_to_attention(
         # pyrefly: ignore [missing-attribute]
         block.attention.inner_attention
         for block in model.layers.values()
+        if getattr(block, "attention", None) is not None
     ]
     apply_cp_to_forward(attention_modules, parallel_dims.get_mesh("cp"))
 

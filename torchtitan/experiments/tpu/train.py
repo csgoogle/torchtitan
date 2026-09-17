@@ -32,6 +32,7 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_applied
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
+import torchtitan.experiments.tpu.qwen3_5  # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools.logging import init_logger, logger
 import torchtitan.train
@@ -178,6 +179,10 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
 
     if model_name == "qwen3":
       from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+          model_registry as gt_registry,
+      )
+    elif model_name in ("qwen3_5", "qwen3_5_tpu"):
+      from torchtitan.experiments.tpu.graph_trainer.qwen3_5 import (
           model_registry as gt_registry,
       )
     elif model_name == "llama3":

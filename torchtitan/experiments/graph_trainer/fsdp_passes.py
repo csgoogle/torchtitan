@@ -662,7 +662,7 @@ def _is_moe_layer_dense_fqn(fqn: str) -> bool:
     parts = fqn.split(".")
     if len(parts) < 3:
         return False
-    return parts[2] in {"attention", "attention_norm"}
+    return parts[2] in {"attention", "attention_norm", "delta_net"}
 
 
 def _is_top_level_param_fqn(fqn: str) -> bool:

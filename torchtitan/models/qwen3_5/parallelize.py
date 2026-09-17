@@ -31,6 +31,7 @@ from torchtitan.distributed.fsdp import (
     get_fsdp_reshard_after_forward_policy,
 )
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
+from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
 
 
 def _apply_fsdp_to_vision_encoder(
@@ -68,6 +69,7 @@ def parallelize_qwen3_5(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
     """
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
@@ -97,6 +99,8 @@ def parallelize_qwen3_5(
         # pyrefly: ignore [not-callable]
         model.parallelize(parallel_dims)
 
+    configure_moe_aux_loss_reduction(model, parallel_dims)
+
     if parallel_dims.tp_enabled:
         maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
 
@@ -111,6 +115,9 @@ def parallelize_qwen3_5(
         if model.vision_encoder is not None:
             # pyrefly: ignore [bad-argument-type]
             apply_compile(model.vision_encoder, compile_config)
+
+    if skip_dp:
+        return model
 
     dp_mesh_names = (
         ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]

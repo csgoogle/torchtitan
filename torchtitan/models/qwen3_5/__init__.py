@@ -6,6 +6,7 @@
 
 from collections.abc import Callable
 from functools import partial
+import math
 from typing import Literal
 
 import torch.nn as nn
@@ -249,7 +250,7 @@ def _qwen35_deltanet_config(
     layer_id: int,
     conv_kernel_size: int = 4,
     fla_backend: Literal[
-        "fla_chunked", "fla_fused_recurrent", "torch_native"
+        "fla_chunked", "fla_fused_recurrent", "tpu_chunked", "torch_native"
     ] = "fla_chunked",
 ) -> GatedDeltaNet.Config:
     """Build a fully-specified GatedDeltaNet.Config."""
@@ -271,6 +272,9 @@ def _qwen35_deltanet_config(
             groups=channels,
             padding=0,
             bias=False,
+            param_init={
+                "weight": partial(nn.init.kaiming_uniform_, a=math.sqrt(5)),
+            },
         )
 
     return GatedDeltaNet.Config(
@@ -317,7 +321,7 @@ def _build_qwen35_layers(
     full_attention_interval: int = 4,
     attn_backend: str,
     fla_backend: Literal[
-        "fla_chunked", "fla_fused_recurrent", "torch_native"
+        "fla_chunked", "fla_fused_recurrent", "tpu_chunked", "torch_native"
     ] = "fla_chunked",
 ) -> list[Qwen35TransformerBlock.Config]:
     """Build per-layer configs for dense Qwen3.5 models."""
@@ -390,7 +394,7 @@ def _build_qwen35_moe_layers(
     full_attention_interval: int = 4,
     attn_backend: str,
     fla_backend: Literal[
-        "fla_chunked", "fla_fused_recurrent", "torch_native"
+        "fla_chunked", "fla_fused_recurrent", "tpu_chunked", "torch_native"
     ] = "fla_chunked",
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,

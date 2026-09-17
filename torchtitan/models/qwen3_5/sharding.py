@@ -115,7 +115,9 @@ def set_qwen35_sharding_config(
         out_dst_shardings=dense_activation_placement(tp=spmd.R),
         local_map=LocalMapConfig(in_grad_placements=None),
     )
-    _set_vision_encoder_sharding(config.vision_encoder)
+    if config.vision_encoder is not None:
+        _set_vision_encoder_sharding(config.vision_encoder)
+
     # The embedding path stays replicated through multimodal vision scatter.
     # The first attention block restores SP; later decoder block inputs are SP.
     first_layer_input_layout = dense_activation_placement(tp=spmd.R)

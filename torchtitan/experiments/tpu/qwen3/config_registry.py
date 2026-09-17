@@ -852,3 +852,129 @@ def qwen3_moe_30b_proxy() -> TPUTrainerConfig:
   # Slice layers to only keep 4 layers to save memory and compile time
   model_config.layers = model_config.layers[:4]
   return cfg
+
+
+# -----------------------------------------------------------------------------
+# CI (`bazel test`) 4-layer variants of the 30B MoE recipe.
+#
+# CI schedules single-host slices only, so the largest pool reachable from a
+# test is 4 v5p chips (`tpu_2x2x1_megachip`, 95GiB/chip). The production recipe
+# uses 128 chips. Every config below therefore slices depth to 4 layers to fit
+# 4 chips.
+#
+# Repro command (4x TPU v5p `tpu_2x2x1_megachip` on CI):
+#   bazel test -c opt \
+#     --norun_validations --nocache_test_results --test_output=errors \
+#     --test_timeout=3600 \
+#     //torchtitan/experiments/tpu:train_tpu_forge_tpu_tpu_2x2x1_megachip \
+#     --test_arg=--nproc_per_node=4 \
+#     --test_arg=--module=torchtitan.experiments.tpu.qwen3 \
+#     --test_arg=--config=qwen3_moe_30b_forge_best_b12 \
+#     --test_arg=--hf_assets_path=tests/assets/tokenizer \
+#     --test_arg=--dataloader.dataset=c4_test \
+#     --test_arg=--dataloader.dataset_path=tests/assets/c4_test
+# -----------------------------------------------------------------------------
+
+# Devices in the `tpu_2x2x1_megachip` (v5p) CI slice. `dp_shard` resolves to
+# this, and `global_batch_size` must equal `local_batch_size * dp_shard`.
+_FORGE_V5P_DP_SHARD = 4
+
+
+def _slice_layers(cfg: TPUTrainerConfig, num_layers: int) -> None:
+  """Truncates the model to its first `num_layers` transformer layers."""
+  assert cfg.model_spec is not None
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  available = len(model_config.layers)
+  if not 0 < num_layers <= available:
+    raise ValueError(
+        f"num_layers must be in (0, {available}], got {num_layers}"
+    )
+  model_config.layers = model_config.layers[:num_layers]
+
+
+def _size_for_forge_slice(cfg: TPUTrainerConfig, local_batch_size: int) -> None:
+  """Rescales the batch from the 128-chip recipe to the 4-chip CI slice."""
+  cfg.training.local_batch_size = local_batch_size
+  cfg.training.global_batch_size = local_batch_size * _FORGE_V5P_DP_SHARD
+
+
+def qwen3_moe_30b_proxy_forge() -> TPUTrainerConfig:
+  """Four-layer Qwen3 30B-A3B MoE baseline on a 4-chip v5p CI slice."""
+  cfg = TPUTrainerConfig.derive_from(qwen3_30b_a3b_global_aux())
+  cfg.optimizer.implementation = "foreach"
+  cfg.loss = CrossEntropyLoss.Config()
+  cfg.model_spec = model_registry("30B-A3B-global-aux", attn_backend="sdpa")
+  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
+  _slice_layers(cfg, 4)
+  _size_for_forge_slice(cfg, local_batch_size=1)
+  cfg.training.seq_len = 2048
+  cfg.training.steps = 10
+  cfg.parallelism = ParallelismConfig(
+      use_simple_fsdp=True,
+      data_parallel_shard_degree=-1,
+      expert_parallel_degree=1,
+  )
+  cfg.tpu_config = TPUConfig(
+      use_graph_trainer=True,
+      compile_mode="aot_fx_trace",
+      graph_trainer_memory_policy="full",
+  )
+  cfg.compile = CompileConfig(
+      enable=True,
+      backend="tpu",
+      components=["model"],
+  )
+  cfg.loss_kernel = LossKernelConfig(use_loss_kernel=False)
+  cfg.metrics.log_freq = 1
+  cfg.validator = Validator.Config(enable=False)
+  return cfg
+
+
+def _qwen3_moe_30b_forge_best_base(
+    *,
+    num_layers: int = 4,
+    local_batch_size: int = 6,
+) -> TPUTrainerConfig:
+  """Shared builder for the tuned 4-layer 30B-A3B MoE CI configs."""
+  cfg = qwen3_moe_30b_proxy_forge()
+  cfg.parallelism.enable_tpu_topo_mesh = False
+  _size_for_forge_slice(cfg, local_batch_size=local_batch_size)
+  cfg.training.steps = 12
+
+  cfg.model_spec = model_registry(
+      "30B-A3B-global-aux",
+      attn_backend="sdpa",
+      converters=[
+          TpuTokenDispatcherConverter.Config(),
+          TpuGroupedExpertsConverter.Config(),
+      ],
+  )
+  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
+  _slice_layers(cfg, num_layers)
+
+  cfg.optimizer.implementation = "fused"
+  cfg.parallelism.fsdp_reshard_after_forward = "never"
+  cfg.tpu_config.enable_graph_trainer_remat_schedule = True
+  cfg.tpu_config.compile_grad_norm = True
+  return cfg
+
+
+def qwen3_moe_30b_forge_best() -> TPUTrainerConfig:
+  """Closest working 4-layer approximation of the 128-chip recipe on a 4x v5p CI slice.
+
+  Combines every recipe feature validated on 4x v5p: the recipe's
+  `local_batch_size=6`, the TPU expert/dispatch converters, fused AdamW, Zero-2
+  resharding, compiled grad norm, and the graph trainer's remat schedule.
+  Custom Pallas kernels (`use_pallas_grouped_mm`, `TpuPackedQKVConverter`, and
+  splash attention) remain disabled due to the Shardy MLIR partitioner crash on
+  custom calls.
+
+  Returns:
+    A trainer config for a 4-chip v5p CI slice.
+  """
+  return _qwen3_moe_30b_forge_best_base(num_layers=4, local_batch_size=6)
+
+
+def qwen3_moe_30b_forge_best_b12() -> TPUTrainerConfig:
+  """`qwen3_moe_30b_forge_best()` at per-device batch 12 instead of 6."""
+  return _qwen3_moe_30b_forge_best_base(num_layers=4, local_batch_size=12)
