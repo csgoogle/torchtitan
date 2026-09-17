@@ -3,6 +3,8 @@ import torchtitan.models.qwen3 as qwen3_models
 
 from .infra.parallelize import parallelize_qwen3
 
+from torchtitan.models.common.config_utils import make_aux_loss_config
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
@@ -172,6 +174,31 @@ qwen3_configs = {
     ),
 }
 
+def _235b_a22b_global_aux(
+    attn_backend: str, moe_comm_backend: str = "standard"
+) -> Qwen3Model.Config:
+  """`235B-A22B` balanced by the aux loss instead of the expert-bias scheme.
+
+  The bias scheme keeps per-layer state in buffers, and layer stacking shares
+  layer 0's buffers rather than stacking them
+  (https://github.com/google-pytorch/torchtitan/issues/391). 1e-3 is MaxText's
+  `load_balance_loss_weight` for this model.
+
+  Upstream's `30B-A3B-global-aux` passes two arguments instead, but only
+  `_30b_a3b` accepts them; `_235b_a22b` hardcodes the bias scheme, so the swap
+  has to happen after the config is built.
+  """
+  config = qwen3_models.qwen3_configs["235B-A22B"](
+      attn_backend, moe_comm_backend
+  )
+  for _, moe, _, _ in config.traverse(MoE.Config):
+    moe.load_balance_coeff = None
+    moe.aux_loss = make_aux_loss_config(
+        type="batch_wise", coeff=1e-3, top_k=moe.router.top_k
+    )
+  return config
+
+
 def qwen3_debugmodel():
     return qwen3_configs["debugmodel"]
 
@@ -197,6 +224,21 @@ def model_registry(
         name="qwen3",
         flavor=flavor,
         model=config,
+        parallelize_fn=parallelize_qwen3,
+        pipelining_fn=qwen3_models.pipeline_llm,
+        post_optimizer_build_fn=qwen3_models.register_moe_load_balancing_hook,
+        state_dict_adapter=Qwen3StateDictAdapter,
+    )
+  if flavor == "235B-A22B-global-aux":
+    config = _235b_a22b_global_aux(attn_backend, moe_comm_backend or "standard")
+    if converters is not None:
+      qwen3_models.validate_converter_order(converters)
+      for c in converters:
+        config = c.build().convert(config)
+    return ModelSpec(
+        name="qwen3",
+        flavor=flavor,
+        model=MaxTextQwen3Config.from_qwen3(config),
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=qwen3_models.pipeline_llm,
         post_optimizer_build_fn=qwen3_models.register_moe_load_balancing_hook,

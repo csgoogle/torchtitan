@@ -50,6 +50,9 @@ from torchtitan.tools.profiler import Profiler
 
 _FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
 _BF16_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.bf16_rope"
+_DISCARDED_TOKEN_COUNTER_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.discarded_token_counter"
+)
 
 
 # Compiler policy shared by the FP32 and MaxText-parity offload recipes.
@@ -696,6 +699,74 @@ def qwen3_moe_235b_fsdp_smoke() -> TPUTrainerConfig:
   cfg.training.seq_len = 128
   cfg.training.steps = 2
   cfg.tpu_config.enable_mfu_benchmark = False
+  return cfg
+
+
+def qwen3_moe_235b_scan() -> TPUTrainerConfig:
+  """Qwen3 235B-A22B on the graph trainer with its 94 layers scanned.
+
+  Shaped after MaxText's published Ironwood recipe
+  (`tpu-recipes/training/ironwood/qwen3-235b-a22b/4k-bf16-tpu7x-4x8x8`): 256
+  chips, sequence 4096, batch 16 per device, activation offloading on, no
+  expert parallelism. Batch and global batch are the two things to override on
+  a smaller slice -- `global_batch_size` must equal ranks x `local_batch_size`
+  or config validation fails with a message that reads like a scan error.
+  """
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  cfg.model_spec = model_registry(
+      # Aux-loss balancing, because stacking cannot share the bias scheme's
+      # per-layer buffers (#391).
+      "235B-A22B-global-aux",
+      attn_backend="sdpa",
+      converters=[
+          TpuTokenDispatcherConverter.Config(),
+          TpuGroupedExpertsConverter.Config(),
+      ],
+  )
+  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
+  # nothing reads, and a scan body cannot write to a tensor it closed over.
+  # TODO(#391): delete once `MoE.forward` guards that write.
+  cfg.override.imports.append(_DISCARDED_TOKEN_COUNTER_OVERRIDE)
+  for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
+    experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 512)
+    experts.use_kernel_native_weight_layout = True
+  cfg.training.local_batch_size = 16
+  cfg.training.global_batch_size = 8192
+  cfg.training.seq_len = 4096
+  cfg.training.steps = 15
+  # The 30B chain leaves this at the real `c4`, whose only builder config is
+  # `default`; asking for `en` fails before the first step.
+  cfg.dataloader = HuggingFaceTextDataLoader.Config(dataset="c4_test")
+  # 94 layers of 128 experts do not fit without Zero-3 plus offloading, which
+  # is also what MaxText does here (`remat_policy=custom`,
+  # `decoder_layer_input=offload`).
+  cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.tpu_config.use_scan_layers = True
+  cfg.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  # The routing metrics stash tensors on the module, which a scan body cannot
+  # do (https://github.com/google-pytorch/torchtitan/issues/399).
+  cfg.metrics.enable_moe_routing = False
+  cfg.metrics.log_freq = 1
+  return cfg
+
+
+def qwen3_moe_235b_scan_proxy() -> TPUTrainerConfig:
+  """`qwen3_moe_235b_scan` cut to 12 of its 94 layers, so it fits a 32-chip slice.
+
+  Every layer is a real 235B layer -- dim 4096, 128 experts, top-k 8 -- so the
+  scan body is the shape the full model would scan over. Only the trip count
+  changes, which is the one thing scan is meant not to care about.
+  """
+  cfg = qwen3_moe_235b_scan()
+  assert cfg.model_spec is not None
+  model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  model_config.layers = model_config.layers[:12]
+  cfg.training.local_batch_size = 1
+  cfg.training.global_batch_size = 32
   return cfg
 
 

@@ -55,18 +55,24 @@ from torchtitan.experiments.tpu.overrides.fused_loss import (
 from torchtitan.experiments.tpu.overrides.real_rope import (
     TpuRealArithmeticComplexRoPE,
 )
+from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
+    TpuDiscardedTokenCounterMoE,
+)
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
     qwen3_moe_30b,
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
+    qwen3_moe_235b_scan,
+    qwen3_moe_235b_scan_proxy,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
 from torchtitan.models.common import ComplexRoPE, Linear
+from torchtitan.models.common.moe import MoE
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
@@ -529,6 +535,48 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             isinstance(rope, TpuActivationDtypeCosSinRoPE.Config)
             for rope in rope_configs
         )
+    )
+
+  def test_235b_recipe_stays_stackable_under_scan(self) -> None:
+    config = qwen3_moe_235b_scan()
+
+    assert config.model_spec is not None
+    self.assertEqual(config.model_spec.flavor, "235B-A22B-global-aux")
+    # Bias-based load balancing (#391) and the routing metrics (#399) both keep
+    # per-layer state a scan body cannot hold.
+    moes = list(config.model_spec.model.traverse(MoE.Config))
+    self.assertLen(moes, 94)
+    self.assertTrue(all(moe.load_balance_coeff is None for _, moe, _, _ in moes))
+    self.assertTrue(all(moe.aux_loss is not None for _, moe, _, _ in moes))
+    self.assertFalse(config.metrics.enable_moe_routing)
+    # Clearing the coeff leaves a dead in-place write scan also rejects, so the
+    # override has to reach every MoE.
+    apply_overrides(config.override, config)
+    self.assertTrue(
+        all(
+            isinstance(moe, TpuDiscardedTokenCounterMoE.Config)
+            for _, moe, _, _ in config.model_spec.model.traverse(MoE.Config)
+        )
+    )
+
+  def test_235b_recipe_matches_the_maxtext_shape(self) -> None:
+    config = qwen3_moe_235b_scan()
+
+    self.assertEqual(config.training.local_batch_size, 16)
+    self.assertEqual(config.training.seq_len, 4096)
+    self.assertTrue(config.tpu_config.use_scan_layers)
+    self.assertEqual(
+        config.tpu_config.graph_trainer_memory_policy, "full_and_scan_offload"
+    )
+    self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
+
+  def test_235b_proxy_keeps_the_layer_shape_and_drops_the_count(self) -> None:
+    proxy = qwen3_moe_235b_scan_proxy()
+
+    assert proxy.model_spec is not None
+    self.assertLen(proxy.model_spec.model.layers, 12)
+    self.assertEqual(
+        proxy.training.global_batch_size, 32 * proxy.training.local_batch_size
     )
 
   def test_optimizer_implementation_cli_override_is_authoritative(self) -> None:
