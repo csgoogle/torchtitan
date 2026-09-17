@@ -542,7 +542,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_moe_235b_scan()
 
     assert config.model_spec is not None
-    self.assertEqual(config.model_spec.flavor, "235B-A22B-global-aux")
+    self.assertEqual(config.model_spec.flavor, "235B-A22B")
     # Bias-based load balancing (#391) and the routing metrics (#399) both keep
     # per-layer state a scan body cannot hold.
     moes = list(config.model_spec.model.traverse(MoE.Config))
@@ -559,6 +559,17 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             for _, moe, _, _ in config.model_spec.model.traverse(MoE.Config)
         )
     )
+
+  def test_235b_flavor_resolves_through_the_graph_trainer(self) -> None:
+    # The graph trainer discards the recipe's ModelSpec and re-resolves the
+    # flavor string against upstream's registry. A flavor that only the TPU
+    # registry knows dies there on a KeyError, after every other test passes.
+    config = qwen3_moe_235b_scan()
+    assert config.model_spec is not None
+
+    spec = tpu_qwen3_graph_registry(config.model_spec.flavor)
+
+    self.assertIsInstance(spec.model, GraphTrainerQwen3Model.Config)
 
   def test_235b_recipe_matches_the_maxtext_shape(self) -> None:
     config = qwen3_moe_235b_scan()

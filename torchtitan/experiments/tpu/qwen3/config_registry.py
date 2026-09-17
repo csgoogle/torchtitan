@@ -41,6 +41,8 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.models.common.config_utils import make_aux_loss_config
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
@@ -714,9 +716,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   """
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
   cfg.model_spec = model_registry(
-      # Aux-loss balancing, because stacking cannot share the bias scheme's
-      # per-layer buffers (#391).
-      "235B-A22B-global-aux",
+      "235B-A22B",
       attn_backend="sdpa",
       converters=[
           TpuTokenDispatcherConverter.Config(),
@@ -725,6 +725,13 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  # Stacking cannot share the bias scheme's per-layer buffers (#391), so
+  # balance with the aux loss. 1e-3 is MaxText's weight for this model.
+  for _, moe, _, _ in model_config.traverse(MoE.Config):
+    moe.load_balance_coeff = None
+    moe.aux_loss = make_aux_loss_config(
+        type="batch_wise", coeff=1e-3, top_k=moe.router.top_k
+    )
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.
   # TODO(#391): delete once `MoE.forward` guards that write.
@@ -747,6 +754,10 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.parallelism.fsdp_reshard_after_forward = "always"
   cfg.tpu_config.use_scan_layers = True
   cfg.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  # The 30B chain coalesces its packed-QKV and `wo` reductions (#419). This
+  # model packs no QKV and scan leaves no per-layer FQN to match, so the pass
+  # would find none of its targets and refuse to run.
+  cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
   # The routing metrics stash tensors on the module, which a scan body cannot
   # do (https://github.com/google-pytorch/torchtitan/issues/399).
   cfg.metrics.enable_moe_routing = False
