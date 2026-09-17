@@ -11,7 +11,7 @@ and helper utilities for registering and synchronizing model parameter buffers w
 running in-graph optimizer execution under `TpuGraphTrainer`.
 """
 
-from typing import List, Sequence, Tuple
+from typing import List, Mapping, Sequence, Tuple
 import torch
 from torch import nn
 import torch.optim.adamw as _adamw_mod
@@ -63,6 +63,45 @@ def update_model_and_optstate_buffers(
     for fqn, new_eas in zip(param_fqns, new_exp_avg_sqs, strict=True):
         buf = _get_optstate_buffer(model, fqn, "exp_avg_sq")
         buf.copy_(new_eas.detach() if isinstance(new_eas, torch.Tensor) else new_eas)
+
+
+def _parent_and_leaf(model: nn.Module, fqn: str) -> Tuple[nn.Module, str]:
+    parent_path, _, leaf = fqn.rpartition(".")
+    return (model.get_submodule(parent_path) if parent_path else model), leaf
+
+
+def rebind_model_and_optstate_buffers(
+    model: nn.Module,
+    param_fqns: Sequence[str],
+    new_params: Sequence[torch.Tensor],
+    new_exp_avgs: Sequence[torch.Tensor],
+    new_exp_avg_sqs: Sequence[torch.Tensor],
+    fqn_to_canonical: Mapping[str, str] | None = None,
+) -> None:
+    """Replaces live model parameters and optimizer state buffers with graph outputs.
+
+    Used when the step program donates the parameter and optimizer-state inputs
+    to their outputs (``donated_inputs`` in the TPU backend pass): the input
+    buffers are consumed by the execution, so the outputs replace them in the
+    module's ``_parameters`` / ``_buffers`` rather than being copied back.
+    ``fqn_to_canonical`` (from ``_register_optimizer_buffers``) maps every
+    parameter FQN, including aliases of a tied parameter, to the FQN that owns
+    the optimizer state; all aliases are rebound to the same new Parameter so
+    tying survives the replacement.
+    """
+    aliases: dict[str, list[str]] = {}
+    for fqn, canonical in (fqn_to_canonical or {}).items():
+        aliases.setdefault(canonical, []).append(fqn)
+    for fqn, new_p in zip(param_fqns, new_params, strict=True):
+        live = _get_param_by_fqn(model, fqn)
+        new_param = nn.Parameter(new_p.detach(), requires_grad=live.requires_grad)
+        for target in aliases.get(fqn, [fqn]):
+            parent, leaf = _parent_and_leaf(model, target)
+            parent._parameters[leaf] = new_param
+    for kind, news in (("exp_avg", new_exp_avgs), ("exp_avg_sq", new_exp_avg_sqs)):
+        for fqn, new in zip(param_fqns, news, strict=True):
+            parent, leaf = _parent_and_leaf(model, fqn)
+            parent._buffers[f"_optstate_{leaf}_{kind}"] = new.detach()
 
 
 def functional_adamw_step(
@@ -137,4 +176,5 @@ __all__ = [
     "_get_optstate_buffer",
     "functional_adamw_step",
     "update_model_and_optstate_buffers",
+    "rebind_model_and_optstate_buffers",
 ]

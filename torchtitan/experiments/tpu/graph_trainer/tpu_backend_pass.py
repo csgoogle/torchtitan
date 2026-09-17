@@ -13,7 +13,7 @@ import functools
 import logging
 import operator
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from torch._dynamo.utils import detect_fake_mode
@@ -367,6 +367,10 @@ def tpu_backend_compile_pass(
         tensor_index += 1
     compiler_kwargs = {"is_fwd": is_fwd}
     if donated_inputs:
+        logger.info(
+            "[tpu_backend_pass] donating %d inputs to their outputs",
+            len(donated_inputs),
+        )
         # Added in TorchTPU PR #2800. Keep this keyword conditional so the
         # default no-donation path also works with older TorchTPU builds.
         compiler_kwargs["donated_inputs"] = donated_inputs
@@ -516,6 +520,47 @@ def tpu_backend_compile_partitioned_pass(
     return gm
 
 
+def donated_input_indices(
+    state_fqns: Sequence[str],
+    input_subclass_layouts: Mapping[int, Any],
+) -> list[int]:
+    """Graph-input indices of the parameters and AdamW moments updated in-graph.
+
+    The in-graph optimizer returns a fresh tensor for every parameter,
+    ``exp_avg`` and ``exp_avg_sq`` it owns. Without donation XLA keeps the input
+    and the output copies of all three resident at once; donating the inputs
+    lets it alias them (``jax.buffer_donor`` -> ``input_output_alias``).
+
+    A parameter is optimizer-owned iff ``_register_optimizer_buffers`` gave it a
+    sibling ``_optstate_<leaf>_exp_avg`` buffer; the moments are the
+    ``_optstate_*_exp_avg`` / ``_optstate_*_exp_avg_sq`` buffers themselves
+    (``_optstate_step`` / ``_optstate_lr`` are not donated). ``state_fqns`` are
+    the leading graph inputs in order; a wrapper-subclass state leaf (a DTensor
+    parameter) occupies ``input_subclass_layouts[i].num_tensors`` consecutive
+    plain graph inputs, all of which are donated.
+    """
+    names = set(state_fqns)
+
+    def _optstate_sibling(fqn: str, kind: str) -> str:
+        parent, _, leaf = fqn.rpartition(".")
+        return f"{parent}._optstate_{leaf}_{kind}" if parent else f"_optstate_{leaf}_{kind}"
+
+    donated: list[int] = []
+    flat_index = 0
+    for i, fqn in enumerate(state_fqns):
+        leaf = fqn.rpartition(".")[2]
+        is_moment = leaf.startswith("_optstate_") and (
+            leaf.endswith("_exp_avg") or leaf.endswith("_exp_avg_sq")
+        )
+        is_owned_param = _optstate_sibling(fqn, "exp_avg") in names
+        layout = input_subclass_layouts.get(i)
+        width = layout.num_tensors if layout is not None else 1
+        if is_moment or is_owned_param:
+            donated.extend(range(flat_index, flat_index + width))
+        flat_index += width
+    return donated
+
+
 def construct_tpu_transform_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
@@ -648,10 +693,29 @@ def construct_tpu_pass_pipeline(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
 ) -> list[Callable]:
-    """Build the normal unsplit pipeline: joint transforms, then compilation."""
+    """Build the normal unsplit pipeline: joint transforms, then compilation.
+
+    With ``optimizer_in_graph`` the step program returns updated parameters and
+    AdamW moments; their inputs are donated so XLA aliases them instead of
+    holding both copies (``_fwd_bwd_adamw_step`` rebinds the outputs).
+    """
+    compile_pass: Callable = tpu_backend_compile_pass
+    # `state_fqns` is only present on a real `TracedResult`; pipeline-shape
+    # tests build the pipeline from a stub without it and expect no donation.
+    state_fqns = getattr(traced_result, "state_fqns", None)
+    if config.tpu_config.optimizer_in_graph and state_fqns is not None:
+        compile_pass = functools.partial(
+            tpu_backend_compile_pass,
+            donated_input_positions=tuple(
+                donated_input_indices(
+                    state_fqns,
+                    traced_result.input_subclass_layouts,
+                )
+            ),
+        )
     return [
         *construct_tpu_transform_passes(traced_result, config),
-        tpu_backend_compile_pass,
+        compile_pass,
     ]
 
 
@@ -670,6 +734,7 @@ __all__ = [
     "tpu_backend_compile_pass",
     "tpu_backend_compile_partitioned_pass",
     "construct_tpu_transform_passes",
+    "donated_input_indices",
     "construct_tpu_pass_pipeline",
     "register",
     "PASS_PIPELINE_REGISTRY",
