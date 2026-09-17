@@ -1,9 +1,3 @@
-import torchtitan.components.loss as loss
-from torchtitan.components.optimizer import OptimizersContainer, default_adamw
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.components.validate import Validator
-from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 import torchtitan.models.common as common_models
 import torchtitan.models.qwen3 as qwen3_models
 
@@ -183,24 +177,6 @@ def qwen3_debugmodel():
 
 def qwen3_debugmodel_moe():
     return qwen3_configs["debugmodel_moe"]
-
-# pytype: disable=wrong-arg-types
-register_train_spec(
-    name="qwen3_tpu",
-    train_spec=TrainSpec(
-        model_cls=Qwen3Model,
-        model_args=qwen3_configs,
-        parallelize_fn=parallelize_qwen3,
-        pipelining_fn=None,
-        loss_config=loss.ChunkedLossWrapper.Config(),
-        optimizer_config=default_adamw(lr=8e-4, implementation="foreach"),
-        lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
-        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        validator_config=Validator.Config(enable=True),
-        state_dict_adapter=Qwen3StateDictAdapter,
-    )
-)
-# pytype: enable=wrong-arg-types
 
 
 def model_registry(

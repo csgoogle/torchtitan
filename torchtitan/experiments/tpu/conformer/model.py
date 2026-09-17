@@ -8,7 +8,6 @@ import torch.nn as nn
 from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 from torchtitan.protocols.model import BaseModel
-from torchtitan.protocols.train_spec import BaseModelArgs
 from torchtitan.tools.logging import logger
 
 

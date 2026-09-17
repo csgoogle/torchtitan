@@ -6,13 +6,6 @@
 
 """Mamba-2 TPU model definitions, training specifications, and configs."""
 
-from torchtitan.components import loss
-from torchtitan.components import lr_scheduler
-from torchtitan.components import optimizer
-from torchtitan.components import validate
-from torchtitan.hf_datasets import text_datasets
-from torchtitan.protocols import train_spec
-
 from . import config_registry
 from . import model
 from . import parallelize
@@ -71,25 +64,3 @@ __all__ = [
     "mamba2_2_7b",
     "mamba2_2_7b_256k",
 ]
-
-_mamba2_train_spec = train_spec.TrainSpec(
-    model_cls=Mamba2LM,
-    model_args=mamba2_tpu_configs,
-    parallelize_fn=parallelize_mamba2,
-    pipelining_fn=None,
-    loss_config=loss.CrossEntropyLoss.Config(),
-    optimizer_config=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
-    lr_scheduler_config=lr_scheduler.LRSchedulersContainer.Config(
-        warmup_steps=1000
-    ),
-    dataloader_config=text_datasets.HuggingFaceTextDataLoader.Config(
-        dataset="c4_test"
-    ),
-    validator_config=validate.Validator.Config(enable=True),
-    state_dict_adapter=None,
-)
-
-train_spec.register_train_spec(name="mamba2", train_spec=_mamba2_train_spec)
-train_spec.register_train_spec(
-    name="mamba2_pallas", train_spec=_mamba2_train_spec
-)

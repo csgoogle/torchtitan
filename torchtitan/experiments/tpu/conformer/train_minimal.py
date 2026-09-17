@@ -29,7 +29,6 @@ import torchtitan.experiments.tpu.gmain as gmain
 import torchtitan.experiments.tpu.model_annotator as model_annotator
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 import torchtitan.experiments.tpu.utils as tpu_utils
-import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.tools import utils
 import torchtitan.tools.logging
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround

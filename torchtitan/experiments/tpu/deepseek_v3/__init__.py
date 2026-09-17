@@ -4,18 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import torchtitan.components.loss as loss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import OptimizersContainer, default_adamw
-from torchtitan.components.validate import Validator
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 import torchtitan.models.common as common_models
 import torchtitan.models.deepseek_v3 as deepseek_v3_models
-from torchtitan.models.deepseek_v3.model import DeepSeekV3Model
 from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
-from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
-from torchtitan.protocols.train_spec import TrainSpec, register_train_spec
 
 __all__ = [
     "parallelize_deepseekv3",
@@ -162,22 +153,3 @@ deepseekv3_configs = {
         attn_backend="flex", moe_comm_backend="standard"
     ),
 }
-
-
-# pytype: disable=wrong-arg-types
-register_train_spec(
-    name="deepseek_v3",
-    train_spec=TrainSpec(
-        model_cls=DeepSeekV3Model,
-        model_args=deepseekv3_configs,
-        parallelize_fn=parallelize_deepseekv3,
-        pipelining_fn=pipeline_llm,
-        loss_config=loss.ChunkedLossWrapper.Config(),
-        optimizer_config=default_adamw(lr=8e-4, implementation="foreach"),
-        lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
-        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        validator_config=Validator.Config(enable=True),
-        state_dict_adapter=DeepSeekV3StateDictAdapter,
-    ),
-)
-# pytype: enable=wrong-arg-types

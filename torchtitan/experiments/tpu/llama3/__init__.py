@@ -1,15 +1,7 @@
-import torchtitan.components.loss as loss
-from torchtitan.components.optimizer import OptimizersContainer, default_adamw
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.components.validate import Validator
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.protocols.train_spec import TrainSpec, register_train_spec
 import torchtitan.models.common as common_models
 import torchtitan.models.llama3 as llama3_models
 
 from .infra.parallelize import parallelize_llama
-from .infra.pipeline import pipeline_llama
 
 __all__ = [
     "parallelize_llama",
@@ -62,21 +54,3 @@ llama3_configs = {
     "70B": llama3_models.llama3_configs["70B"]("sdpa"),
     "405B": llama3_models.llama3_configs["405B"]("sdpa"),
 }
-
-# pytype: disable=wrong-arg-types
-register_train_spec(
-    name="llama3_tpu",
-    train_spec=TrainSpec(
-        model_cls=llama3_models.Llama3Model,
-        model_args=llama3_configs,
-        parallelize_fn=parallelize_llama,
-        pipelining_fn=pipeline_llama,
-        loss_config=loss.ChunkedLossWrapper.Config(),
-        optimizer_config=default_adamw(lr=8e-4, implementation="foreach"),
-        lr_scheduler_config=LRSchedulersContainer.Config(warmup_steps=2),
-        dataloader_config=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        validator_config=Validator.Config(enable=True),
-        state_dict_adapter=llama3_models.Llama3StateDictAdapter,
-    )
-)
-# pytype: enable=wrong-arg-types
