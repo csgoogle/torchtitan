@@ -708,7 +708,8 @@ class TestCpuOffloadPass(TestCase):
         graph.output(bwd)
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-        apply_cpu_offload_pass(gm, defer_n_layers=1, prefetch_lookahead=0)
+        apply_cpu_offload_pass(gm, defer_n_layers=0, prefetch_lookahead=0)
+        gm.graph.lint()
 
         # Find the forward wait for mm's offload
         fwd_waits = [
@@ -729,6 +730,9 @@ class TestCpuOffloadPass(TestCase):
             torch.ops.aten.relu.default,
             "dep should follow view chain to the last consumer of the storage",
         )
+        node_pos = {node: index for index, node in enumerate(gm.graph.nodes)}
+        self.assertEqual(node_pos[wait], node_pos[relu] + 1)
+        self.assertLess(node_pos[wait], node_pos[mm2])
 
     def test_wait_dep_non_tensor_consumer(self):
         """When the last consumer produces a non-Tensor (e.g. sort -> tuple),

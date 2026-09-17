@@ -7,10 +7,14 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch import nn
 from torch.testing._internal.distributed.fake_pg import FakeStore
+from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
     annotate_module_fqns,
+)
+from torchtitan.experiments.graph_trainer.cpu_offload import (
+    apply_cpu_offload_pass,
 )
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
@@ -31,6 +35,9 @@ from torchtitan.experiments.tpu.graph_trainer.graph_split import (
     split_backward_graph_by_layer,
     split_forward_graph_by_layer,
     split_forward_backward_graph,
+)
+from torchtitan.experiments.tpu.graph_trainer.split_cpu_offload import (
+    thread_host_offload_donors,
 )
 
 
@@ -60,6 +67,21 @@ class _BufferMutatingToyTransformer(_ToyTransformer):
       with torch.no_grad():
         self.counters[layer_id].add_(inputs.detach().sum())
       inputs = torch.relu(layer(inputs))
+    return inputs
+
+
+class _OffloadToyTransformer(nn.Module):
+
+  def __init__(self, n_layers: int) -> None:
+    super().__init__()
+    self.layers = nn.ModuleList(
+        nn.Sequential(nn.Linear(8, 8, bias=False), nn.ReLU())
+        for _ in range(n_layers)
+    )
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    for layer in self.layers:
+      inputs = layer(inputs)
     return inputs
 
 
@@ -346,6 +368,204 @@ class GraphSplitTest(absltest.TestCase):
           ValueError, "would discard forward mutation nodes"
       ):
         split_forward_backward_graph(traced.gm, traced.example_inputs)
+
+  def _trace_cpu_offload_graph(self):
+    model = _OffloadToyTransformer(n_layers=3)
+    annotate_module_fqns(model)
+    inputs = torch.randn(512, 8, requires_grad=True)
+    traced = self._trace_toy_model(model=model, inputs=inputs)
+    layer_0_output = next(
+        node
+        for node in traced.gm.graph.nodes
+        if node.target is torch.ops.aten.relu.default
+        and _get_layer_id(node) == 0
+    )
+    layer_0_output.meta["recompute"] = CheckpointPolicy.MUST_CPU_OFFLOAD
+    apply_cpu_offload_pass(
+        traced.gm,
+        prefetch_lookahead=0,
+        defer_n_layers=0,
+    )
+    return traced
+
+  def test_cpu_offload_ops_are_compiled_inside_layer_children(self):
+    """Keep each AO copy and wait together instead of in the eager parent."""
+    traced = self._trace_cpu_offload_graph()
+    split = split_forward_backward_graph(
+        traced.gm, traced.example_inputs
+    )
+    donor_specs, donor_output_positions, donor_examples = (
+        thread_host_offload_donors(split.forward_graph)
+    )
+    forward = split_forward_graph_by_layer(split.forward_graph, 1)
+    backward = split_backward_graph_by_layer(
+        split.backward_graph,
+        n_layers=3,
+    )
+
+    ao_targets = {
+        torch.ops.ao.offload.default,
+        torch.ops.ao.reload.default,
+        torch.ops.ao.wait_tensor.default,
+    }
+
+    def targets(module: torch.fx.GraphModule) -> set[object]:
+      return {
+          node.target
+          for node in module.graph.nodes
+          if node.op == "call_function"
+      }
+
+    self.assertTrue(
+        all(target not in ao_targets for target in targets(forward.module))
+    )
+    self.assertTrue(
+        all(target not in ao_targets for target in targets(backward.module))
+    )
+    forward_child_targets = set().union(
+        *(targets(child) for child in forward.module.children())
+    )
+    backward_child_targets = set().union(
+        *(targets(child) for child in backward.module.children())
+    )
+    self.assertIn(torch.ops.ao.offload.default, forward_child_targets)
+    self.assertNotIn(torch.ops.ao.reload.default, forward_child_targets)
+    self.assertIn(torch.ops.ao.reload.default, backward_child_targets)
+    self.assertNotIn(torch.ops.ao.offload.default, backward_child_targets)
+    for parent in (forward.module, backward.module):
+      for child in parent.children():
+        child_nodes = set(child.graph.nodes)
+        for node in child_nodes:
+          if node.target not in {
+              torch.ops.ao.offload.default,
+              torch.ops.ao.reload.default,
+          }:
+            continue
+          self.assertTrue(
+              any(
+                  user.target == torch.ops.ao.wait_tensor.default
+                  and user in child_nodes
+                  for user in node.users
+              )
+          )
+
+    self.assertLen(donor_specs, 1)
+    self.assertLen(donor_output_positions, 1)
+    self.assertLen(donor_examples, 1)
+    split.module.forward_graph = forward.module
+    split.module.host_donor_specs = donor_specs
+    with self.assertRaisesRegex(RuntimeError, "compiled TPU forward program"):
+      split.module._initialize_host_donors(split.forward_example_inputs)
+    forward.module._tpu_executable = object()
+    with self.assertRaisesRegex(RuntimeError, "without a TPU input"):
+      split.module._initialize_host_donors(split.forward_example_inputs)
+    del forward.module._tpu_executable
+    for child in forward.module.children():
+      wrapper = torch.nn.Module()
+      wrapper._tpu_executable = object()
+      child.add_module("compiled_child", wrapper)
+    with self.assertRaisesRegex(RuntimeError, "without a TPU input"):
+      split.module._initialize_host_donors(split.forward_example_inputs)
+    parent_donors = [
+        node
+        for node in forward.module.graph.nodes
+        if node.op == "placeholder"
+        and node.meta.get("tpu_force_donate", False)
+    ]
+    self.assertLen(parent_donors, 1)
+    child_donors = [
+        node
+        for child in forward.module.children()
+        for node in child.graph.nodes
+        if node.op == "placeholder"
+        and node.meta.get("tpu_force_donate", False)
+    ]
+    self.assertLen(child_donors, 1)
+    donor_waits = [
+        node
+        for child in forward.module.children()
+        for node in child.graph.nodes
+        if node.target == torch.ops.ao.wait_tensor.default
+        and len(node.args) > 1
+        and node.args[1] in child_donors
+    ]
+    self.assertLen(donor_waits, 1)
+
+  def test_cpu_reload_prefetch_distance_counts_executables(self):
+    """Zero uses the consumer child; one uses its immediate predecessor."""
+    for distance in (0, 1):
+      with self.subTest(distance=distance):
+        traced = self._trace_cpu_offload_graph()
+        split = split_forward_backward_graph(
+            traced.gm, traced.example_inputs
+        )
+        backward = split_backward_graph_by_layer(
+            split.backward_graph,
+            n_layers=3,
+            cpu_offload_prefetch_executables=distance,
+        )
+
+        reload_0 = next(
+            node
+            for node in split.backward_graph.graph.nodes
+            if node.target == torch.ops.ao.reload.default
+            and _get_layer_id(node) == 0
+        )
+        wait_0 = next(
+            user
+            for user in reload_0.users
+            if user.target == torch.ops.ao.wait_tensor.default
+        )
+        # Layer 0's output is consumed while recomputing layer 1. In backward
+        # order, layer 2's child immediately precedes that consumer child.
+        expected_partition = backward.layer_to_partition[1 + distance]
+        self.assertEqual(backward.partition_map[reload_0], expected_partition)
+        self.assertEqual(backward.partition_map[wait_0], expected_partition)
+
+  def test_unsplit_forward_still_donates_persistent_host_slot(self):
+    """The default forward setting must not fall back to per-step mappings."""
+    traced = self._trace_cpu_offload_graph()
+    splitter = graph_split_lib.GraphSplitter(
+        enabled=True,
+        config=SimpleNamespace(
+            forward_layers_per_executable=-1,
+            forward_isolate_prefix=False,
+            backward_partition_mode="none",
+            backward_layers_per_executable=1,
+            cpu_offload_prefetch_executables=0,
+            donate_internal_buffers=False,
+        ),
+        n_layers=3,
+    )
+
+    with (
+        mock.patch.object(
+            graph_split_lib, "tpu_backend_compile_pass"
+        ) as compile_pass,
+        mock.patch.object(
+            graph_split_lib, "tpu_backend_compile_partitioned_pass"
+        ) as compile_partitioned,
+    ):
+      module = splitter.split_and_compile(traced)
+
+    compile_partitioned.assert_not_called()
+    self.assertEqual(compile_pass.call_count, 2)
+    forward_call = compile_pass.call_args_list[0]
+    original_input_count = len(traced.example_inputs)
+    self.assertEqual(
+        forward_call.kwargs["donated_input_positions"],
+        (original_input_count,),
+    )
+    self.assertLen(forward_call.args[1], original_input_count + 1)
+    self.assertLen(module.host_donor_specs, 1)
+    self.assertLen(module.host_donor_output_positions, 1)
+    self.assertTrue(
+        any(
+            node.op == "placeholder"
+            and node.meta.get("tpu_force_donate", False)
+            for node in module.forward_graph.graph.nodes
+        )
+    )
 
   def test_partition_layouts_reuse_one_simple_fsdp_trace(self):
     """Check forward, by-layer, and pipelined four-layer layouts.

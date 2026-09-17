@@ -32,14 +32,23 @@ def to_tpu_graph_trainer_config(
 ) -> ConfigT:
   """Convert a TPU recipe and propagate its TPU-only GraphTrainer settings."""
   memory_policy = train_config.tpu_config.graph_trainer_memory_policy
-  if memory_policy == "sac_and_offload":
+  budget = train_config.tpu_config.graph_trainer_cpu_offload_budget_gb
+  if (
+      train_config.tpu_config.use_scan_layers
+      and memory_policy.endswith("_and_offload")
+      and memory_policy != "full_and_scan_offload"
+  ):
     raise ValueError(
-        "TPU GraphTrainer does not support memory_policy='sac_and_offload'"
+        f"generic offload policy {memory_policy!r} is unsupported with scan; "
+        "use the scan-specific 'full_and_scan_offload' policy from PR #374"
     )
+  if budget < 0:
+    raise ValueError("CPU-offload budget must be nonnegative")
   graph_config = to_graph_trainer_config(
       train_config, model_registry, target_cls=target_cls
   )
   graph_config.compile.memory_policy = memory_policy
+  graph_config.compile.cpu_offload_budget_gb = budget
   if train_config.tpu_config.use_scan_layers:
     check_scan_parallelism(train_config.parallelism)
     # Expert parallelism shards `moe.experts` on a mesh of its own. A stack is

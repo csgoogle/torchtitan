@@ -45,6 +45,36 @@ class PartitionDonationTest(absltest.TestCase):
         (0, 1),
     )
 
+  def test_forced_donation_does_not_require_internal_inference(self):
+    def fn(x):
+      boundary = x + 1
+      return boundary.sin()
+
+    gm = self._split(
+        fn,
+        (torch.randn(2, 3),),
+        {"add": 0, "sin": 1},
+    )
+    child = list(gm.children())[1]
+    placeholder = next(
+        node for node in child.graph.nodes if node.op == "placeholder"
+    )
+    placeholder.meta["tpu_force_donate"] = True
+    # Forced host donors do not depend on whole-parent alias analysis. Keep
+    # them enabled even if an unrelated boundary lacks fake-tensor metadata.
+    first_child = list(gm.children())[0]
+    first_child_output = next(
+        node for node in first_child.graph.nodes if node.op == "output"
+    )
+    first_child_output.args[0].meta.pop("val", None)
+
+    tpu_backend_pass._annotate_internal_donations(
+        gm,
+        donate_internal_buffers=False,
+    )
+
+    self.assertEqual(child.meta["tpu_donated_input_positions"], (0,))
+
   def test_does_not_donate_view_of_parent_input(self):
     def fn(x):
       boundary = x.view(2, 3)
@@ -278,6 +308,52 @@ class PartitionDonationTest(absltest.TestCase):
     self.assertEqual(
         compiler_instance.call_args.kwargs["donated_inputs"], [0, 1]
     )
+
+  def test_direct_compile_restores_pinned_host_reload_input(self):
+    graph = torch.fx.Graph()
+    host = graph.placeholder("host")
+    host.meta["val"] = torch.empty_strided((2, 3), (3, 1))
+    reload_node = graph.call_function(
+        torch.ops.ao.reload.default,
+        args=(host, torch.device("cpu"), [2, 3], [3, 1]),
+    )
+    reload_node.meta["val"] = torch.empty_strided((2, 3), (3, 1))
+    graph.output((reload_node,))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    executable = mock.Mock(return_value=(torch.randn(2, 3),))
+    compiler_instance = mock.Mock(return_value=executable)
+    compiler = mock.Mock(return_value=compiler_instance)
+    real_empty_strided = torch.empty_strided
+
+    def make_test_tensor(*args, **kwargs):
+      kwargs["device"] = "cpu"
+      return real_empty_strided(*args, **kwargs)
+
+    with (
+        mock.patch.object(
+            tpu_backend_pass, "_import_static_compiler", return_value=compiler
+        ),
+        mock.patch.object(
+            tpu_backend_pass.torch._subclasses.fake_tensor,
+            "FakeTensorMode",
+            return_value=mock.MagicMock(),
+        ),
+        mock.patch.object(
+            tpu_backend_pass.torch,
+            "empty_strided",
+            side_effect=make_test_tensor,
+        ),
+    ):
+      tpu_backend_pass.tpu_backend_compile_pass(
+          gm,
+          (torch.randn(2, 3),),
+          is_fwd=False,
+      )
+
+    compile_inputs = compiler_instance.call_args.args[1]
+    self.assertEqual(len(compile_inputs), 1)
+    self.assertTrue(compile_inputs[0]._is_pinned_host)
 
   def test_legacy_static_compiler_works_when_donation_is_disabled(self):
     gm = make_fx(lambda x: (x.sin(),))(torch.randn(2, 3))

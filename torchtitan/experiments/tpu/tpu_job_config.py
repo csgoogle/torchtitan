@@ -15,6 +15,11 @@ BackwardPartitionMode = Literal[
     "by_layer",
     "fsdp_pipeline",
 ]
+# This policy is registered by the TPU-only tpu_memory_policy module, so keep
+# its CLI/config type out of the shared GraphTrainer policy Literal.
+TpuGraphTrainerMemoryPolicy = Literal[
+    GraphTrainerMemoryPolicy, "full_and_offload"
+]
 
 
 @dataclasses.dataclass
@@ -43,6 +48,11 @@ class GraphSplitterConfig:
   # TorchTPU includes donation in its compilation cache key (torch_tpu#3614).
   # Original graph inputs and forward-saved tensors are never candidates.
   donate_internal_buffers: bool = False
+  # Number of complete backward child executables by which to advance each H2D
+  # reload pair relative to its first consumer. Zero keeps the pair in the
+  # consumer child; one places it in the immediately preceding child and carries
+  # only the completed device tensor across the boundary.
+  cpu_offload_prefetch_executables: int = 0
 
 
 @dataclasses.dataclass
@@ -72,7 +82,9 @@ class TPUConfig:
   optimizer_in_graph: bool = False
   # GraphTrainer rematerializes its joint forward/backward FX graph instead of
   # tracing eager activation-checkpoint wrappers.
-  graph_trainer_memory_policy: GraphTrainerMemoryPolicy = "default"
+  graph_trainer_memory_policy: TpuGraphTrainerMemoryPolicy = "default"
+  # CPU-offload controls propagated into GraphTrainer's compile config.
+  graph_trainer_cpu_offload_budget_gb: float = 100.0
   # Run the decoder layers as a single scan instead of a Python loop, so the
   # compiler sees one loop body rather than n_layers copies of it. Each layer's
   # weights become a row of one stacked tensor, which is what gives the scan

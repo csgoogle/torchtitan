@@ -19,17 +19,29 @@ import torch
 from torch._dynamo.utils import detect_fake_mode
 from torch.utils import _pytree
 
+from torchtitan.experiments.graph_trainer.cpu_offload import (
+    apply_cpu_offload_pass,
+)
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     schedule_fsdp_comms_to_dense_regions_pass,
 )
+from torchtitan.experiments.graph_trainer.memory_policy import (
+    tag_with_memory_policy_pass,
+)
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
+)
+from torchtitan.experiments.graph_trainer.selective_activation_remat import (
+    selective_activation_remat_pass,
 )
 from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_fsdp_rs_deadline_schedule,
     apply_tpu_remat_fsdp_all_gather_schedule,
     apply_tpu_remat_schedule,
 )
+# Imported for the side effect: it registers TPU-only memory policies before
+# ``tag_with_memory_policy_pass`` looks them up by name.
+import torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy  # noqa: F401
 from torchtitan.tools.logging import logger
 
 
@@ -166,8 +178,12 @@ def _donatable_input_positions(
     )
 
 
-def _annotate_internal_donations(gm: torch.fx.GraphModule) -> None:
-    """Annotate safe last-use donation between children of a split graph.
+def _annotate_internal_donations(
+    gm: torch.fx.GraphModule,
+    *,
+    donate_internal_buffers: bool = True,
+) -> None:
+    """Annotate forced donors and safe last-use boundaries between children.
 
     An internal boundary is a tensor produced by one ``call_module`` child and
     passed to another. The analysis first resolves boundary aliases by fake
@@ -175,71 +191,93 @@ def _annotate_internal_donations(gm: torch.fx.GraphModule) -> None:
     storage's final consumer. At that consumer, a boundary is donated only if
     it is uniquely referenced, is not an original input or constant, and is
     not also returned by the consuming child. Missing alias metadata disables
-    donation for the graph rather than guessing.
+    donation for the graph rather than guessing. Inputs explicitly marked
+    ``tpu_force_donate`` are always included; ``donate_internal_buffers`` gates
+    only inference of additional ordinary device-buffer donors.
     """
     calls = [node for node in gm.graph.nodes if node.op == "call_module"]
     submodules = [gm.get_submodule(str(call.target)) for call in calls]
     for submodule in submodules:
         submodule.meta.pop("tpu_donated_input_positions", None)
 
-    protected_nodes = [
-        node
-        for node in gm.graph.nodes
-        if node.op in ("placeholder", "get_attr")
-    ]
-    boundary_outputs = [
-        output
-        for submodule in submodules
-        for output in _submodule_outputs(submodule)
-    ]
-    missing_values = [
-        node.name
-        for node in (*protected_nodes, *boundary_outputs)
-        if "tensor_meta" in node.meta
-        and not isinstance(node.meta.get("val"), torch.Tensor)
-    ]
-    missing_values.extend(
-        node.name for node in boundary_outputs if "val" not in node.meta
-    )
-    if missing_values:
-        logger.warning(
-            "Disabling TPU split boundary donation: tensor metadata lacks "
-            "values for %s",
-            missing_values,
-        )
-        return
-
-    node_order = {node: index for index, node in enumerate(gm.graph.nodes)}
+    node_order: dict[torch.fx.Node, int] = {}
     last_use_by_storage: dict[int, int] = {}
-    for node in gm.graph.nodes:
-        if node.op == "call_function" and node.target is operator.getitem:
-            continue
-        for source in node.all_input_nodes:
-            storage = _producer_output_storage(gm, source)
-            if storage is not None:
-                last_use_by_storage[storage] = node_order[node]
+    protected_storages: set[int] = set()
+    inference_disabled_due_to_metadata = False
+    if donate_internal_buffers:
+        protected_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.op in ("placeholder", "get_attr")
+        ]
+        boundary_outputs = [
+            output
+            for submodule in submodules
+            for output in _submodule_outputs(submodule)
+        ]
+        missing_values = [
+            node.name
+            for node in (*protected_nodes, *boundary_outputs)
+            if "tensor_meta" in node.meta
+            and not isinstance(node.meta.get("val"), torch.Tensor)
+        ]
+        missing_values.extend(
+            node.name for node in boundary_outputs if "val" not in node.meta
+        )
+        if missing_values:
+            logger.warning(
+                "Disabling inferred TPU split boundary donation: tensor "
+                "metadata lacks values for %s",
+                missing_values,
+            )
+            donate_internal_buffers = False
+            inference_disabled_due_to_metadata = True
+        else:
+            node_order = {
+                node: index for index, node in enumerate(gm.graph.nodes)
+            }
+            for node in gm.graph.nodes:
+                if node.op == "call_function" and node.target is operator.getitem:
+                    continue
+                for source in node.all_input_nodes:
+                    storage = _producer_output_storage(gm, source)
+                    if storage is not None:
+                        last_use_by_storage[storage] = node_order[node]
 
-    protected_storages = {
-        storage
-        for node in protected_nodes
-        if (storage := _tensor_storage_id(node.meta.get("val"))) is not None
-    }
+            protected_storages = {
+                storage
+                for node in protected_nodes
+                if (storage := _tensor_storage_id(node.meta.get("val")))
+                is not None
+            }
 
     donated_count = 0
     donated_bytes = 0
     for call, submodule in zip(calls, submodules, strict=True):
-        positions = _donatable_input_positions(
-            gm,
-            call,
-            last_use_by_storage,
-            node_order,
-            protected_storages,
+        inferred_positions = (
+            _donatable_input_positions(
+                gm,
+                call,
+                last_use_by_storage,
+                node_order,
+                protected_storages,
+            )
+            if donate_internal_buffers
+            else ()
         )
-        # _SubmodCompiler deep-copies children; GraphModule.meta is preserved.
-        submodule.meta["tpu_donated_input_positions"] = positions
         placeholders = [
             node for node in submodule.graph.nodes if node.op == "placeholder"
         ]
+        forced_positions = tuple(
+            position
+            for position, placeholder in enumerate(placeholders)
+            if placeholder.meta.get("tpu_force_donate", False)
+        )
+        if inference_disabled_due_to_metadata and not forced_positions:
+            continue
+        positions = tuple(dict.fromkeys((*inferred_positions, *forced_positions)))
+        # _SubmodCompiler deep-copies children; GraphModule.meta is preserved.
+        submodule.meta["tpu_donated_input_positions"] = positions
         for position in positions:
             value = placeholders[position].meta.get("val")
             if isinstance(value, torch.Tensor):
@@ -268,6 +306,8 @@ def tpu_backend_compile_pass(
     eliminating per-node host dispatch overhead during training steps.
     """
     StaticCompiler = _import_static_compiler()
+
+    example_inputs = _restore_pinned_host_compile_inputs(gm, example_inputs)
 
     # Only iterate over nodes and count op/collective statistics when debug logging is enabled.
     if logger.isEnabledFor(logging.DEBUG):
@@ -352,6 +392,68 @@ def tpu_backend_compile_pass(
     return gm
 
 
+def _restore_pinned_host_compile_inputs(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+) -> tuple:
+    """Represent AO host inputs as TPU tensors in PJRT pinned-host memory.
+
+    Forward/backward separation and ``split_module`` propagate an AO host
+    output as a CPU fake tensor. Its runtime value is instead a TPU tensor
+    backed by PJRT pinned-host memory. StaticCompiler reads that placement from
+    a TPU fake tensor's ``_is_pinned_host`` marker, so reconstruct the compiler
+    input for both whole and partitioned graphs.
+    """
+    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+    pinned_positions = []
+    for index, placeholder in enumerate(placeholders):
+        metadata_value = placeholder.meta.get("val")
+        reload_consumer = any(
+            user.op == "call_function"
+            and user.target is torch.ops.ao.reload.default
+            and user.args
+            and user.args[0] is placeholder
+            for user in placeholder.users
+        )
+        if (
+            isinstance(metadata_value, torch.Tensor)
+            and metadata_value.device.type == "cpu"
+            and (placeholder.meta.get("tpu_force_donate") or reload_consumer)
+        ):
+            pinned_positions.append(index)
+
+    if not pinned_positions:
+        return example_inputs
+    if len(placeholders) != len(example_inputs):
+        raise ValueError(
+            "TPU graph input count does not match its placeholders: "
+            f"{len(example_inputs)} != {len(placeholders)}"
+        )
+
+    fake_mode = detect_fake_mode(example_inputs)
+    if fake_mode is None:
+        fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
+    compile_inputs = list(example_inputs)
+    with fake_mode:
+        for index in pinned_positions:
+            value = compile_inputs[index]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(
+                    "TPU pinned-host graph input must have a Tensor example: "
+                    f"position {index} is {type(value).__name__}"
+                )
+            pinned_value = torch.empty_strided(
+                value.shape,
+                value.stride(),
+                dtype=value.dtype,
+                device="tpu",
+                requires_grad=value.requires_grad,
+            )
+            pinned_value._is_pinned_host = True
+            compile_inputs[index] = pinned_value
+    return tuple(compile_inputs)
+
+
 def tpu_backend_compile_partitioned_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple,
@@ -369,21 +471,26 @@ def tpu_backend_compile_partitioned_pass(
     if fake_mode is None:
         fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
 
-    if donate_internal_buffers:
-        _annotate_internal_donations(gm)
+    _annotate_internal_donations(
+        gm,
+        donate_internal_buffers=donate_internal_buffers,
+    )
 
     def compile_submodule(
         submodule: torch.fx.GraphModule,
         submodule_inputs: list[torch.Tensor],
+        *,
+        module_name: str | None = None,
     ) -> torch.fx.GraphModule:
+        # Newer TorchTPU passes this diagnostic name to the callback, while
+        # the canonical build calls it with only the module and inputs.
+        del module_name
         return tpu_backend_compile_pass(
             submodule,
             tuple(submodule_inputs),
             is_fwd=is_fwd,
-            donated_input_positions=(
-                tuple(submodule.meta.get("tpu_donated_input_positions", ()))
-                if donate_internal_buffers
-                else ()
+            donated_input_positions=tuple(
+                submodule.meta.get("tpu_donated_input_positions", ())
             ),
         )
 
@@ -431,14 +538,6 @@ def construct_tpu_transform_passes(
         )
 
     if memory_policy and memory_policy != "none":
-        from torchtitan.experiments.graph_trainer.cpu_offload import (
-            apply_cpu_offload_pass,
-        )
-        from torchtitan.experiments.graph_trainer.passes import (
-            selective_activation_remat_pass,
-            tag_with_memory_policy_pass,
-        )
-
         passes.append(
             functools.partial(tag_with_memory_policy_pass, config=config)
         )
@@ -450,8 +549,19 @@ def construct_tpu_transform_passes(
         passes.append(
             functools.partial(
                 apply_cpu_offload_pass,
-                prefetch_lookahead=config.compile.cpu_offload_prefetch_n_layers,
-                defer_n_layers=config.compile.cpu_offload_defer_n_layers,
+                # Split mode places complete H2D pairs by executable after
+                # partition ownership is known. Keep the generic pre-split
+                # rewrite at the first consumer in that mode.
+                prefetch_lookahead=(
+                    0
+                    if config.tpu_config.use_graph_split
+                    else config.compile.cpu_offload_prefetch_n_layers
+                ),
+                defer_n_layers=(
+                    0
+                    if config.tpu_config.use_graph_split
+                    else config.compile.cpu_offload_defer_n_layers
+                ),
             )
         )
         passes.append(selective_activation_remat_pass)
