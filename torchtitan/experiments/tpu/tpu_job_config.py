@@ -15,10 +15,10 @@ BackwardPartitionMode = Literal[
     "by_layer",
     "fsdp_pipeline",
 ]
-# This policy is registered by the TPU-only tpu_memory_policy module, so keep
-# its CLI/config type out of the shared GraphTrainer policy Literal.
+# These policies are registered by TPU-only modules, so keep their CLI/config
+# type out of the shared GraphTrainer policy Literal.
 TpuGraphTrainerMemoryPolicy = Literal[
-    GraphTrainerMemoryPolicy, "full_and_offload"
+    GraphTrainerMemoryPolicy, "full_and_offload", "full_and_scan_offload"
 ]
 
 
