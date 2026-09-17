@@ -624,6 +624,23 @@ def construct_tpu_transform_passes(
                 )
             )
 
+    parameter_patterns = (
+        config.tpu_config.fsdp_allreduce_slice_parameter_patterns
+    )
+    if parameter_patterns:
+        from torchtitan.experiments.tpu.graph_trainer.passes.reduce_scatter_allreduce import (
+            apply_selected_reduce_scatter_allreduce_pass,
+        )
+
+        passes.append(
+            functools.partial(
+                apply_selected_reduce_scatter_allreduce_pass,
+                parameter_patterns=parameter_patterns,
+                max_input_bytes=(
+                    config.tpu_config.fsdp_allreduce_slice_max_input_bytes
+                ),
+            )
+        )
     return passes
 
 
