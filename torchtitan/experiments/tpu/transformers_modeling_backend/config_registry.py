@@ -16,9 +16,14 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
-from torchtitan.config.configs import ParallelismConfig, TrainingConfig
+from torchtitan.config.configs import (
+    CompileConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.transformers_modeling_backend import model_registry
+from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 
 from .job_config import TPUTransformersBackendConfig
@@ -35,6 +40,7 @@ def _tpu_hf_config(
     local_batch_size: int = 1,
     seq_len: int = 2048,
     steps: int = 10,
+    compile: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
   model_spec = model_registry(flavor)
@@ -63,6 +69,16 @@ def _tpu_hf_config(
       # SimpleFSDP is the data-parallel implementation on this lane; see
       # parallelize.py for why it is not FSDP2.
       parallelism=ParallelismConfig(use_simple_fsdp=True),
+      # "layer" compiles each decoder block on its own. Compiling is what makes
+      # the SimpleFSDP choice pay off: its all-gather sits on the .weight
+      # access path, so the graph break lands before the layer body and the
+      # body stays one compile region.
+      tpu_config=TPUConfig(compile_mode="layer"),
+      compile=CompileConfig(
+          enable=compile,
+          backend="tpu",
+          components=["model"],
+      ),
       dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
       metrics=MetricsProcessor.Config(log_freq=1),
       checkpoint=CheckpointManager.Config(
@@ -81,3 +97,13 @@ def hf_debugmodel() -> TPUTransformersBackendConfig:
 def hf_full() -> TPUTransformersBackendConfig:
   """The published model at its real width and depth."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL)
+
+
+def hf_debugmodel_compile() -> TPUTransformersBackendConfig:
+  """`hf_debugmodel` with per-layer torch.compile on the TPU backend."""
+  return _tpu_hf_config("debugmodel", _DEFAULT_HF_MODEL, seq_len=512, compile=True)
+
+
+def hf_full_compile() -> TPUTransformersBackendConfig:
+  """`hf_full` with per-layer torch.compile on the TPU backend."""
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True)
