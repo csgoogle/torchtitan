@@ -55,18 +55,25 @@ from torchtitan.experiments.tpu.overrides.fused_loss import (
 from torchtitan.experiments.tpu.overrides.real_rope import (
     TpuRealArithmeticComplexRoPE,
 )
+from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
+    TpuDiscardedTokenCounterMoE,
+)
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
     qwen3_moe_30b,
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
+    qwen3_moe_235b_scan,
+    qwen3_moe_235b_scan_maxtext,
+    qwen3_moe_235b_scan_proxy,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
 from torchtitan.models.common import ComplexRoPE, Linear
+from torchtitan.models.common.moe import MoE
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
@@ -530,6 +537,83 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             for rope in rope_configs
         )
     )
+
+  def test_235b_recipe_stays_stackable_under_scan(self) -> None:
+    config = qwen3_moe_235b_scan()
+
+    assert config.model_spec is not None
+    self.assertEqual(config.model_spec.flavor, "235B-A22B")
+    # Bias-based load balancing (#391) and the routing metrics (#399) both keep
+    # per-layer state a scan body cannot hold.
+    moes = list(config.model_spec.model.traverse(MoE.Config))
+    self.assertLen(moes, 94)
+    self.assertTrue(all(moe.load_balance_coeff is None for _, moe, _, _ in moes))
+    self.assertTrue(all(moe.aux_loss is not None for _, moe, _, _ in moes))
+    self.assertFalse(config.metrics.enable_moe_routing)
+    # Clearing the coeff leaves a dead in-place write scan also rejects, so the
+    # override has to reach every MoE.
+    apply_overrides(config.override, config)
+    self.assertTrue(
+        all(
+            isinstance(moe, TpuDiscardedTokenCounterMoE.Config)
+            for _, moe, _, _ in config.model_spec.model.traverse(MoE.Config)
+        )
+    )
+
+  def test_235b_flavor_resolves_through_the_graph_trainer(self) -> None:
+    # The graph trainer discards the recipe's ModelSpec and re-resolves the
+    # flavor string against upstream's registry. A flavor that only the TPU
+    # registry knows dies there on a KeyError, after every other test passes.
+    config = qwen3_moe_235b_scan()
+    assert config.model_spec is not None
+
+    spec = tpu_qwen3_graph_registry(config.model_spec.flavor)
+
+    self.assertIsInstance(spec.model, GraphTrainerQwen3Model.Config)
+
+  def test_235b_recipe_matches_the_maxtext_shape(self) -> None:
+    config = qwen3_moe_235b_scan()
+
+    self.assertEqual(config.training.local_batch_size, 16)
+    self.assertEqual(config.training.seq_len, 4096)
+    self.assertTrue(config.tpu_config.use_scan_layers)
+    self.assertEqual(
+        config.tpu_config.graph_trainer_memory_policy, "full_and_scan_offload"
+    )
+    self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
+
+  def test_235b_proxy_keeps_the_layer_shape_and_drops_the_count(self) -> None:
+    proxy = qwen3_moe_235b_scan_proxy()
+
+    assert proxy.model_spec is not None
+    self.assertLen(proxy.model_spec.model.layers, 12)
+    self.assertEqual(
+        proxy.training.global_batch_size, 32 * proxy.training.local_batch_size
+    )
+
+  def test_235b_maxtext_twin_changes_only_the_three_numerics_knobs(self) -> None:
+    base = qwen3_moe_235b_scan()
+    maxtext = qwen3_moe_235b_scan_maxtext()
+
+    self.assertEqual(base.training.mixed_precision_reduce, "float32")
+    self.assertEqual(maxtext.training.mixed_precision_reduce, "bfloat16")
+    self.assertEqual(
+        set(maxtext.override.imports) - set(base.override.imports),
+        {"torchtitan.experiments.tpu.overrides.bf16_rope"},
+    )
+    assert base.model_spec is not None and maxtext.model_spec is not None
+    for config, expected in ((base, False), (maxtext, True)):
+      dispatchers = list(
+          config.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+      )
+      self.assertLen(dispatchers, 94)
+      self.assertTrue(
+          all(d.fuse_route_score_backward is expected for _, d, _, _ in dispatchers)
+      )
+    # Everything the base recipe works around is inherited, not re-derived.
+    self.assertEqual(maxtext.model_spec.flavor, base.model_spec.flavor)
+    self.assertEqual(maxtext.training.local_batch_size, 16)
+    self.assertTrue(maxtext.tpu_config.use_scan_layers)
 
   def test_optimizer_implementation_cli_override_is_authoritative(self) -> None:
     config = ConfigManager().parse_args([
