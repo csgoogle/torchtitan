@@ -486,6 +486,32 @@ class HFTransformerModel(BaseModel):
                 "Weight initialization might not match TorchTitan."
             )
 
+        # Size the learned position table to actually hold max_seq_len
+        # positions before building for real. The config bridges
+        # max_seq_len -> max_position_embeddings, but a family that reserves
+        # slots at the front of the table addresses fewer rows than it has:
+        # XLM-R starts position ids at padding_idx + 1, so a 2048-row table
+        # tops out at 2046 and the last two positions of every batch read out
+        # of range. Measuring on a meta build costs no memory and keeps this
+        # free of per-architecture knowledge.
+        _wanted = getattr(config, "max_seq_len", None)
+        if _wanted:
+            try:
+                with torch.device("meta"):
+                    _probe = model_cls(config=config)
+                _cap = _structure.position_capacity(_probe)
+                if _cap is not None and _cap < _wanted:
+                    config.max_position_embeddings = (
+                        config.max_position_embeddings + (_wanted - _cap)
+                    )
+                    logger.info(
+                        f"Grew the position table by {_wanted - _cap} to address "
+                        f"{_wanted} positions ({type(_probe).__name__} reserves "
+                        "slots at the front of its table)."
+                    )
+            except Exception as e:
+                logger.warning(f"Could not size the position table: {e}")
+
         self.model = model_cls(config=config)
         # Resolved once: forward() compares an int, so it stays traceable.
         self._position_capacity = _structure.position_capacity(self.model)

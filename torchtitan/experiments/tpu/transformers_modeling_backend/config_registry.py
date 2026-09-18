@@ -30,50 +30,11 @@ from torchtitan.experiments.transformers_modeling_backend import model_registry
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 
-from torchtitan.tools.logging import logger
-
 from .job_config import TPUTransformersBackendConfig
 from .parallelize import parallelize_hf_transformers_tpu
 
 # Small enough to compile and run a step on a single v6e chip.
 _DEFAULT_HF_MODEL = "Qwen/Qwen3-0.6B"
-
-
-def _position_capped_seq_len(hf_model: str, seq_len: int) -> int:
-  """Lower seq_len to what the model can actually position.
-
-  GPT-2 tops out at 1024 learned positions, BERT and XLM-R at 512. Feeding
-  them more does not fail on TPU -- the out-of-range rows come back silently
-  clamped, and the only symptom is a loss an order of magnitude too high. The
-  capacity is read off the instantiated position table rather than
-  config.max_position_embeddings, which counts XLM-R's two reserved slots and
-  so overstates it by 2. Models that position with RoPE report no capacity.
-  """
-  if not hf_model:
-    return seq_len
-  try:
-    import torch
-    import transformers
-    from transformers import AutoConfig
-
-    from torchtitan.experiments.transformers_modeling_backend import _structure
-
-    cfg = AutoConfig.from_pretrained(hf_model)
-    model_cls = getattr(transformers, cfg.architectures[0])
-    with torch.device("meta"):
-      probe = model_cls(config=cfg)
-    cap = _structure.position_capacity(probe)
-  except Exception as e:  # offline, gated repo, unusual architecture
-    logger.warning(f"Could not probe position capacity for {hf_model}: {e}")
-    return seq_len
-
-  if cap is None or seq_len <= cap:
-    return seq_len
-  logger.warning(
-      f"{hf_model} positions at most {cap} tokens; lowering seq_len "
-      f"{seq_len} -> {cap}. Benchmarks against this model are at {cap}."
-  )
-  return cap
 
 
 def _tpu_hf_config(
@@ -88,7 +49,6 @@ def _tpu_hf_config(
     fused_loss: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
-  seq_len = _position_capped_seq_len(hf_model, seq_len)
   model_spec = model_registry(flavor)
   model_spec.parallelize_fn = parallelize_hf_transformers_tpu
   # flex attention has no TPU lowering. "sdpa" is the portable default;
