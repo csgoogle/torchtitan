@@ -89,6 +89,43 @@ def prepare_native_moe_configs(model: nn.Module, config) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _apply_expert_impl_converters(moe_config):
+    """Let the accelerator swap in its own grouped-expert implementation.
+
+    The probe in phase 1 is architecture-agnostic -- it reads num_experts,
+    top_k, the score function and the expert dims off whatever HF module it is
+    handed, which is how one path covers qwen3_moe, mixtral, deepseek_v2/v3,
+    olmoe and glm4_moe. What it produces is a config, and
+    ``GroupedExperts.Config`` inside it names the implementation.
+
+    Registered ModelConfigConverters never see this config: they run over the
+    model spec before construction, and these are built during it. So run the
+    accelerator's converter here, where the config is read and before the
+    module is built. On TPU that substitutes ``TpuGroupedExperts``, whose
+    grouped matmul is the kernel this lane already uses for its own MoE
+    models.
+
+    Expert parallelism is deliberately not involved: this keeps the experts
+    replicated and lets SimpleFSDP shard them, which is what the qwen3 TPU
+    lane does. The all-to-all dispatcher is an EP concern and is left alone.
+    """
+    try:
+        import torch
+
+        if not (hasattr(torch, "tpu") and torch.tpu.is_available()):
+            return moe_config
+        from torchtitan.experiments.tpu.grouped_experts import (
+            TpuGroupedExpertsConverter,
+        )
+    except Exception:
+        return moe_config
+
+    converter = TpuGroupedExpertsConverter(TpuGroupedExpertsConverter.Config())
+    converted = converter.convert(moe_config)
+    logger.info("Substituted the TPU grouped-expert implementation for this MoE.")
+    return converted
+
+
 def build_and_swap_native_moe(
     model: nn.Module,
     parallel_dims: ParallelDims,
@@ -113,6 +150,8 @@ def build_and_swap_native_moe(
         moe_config = getattr(layer, "_native_moe_config", None)
         if moe_config is None:
             continue
+
+        moe_config = _apply_expert_impl_converters(moe_config)
 
         _, expert_layout = _get_expert_param_info()
         set_moe_sharding_config(
@@ -221,7 +260,22 @@ def _get_moe_attr_name(layer: nn.Module) -> str:
     """
     if hasattr(layer, "mlp"):
         return "mlp"
-    raise AttributeError(f"Layer {type(layer).__name__} has no 'mlp'")
+    # Mixtral and GraniteMoe put it at block_sparse_moe; others use their own
+    # name again. Fall back to whichever child module looks like a MoE block
+    # rather than enumerating every family -- the probe that follows reads the
+    # geometry off the module itself, so the attribute name is the only thing
+    # that has to be found here.
+    for name in ("block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
+        if hasattr(layer, name):
+            return name
+    for name, child in layer.named_children():
+        cls = type(child).__name__.lower()
+        if "moe" in cls or "sparse" in cls or "experts" in cls:
+            return name
+    raise AttributeError(
+        f"Layer {type(layer).__name__} has no recognisable MoE block "
+        f"(children: {[n for n, _ in layer.named_children()]})"
+    )
 
 
 def _get_moe_block(layer: nn.Module) -> nn.Module:
