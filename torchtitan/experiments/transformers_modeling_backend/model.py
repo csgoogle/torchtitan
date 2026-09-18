@@ -1376,6 +1376,14 @@ class HFTransformerModel(BaseModel):
         express); "causal" is plain causal (flex with no mask would be full
         attention, so a causal BlockMask is still required).
         """
+
+        # A flex BlockMask is only consumable by the flex attention path, and
+        # flex has no TPU lowering -- building one here is what puts an
+        # untranslatable gather/concatenate into the graph. This lane runs
+        # sdpa or the splash kernel, which build their own causal masking, so
+        # only produce a BlockMask when flex is actually the implementation.
+        if getattr(self.model.config, "_attn_implementation", "") != _ATTN_IMPLEMENTATION:
+            return None
         if _uses_dsa(self.model.config):
             # DSA models cannot consume a flex BlockMask: their indexer and main
             # attention treat the mask as a dense additive tensor (see
@@ -1489,11 +1497,28 @@ class HFTransformerModel(BaseModel):
         # Resolve the backbone rather than assuming the Llama nesting: OPT
         # keeps it at model.decoder, GPT-2 at transformer, and a bare encoder
         # is its own backbone.
-        backbone, _ = _structure.find_backbone(self.model)
-        if backbone is None:
-            backbone = self.model
-        output = backbone(*model_args, **kwargs)
-        hidden_states = output.last_hidden_state.squeeze(0)
+        # Run the whole model and take hidden states from whatever it
+        # returns. Calling a resolved backbone directly only works when the
+        # backbone accepts input_ids -- BERT's is its encoder, which takes
+        # embeddings -- and the wrapper's output type varies by head
+        # (BaseModelOutput, MaskedLMOutput, ...). Asking for hidden states is
+        # the one contract every HF model honours.
+        if self._added_lm_head is not None or not hasattr(self.model, "lm_head"):
+            kwargs["output_hidden_states"] = True
+        output = self.model(*model_args, **kwargs)
+        hidden = getattr(output, "last_hidden_state", None)
+        if hidden is None:
+            states = getattr(output, "hidden_states", None)
+            hidden = states[-1] if states else None
+        if hidden is None:
+            logits = getattr(output, "logits", None)
+            if logits is None:
+                raise AttributeError(
+                    f"{type(self.model).__name__} returned neither hidden "
+                    "states nor logits to train on"
+                )
+            return logits.squeeze(0)
+        hidden_states = hidden.squeeze(0)
 
         if self._skip_lm_head:
             return hidden_states
@@ -1662,6 +1687,14 @@ class HFTransformerModel(BaseModel):
                 continue
             for child_name, child in holder.named_children():
                 if child is None or id(child) in seen:
+                    continue
+                # Skip a module that *contains* something already yielded.
+                # BERT keeps its head at cls.predictions.decoder and its token
+                # table at embeddings.word_embeddings, so yielding `cls` or
+                # `embeddings` here would hand the caller a second route to a
+                # part already given -- and Module.parallelize() refuses to
+                # visit a module twice.
+                if any(id(d) in seen for d in child.modules()):
                     continue
                 seen.add(id(child))
                 yield child_name, child
