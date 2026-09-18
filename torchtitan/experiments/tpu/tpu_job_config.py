@@ -10,17 +10,11 @@ import torchtitan.trainer
 
 @dataclasses.dataclass
 class TPUConfig:
+  """TorchTPU runtime controls shared by the regular and graph trainers."""
+
   use_simple_fsdp: bool = False
-  compile_mode: str = "layer"
   apply_rope_complex_workaround: bool = False
   use_jax_profiler: bool = False
-  # Materialize the regular trainer's eager forward graph before backward.
-  # GraphTrainer has its own structured splitter under ``compile.graph_split``.
-  use_graph_split: bool = False
-  # Compile AdamW step into its own separate FX graph.
-  compile_optimizer: bool = False
-  # Compile the DTensor-aware global gradient norm as a separate static graph.
-  compile_grad_norm: bool = False
   # Emit one aggregate MFU measurement after the configured start log step
   # through the end of training. Both boundaries must be metric log steps.
   enable_mfu_benchmark: bool = False
@@ -36,6 +30,25 @@ class TPUConfig:
       "DEFER_NEVER",
       "DEFER_NEVER_AND_LAUNCH_BLOCKING",
   ] = ""
+
+
+TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class TpuTrainerCompileConfig(torchtitan.config.CompileConfig):
+  """Generic compile policy plus regular-Trainer TorchTPU controls."""
+
+  # TPU model families support different subsets: Llama/Qwen use
+  # layer/fullgraph, Conformer uses layer/whole, and redacted uses block/whole.
+  mode: TpuTrainerCompileMode = "layer"
+  # Materialize the eager forward graph before backward. This is a single
+  # execution boundary, not GraphTrainer's multi-executable GraphSplitter.
+  split_forward_backward: bool = False
+  # Compile AdamW into its own FX graph, separate from model execution.
+  compile_optimizer: bool = False
+  # Compile the DTensor-aware global gradient norm as a separate static graph.
+  compile_grad_norm: bool = False
 
 
 @dataclasses.dataclass
@@ -208,11 +221,22 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class TPUTrainerConfig(BaseTPUTrainerConfig):
+  compile: TpuTrainerCompileConfig = dataclasses.field(
+      default_factory=TpuTrainerCompileConfig
+  )
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()
-    if self.tpu_config.compile_grad_norm:
+    if type(self.compile) is torchtitan.config.CompileConfig:
+      # ``derive_from`` may receive an upstream Trainer.Config. Preserve its
+      # generic compile policy while restoring the TPU-specific config type.
+      self.compile = TpuTrainerCompileConfig(
+          enable=self.compile.enable,
+          components=list(self.compile.components),
+          backend=self.compile.backend,
+      )
+    if self.compile.compile_grad_norm:
       # PP needs an additional reduction across stages, which each own only a
       # subset of the parameters. EP mixes dense and expert gradients on
       # different meshes, so upstream computes their norms separately before
@@ -222,7 +246,9 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
           self.parallelism.expert_parallel_degree > 1
           or self.parallelism.pipeline_parallel_degree > 1
       ):
-        raise ValueError("compile_grad_norm currently requires EP1 and PP1")
+        raise ValueError(
+            "compile.compile_grad_norm currently requires EP1 and PP1"
+        )
     # Set the default location of dump_folder. Allow the runtime CLI
     # configuration (i.e. --job.dump_folder=...) to override this parameter.
     if not self.dump_folder:

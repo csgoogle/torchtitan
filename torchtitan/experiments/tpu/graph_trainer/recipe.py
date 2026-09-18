@@ -20,7 +20,13 @@ def to_tpu_graph_trainer_config(
     base_config: TPUTrainerConfig,
     model_registry: Callable[[str], ModelSpec],
 ) -> TpuGraphTrainer.Config:
-  """Convert a TPU recipe directly to its final GraphTrainer config type."""
+  """Convert a TPU recipe directly to its final GraphTrainer config type.
+
+  Upstream ``to_graph_trainer_config`` copies the shared job fields, replaces
+  the model spec, and deliberately drops the regular Trainer's ``compile``
+  value so the target class installs ``TpuGraphTrainerCompileConfig``. Callers
+  then replace or mutate that default with their explicit graph-compile policy.
+  """
   return to_graph_trainer_config(
       base_config,
       model_registry,

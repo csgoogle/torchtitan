@@ -15,7 +15,6 @@ from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.config.configs import (
-    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -50,6 +49,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     LossKernelConfig,
     SplashAttentionKernelConfig,
     TPUConfig,
+    TpuTrainerCompileConfig,
     TPUTrainerConfig,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
@@ -228,15 +228,13 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=True,
           use_jax_profiler=False,
-          compile_optimizer=False,
-          compile_mode="layer",
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
+          split_forward_backward=True,
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
@@ -305,15 +303,14 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=True,
           use_jax_profiler=True,
-          compile_mode="layer",
-          compile_grad_norm=True,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
+          split_forward_backward=True,
+          compile_grad_norm=True,
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
@@ -428,8 +425,8 @@ def qwen3_8b_zero3() -> TpuGraphTrainer.Config:
   cfg = qwen3_8b()
   cfg.parallelism.fsdp_reshard_after_forward = "always"
   cfg.compile.memory_policy = "full"
-  cfg.compile.remat_schedule = True
-  cfg.compile.fsdp_schedule = "interleave"
+  cfg.compile.enable_remat_barriers = True
+  cfg.compile.fsdp_barrier_policy = "interleave"
   cfg.splash_attention_kernel.use_vmap_bwd = True
   cfg.splash_attention_kernel.sa_use_document_aware_block_skipping = False
   return cfg
@@ -523,18 +520,15 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TpuGraphTrainer.Config:
   cfg.training.global_batch_size = 768
   cfg.training.seq_len = 2048
   cfg.training.steps = 8
-  cfg.tpu_config = TPUConfig(
-      compile_mode="aot_fx_trace",
-      compile_grad_norm=True,
-      compile_optimizer=False,
-  )
+  cfg.tpu_config = TPUConfig()
   cfg.optimizer.implementation = "fused"
   cfg.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       backend="tpu",
       components=["model"],
       memory_policy="full",
-      remat_schedule=True,
+      compile_grad_norm=True,
+      enable_remat_barriers=True,
       fsdp_allreduce_slice_parameter_patterns=(
           "layers.*.attention.qkv_linear.wqkv_packed.weight",
           "layers.*.attention.wo.weight",
@@ -658,9 +652,13 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
   cfg.compile.graph_split.forward_isolate_prefix = True
   cfg.compile.graph_split.backward_partition_mode = "fsdp_pipeline"
   cfg.compile.graph_split.backward_layers_per_executable = 1
-  cfg.compile.remat_schedule = False
-  cfg.compile.fsdp_schedule = "none"
-  cfg.tpu_config.compile_optimizer = False
+  # This measured Q235 split formed one remat region per backward executable
+  # and reduced the batch-16 allocator deficit by 9.30 GiB. Those executable
+  # boundaries already provide the layer-local lifetime ordering that remat
+  # barriers add to a multi-layer graph, so do not add redundant dependencies.
+  cfg.compile.enable_remat_barriers = False
+  cfg.compile.fsdp_barrier_policy = "none"
+  cfg.compile.compile_optimizer = False
   cfg.compile.optimizer_in_graph = False
   cfg.hf_assets_path = "./assets/hf/Qwen3-235B-A22B"
   cfg.metrics.log_freq = 1

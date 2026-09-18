@@ -32,7 +32,10 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
   reg_trainer_qwen3_8b,
 )
 from torchtitan.experiments.tpu.train import TPUTrainer
-from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+  TPUTrainerConfig,
+  TpuTrainerCompileConfig,
+)
 
 
 class CompiledGradNormUnitTest(absltest.TestCase):
@@ -63,7 +66,7 @@ class CompiledGradNormUnitTest(absltest.TestCase):
         qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     ):
       with self.subTest(recipe=recipe.__name__):
-        self.assertTrue(recipe().tpu_config.compile_grad_norm)
+        self.assertTrue(recipe().compile.compile_grad_norm)
 
   def test_unsupported_training_topologies_are_rejected(self) -> None:
     cases = (
@@ -76,11 +79,11 @@ class CompiledGradNormUnitTest(absltest.TestCase):
       ):
         TPUTrainerConfig(
             parallelism=ParallelismConfig(**parallelism),
-            tpu_config=TPUConfig(compile_grad_norm=True),
+            compile=TpuTrainerCompileConfig(compile_grad_norm=True),
         )
 
     config = qwen3_8b()
-    config.tpu_config.compile_grad_norm = True
+    config.compile.compile_grad_norm = True
     config.compile.optimizer_in_graph = True
     with self.assertRaisesRegex(ValueError, "optimizer_in_graph"):
       apply_tpu_graph_trainer_model_transforms(config)

@@ -6,7 +6,7 @@ torchrun --nproc_per_node=4 \
   --module=torchtitan.experiments.tpu.conformer \
   --config=conformer_test \
   --tpu_config.use_simple_fsdp \
-  --tpu_config.compile_mode=layer \
+  --compile.mode=layer \
   --metrics.log_freq=1 \
   --compile.enable
 """
@@ -214,9 +214,9 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
           distinct_seed_mesh_dims=["pp"],
       )
 
-  use_graph_split = (
+  split_forward_backward = (
       isinstance(train_config, TPUTrainerConfig)
-      and train_config.tpu_config.use_graph_split
+      and train_config.compile.split_forward_backward
   )
   log_freq = train_config.metrics.log_freq
 
@@ -344,10 +344,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
 
   optimizer = train_config.optimizer.build(model_parts=[model])
 
-  if (
-      train_config.compile.enable
-      and "optimizer" in train_config.compile.components
-  ):
+  if train_config.compile.compile_optimizer:
     logger.info("Applying torch.compile to optimizer.step")
     optimizer.step = torch.compile(
         optimizer.step,
@@ -433,7 +430,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
             targets,
             optimizer,
             loss_fn,
-            graph_split=use_graph_split,
+            graph_split=split_forward_backward,
             use_ctc=use_ctc,
             use_jax_ctc=use_jax_ctc,
             output_lengths=torch.full(
@@ -455,7 +452,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
           loss_cpu = loss.cpu().item()
         should_log = True
       else:
-        if use_graph_split:
+        if split_forward_backward:
           import torch_tpu._internal.sync
 
           torch_tpu._internal.sync.synchronize(loss, wait=False)

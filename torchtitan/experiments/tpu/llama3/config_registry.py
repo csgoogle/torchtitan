@@ -12,7 +12,6 @@ from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
-    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -20,6 +19,7 @@ from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
     TPUConfig,
+    TpuTrainerCompileConfig,
     TPUTrainerConfig,
 )
 from torchtitan.experiments.graph_trainer.llama3 import (
@@ -207,9 +207,8 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
@@ -275,9 +274,8 @@ def llama3_70b() -> TPUTrainerConfig:
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
@@ -343,9 +341,8 @@ def llama3_405b() -> TPUTrainerConfig:
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
@@ -424,9 +421,8 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
       activation_checkpoint=FullAC.Config(),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
-          use_graph_split=False,
       ),
-      compile=CompileConfig(
+      compile=TpuTrainerCompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],

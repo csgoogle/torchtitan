@@ -13,7 +13,7 @@ import functools
 import logging
 import operator
 import time
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 from torch._dynamo.utils import detect_fake_mode
@@ -44,6 +44,10 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
 import torchtitan.experiments.tpu.graph_trainer.tpu_host_offload  # noqa: F401
 import torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy  # noqa: F401
 from torchtitan.tools.logging import logger
+
+if TYPE_CHECKING:
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
+    from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 
 
 def _import_static_compiler():
@@ -529,13 +533,14 @@ def construct_tpu_transform_passes(
     passes: list[Callable] = [remove_parameter_gradient_markers_pass]
 
     memory_policy = getattr(config.compile, "memory_policy", "none")
-    fsdp_schedule = config.compile.fsdp_schedule
-    if fsdp_schedule != "none" and (
+    fsdp_barrier_policy = config.compile.fsdp_barrier_policy
+    if fsdp_barrier_policy != "none" and (
         memory_policy in (None, "none")
-        or not config.compile.remat_schedule
+        or not config.compile.enable_remat_barriers
     ):
         raise ValueError(
-            "compile.fsdp_schedule requires GraphTrainer rematerialization"
+            "compile.fsdp_barrier_policy requires GraphTrainer "
+            "rematerialization and compile.enable_remat_barriers"
         )
 
     if memory_policy and memory_policy != "none":
@@ -566,20 +571,20 @@ def construct_tpu_transform_passes(
             )
         )
         passes.append(selective_activation_remat_pass)
-        if config.compile.remat_schedule:
+        if config.compile.enable_remat_barriers:
             passes.append(
                 functools.partial(
                     apply_tpu_remat_schedule,
                     num_static_inputs=traced_result.num_static_inputs,
                 )
             )
-            if fsdp_schedule != "none":
+            if fsdp_barrier_policy != "none":
                 passes.append(
                     functools.partial(
                         apply_tpu_remat_fsdp_all_gather_schedule,
                         num_static_inputs=traced_result.num_static_inputs,
                         prefetch_distance=(
-                            config.compile.fsdp_prefetch_distance
+                            config.compile.fsdp_barrier_prefetch_distance
                         ),
                     )
                 )
@@ -594,7 +599,7 @@ def construct_tpu_transform_passes(
     )
     passes.append(apply_combine_barrier_pass)
 
-    if fsdp_schedule != "none":
+    if fsdp_barrier_policy != "none":
         model_config = config.model_spec.model
         n_layers = len(model_config.layers)
         # TransformerBlock.Config exposes ``moe`` independently of the concrete
@@ -612,7 +617,7 @@ def construct_tpu_transform_passes(
                 strict=False,
             )
         )
-        if fsdp_schedule == "interleave":
+        if fsdp_barrier_policy == "interleave":
             passes.append(
                 functools.partial(
                     apply_tpu_fsdp_rs_deadline_schedule,

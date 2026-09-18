@@ -298,10 +298,11 @@ class GraphSplitter:
       raise ValueError(
           "cpu_offload_prefetch_executables requires a split backward graph"
       )
-    if enabled and config.compile.fsdp_schedule != "none":
+    if enabled and config.compile.fsdp_barrier_policy != "none":
       raise ValueError(
           "Graph splitting does not currently compose with "
-          "compile.fsdp_schedule"
+          "compile.fsdp_barrier_policy because the whole-graph collective "
+          "placement pass is not partition-boundary aware"
       )
     # Optimizer-in-graph needs a third explicit phase rather than treating its
     # state reads, mutations, and parameter updates as backward.

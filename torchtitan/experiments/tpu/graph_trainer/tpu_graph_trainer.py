@@ -123,12 +123,13 @@ class TpuGraphTrainer(GraphTrainer):
                 group["capturable"] = True
 
         self._optimizer_in_graph = config.compile.optimizer_in_graph
-        if self._optimizer_in_graph and config.tpu_config.compile_grad_norm:
+        if self._optimizer_in_graph and config.compile.compile_grad_norm:
             raise ValueError(
-                "compile_grad_norm cannot be combined with optimizer_in_graph"
+                "compile.compile_grad_norm cannot be combined with "
+                "compile.optimizer_in_graph"
             )
         self._compiled_grad_norm = (
-            CompiledGradNorm() if config.tpu_config.compile_grad_norm else None
+            CompiledGradNorm() if config.compile.compile_grad_norm else None
         )
 
         # Only dump weight/buffer statistics when debug logging is explicitly enabled per review comment.
@@ -139,7 +140,7 @@ class TpuGraphTrainer(GraphTrainer):
             self._opt_state_registered = False
 
         self._optimizer_compile = (
-            config.tpu_config.compile_optimizer and not self._optimizer_in_graph
+            config.compile.compile_optimizer and not self._optimizer_in_graph
         )
         self._graph_splitter = GraphSplitter.from_trainer_config(
             config,

@@ -552,7 +552,7 @@ def _apply_stacked_layers(model: nn.Module, *, use_scan: bool) -> None:
     * The layer must not mutate its inputs. ``scan`` is a higher-order op, and a
       body that writes to what it was handed raises
       ``UncapturedHigherOrderOpError`` at trace time.
-    * The step has to be traced: ``--tpu-config.compile-mode=aot_fx_trace``.
+    * The step has to be traced: ``--compile.mode=aot_fx_trace``.
       Eager ``scan`` doesn't materialize on TPU.
 
     What does and does not change:

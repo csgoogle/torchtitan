@@ -32,9 +32,9 @@ import torchtitan.train
 class TPUTrainer(torchtitan.train.Trainer):
   """Trainer subclass with TPU-specific optimizations.
 
-  Adds the following optional behaviors controlled by tpu_config flags:
+  Adds the following optional behaviors controlled by ``compile`` policy:
 
-  use_graph_split:
+  compile.split_forward_backward:
     Inserts a `synchronize(loss, wait=False)` call between the forward+loss
     computation and the backward pass. This splits the monolithic XLA
     computation graph into two smaller graphs (forward and backward),
@@ -43,7 +43,7 @@ class TPUTrainer(torchtitan.train.Trainer):
     breaking autograd, so loss.backward() still propagates gradients
     correctly through the full model.
 
-  compile_grad_norm:
+  compile.compile_grad_norm:
     Compiles the DTensor-aware global gradient norm as a standalone static XLA
     graph. In-place clipping remains on PyTorch's eager path.
   """
@@ -56,13 +56,12 @@ class TPUTrainer(torchtitan.train.Trainer):
       from torchtitan.experiments.tpu.loss import build_cross_entropy_loss
       self.loss_fn = build_cross_entropy_loss(job_config)
 
-      tpu_config = job_config.tpu_config
-      if not tpu_config.enable_amp:
+      if not job_config.tpu_config.enable_amp:
         logger.info("AMP is disabled, using uniform precision training.")
       self._compiled_grad_norm = (
-          CompiledGradNorm() if tpu_config.compile_grad_norm else None
+          CompiledGradNorm() if job_config.compile.compile_grad_norm else None
       )
-      if tpu_config.compile_optimizer:
+      if job_config.compile.compile_optimizer:
         from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
         apply_compiled_optimizer(self)
 
@@ -83,12 +82,12 @@ class TPUTrainer(torchtitan.train.Trainer):
       global_valid_tokens: float,
   ) -> torch.Tensor:
     config = self.config
-    use_graph_split = (
+    split_forward_backward = (
         isinstance(config, tpu_job_config_module.TPUTrainerConfig)
-        and config.tpu_config.use_graph_split
+        and config.compile.split_forward_backward
         and not self.parallel_dims.pp_enabled
     )
-    if not use_graph_split:
+    if not split_forward_backward:
       return super().forward_backward_step(
           input_dict=input_dict,
           labels=labels,
@@ -140,20 +139,20 @@ def start_trainer(
   is_graph_trainer = isinstance(train_config, TpuGraphTrainer.Config)
   if model_name == "flux":
     # FluxTrainer owns a separate train_step and bypasses the TPU integration.
-    if train_config.tpu_config.compile_grad_norm:
-      raise ValueError("compile_grad_norm does not support FluxTrainer")
+    if train_config.compile.compile_grad_norm:
+      raise ValueError("compile.compile_grad_norm does not support FluxTrainer")
     from torchtitan.models.flux.trainer import FluxTrainer
     trainer_cls = FluxTrainer
   elif is_graph_trainer:
     trainer_cls = TpuGraphTrainer
   else:
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
-      if train_config.tpu_config.compile_mode == "fullgraph":
+      if train_config.compile.mode == "fullgraph":
         logger.warning(
             "Running fullgraph compile mode (`%s`) on regular TPUTrainer. "
             "Note: this wraps forward+backward together via `torch.compile(model, fullgraph=True, backend='tpu')`, "
             "but does NOT capture the optimizer step right inside the graph.",
-            train_config.tpu_config.compile_mode,
+            train_config.compile.mode,
         )
     trainer_cls = TPUTrainer
 
@@ -184,7 +183,7 @@ def start_trainer(
     workarounds.apply_patches(model, train_config)
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
       if model_spec.name in ("llama3", "qwen3"):
-        kwargs["tpu_compile_mode"] = train_config.tpu_config.compile_mode
+        kwargs["tpu_compile_mode"] = train_config.compile.mode
     if model_spec.name in (
         "redacted",
         "redacted_tpu",

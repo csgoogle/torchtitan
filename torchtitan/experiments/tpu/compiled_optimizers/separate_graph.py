@@ -5,9 +5,9 @@ executable via `StaticCompiler`, eliminating 300+ host dispatch roundtrips per
 step without merging the optimizer into the forward/backward graph.
 
 Used by:
-1. Regular TPUTrainer when `--tpu-config.compile-optimizer` is enabled.
+1. Regular TPUTrainer when `--compile.compile-optimizer` is enabled.
 2. TpuGraphTrainer when `--compile.optimizer-in-graph` is false and
-   `--tpu-config.compile-optimizer` is enabled.
+   `--compile.compile-optimizer` is enabled.
 """
 
 from typing import Any, Optional

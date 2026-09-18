@@ -28,7 +28,7 @@ if TYPE_CHECKING:
   )
 
 
-GraphTrainerFSDPSchedule = Literal["none", "prefetch", "interleave"]
+GraphTrainerFSDPBarrierPolicy = Literal["none", "prefetch", "interleave"]
 BackwardPartitionMode = Literal["none", "by_layer", "fsdp_pipeline"]
 TpuGraphTrainerMemoryPolicy = Literal[
     GraphTrainerMemoryPolicy, "full_and_offload", "full_and_scan_offload"
@@ -45,8 +45,16 @@ class GraphSplitterConfig:
   top-level forward and backward executables; the mode only controls finer
   subdivision of the backward executable.
 
-  GraphSplitter and ``fsdp_schedule`` are alternative scheduling strategies
-  and cannot currently be enabled together.
+  ``GraphSplitterConfig()`` performs no split because ``enabled`` defaults to
+  false. Enabling it with all other defaults produces one forward executable
+  and one backward executable. ``backward_partition_mode='by_layer'`` or
+  ``'fsdp_pipeline'`` additionally partitions backward, using
+  ``backward_layers_per_executable`` as the grouping size.
+
+  Layerwise remat barriers may run before splitting and can still help inside
+  a child containing multiple layers. ``fsdp_barrier_policy`` is rejected with
+  GraphSplitter: it moves collectives across layers on the complete graph and
+  is not yet aware of the later executable boundaries.
   """
 
   enabled: bool = False
@@ -77,27 +85,41 @@ class GraphSplitterConfig:
 class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   """Compilation and graph-transformation policy for TPU GraphTrainer."""
 
+  enable: bool = False
+  """Enable the upstream GraphTrainer compilation path.
+
+  This field is inherited from ``CompileConfig`` and repeated here to make the
+  public TPU surface explicit. ``mode`` selects JIT or joint-step AOT tracing.
+  """
   backend: str = "tpu"
   pass_pipeline: str = "tpu"
   memory_policy: TpuGraphTrainerMemoryPolicy = "default"
+  # Compile AdamW into its own FX graph, separate from the joint training graph.
+  compile_optimizer: bool = False
+  # Compile the DTensor-aware global gradient norm as a separate static graph.
+  compile_grad_norm: bool = False
   # Compile the optimizer step into the joint forward/loss/backward graph.
   optimizer_in_graph: bool = False
   # Stack decoder-layer parameters and execute the layers with one scan.
   # Checkpoint keys remain per-layer; optimizer checkpoint names change.
   use_scan_layers: bool = False
-  # Run TPU's post-rematerialization scheduling pass. This does not select the
-  # memory policy: ``memory_policy`` decides what is saved, recomputed, or
-  # offloaded. This flag only reorders already-rematerialized layer work so its
-  # workspace stays local. It therefore has no effect with no memory policy.
-  remat_schedule: bool = False
-  # Schedule recomputed SimpleFSDP collectives around dense backward compute.
-  # ``prefetch`` preserves recomputed all-gathers and places them in preceding
-  # dense compute. ``interleave`` additionally fences each next all-gather on
-  # the prior reduce-scatter, reducing memory at the cost of AG/RS concurrency.
-  # This requires remat_schedule and does not compose with GraphSplitter.
-  fsdp_schedule: GraphTrainerFSDPSchedule = "none"
+  # Make each layer's local parameter gradients a dependency of the next
+  # layer's recomputation. This prevents XLA from starting the next layer and
+  # retaining both layers' recompute workspaces at once. It can lower peak HBM
+  # for an unsplit or multi-layer executable, but can reduce scheduling freedom;
+  # a one-layer GraphSplitter child already supplies the same lifetime boundary.
+  # ``memory_policy`` independently decides what is saved or recomputed, so
+  # these barriers do nothing when rematerialization is disabled.
+  enable_remat_barriers: bool = False
+  # Bound recomputed SimpleFSDP parameter lifetimes and place their collectives
+  # near dense backward work. ``prefetch`` permits AG/compute overlap within a
+  # bounded window. ``interleave`` additionally makes each next AG wait for the
+  # prior RS, reducing HBM at the cost of AG/RS concurrency. This requires
+  # ``enable_remat_barriers`` and is not yet partition-aware, so it cannot be
+  # combined with GraphSplitter.
+  fsdp_barrier_policy: GraphTrainerFSDPBarrierPolicy = "none"
   # Release layer L's recomputed parameters at backward layer L+N.
-  fsdp_prefetch_distance: int = 1
+  fsdp_barrier_prefetch_distance: int = 1
   graph_split: GraphSplitterConfig = field(default_factory=GraphSplitterConfig)
   # Lower selected FSDP gradient reduce-scatters as all-reduce plus rank-local
   # slice. Patterns match parameter FQNs; an empty tuple disables the rewrite.
@@ -149,19 +171,40 @@ def apply_tpu_graph_trainer_model_transforms(
   _validate_fsdp_allreduce_slice(config)
 
   compile_config = config.compile
-  if compile_config.optimizer_in_graph and config.tpu_config.compile_grad_norm:
+  if compile_config.optimizer_in_graph and compile_config.compile_optimizer:
     raise ValueError(
-        "compile_grad_norm cannot be combined with optimizer_in_graph"
+        "compile.compile_optimizer cannot be combined with "
+        "compile.optimizer_in_graph"
+    )
+  if compile_config.optimizer_in_graph and compile_config.compile_grad_norm:
+    raise ValueError(
+        "compile.compile_grad_norm cannot be combined with "
+        "compile.optimizer_in_graph"
+    )
+  if compile_config.fsdp_barrier_policy != "none" and (
+      compile_config.memory_policy in (None, "none")
+      or not compile_config.enable_remat_barriers
+  ):
+    raise ValueError(
+        "compile.fsdp_barrier_policy requires GraphTrainer "
+        "rematerialization and compile.enable_remat_barriers"
+    )
+  if (
+      compile_config.fsdp_barrier_policy != "none"
+      and compile_config.fsdp_barrier_prefetch_distance < 1
+  ):
+    raise ValueError(
+        "compile.fsdp_barrier_prefetch_distance must be positive"
     )
   if (
       config.parallelism.fsdp_reshard_after_forward == "always"
       and not compile_config.use_scan_layers
       and not compile_config.graph_split.enabled
-      and compile_config.fsdp_schedule == "none"
+      and compile_config.fsdp_barrier_policy == "none"
   ):
     raise ValueError(
         "TPU GraphTrainer ZeRO-3 requires compile.use_scan_layers, "
-        "compile.graph_split.enabled, or compile.fsdp_schedule="
+        "compile.graph_split.enabled, or compile.fsdp_barrier_policy="
         "'prefetch'/'interleave'; without one, XLA can merge forward and "
         "recomputed all-gathers and retain full parameters through backward."
     )
@@ -200,7 +243,7 @@ def apply_tpu_graph_trainer_model_transforms(
 
 __all__ = [
     "GraphSplitterConfig",
-    "GraphTrainerFSDPSchedule",
+    "GraphTrainerFSDPBarrierPolicy",
     "TpuGraphTrainerCompileConfig",
     "TpuGraphTrainerMemoryPolicy",
     "apply_tpu_graph_trainer_model_transforms",
