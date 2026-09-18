@@ -44,6 +44,7 @@ def parallelize_hf_transformers(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
     """
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
@@ -80,24 +81,28 @@ def parallelize_hf_transformers(
     if model_compile_enabled:
         apply_compile(model, compile_config)
 
-    dp_mesh_dim_names = (
-        ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-    )
-    apply_fsdp(
-        model,
-        parallel_dims.get_mesh(dp_mesh_dim_names),
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        pp_enabled=parallel_dims.pp_enabled,
-        cpu_offload=training.enable_cpu_offload,
-        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
-    )
+    # skip_dp lets a caller take everything above (TP, AC, compile) and supply
+    # its own data-parallel wrapping -- the TPU lane uses SimpleFSDP instead of
+    # fully_shard. Mirrors the same parameter on parallelize_llama.
+    if not skip_dp:
+        dp_mesh_dim_names = (
+            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
+        )
+        apply_fsdp(
+            model,
+            parallel_dims.get_mesh(dp_mesh_dim_names),
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        )
 
-    logger.info("Applied fully_shard to the model")
+        logger.info("Applied fully_shard to the model")
 
-    if training.enable_cpu_offload:
-        logger.info("Applied CPU Offloading to the model")
+        if training.enable_cpu_offload:
+            logger.info("Applied CPU Offloading to the model")
 
     if parallel_dims.cp_enabled:
         model.set_cp_mesh(parallel_dims.get_mesh("cp"))
