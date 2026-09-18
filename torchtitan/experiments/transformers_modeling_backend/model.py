@@ -16,6 +16,7 @@ from torch.nn import init
 from torch.nn.attention.flex_attention import BlockMask
 
 from transformers import AutoConfig
+from . import _meta_init, _structure
 from transformers.configuration_utils import PretrainedConfig
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.modeling_utils import AttentionInterface, PreTrainedModel
@@ -210,9 +211,15 @@ class HFTransformerModel(BaseModel):
 
             dataclasses.replace() re-invokes __init__, which is incompatible
             with the custom __init__ here (expects titan_dense_config).
+
+            The build also runs under `params_meta_buffers_real`: HF modules
+            compute real buffers in `__init__` (causal masks, rope tables,
+            embedding normalizers) and a plain meta build throws all of them
+            away. See _meta_init.py.
             """
             clone = self._replace()
-            instance = self._owner(config=clone, **kwargs)
+            with _meta_init.params_meta_buffers_real():
+                instance = self._owner(config=clone, **kwargs)
             if self.param_init is not None:
                 instance._param_init = self.param_init
             return instance
@@ -335,8 +342,16 @@ class HFTransformerModel(BaseModel):
                 if hasattr(hf_model_config, hf_name):
                     setattr(self, titan_name, getattr(hf_model_config, hf_name))
 
-            # Copy any other attributes that might not be in the mapping
+            # Copy any other attributes that might not be in the mapping.
+            # to_dict() serializes nested configs (vision_config, ...) into
+            # plain dicts; re-attach the original objects instead, or the
+            # submodel constructors reject them:
+            #   TypeError: Parameter config in `GitVisionModel(config)` should
+            #   be an instance of class `PretrainedConfig`
             for key, value in hf_model_config.to_dict().items():
+                original = getattr(hf_model_config, key, None)
+                if isinstance(original, PretrainedConfig):
+                    value = original
                 setattr(self, key, value)
 
             # Update our attributes with the passed args from flavors
@@ -453,13 +468,23 @@ class HFTransformerModel(BaseModel):
         self.cp_mesh = None
 
         # Convert ModuleList to ModuleDict to preserve original indices
-        # This ensures state dict keys match checkpoint keys
-        if isinstance(self.model.model.layers, nn.ModuleList):
-            self.model.model.layers = SliceableModuleDict(
-                {str(i): layer for i, layer in enumerate(self.model.model.layers)}
+        # This ensures state dict keys match checkpoint keys. Resolve the
+        # stack structurally -- OPT keeps it at model.decoder.layers, GPT-2
+        # at transformer.h, so a hardcoded self.model.model.layers raises
+        # before the first step for anything not shaped like Llama.
+        _blocks, _blocks_path = _structure.find_layers(self.model)
+        if _blocks is None:
+            raise AttributeError(
+                f"Could not locate the block stack on {type(self.model).__name__}; "
+                "add its nesting to transformers_modeling_backend/_structure.py"
             )
+        if isinstance(_blocks, nn.ModuleList):
+            _blocks = SliceableModuleDict(
+                {str(i): layer for i, layer in enumerate(_blocks)}
+            )
+            _structure.set_at(self.model, _blocks_path, _blocks)
 
-        for layer in self.model.model.layers.values():
+        for layer in _blocks.values():
             layer.moe_enabled = False
             # Attach FlexAttention kernel module to each attention layer
             # so apply_cp_to_forward can find and wrap it for CP.
@@ -645,123 +670,97 @@ class HFTransformerModel(BaseModel):
 
     @property
     def tok_embeddings(self):
-        """Returns the model's embed_tokens, handling different Hugging Face model structures."""
-        if hasattr(self.model, "model") and hasattr(
-            self.model.model, "embed_tokens"
-        ):  # Llama-like
-            return self.model.model.embed_tokens
-        else:
+        """The token embedding table."""
+        found, _ = _structure.find_embedding(self.model)
+        if found is None:
             raise AttributeError(
-                "Could not find embed_tokens in the model. Please check the model structure."
+                "Could not locate tok_embeddings on "
+                f"{type(self.model).__name__}; add its nesting to "
+                "transformers_modeling_backend/_structure.py"
             )
+        return found
 
     @tok_embeddings.setter
     def tok_embeddings(self, value):
-        if hasattr(self.model, "model") and hasattr(
-            self.model.model, "embed_tokens"
-        ):  # Llama-like
-            self.model.model.embed_tokens = value
-        else:
-            raise AttributeError(
-                "Could not find embed_tokens in the model. Please check the model structure."
-            )
+        _, path = _structure.find_embedding(self.model)
+        if path is None:
+            raise AttributeError("Could not locate tok_embeddings to assign")
+        _structure.set_at(self.model, path, value)
 
     @property
     def layers(self):
-        """Returns the model's layers, handling different Hugging Face model structures."""
-        if hasattr(self.model, "model") and hasattr(
-            self.model.model, "layers"
-        ):  # Llama-like
-            return self.model.model.layers
-        else:
-            # Add more cases here if needed for other model architectures
+        """The block stack, wherever this architecture keeps it."""
+        found, _ = _structure.find_layers(self.model)
+        if found is None:
             raise AttributeError(
-                "Could not find layers in the model. Please check the model structure."
+                "Could not locate layers on "
+                f"{type(self.model).__name__}; add its nesting to "
+                "transformers_modeling_backend/_structure.py"
             )
+        return found
 
     @layers.setter
     def layers(self, value):
-        if hasattr(self.model, "model") and hasattr(
-            self.model.model, "layers"
-        ):  # Llama-like
-            self.model.model.layers = value
-        else:
-            raise AttributeError(
-                "Could not find layers in the model. Please check the model structure."
-            )
+        _, path = _structure.find_layers(self.model)
+        if path is None:
+            raise AttributeError("Could not locate layers to assign")
+        _structure.set_at(self.model, path, value)
 
     @property
     def norm(self):
-        """Returns the model's norm, handling different Hugging Face model structures."""
-        if hasattr(self.model, "model") and hasattr(
-            self.model.model, "norm"
-        ):  # Llama-like
-            return self.model.model.norm
-        elif hasattr(self.model, "model") and hasattr(
-            self.model.model, "final_layernorm"
-        ):  # Phi-like
-            return self.model.model.final_layernorm
-        else:
+        """The final norm."""
+        found, _ = _structure.find_norm(self.model)
+        if found is None:
             raise AttributeError(
-                "Could not find norm in the model. Please check the model structure."
+                "Could not locate norm on "
+                f"{type(self.model).__name__}; add its nesting to "
+                "transformers_modeling_backend/_structure.py"
             )
+        return found
 
     @norm.setter
     def norm(self, value):
-        if hasattr(self.model, "model") and hasattr(
-            self.model.model, "norm"
-        ):  # Llama-like
-            self.model.model.norm = value
-        elif hasattr(self.model, "model") and hasattr(
-            self.model.model, "final_layernorm"
-        ):  # Phi-like
-            self.model.model.final_layernorm = value
-        else:
-            raise AttributeError(
-                "Could not find norm in the model. Please check the model structure."
-            )
+        _, path = _structure.find_norm(self.model)
+        if path is None:
+            raise AttributeError("Could not locate norm to assign")
+        _structure.set_at(self.model, path, value)
 
     @property
     def lm_head(self):
-        """Returns the model's output layer, handling different Hugging Face model structures."""
-        if hasattr(self.model, "lm_head"):  # For models like LlamaForCausalLM
-            return self.model.lm_head
-        else:
+        """The output head."""
+        found, _ = _structure.find_head(self.model)
+        if found is None:
             raise AttributeError(
-                "Could not find lm_head in the model. Please check the model structure."
+                "Could not locate lm_head on "
+                f"{type(self.model).__name__}; add its nesting to "
+                "transformers_modeling_backend/_structure.py"
             )
+        return found
 
     @lm_head.setter
     def lm_head(self, value):
-        if hasattr(self.model, "lm_head"):  # For models like LlamaForCausalLM
-            self.model.lm_head = value
-        else:
-            raise AttributeError(
-                "Could not find lm_head in the model. Please check the model structure."
-            )
+        _, path = _structure.find_head(self.model)
+        if path is None:
+            raise AttributeError("Could not locate lm_head to assign")
+        _structure.set_at(self.model, path, value)
 
     @property
     def rotary_emb(self):
-        """Returns the model's rotary_emb, handling different Hugging Face model structures."""
-        if hasattr(self.model, "model") and hasattr(
-            self.model.model, "rotary_emb"
-        ):  # Llama-like
-            return self.model.model.rotary_emb
-        else:
-            raise AttributeError(
-                "Could not find rotary_emb in the model. Please check the model structure."
-            )
+        """Rotary embedding module, or None for learned-position models.
+
+        OPT and GPT-2 have no rotary embedding at all; returning None lets
+        named_children skip it instead of aborting the run.
+        """
+        found, _ = _structure.find_rotary(self.model)
+        return found
 
     @rotary_emb.setter
     def rotary_emb(self, value):
-        if hasattr(self.model, "model") and hasattr(
-            self.model.model, "rotary_emb"
-        ):  # Llama-like
-            self.model.model.rotary_emb = value
-        else:
-            raise AttributeError(
-                "Could not find rotary_emb in the model. Please check the model structure."
-            )
+        _, path = _structure.find_rotary(self.model)
+        if path is None:
+            raise AttributeError("This architecture has no rotary_emb to assign")
+        _structure.set_at(self.model, path, value)
+
 
     def forward(self, *args, positions=None, attention_masks=None, **kwargs):
         local_seq_len = self.max_seq_len
@@ -781,11 +780,28 @@ class HFTransformerModel(BaseModel):
         if attention_masks is not None:
             kwargs["attention_mask"] = attention_masks
 
-        output = self.model.model(*args, **kwargs)
+        # Calling the backbone and head separately only works for models that
+        # nest them as model.model / model.lm_head. Running the whole model and
+        # taking its logits works for every HF causal LM; the split is kept only
+        # for the pipeline-parallel case that needs the head detached.
         if self._skip_lm_head:
-            return output.last_hidden_state
-        output = self.model.lm_head(output.last_hidden_state)
-        return output
+            backbone, _ = _structure.find_backbone(self.model)
+            if backbone is None:
+                raise AttributeError(
+                    f"Cannot split the head off {type(self.model).__name__}"
+                )
+            return backbone(*args, **kwargs).last_hidden_state
+
+        output = self.model(*args, **kwargs)
+        return getattr(output, "logits", output)
+
+    def to_empty(self, *, device, recurse: bool = True):
+        """Materialize parameters, but keep buffer values.
+
+        torch's to_empty() runs empty_like over buffers too, discarding the
+        causal masks / rope tables / normalizers that __init__ computed.
+        """
+        return _meta_init.to_empty_keep_buffers(self, device)
 
     def verify_module_protocol(self) -> None:
         """Skip recursive verification for HuggingFace model internals.
@@ -845,12 +861,37 @@ class HFTransformerModel(BaseModel):
         """
         Provides a flattened view of the model's main components,
         making it compatible with TorchTitan's expectations.
+
+        Parts that a given architecture does not have are skipped rather than
+        raising: OPT and GPT-2 use learned positional embeddings and so have
+        no rotary_emb at all, and some heads are tied away entirely.
         """
-        yield "tok_embeddings", self.tok_embeddings
-        yield "layers", self.layers
-        yield "norm", self.norm
-        yield "lm_head", self.lm_head
-        yield "rotary_emb", self.rotary_emb
+        seen: set[int] = set()
+        for name in ("tok_embeddings", "layers", "norm", "lm_head", "rotary_emb"):
+            try:
+                child = getattr(self, name)
+            except AttributeError:
+                continue
+            if child is None or id(child) in seen:
+                continue
+            seen.add(id(child))
+            yield name, child
+
+        # Anything the architecture carries outside those five buckets must
+        # still be yielded. nn.Module._apply walks children(), which is this
+        # method, so a module omitted here is a module .to_empty() never
+        # materializes -- it stays on meta and dies at the first forward with
+        # "Cannot copy out of meta tensor". Llama has nothing outside the five;
+        # GPT-2 has wpe and OPT has embed_positions.
+        backbone, _ = _structure.find_backbone(self.model)
+        for holder in (backbone, self.model):
+            if holder is None:
+                continue
+            for child_name, child in holder.named_children():
+                if child is None or id(child) in seen:
+                    continue
+                seen.add(id(child))
+                yield child_name, child
 
     def __setattr__(self, name, value):
         # If a property with a setter exists for this name, use it.
