@@ -267,6 +267,12 @@ class HFTransformerModel(BaseModel):
             """Configure HuggingFace attention settings."""
             self._titan_injected_model_args["attn_implementation"] = attn_implementation
             self.attn_implementation = attn_implementation
+            # HF dispatches on the private field, not this one. Without this
+            # line, selecting an implementation after the Config is built is a
+            # silent no-op: the attribute reads back correctly while every
+            # attention layer keeps calling whatever was passed to
+            # PretrainedConfig.__init__.
+            self._attn_implementation = attn_implementation
             if attn_implementation == "flex_torchtitan":
                 AttentionInterface._global_mapping[
                     attn_implementation

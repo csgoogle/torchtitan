@@ -22,6 +22,9 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
+                                            #  before the backend builds its
+                                            #  flavor Configs at import time)
 from torchtitan.experiments.transformers_modeling_backend import model_registry
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
@@ -41,13 +44,19 @@ def _tpu_hf_config(
     seq_len: int = 2048,
     steps: int = 10,
     compile: bool = False,
+    attn: str = "sdpa",
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
   model_spec = model_registry(flavor)
   model_spec.parallelize_fn = parallelize_hf_transformers_tpu
-  # flex attention has no TPU lowering; sdpa is what the TPU lane's own models
-  # use, and it is what the splash-attention patch would later replace.
-  model_spec.model.attn_implementation = "sdpa"
+  # flex attention has no TPU lowering. "sdpa" is the portable default;
+  # "splash_tpu" routes attention through the TPU splash kernel via HF's
+  # AttentionInterface (see attention.py), which works for any architecture
+  # rather than only those whose modules the lane's patch can pattern-match.
+  # Go through _configure_hf_attention rather than setting the attribute:
+  # it also updates _titan_injected_model_args, which update_from_config
+  # re-applies afterwards and would otherwise overwrite a bare assignment.
+  model_spec.model._configure_hf_attention(attn)
 
   return TPUTransformersBackendConfig(
       hf_model=hf_model,
@@ -107,3 +116,13 @@ def hf_debugmodel_compile() -> TPUTransformersBackendConfig:
 def hf_full_compile() -> TPUTransformersBackendConfig:
   """`hf_full` with per-layer torch.compile on the TPU backend."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True)
+
+
+def hf_full_splash() -> TPUTransformersBackendConfig:
+  """`hf_full` with attention served by the TPU splash-attention kernel."""
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, attn="splash_tpu")
+
+
+def hf_full_splash_compile() -> TPUTransformersBackendConfig:
+  """Splash attention plus per-layer torch.compile."""
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True, attn="splash_tpu")
