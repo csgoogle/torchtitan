@@ -167,6 +167,10 @@ _TT_SPECIFIC_ATTRIBUTES = [
 class HFTransformerModel(BaseModel):
     # TODO(#ISSUE): Remove after fixing PP backward to skip non-tensor inputs.
     _skip_lm_head: bool = False
+    # When set, forward() returns (hidden_states, lm_head_weight.T) instead of
+    # logits so a fused projection+softmax+CE kernel can consume the pair. See
+    # the fused-loss branch in forward().
+    _fused_loss: bool = False
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseModel.Config, PretrainedConfig):
@@ -470,6 +474,8 @@ class HFTransformerModel(BaseModel):
             )
 
         self.model = model_cls(config=config)
+        # Carried from the Config: forward() reads it off the instance.
+        self._fused_loss = bool(getattr(config, "_fused_loss", False))
         self.max_seq_len = config.max_seq_len
         self.cp_mesh = None
 
@@ -790,13 +796,27 @@ class HFTransformerModel(BaseModel):
         # nest them as model.model / model.lm_head. Running the whole model and
         # taking its logits works for every HF causal LM; the split is kept only
         # for the pipeline-parallel case that needs the head detached.
-        if self._skip_lm_head:
+        if self._skip_lm_head or self._fused_loss:
             backbone, _ = _structure.find_backbone(self.model)
             if backbone is None:
                 raise AttributeError(
                     f"Cannot split the head off {type(self.model).__name__}"
                 )
-            return backbone(*args, **kwargs).last_hidden_state
+            hidden = backbone(*args, **kwargs).last_hidden_state
+            if not self._fused_loss:
+                return hidden
+            # Hand the loss the operands instead of the logits. Materializing
+            # them costs B*S*vocab: for Qwen3-0.6B that is 2048 x 151936 in
+            # bf16, ~622 MB a step, against 1.2 GB of weights -- the vocab
+            # projection dominates a model this small. A fused kernel does the
+            # projection, softmax and CE without ever writing that tensor.
+            head = self.lm_head
+            weight = getattr(head, "weight", None)
+            if weight is None:
+                raise AttributeError(
+                    f"fused loss needs a weight on {type(head).__name__}"
+                )
+            return hidden, weight.t()
 
         output = self.model(*args, **kwargs)
         return getattr(output, "logits", output)

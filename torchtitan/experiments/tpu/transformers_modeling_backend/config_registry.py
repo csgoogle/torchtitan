@@ -13,6 +13,7 @@ lane's existing ones.
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
@@ -45,6 +46,7 @@ def _tpu_hf_config(
     steps: int = 10,
     compile: bool = False,
     attn: str = "sdpa",
+    fused_loss: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
   model_spec = model_registry(flavor)
@@ -57,10 +59,15 @@ def _tpu_hf_config(
   # it also updates _titan_injected_model_args, which update_from_config
   # re-applies afterwards and would otherwise overwrite a bare assignment.
   model_spec.model._configure_hf_attention(attn)
+  # Route the vocab projection through the lane's fused Pallas CE: the model
+  # hands back (hidden, lm_head.weight.T) and the kernel fuses projection,
+  # softmax and cross entropy, so the B*S*vocab logits tensor is never built.
+  model_spec.model._fused_loss = fused_loss
 
   return TPUTransformersBackendConfig(
       hf_model=hf_model,
-      loss=CrossEntropyLoss.Config(),
+      loss=(PallasCrossEntropyLoss.Config() if fused_loss
+            else CrossEntropyLoss.Config()),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
       optimizer=default_adamw(lr=8e-4, implementation="foreach"),
@@ -126,3 +133,19 @@ def hf_full_splash() -> TPUTransformersBackendConfig:
 def hf_full_splash_compile() -> TPUTransformersBackendConfig:
   """Splash attention plus per-layer torch.compile."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True, attn="splash_tpu")
+
+
+def hf_full_fused() -> TPUTransformersBackendConfig:
+  """`hf_full` with the vocab projection fused into the Pallas CE kernel."""
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, fused_loss=True)
+
+
+def hf_full_fused_compile() -> TPUTransformersBackendConfig:
+  """Fused CE plus per-layer torch.compile."""
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True, fused_loss=True)
+
+
+def hf_full_max() -> TPUTransformersBackendConfig:
+  """Everything on: splash attention, fused CE, per-layer compile."""
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
+                        attn="splash_tpu", fused_loss=True)
