@@ -251,6 +251,53 @@ def test_paired_grouped_mm_validates_supported_configuration():
         experts.parallelize(ParallelDimsWithEp())
 
 
+def test_paired_grouped_mm_forwards_tgmm_tile_k():
+    """The K tile configured on the experts must reach the paired kernel.
+
+    Construction and the kernel's own tests each pass on their own if this
+    wiring is lost; only a forward with the kernel stubbed out can see the
+    keyword the experts actually hand over.
+    """
+    experts = TpuGroupedExperts.Config(
+        dim=16,
+        hidden_dim=24,
+        num_experts=2,
+        use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=True,
+        pallas_grouped_mm_tgmm_tiling=(128, 8, 0),
+        token_dispatcher=LocalTokenDispatcher.Config(num_experts=2, top_k=1),
+    ).build()
+    for param in experts.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    x = torch.randn(7, 16)
+    counts = torch.tensor([3, 4], dtype=torch.int32)
+
+    def grouped_mm(x, weight, counts, **kwargs):
+        del kwargs
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        return torch._grouped_mm(x, weight, offs=offsets)
+
+    def paired_grouped_mm(x, w1, w3, counts, **kwargs):
+        del kwargs
+        return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
+
+    with patch(
+        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
+        side_effect=grouped_mm,
+    ) as unpaired, patch(
+        "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
+        side_effect=paired_grouped_mm,
+    ) as paired:
+        experts._experts_forward(x, counts)
+
+    paired.assert_called_once()
+    assert paired.call_args.kwargs["tgmm_tile_m"] == 128
+    assert paired.call_args.kwargs["tgmm_tile_k"] == 8
+    # The down projection stays on the unpaired kernel and gets the full tuple.
+    unpaired.assert_called_once()
+    assert unpaired.call_args.kwargs["tgmm_tiling"] == (128, 8, 0)
+
+
 def test_kernel_native_layout_preserves_initialization_and_state_dict():
     param_init = {
         "w1_EFD": lambda x: torch.nn.init.normal_(x, std=0.02),
