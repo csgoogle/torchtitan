@@ -21,7 +21,8 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
   SparseCore collective offloading for FSDP, requested through the config's
   `--libtpu-init-flags` and exported before PJRT initialization.
 - **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--tpu_config.compile_optimizer` and `--tpu_config.optimizer_in_graph`.
-- **Splash Attention**: Splash Attention block sizes are manually tuned to 1024 across the board for optimal tile sizing.
+- **Splash Attention**: Q/K/V layouts and backward tiles are tuned for this
+  model and topology.
 
 ## Training Command
 
@@ -74,10 +75,24 @@ xpk workload create \
 
 ## Expected Metrics
 
-With this configuration, you should observe the following metrics around step 30 (as of 9/8/2026):
+With this configuration, you should observe the following metrics around step 30 (as of 9/16/2026):
 
-- **TPS (Tokens per second)**: ~12,199
-- **TFLOPS**: ~576.03
-- **MFU**: ~49.94%
-- **Step Time (time_end_to_end)**: ~1.01s
-- **Memory**: 76.34GiB (79.53%)
+- **TPS (Tokens per second)**: ~12,389
+- **TFLOPS**: ~585.01
+- **MFU**: ~50.72%
+- **Step Time (time_end_to_end)**: ~0.992s
+- **Physical peak HBM (XProf)**: 86.81GiB
+
+## Alternative configurations
+
+The Qwen3 TPU module also provides two tuned 8B configurations. Both use the
+same model, batch shape, optimizer, and attention implementation as
+`qwen3_8b`.
+
+| Configuration | Purpose | Main differences from `qwen3_8b` |
+|---|---|---|
+| `qwen3_8b_zero3` | Memory-oriented configuration | ZeRO-3, full rematerialization, interleaved FSDP scheduling, and tuned Splash policy |
+| `qwen3_8b_maxtext_parity` | MaxText policy comparison | Tuned ZeRO-3 plus BF16 FSDP reductions and BF16 RoPE; scan remains disabled |
+
+Keep canonical FP32-reduction results separate from MaxText-policy results.
+The latter deliberately changes reduction precision and RoPE arithmetic.

@@ -60,6 +60,8 @@ from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
 )
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
+    qwen3_8b_maxtext_parity,
+    qwen3_8b_zero3,
     qwen3_moe_30b,
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
@@ -362,11 +364,19 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_8b()
 
     self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
+    self.assertTrue(config.parallelism.enable_tpu_topo_mesh)
     self.assertEqual(
         config.tpu_config.graph_trainer_memory_policy,
         "default",
     )
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "never")
+    splash = config.splash_attention_kernel
+    self.assertEqual(splash.sa_q_layout, "SEQ_MINOR")
+    self.assertEqual(splash.sa_k_layout, "SEQ_MINOR")
+    self.assertEqual(splash.sa_v_layout, "HEAD_DIM_MINOR")
+    self.assertEqual(splash.sa_block_kv_compute, 512)
+    self.assertEqual(splash.sa_block_q_dkv, 2048)
+    self.assertEqual(splash.sa_block_kv_dkv, 2048)
 
     graph_config = to_tpu_graph_trainer_config(
         config,
@@ -375,6 +385,78 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
     self.assertIsInstance(graph_config.loss, PallasCrossEntropyLoss.Config)
     self.assertEqual(graph_config.compile.memory_policy, "default")
+
+  def test_qwen3_8b_zero3_recipe_uses_whole_graph_fsdp_schedule(self) -> None:
+    config = qwen3_8b_zero3()
+
+    self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
+    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
+    self.assertTrue(config.tpu_config.enable_graph_trainer_remat_schedule)
+    self.assertEqual(config.tpu_config.graph_trainer_fsdp_schedule, "interleave")
+    self.assertTrue(config.tpu_config.optimizer_in_graph)
+    self.assertFalse(config.tpu_config.use_graph_split)
+    self.assertTrue(config.splash_attention_kernel.use_vmap_bwd)
+    self.assertFalse(
+        config.splash_attention_kernel.sa_use_document_aware_block_skipping
+    )
+
+  def test_unprotected_graph_trainer_zero3_is_rejected(self) -> None:
+    config = qwen3_8b()
+    config.parallelism.fsdp_reshard_after_forward = "always"
+
+    with self.assertRaisesRegex(ValueError, "GraphTrainer ZeRO-3 requires"):
+      self._qwen3_graph_config(config)
+
+  @parameterized.named_parameters(
+      ("fsdp_barriers", False, False, "prefetch"),
+      ("graph_split", True, False, "none"),
+      ("scan", False, True, "none"),
+  )
+  def test_graph_trainer_zero3_accepts_lifetime_boundary(
+      self,
+      use_graph_split: bool,
+      use_scan_layers: bool,
+      fsdp_schedule: str,
+  ) -> None:
+    config = qwen3_8b()
+    config.parallelism.fsdp_reshard_after_forward = "always"
+    config.tpu_config.use_graph_split = use_graph_split
+    config.tpu_config.use_scan_layers = use_scan_layers
+    config.tpu_config.graph_trainer_fsdp_schedule = fsdp_schedule
+
+    self._qwen3_graph_config(config)
+
+  def test_qwen3_8b_maxtext_parity_recipe(self) -> None:
+    config = qwen3_8b_maxtext_parity()
+
+    self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
+    self.assertEqual(config.training.mixed_precision_reduce, "bfloat16")
+    self.assertFalse(config.tpu_config.use_scan_layers)
+    self.assertIn(
+        "torchtitan.experiments.tpu.overrides.bf16_rope",
+        config.override.imports,
+    )
+    splash = config.splash_attention_kernel
+    self.assertTrue(splash.use_vmap_bwd)
+    self.assertFalse(splash.sa_use_document_aware_block_skipping)
+    self.assertEqual(splash.sa_q_layout, "SEQ_MINOR")
+    self.assertEqual(splash.sa_k_layout, "SEQ_MINOR")
+    self.assertEqual(splash.sa_v_layout, "HEAD_DIM_MINOR")
+    self.assertEqual(splash.sa_block_kv_compute, 512)
+    self.assertEqual(splash.sa_block_q_dkv, 2048)
+    self.assertEqual(splash.sa_block_kv_dkv, 2048)
+
+    graph_config = self._qwen3_graph_config(config)
+    apply_overrides(graph_config.override, graph_config)
+    assert graph_config.model_spec is not None
+    ropes = [layer.attention.rope for layer in graph_config.model_spec.model.layers]
+    self.assertTrue(ropes)
+    self.assertTrue(
+        all(
+            isinstance(rope, TpuActivationDtypeCosSinRoPE.Config)
+            for rope in ropes
+        )
+    )
 
   def test_fsdp_only_recipe_uses_fused_adamw_and_attention_tuning(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
