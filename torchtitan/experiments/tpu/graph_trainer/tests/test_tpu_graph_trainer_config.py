@@ -484,16 +484,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           target_cls=TpuGraphTrainer.Config,
       )
 
-  def test_fsdp_allreduce_slice_requires_fp32_reductions(self) -> None:
+  def test_fsdp_allreduce_slice_allows_bf16_reductions(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
     config.training.mixed_precision_reduce = "bfloat16"
 
-    with self.assertRaisesRegex(ValueError, "FP32 FSDP reductions"):
-      to_tpu_graph_trainer_config(
-          config,
-          qwen3_gt.model_registry,
-          target_cls=TpuGraphTrainer.Config,
-      )
+    to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
 
   def test_attention_parity_recipe_adds_bf16_rope(self) -> None:
     config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()

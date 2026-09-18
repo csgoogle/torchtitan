@@ -52,10 +52,6 @@ def _validate_fsdp_allreduce_slice(
         "fsdp all-reduce-plus-slice currently requires full-world FSDP "
         "with DP-replicate/TP/CP/PP/EP degrees all equal to 1"
     )
-  if train_config.training.mixed_precision_reduce != "float32":
-    raise ValueError(
-        "fsdp all-reduce-plus-slice currently requires FP32 FSDP reductions"
-    )
 
 
 def to_tpu_graph_trainer_config(

@@ -79,7 +79,9 @@ class TestReduceScatterAllReduce(unittest.TestCase):
             max_input_bytes=_MAX_INPUT_BYTES,
         )
 
-        targets = [node.target for node in gm.graph.nodes if node.op == "call_function"]
+        targets = [
+            node.target for node in gm.graph.nodes if node.op == "call_function"
+        ]
         self.assertNotIn(
             torch.ops._c10d_functional.reduce_scatter_tensor.default, targets
         )
@@ -152,19 +154,27 @@ class TestReduceScatterAllReduce(unittest.TestCase):
 
     @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torch.distributed.get_world_size", return_value=128)
-    def test_selected_bf16_gradient_errors_without_mutating_graph(self, *_):
+    @mock.patch(
+        "torch.distributed.distributed_c10d._resolve_process_group",
+        return_value=mock.sentinel.process_group,
+    )
+    def test_rewrites_selected_bf16_gradient(self, *_):
         gm = self._make_graph((5120, 2048), dtype=torch.bfloat16)
-        before = str(gm.graph)
 
-        with self.assertRaisesRegex(ValueError, "expected FP32"):
-            apply_selected_reduce_scatter_allreduce_pass(
-                gm,
-                (),
-                parameter_patterns=(_QKV_PATTERN,),
-                max_input_bytes=_MAX_INPUT_BYTES,
-            )
+        apply_selected_reduce_scatter_allreduce_pass(
+            gm,
+            (),
+            parameter_patterns=(_QKV_PATTERN,),
+            max_input_bytes=_MAX_INPUT_BYTES,
+        )
 
-        self.assertEqual(str(gm.graph), before)
+        targets = [node.target for node in gm.graph.nodes if node.op == "call_function"]
+        self.assertNotIn(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default, targets
+        )
+        self.assertEqual(
+            targets.count(torch.ops._c10d_functional.all_reduce.default), 1
+        )
 
     @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torch.distributed.get_world_size", return_value=128)
@@ -174,7 +184,7 @@ class TestReduceScatterAllReduce(unittest.TestCase):
         )
         before = str(gm.graph)
 
-        with self.assertRaisesRegex(ValueError, "expected FP32"):
+        with self.assertRaisesRegex(ValueError, "matching FP32 or BF16"):
             apply_selected_reduce_scatter_allreduce_pass(
                 gm,
                 (),
