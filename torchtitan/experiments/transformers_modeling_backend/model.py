@@ -157,20 +157,24 @@ _REMOTE_CONFIG_DENYLIST = frozenset({"deepseek_v2", "deepseek_v3"})
 
 
 def _get_moe_attr_name(layer: nn.Module) -> str | None:
-    """Return the attribute name holding the MoE block on a decoder layer.
+    """The attribute holding this layer's MoE block, or None if it has none.
 
-    Models use ``mlp``.  Returns ``None`` if not present.
+    Models differ: most use ``mlp``, Mixtral and GraniteMoe use
+    ``block_sparse_moe``. Fall back to whichever child module looks like a MoE
+    block rather than enumerating every family -- the caller only needs the
+    attribute found; the probe that follows reads the geometry off the module.
     """
-    return "mlp" if hasattr(layer, "mlp") else None
+    if hasattr(layer, "mlp"):
+        return "mlp"
+    for name in ("block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
+        if hasattr(layer, name):
+            return name
+    for name, child in layer.named_children():
+        cls = type(child).__name__.lower()
+        if "moe" in cls or "sparse" in cls or "experts" in cls:
+            return name
+    return None
 
-
-# The backend routes attention through flex. The custom impl name is registered
-# in the HF ``AttentionInterface`` (see
-# ``_configure_hf_attention``) and set on ``config._attn_implementation`` so HF
-# routes attention through ``_flex_attention_torchtitan`` -- bypassing HF's
-# per-model ``_supports_flex_attn`` gate. A causal or document/packing BlockMask
-# is applied via the titan-built mask (is_causal alone cannot express
-# cross-sample masking); see ``get_attention_masks``.
 def _derive_dim(config, field: str, default: int = 1) -> int:
     """Read a structural size the top-level config does not state."""
     for name in ("text_config", "vision_config", "audio_config"):
@@ -461,11 +465,34 @@ class HFTransformerModel(BaseModel):
                 config_dict.get("model_type", "") not in _REMOTE_CONFIG_DENYLIST
             )
             # Load HF config (overwrites our HF attributes)
+            # is_moe was decided from the *flavor* in __init__, before
+            # --hf-model had been applied, so a MoE checkpoint selected on the
+            # command line arrived with a dense flavor and the MoE replacement
+            # never ran. hf_model_id is final here: ask the checkpoint.
             hf_model_config = AutoConfig.from_pretrained(
                 hf_model_id,
                 attn_implementation=self.attn_implementation,
                 trust_remote_code=trust_remote_code,
             )
+
+            if not getattr(self, "is_moe", False):
+                for _attr in ("num_experts", "n_routed_experts", "num_local_experts"):
+                    for _holder in (
+                        hf_model_config,
+                        getattr(hf_model_config, "text_config", None),
+                    ):
+                        _v = getattr(_holder, _attr, None) if _holder is not None else None
+                        if isinstance(_v, int) and _v > 1:
+                            logger.warning(
+                                f"{hf_model_id} declares {_v} experts but the "
+                                "selected flavor is dense, so the MoE replacement "
+                                "will not run and HF's own MoE executes unreplaced. "
+                                "Select a *_moe config for this model."
+                            )
+                            break
+                    else:
+                        continue
+                    break
 
             # For composite (VL) models, use the nested text config so we
             # build the text-only CausalLM instead of the conditional model.
