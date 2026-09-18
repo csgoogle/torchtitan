@@ -512,9 +512,29 @@ class HFTransformerModel(BaseModel):
             except Exception as e:
                 logger.warning(f"Could not size the position table: {e}")
 
-        self.model = model_cls(config=config)
+        try:
+            self.model = model_cls(config=config)
+        except ValueError as e:
+            # Older architectures (Electra, the T5 family) implement only the
+            # eager attention path and reject anything else outright, before
+            # AttentionInterface gets a say. Fall back rather than lose the
+            # model: eager attention is slower, not wrong.
+            if "attention implementation" not in str(e):
+                raise
+            logger.warning(
+                f"{model_class_name} does not support "
+                f"attn_implementation={getattr(config, '_attn_implementation', None)!r}; "
+                "falling back to eager."
+            )
+            config._attn_implementation = "eager"
+            config.attn_implementation = "eager"
+            self.model = model_cls(config=config)
         # Resolved once: forward() compares an int, so it stays traceable.
         self._position_capacity = _structure.position_capacity(self.model)
+        # T5 positions with relative bias and DistilBERT with its own
+        # embedding, so neither takes position_ids; passing it is a TypeError
+        # rather than something they ignore. Ask the signature once.
+        self._forward_kwargs = _structure.accepted_kwargs(self.model.forward)
 
         # A bare encoder -- sentence-transformers ships MiniLM as a plain
         # BertModel -- has no output projection at all, so there is nothing to
@@ -525,6 +545,19 @@ class HFTransformerModel(BaseModel):
         # model's own head.
         self._added_lm_head = None
         _head, _ = _structure.find_head(self.model)
+        # A classification head is not an output projection: it maps the
+        # backbone to num_labels, not to the vocabulary, so the token
+        # objective cannot be computed from it. Treat it as absent and
+        # measure the backbone with a head that produces token logits.
+        _head_out = _structure.head_out_features(_head)
+        _vocab = getattr(config, "vocab_size", None)
+        if _head is not None and _head_out is not None and _vocab and _head_out != _vocab:
+            logger.info(
+                f"{type(self.model).__name__}'s head maps to {_head_out} labels, "
+                f"not the {_vocab}-token vocabulary; attaching an lm_head and "
+                "training the backbone on a token objective instead."
+            )
+            _head = None
         if _head is None:
             _emb, _ = _structure.find_embedding(self.model)
             if isinstance(_emb, nn.Embedding):
@@ -884,6 +917,17 @@ class HFTransformerModel(BaseModel):
         if attention_masks is not None:
             kwargs["attention_mask"] = attention_masks
 
+        if self._forward_kwargs is not None:
+            dropped = [k for k in kwargs if k not in self._forward_kwargs]
+            for k in dropped:
+                kwargs.pop(k)
+
+        # An encoder-decoder (T5, BART, Marian, mBART) will not run without
+        # something to feed its decoder. Teacher-force the same sequence, which
+        # is the token objective the rest of this lane trains on.
+        if getattr(self.model.config, "is_encoder_decoder", False):
+            kwargs.setdefault("decoder_input_ids", args[0])
+
         # Calling the backbone and head separately only works for models that
         # nest them as model.model / model.lm_head. Running the whole model and
         # taking its logits works for every HF causal LM; the split is kept only
@@ -910,16 +954,26 @@ class HFTransformerModel(BaseModel):
                 )
             return hidden, weight.t()
 
-        output = self.model(*args, **kwargs)
-        logits = getattr(output, "logits", None)
-        if logits is not None:
-            return logits
-        # A bare encoder returns hidden states and no logits; project them
-        # through the head attached in __init__.
-        hidden = getattr(output, "last_hidden_state", None)
-        if hidden is not None and self._added_lm_head is not None:
+        if self._added_lm_head is not None:
+            # Either the architecture has no output projection, or the one it
+            # has maps to labels rather than to the vocabulary. Ask for hidden
+            # states and produce token logits from them; whatever task head
+            # the model carries is left to run and ignored.
+            kwargs["output_hidden_states"] = True
+            output = self.model(*args, **kwargs)
+            hidden = getattr(output, "last_hidden_state", None)
+            if hidden is None:
+                states = getattr(output, "hidden_states", None)
+                hidden = states[-1] if states else None
+            if hidden is None:
+                raise AttributeError(
+                    f"{type(self.model).__name__} returned neither hidden "
+                    "states nor logits to train on"
+                )
             return self._added_lm_head(hidden)
-        return output
+
+        output = self.model(*args, **kwargs)
+        return getattr(output, "logits", output)
 
     def to_empty(self, *, device, recurse: bool = True):
         """Materialize parameters, but keep buffer values.

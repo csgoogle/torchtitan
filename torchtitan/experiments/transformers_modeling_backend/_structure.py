@@ -244,3 +244,44 @@ def position_capacity(root):
     if getattr(pos, "padding_idx", None) is not None:
         reserved = max(reserved, pos.padding_idx + 1)
     return pos.num_embeddings - reserved
+
+
+def head_out_features(head):
+    """How many classes the head projects to, or None if it cannot be read.
+
+    A head is not always a Linear: RoBERTa wraps dense + out_proj in a
+    RobertaClassificationHead, so the width lives on the last Linear inside
+    it rather than on the module itself.
+    """
+    if head is None:
+        return None
+    direct = getattr(head, "out_features", None)
+    if direct is not None:
+        return direct
+    last = None
+    for mod in head.modules():
+        if isinstance(mod, nn.Linear):
+            last = mod
+    return last.out_features if last is not None else None
+
+
+def accepted_kwargs(fn):
+    """The keyword names a forward accepts, or None if it takes **kwargs.
+
+    None means 'pass everything' -- a forward with **kwargs swallows what it
+    does not use, so filtering against it would drop valid arguments.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return None
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return None
+    return {
+        name
+        for name, p in params.items()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
