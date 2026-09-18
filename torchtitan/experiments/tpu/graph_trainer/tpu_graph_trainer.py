@@ -7,25 +7,24 @@
 """TpuGraphTrainer subclass for TPU with optional optimizer compilation.
 
 Note there are 2 ways of compiling the optimizer graph on TPU:
-1. Together with fwd+bwd+loss (when TpuGraphTrainer is used and
-   optimizer_in_graph=True): TpuGraphTrainer directly traces the fused step,
+1. Together with fwd+bwd+loss (when ``optimizer_compile='in_graph'``):
+   TpuGraphTrainer directly traces the fused step,
    accessing the functional AdamW math and state buffer helpers from
    `torchtitan.experiments.tpu.compiled_optimizers.functional`.
-2. As a separate graph (when TpuGraphTrainer with optimizer_in_graph=False,
-   or Regular Trainer with compiled optimizer): `apply_compiled_optimizer` from
-   `torchtitan.experiments.tpu.compiled_optimizers.separate_graph` handles
-   DTensor subclass wrapping/unwrapping and compiles `optimizer.step()` as a
-   standalone graph, reusing the same functional AdamW math.
+2. As a separate graph (when ``optimizer_compile='separate_graph'`` on either
+   TPU trainer): `apply_compiled_optimizer` handles DTensor subclass
+   wrapping/unwrapping and compiles `optimizer.step()` as a standalone graph,
+   reusing the same functional AdamW math.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 import logging
 import os
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -35,18 +34,19 @@ from torchtitan.components.optimizer import (
     collect_moe_routing_metric_tensors,
     set_moe_routing_metric_tensors,
 )
+from torchtitan.experiments.graph_trainer.configs import to_graph_trainer_config
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
     apply_compiled_optimizer,
 )
 from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
-from torchtitan.experiments.tpu.graph_trainer.graph_split import (
-    GraphSplitter,
-)
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
     apply_tpu_graph_trainer_model_transforms,
+)
+from torchtitan.experiments.tpu.graph_trainer.graph_split import (
+    GraphSplitter,
 )
 from torchtitan.experiments.tpu.graph_trainer.mfu_benchmark import MfuBenchmark
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
@@ -55,6 +55,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     register as register_tpu_pipeline,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.logging import logger
 
 
@@ -71,12 +72,13 @@ class TpuGraphTrainer(GraphTrainer):
        - Lowers joint fwd+loss+bwd trace applying PASS_PIPELINE_REGISTRY["tpu"] graph passes.
     3. train_step and forward_backward_step (Overridden conditionally):
        - Delegates to super() when standard tracing is used.
-       - Branches to _train_step_optimizer_in_graph / _fwd_bwd_adamw_step when optimizer_in_graph=True.
+       - Uses the fused optimizer path when optimizer_compile='in_graph'.
 
     New TPU/PJRT Methods:
     - _compiled_optimizer_step: Executes compiled_optimizer groups across meshes.
-    - _register_optimizer_buffers: Registers persistent optstate buffers for optimizer_in_graph.
-    - _train_step_optimizer_in_graph and _fwd_bwd_adamw_step: Joint fwd+loss+bwd+opt execution loop.
+    - _register_optimizer_buffers: Registers persistent in-graph optstate buffers.
+    - _train_step_optimizer_in_graph and _fwd_bwd_adamw_step: Joint
+      fwd+loss+bwd+opt execution loop.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -84,6 +86,27 @@ class TpuGraphTrainer(GraphTrainer):
         compile: TpuGraphTrainerCompileConfig = field(
             default_factory=TpuGraphTrainerCompileConfig
         )
+
+        @classmethod
+        def from_tpu_trainer_config(
+            cls,
+            base_config: TPUTrainerConfig,
+            model_registry: Callable[[str], ModelSpec],
+        ) -> TpuGraphTrainer.Config:
+            """Convert a TPU recipe to the final GraphTrainer config type.
+
+            The upstream converter copies shared job fields, replaces the model
+            spec, and deliberately drops the regular Trainer compile config so
+            this class supplies its GraphTrainer-specific default.
+            """
+            return cast(
+                TpuGraphTrainer.Config,
+                to_graph_trainer_config(
+                    base_config,
+                    model_registry,
+                    target_cls=cls,
+                ),
+            )
 
     def __init__(self, config: Config) -> None:
         """Override of GraphTrainer.__init__ adding TPU pipeline registration, Pallas loss, and opt-in-graph setup."""
@@ -122,11 +145,13 @@ class TpuGraphTrainer(GraphTrainer):
             for group in opt.param_groups:
                 group["capturable"] = True
 
-        self._optimizer_in_graph = config.compile.optimizer_in_graph
+        self._optimizer_in_graph = (
+            config.compile.optimizer_compile == "in_graph"
+        )
         if self._optimizer_in_graph and config.compile.compile_grad_norm:
             raise ValueError(
                 "compile.compile_grad_norm cannot be combined with "
-                "compile.optimizer_in_graph"
+                "compile.optimizer_compile='in_graph'"
             )
         self._compiled_grad_norm = (
             CompiledGradNorm() if config.compile.compile_grad_norm else None
@@ -139,14 +164,14 @@ class TpuGraphTrainer(GraphTrainer):
         if self._optimizer_in_graph:
             self._opt_state_registered = False
 
-        self._optimizer_compile = (
-            config.compile.compile_optimizer and not self._optimizer_in_graph
+        self._optimizer_separate_graph = (
+            config.compile.optimizer_compile == "separate_graph"
         )
         self._graph_splitter = GraphSplitter.from_trainer_config(
             config,
             optimizer_in_graph=self._optimizer_in_graph,
         )
-        if self._optimizer_compile:
+        if self._optimizer_separate_graph:
             apply_compiled_optimizer(self)
 
         self._mfu_benchmark = None
@@ -160,7 +185,7 @@ class TpuGraphTrainer(GraphTrainer):
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> None:
-        """Override of GraphTrainer.train_step to branch into optimizer_in_graph loop when enabled."""
+        """Run the in-graph optimizer loop when that execution mode is selected."""
         if not self._optimizer_in_graph:
             super().train_step(data_iterator)
         else:
@@ -169,11 +194,11 @@ class TpuGraphTrainer(GraphTrainer):
             self._mfu_benchmark.record(self.step, self.ntokens_seen)
 
     def _register_optimizer_buffers(self) -> None:
-        """TPU/PJRT addition: registers persistent optstate buffers when optimizer_in_graph is enabled."""
+        """Register persistent optstate buffers for the in-graph optimizer."""
         if self._opt_state_registered:
             return
         assert len(self.model_parts) == 1, (
-            "optimizer_in_graph supports exactly one model part."
+            "optimizer_compile='in_graph' supports exactly one model part."
         )
         model = self.model_parts[0]
         seen_ids: dict[int, str] = {}
@@ -220,7 +245,7 @@ class TpuGraphTrainer(GraphTrainer):
         self,
         data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]],
     ) -> None:
-        """TPU/PJRT addition: runs joint fwd+loss+bwd+opt training loop when optimizer_in_graph is active."""
+        """Run the TPU/PJRT joint fwd+loss+bwd+optimizer training loop."""
         from torchtitan.components.loss import IGNORE_INDEX
         from torchtitan.distributed import utils as dist_utils
 
@@ -288,7 +313,7 @@ class TpuGraphTrainer(GraphTrainer):
         labels: torch.Tensor,
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Override of GraphTrainer.forward_backward_step to branch into AdamW step when optimizer_in_graph is set."""
+        """Include AdamW when the in-graph optimizer mode is selected."""
         if not self._optimizer_in_graph:
             return super().forward_backward_step(
                 input_dict=input_dict,

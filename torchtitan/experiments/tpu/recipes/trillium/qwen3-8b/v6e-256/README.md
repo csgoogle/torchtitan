@@ -75,7 +75,7 @@ xpk workload create \
     --splash_attention_kernel.sa_block_kv_dq=1024 \
     --loss_kernel.use_loss_kernel \
     --tpu_config.eager_mode=DEFER_AND_FUSE \
-    --compile.split_forward_backward \
+    --compile.materialize_forward_before_backward \
     --compile.mode=layer \
     --libtpu-init-flags='xla_tpu_use_enhanced_launch_barrier=false xla_tpu_scoped_vmem_limit_kib=65536'"
 ```

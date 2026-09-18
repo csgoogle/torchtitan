@@ -30,6 +30,10 @@ if TYPE_CHECKING:
 
 GraphTrainerFSDPBarrierPolicy = Literal["none", "prefetch", "interleave"]
 BackwardPartitionMode = Literal["none", "by_layer", "fsdp_pipeline"]
+# This extends TPUTrainer's optimizer_compile modes with joint-graph execution.
+TpuGraphTrainerOptimizerCompileMode = Literal[
+    "eager", "separate_graph", "in_graph"
+]
 TpuGraphTrainerMemoryPolicy = Literal[
     GraphTrainerMemoryPolicy, "full_and_offload", "full_and_scan_offload"
 ]
@@ -50,6 +54,10 @@ class GraphSplitterConfig:
   and one backward executable. ``backward_partition_mode='by_layer'`` or
   ``'fsdp_pipeline'`` additionally partitions backward, using
   ``backward_layers_per_executable`` as the grouping size.
+
+  The explicit ``enabled`` switch keeps all splitter options on one stable CLI
+  path. Making this config optional would instead require selecting a Tyro union
+  subcommand before setting any of its fields.
 
   Layerwise remat barriers may run before splitting and can still help inside
   a child containing multiple layers. ``fsdp_barrier_policy`` is rejected with
@@ -85,21 +93,14 @@ class GraphSplitterConfig:
 class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
   """Compilation and graph-transformation policy for TPU GraphTrainer."""
 
-  enable: bool = False
-  """Enable the upstream GraphTrainer compilation path.
-
-  This field is inherited from ``CompileConfig`` and repeated here to make the
-  public TPU surface explicit. ``mode`` selects JIT or joint-step AOT tracing.
-  """
   backend: str = "tpu"
   pass_pipeline: str = "tpu"
   memory_policy: TpuGraphTrainerMemoryPolicy = "default"
-  # Compile AdamW into its own FX graph, separate from the joint training graph.
-  compile_optimizer: bool = False
+  # Execute optimizer.step eagerly, in a separate compiled FX graph, or inside
+  # the joint forward/loss/backward graph.
+  optimizer_compile: TpuGraphTrainerOptimizerCompileMode = "eager"
   # Compile the DTensor-aware global gradient norm as a separate static graph.
   compile_grad_norm: bool = False
-  # Compile the optimizer step into the joint forward/loss/backward graph.
-  optimizer_in_graph: bool = False
   # Stack decoder-layer parameters and execute the layers with one scan.
   # Checkpoint keys remain per-layer; optimizer checkpoint names change.
   use_scan_layers: bool = False
@@ -171,15 +172,13 @@ def apply_tpu_graph_trainer_model_transforms(
   _validate_fsdp_allreduce_slice(config)
 
   compile_config = config.compile
-  if compile_config.optimizer_in_graph and compile_config.compile_optimizer:
-    raise ValueError(
-        "compile.compile_optimizer cannot be combined with "
-        "compile.optimizer_in_graph"
-    )
-  if compile_config.optimizer_in_graph and compile_config.compile_grad_norm:
+  if (
+      compile_config.optimizer_compile == "in_graph"
+      and compile_config.compile_grad_norm
+  ):
     raise ValueError(
         "compile.compile_grad_norm cannot be combined with "
-        "compile.optimizer_in_graph"
+        "compile.optimizer_compile='in_graph'"
     )
   if compile_config.fsdp_barrier_policy != "none" and (
       compile_config.memory_policy in (None, "none")
@@ -246,5 +245,6 @@ __all__ = [
     "GraphTrainerFSDPBarrierPolicy",
     "TpuGraphTrainerCompileConfig",
     "TpuGraphTrainerMemoryPolicy",
+    "TpuGraphTrainerOptimizerCompileMode",
     "apply_tpu_graph_trainer_model_transforms",
 ]

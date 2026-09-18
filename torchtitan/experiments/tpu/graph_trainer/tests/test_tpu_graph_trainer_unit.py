@@ -16,9 +16,6 @@ from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_parameter_gradient_markers_pass,
 )
 from torchtitan.experiments.tpu.graph_trainer import mfu_benchmark
-from torchtitan.experiments.tpu.graph_trainer.recipe import (
-    to_tpu_graph_trainer_config,
-)
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as tpu_graph_trainer_model_registry,
 )
@@ -109,16 +106,16 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
         ]),
     )
 
-  def test_to_graph_trainer_config_target_cls(self) -> None:
-    """The TPU recipe helper binds the final TpuGraphTrainer config type."""
-    gt_cfg = to_tpu_graph_trainer_config(
+  def test_from_tpu_trainer_config_target_cls(self) -> None:
+    """The classmethod binds the final TpuGraphTrainer config type."""
+    gt_cfg = tpu_graph_trainer.TpuGraphTrainer.Config.from_tpu_trainer_config(
         self.config,
         tpu_graph_trainer_model_registry,
     )
     self.assertIsInstance(
         gt_cfg,
         tpu_graph_trainer.TpuGraphTrainer.Config,
-        "to_tpu_graph_trainer_config must produce TpuGraphTrainer.Config.",
+        "from_tpu_trainer_config must produce TpuGraphTrainer.Config.",
     )
     assert self.config.model_spec is not None
     assert gt_cfg.model_spec is not None

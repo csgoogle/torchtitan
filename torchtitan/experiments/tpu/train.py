@@ -34,7 +34,7 @@ class TPUTrainer(torchtitan.train.Trainer):
 
   Adds the following optional behaviors controlled by ``compile`` policy:
 
-  compile.split_forward_backward:
+  compile.materialize_forward_before_backward:
     Inserts a `synchronize(loss, wait=False)` call between the forward+loss
     computation and the backward pass. This splits the monolithic XLA
     computation graph into two smaller graphs (forward and backward),
@@ -61,7 +61,7 @@ class TPUTrainer(torchtitan.train.Trainer):
       self._compiled_grad_norm = (
           CompiledGradNorm() if job_config.compile.compile_grad_norm else None
       )
-      if job_config.compile.compile_optimizer:
+      if job_config.compile.optimizer_compile == "separate_graph":
         from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import apply_compiled_optimizer  # pylint: disable=g-import-not-at-top
         apply_compiled_optimizer(self)
 
@@ -82,12 +82,12 @@ class TPUTrainer(torchtitan.train.Trainer):
       global_valid_tokens: float,
   ) -> torch.Tensor:
     config = self.config
-    split_forward_backward = (
+    materialize_forward_before_backward = (
         isinstance(config, tpu_job_config_module.TPUTrainerConfig)
-        and config.compile.split_forward_backward
+        and config.compile.materialize_forward_before_backward
         and not self.parallel_dims.pp_enabled
     )
-    if not split_forward_backward:
+    if not materialize_forward_before_backward:
       return super().forward_backward_step(
           input_dict=input_dict,
           labels=labels,

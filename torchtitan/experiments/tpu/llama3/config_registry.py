@@ -28,9 +28,6 @@ from torchtitan.experiments.graph_trainer.llama3 import (
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
 )
-from torchtitan.experiments.tpu.graph_trainer.recipe import (
-    to_tpu_graph_trainer_config,
-)
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
@@ -61,7 +58,7 @@ def _on_scan_lane(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
   Offload is not optional above 8B: without it the scan bodies keep every
   layer's input live and 405B does not compile.
   """
-  graph_config = to_tpu_graph_trainer_config(
+  graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       config, graph_trainer_model_registry
   )
   graph_config.compile = TpuGraphTrainerCompileConfig(
@@ -118,7 +115,7 @@ def llama3_debugmodel() -> TPUTrainerConfig:
 
 def graph_trainer_llama3_debugmodel() -> TpuGraphTrainer.Config:
   """Llama3 debug model using TPU GraphTrainer."""
-  config = to_tpu_graph_trainer_config(
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       llama3_debugmodel(), graph_trainer_model_registry
   )
   config.compile = TpuGraphTrainerCompileConfig(enable=True)

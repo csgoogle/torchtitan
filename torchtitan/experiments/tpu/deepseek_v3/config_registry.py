@@ -21,9 +21,6 @@ from torchtitan.experiments.graph_trainer.deepseek_v3 import (
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
 )
-from torchtitan.experiments.tpu.graph_trainer.recipe import (
-    to_tpu_graph_trainer_config,
-)
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
@@ -64,7 +61,7 @@ def deepseek_v3_debugmodel() -> TPUTrainerConfig:
 
 def graph_trainer_deepseek_v3_debugmodel() -> TpuGraphTrainer.Config:
   """DeepSeek-v3 debug model using TPU GraphTrainer."""
-  config = to_tpu_graph_trainer_config(
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       deepseek_v3_debugmodel(), graph_trainer_model_registry
   )
   config.compile = TpuGraphTrainerCompileConfig(enable=True)

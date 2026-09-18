@@ -27,9 +27,6 @@ from torchtitan.experiments.tpu.grouped_experts import (
 from torchtitan.experiments.tpu.graph_trainer.config import (
     TpuGraphTrainerCompileConfig,
 )
-from torchtitan.experiments.tpu.graph_trainer.recipe import (
-    to_tpu_graph_trainer_config,
-)
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
@@ -156,7 +153,7 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
 
 def graph_trainer_qwen3_debugmodel() -> TpuGraphTrainer.Config:
   """Qwen3 debug model using TPU GraphTrainer."""
-  config = to_tpu_graph_trainer_config(
+  config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       qwen3_debugmodel(), graph_trainer_model_registry
   )
   config.compile = TpuGraphTrainerCompileConfig(enable=True)
@@ -234,7 +231,7 @@ def qwen3_1_7b() -> TPUTrainerConfig:
           enable=True,
           backend="tpu",
           components=["model"],
-          split_forward_backward=True,
+          materialize_forward_before_backward=True,
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
@@ -309,7 +306,7 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
           enable=True,
           backend="tpu",
           components=["model"],
-          split_forward_backward=True,
+          materialize_forward_before_backward=True,
           compile_grad_norm=True,
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
@@ -409,13 +406,13 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
       ),
   )
   _enable_pallas_cross_entropy(config)
-  graph_config = to_tpu_graph_trainer_config(
+  graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       config, graph_trainer_model_registry
   )
   graph_config.compile = TpuGraphTrainerCompileConfig(
       enable=True,
       memory_policy="default",
-      optimizer_in_graph=True,
+      optimizer_compile="in_graph",
   )
   return graph_config
 
@@ -483,7 +480,7 @@ def qwen3_moe_30b() -> TpuGraphTrainer.Config:
   )
   cfg.loss_kernel = LossKernelConfig(use_loss_kernel=False)
   cfg.validator = Validator.Config(enable=False)
-  graph_config = to_tpu_graph_trainer_config(
+  graph_config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       cfg, graph_trainer_model_registry
   )
   graph_config.compile = TpuGraphTrainerCompileConfig(
@@ -658,8 +655,7 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
   # barriers add to a multi-layer graph, so do not add redundant dependencies.
   cfg.compile.enable_remat_barriers = False
   cfg.compile.fsdp_barrier_policy = "none"
-  cfg.compile.compile_optimizer = False
-  cfg.compile.optimizer_in_graph = False
+  cfg.compile.optimizer_compile = "eager"
   cfg.hf_assets_path = "./assets/hf/Qwen3-235B-A22B"
   cfg.metrics.log_freq = 1
   return cfg

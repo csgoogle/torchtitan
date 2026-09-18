@@ -308,7 +308,8 @@ class GraphSplitter:
     # state reads, mutations, and parameter updates as backward.
     if enabled and optimizer_in_graph:
       raise ValueError(
-          "TPU GraphTrainer graph split does not support optimizer_in_graph"
+          "TPU GraphTrainer graph split does not support "
+          "optimizer_compile='in_graph'"
       )
     # This artifact format stores one transformed FX graph. TorchTPU's XLA and
     # Tier-2 executable caches remain supported for every compiled child.

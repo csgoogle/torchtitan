@@ -84,8 +84,8 @@ class CompiledGradNormUnitTest(absltest.TestCase):
 
     config = qwen3_8b()
     config.compile.compile_grad_norm = True
-    config.compile.optimizer_in_graph = True
-    with self.assertRaisesRegex(ValueError, "optimizer_in_graph"):
+    config.compile.optimizer_compile = "in_graph"
+    with self.assertRaisesRegex(ValueError, "optimizer_compile='in_graph'"):
       apply_tpu_graph_trainer_model_transforms(config)
 
 

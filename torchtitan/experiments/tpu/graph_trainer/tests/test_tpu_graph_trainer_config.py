@@ -30,9 +30,6 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
-from torchtitan.experiments.tpu.graph_trainer.recipe import (
-    to_tpu_graph_trainer_config,
-)
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as tpu_qwen3_graph_registry,
 )
@@ -89,7 +86,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     graph_config = (
         config
         if isinstance(config, TpuGraphTrainer.Config)
-        else to_tpu_graph_trainer_config(config, tpu_qwen3_graph_registry)
+        else TpuGraphTrainer.Config.from_tpu_trainer_config(
+            config, tpu_qwen3_graph_registry
+        )
     )
     apply_tpu_graph_trainer_model_transforms(graph_config)
     return graph_config
@@ -194,13 +193,18 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     regular_config = reg_trainer_qwen3_8b()
     graph_config = qwen3_8b()
 
-    self.assertTrue(regular_config.compile.split_forward_backward)
+    self.assertTrue(
+        regular_config.compile.materialize_forward_before_backward
+    )
     self.assertTrue(regular_config.compile.compile_grad_norm)
-    self.assertTrue(graph_config.compile.optimizer_in_graph)
+    self.assertEqual(graph_config.compile.optimizer_compile, "in_graph")
+    self.assertTrue(graph_config.compile.enable)
     for name in (
         "compile_mode",
         "use_graph_split",
         "compile_optimizer",
+        "optimizer_compile",
+        "optimizer_in_graph",
         "compile_grad_norm",
     ):
       self.assertFalse(hasattr(regular_config.tpu_config, name))
@@ -211,33 +215,26 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         "--module=torchtitan.experiments.tpu.qwen3",
         "--config=reg_trainer_qwen3_8b",
         "--compile.mode=fullgraph",
-        "--compile.compile-optimizer",
+        "--compile.optimizer_compile=separate_graph",
         "--compile.no-compile-grad-norm",
-        "--compile.no-split-forward-backward",
+        "--compile.no-materialize-forward-before-backward",
     ])
 
     self.assertIsInstance(config.compile, TpuTrainerCompileConfig)
     self.assertEqual(config.compile.mode, "fullgraph")
-    self.assertTrue(config.compile.compile_optimizer)
+    self.assertEqual(config.compile.optimizer_compile, "separate_graph")
     self.assertFalse(config.compile.compile_grad_norm)
-    self.assertFalse(config.compile.split_forward_backward)
+    self.assertFalse(config.compile.materialize_forward_before_backward)
 
-  def test_graph_compile_optimizer_is_cli_addressable(self) -> None:
+  def test_graph_optimizer_compile_mode_is_cli_addressable(self) -> None:
     config = ConfigManager().parse_args([
         "--module=torchtitan.experiments.tpu.qwen3",
         "--config=graph_trainer_qwen3_debugmodel",
-        "--compile.compile-optimizer",
+        "--compile.optimizer_compile=separate_graph",
     ])
 
     self.assertIsInstance(config.compile, TpuGraphTrainerCompileConfig)
-    self.assertTrue(config.compile.compile_optimizer)
-
-  def test_graph_optimizer_compile_modes_are_mutually_exclusive(self) -> None:
-    config = qwen3_8b()
-    config.compile.compile_optimizer = True
-
-    with self.assertRaisesRegex(ValueError, "compile.optimizer_in_graph"):
-      apply_tpu_graph_trainer_model_transforms(config)
+    self.assertEqual(config.compile.optimizer_compile, "separate_graph")
 
   @parameterized.parameters("sac_and_offload", "full_and_offload")
   def test_scanning_rejects_generic_offload_policy(self, policy: str) -> None:
@@ -430,7 +427,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(config.compile.memory_policy, "full")
     self.assertTrue(config.compile.enable_remat_barriers)
     self.assertEqual(config.compile.fsdp_barrier_policy, "interleave")
-    self.assertTrue(config.compile.optimizer_in_graph)
+    self.assertEqual(config.compile.optimizer_compile, "in_graph")
     self.assertFalse(config.compile.graph_split.enabled)
     self.assertTrue(config.splash_attention_kernel.use_vmap_bwd)
     self.assertFalse(
@@ -800,7 +797,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     graph_config = (
         config
         if isinstance(config, TpuGraphTrainer.Config)
-        else to_tpu_graph_trainer_config(config, llama3_gt.model_registry)
+        else TpuGraphTrainer.Config.from_tpu_trainer_config(
+            config, llama3_gt.model_registry
+        )
     )
 
     self.assertIn(
@@ -829,7 +828,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     graph_config = (
         config
         if isinstance(config, TpuGraphTrainer.Config)
-        else to_tpu_graph_trainer_config(config, module.model_registry)
+        else TpuGraphTrainer.Config.from_tpu_trainer_config(
+            config, module.model_registry
+        )
     )
 
     self.assertIn(
@@ -902,12 +903,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     ):
       TpuGraphTrainer(graph_config)
 
-  def test_remat_barriers_support_optimizer_in_graph(self) -> None:
+  def test_remat_barriers_support_in_graph_optimizer(self) -> None:
     graph_config = qwen3_8b()
     graph_config.compile.enable_remat_barriers = True
     graph_config.compile.fsdp_barrier_policy = "interleave"
     graph_config.compile.fsdp_barrier_prefetch_distance = 2
-    graph_config.compile.optimizer_in_graph = True
+    graph_config.compile.optimizer_compile = "in_graph"
 
     passes = construct_tpu_pass_pipeline(
         typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),

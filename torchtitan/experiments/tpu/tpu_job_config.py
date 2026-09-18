@@ -33,6 +33,7 @@ class TPUConfig:
 
 
 TpuTrainerCompileMode = Literal["layer", "fullgraph", "whole", "block"]
+TpuTrainerOptimizerCompileMode = Literal["eager", "separate_graph"]
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
@@ -42,11 +43,14 @@ class TpuTrainerCompileConfig(torchtitan.config.CompileConfig):
   # TPU model families support different subsets: Llama/Qwen use
   # layer/fullgraph, Conformer uses layer/whole, and redacted uses block/whole.
   mode: TpuTrainerCompileMode = "layer"
-  # Materialize the eager forward graph before backward. This is a single
-  # execution boundary, not GraphTrainer's multi-executable GraphSplitter.
-  split_forward_backward: bool = False
-  # Compile AdamW into its own FX graph, separate from model execution.
-  compile_optimizer: bool = False
+  # TorchTPU builds lazy XLA graphs even though TPUTrainer does not capture a
+  # joint FX graph. Materializing loss before backward ends the forward XLA
+  # graph while preserving autograd, so backward forms a second XLA graph.
+  # This is one runtime boundary, not GraphTrainer's multi-executable splitter.
+  materialize_forward_before_backward: bool = False
+  # How optimizer.step executes: normally through TorchTPU eager/deferred
+  # execution, or as a separately captured and compiled FX graph.
+  optimizer_compile: TpuTrainerOptimizerCompileMode = "eager"
   # Compile the DTensor-aware global gradient norm as a separate static graph.
   compile_grad_norm: bool = False
 
