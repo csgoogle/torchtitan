@@ -517,7 +517,7 @@ class TpuGraphTrainer(GraphTrainer):
             )
 
         # The step program donates the parameter / moment inputs to its outputs
-        # (tpu_backend_pass.donated_input_indices), so the inputs are consumed
+        # (tpu_backend_pass.adamw_donated_input_indices), so the inputs are consumed
         # and the outputs replace them instead of being copied back.
         rebind_model_and_optstate_buffers(
             model,

@@ -520,11 +520,16 @@ def tpu_backend_compile_partitioned_pass(
     return gm
 
 
-def donated_input_indices(
+def adamw_donated_input_indices(
     state_fqns: Sequence[str],
     input_subclass_layouts: Mapping[int, Any],
 ) -> list[int]:
     """Graph-input indices of the parameters and AdamW moments updated in-graph.
+
+    Only supported for Adam/AdamW: ownership is decided by the presence of an
+    ``exp_avg`` sibling and the donated set is exactly the two moments AdamW
+    keeps per parameter. An optimizer with a different state shape donates
+    nothing here rather than donating the wrong buffers.
 
     The in-graph optimizer returns a fresh tensor for every parameter,
     ``exp_avg`` and ``exp_avg_sq`` it owns. Without donation XLA keeps the input
@@ -707,7 +712,7 @@ def construct_tpu_pass_pipeline(
         compile_pass = functools.partial(
             tpu_backend_compile_pass,
             donated_input_positions=tuple(
-                donated_input_indices(
+                adamw_donated_input_indices(
                     state_fqns,
                     traced_result.input_subclass_layouts,
                 )
@@ -734,7 +739,7 @@ __all__ = [
     "tpu_backend_compile_pass",
     "tpu_backend_compile_partitioned_pass",
     "construct_tpu_transform_passes",
-    "donated_input_indices",
+    "adamw_donated_input_indices",
     "construct_tpu_pass_pipeline",
     "register",
     "PASS_PIPELINE_REGISTRY",

@@ -9,7 +9,7 @@ its output (``input_output_alias``) and the second copy disappears.
 
 Three things have to hold, each checked here on its own:
 
-1. ``donated_input_indices`` picks exactly the optimizer-owned parameters and
+1. ``adamw_donated_input_indices`` picks exactly the optimizer-owned parameters and
    the ``_optstate_*_exp_avg`` / ``_exp_avg_sq`` buffers, in graph-input index
    space (a DTensor parameter widens to its local tensors).
 2. The indices reach torch_tpu: the compiled StableHLO carries
@@ -32,7 +32,7 @@ from torchtitan.experiments.tpu.compiled_optimizers.functional import (
     rebind_model_and_optstate_buffers,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
-    donated_input_indices,
+    adamw_donated_input_indices,
     tpu_backend_compile_pass,
 )
 
@@ -63,11 +63,11 @@ class DonatedInputIndicesTest(unittest.TestCase):
             "_optstate_step",  # 8: scalar state, copied back, never donated
             "_optstate_lr",  # 9: scalar state, refilled each step, never donated
         ]
-        self.assertEqual(donated_input_indices(state_fqns, {}), [0, 1, 2, 3, 4, 5])
+        self.assertEqual(adamw_donated_input_indices(state_fqns, {}), [0, 1, 2, 3, 4, 5])
 
     def test_root_level_param_uses_root_level_moments(self):
         state_fqns = ["weight", "_optstate_weight_exp_avg", "_optstate_weight_exp_avg_sq", "_optstate_step"]
-        self.assertEqual(donated_input_indices(state_fqns, {}), [0, 1, 2])
+        self.assertEqual(adamw_donated_input_indices(state_fqns, {}), [0, 1, 2])
 
     def test_dtensor_state_widens_to_its_local_tensors(self):
         state_fqns = [
@@ -81,11 +81,11 @@ class DonatedInputIndicesTest(unittest.TestCase):
         layouts = {0: SubclassLayout(2, None), 5: SubclassLayout(2, None)}
         # b.bias IS owned (its exp_avg sibling exists) -> 4 is donated too.
         self.assertEqual(
-            donated_input_indices(state_fqns, layouts), [0, 1, 2, 3, 4, 5, 6, 7]
+            adamw_donated_input_indices(state_fqns, layouts), [0, 1, 2, 3, 4, 5, 6, 7]
         )
 
     def test_nothing_to_donate_without_in_graph_optimizer_state(self):
-        self.assertEqual(donated_input_indices(["layers.0.w", "norm.scale"], {}), [])
+        self.assertEqual(adamw_donated_input_indices(["layers.0.w", "norm.scale"], {}), [])
 
 
 # --- 3a. rebind semantics (device independent) -----------------------------
