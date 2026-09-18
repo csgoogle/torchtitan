@@ -1530,13 +1530,27 @@ class HFTransformerModel(BaseModel):
         # embeddings -- and the wrapper's output type varies by head
         # (BaseModelOutput, MaskedLMOutput, ...). Asking for hidden states is
         # the one contract every HF model honours.
-        if self._added_lm_head is not None or not hasattr(self.model, "lm_head"):
-            kwargs["output_hidden_states"] = True
-        output = self.model(*model_args, **kwargs)
+        # When the head we train through is one this backend attached, the
+        # hidden states are what we need -- and asking for them through
+        # output_hidden_states no longer works: transformers 5.x dropped that
+        # argument from the task-head forwards (checked on Roberta/Bert/GPT-2/
+        # Qwen3), so the kwarg filter correctly removes it and nothing comes
+        # back. base_model is HF's own handle on the trunk and takes input_ids
+        # on every family checked, so call that instead.
+        use_trunk = self._added_lm_head is not None
+        base = getattr(self.model, "base_model", None) if use_trunk else None
+        if base is not None and base is not self.model:
+            output = base(*model_args, **kwargs)
+        else:
+            output = self.model(*model_args, **kwargs)
         hidden = getattr(output, "last_hidden_state", None)
         if hidden is None:
             states = getattr(output, "hidden_states", None)
             hidden = states[-1] if states else None
+        if hidden is None and isinstance(output, (tuple, list)) and output:
+            first = output[0]
+            if hasattr(first, "dim") and first.dim() == 3:
+                hidden = first
         if hidden is None:
             logits = getattr(output, "logits", None)
             if logits is None:
