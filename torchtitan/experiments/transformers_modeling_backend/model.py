@@ -474,6 +474,8 @@ class HFTransformerModel(BaseModel):
             )
 
         self.model = model_cls(config=config)
+        # Resolved once: forward() compares an int, so it stays traceable.
+        self._position_capacity = _structure.position_capacity(self.model)
         # Carried from the Config: forward() reads it off the instance.
         self._fused_loss = bool(getattr(config, "_fused_loss", False))
         self.max_seq_len = config.max_seq_len
@@ -774,13 +776,34 @@ class HFTransformerModel(BaseModel):
         _structure.set_at(self.model, path, value)
 
 
+    def _check_position_capacity(self, seq_len: int) -> None:
+        """Refuse a sequence the learned position table cannot address.
+
+        An out-of-range embedding gather raises on CPU but is silently
+        clamped on TPU, so overrunning the table costs no error and shows up
+        only as numerics that are wrong by an order of magnitude. Models that
+        position with RoPE report no capacity and are not checked.
+        """
+        cap = self._position_capacity
+        if cap is not None and seq_len > cap:
+            raise ValueError(
+                f"{type(self.model).__name__} positions at most {cap} tokens "
+                f"but was given seq_len={seq_len}. Lower the config's seq_len "
+                f"to {cap} or less; running past the table reads out-of-range "
+                "entries, which TPU returns silently as garbage."
+            )
+
     def forward(self, *args, positions=None, attention_masks=None, **kwargs):
-        local_seq_len = self.max_seq_len
-        local_seq_len //= (
-            self.cp_mesh.size()
-            if self.cp_mesh is not None and self.cp_mesh.size() > 1
-            else 1
+        # Position the batch we were actually handed. Deriving this from
+        # max_seq_len instead only agrees with the input when the two happen
+        # to match, which is every config we ship and nothing that guarantees it.
+        local_seq_len = (
+            args[0].shape[1] if args and hasattr(args[0], "shape") else self.max_seq_len
         )
+        if positions is None and self.cp_mesh is not None and self.cp_mesh.size() > 1:
+            local_seq_len //= self.cp_mesh.size()
+
+        self._check_position_capacity(local_seq_len)
 
         if positions is not None:
             kwargs["position_ids"] = positions.to(args[0].device)
@@ -882,6 +905,7 @@ class HFTransformerModel(BaseModel):
             self.lm_head, nn.Identity
         ):
             self.model.tie_weights()
+
 
     def named_children(self):
         """

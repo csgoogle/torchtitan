@@ -39,6 +39,9 @@ _NORM_PATHS = (
     ("model", "decoder", "final_layer_norm"),
     ("transformer", "ln_f"),
     ("model", "final_layernorm"),
+    ("model", "final_norm"),      # ModernBERT
+    ("vit", "layernorm"),         # ViT
+    ("encoder", "final_layer_norm"),
     ("norm",),
 )
 _HEAD_PATHS = (
@@ -67,6 +70,36 @@ def _resolve(root, paths):
     return None, None
 
 
+def _path_of(root, target):
+    """The dotted path of an existing submodule, by identity."""
+    if target is None:
+        return None
+    for name, mod in root.named_modules():
+        if mod is target:
+            return tuple(name.split(".")) if name else ()
+    return None
+
+
+def _ask_hf(root, getter):
+    """Ask the HF model itself where a part lives.
+
+    `get_input_embeddings` / `get_output_embeddings` are implemented by every
+    PreTrainedModel, so they cover architectures no local table enumerates --
+    DistilBERT calls its head `vocab_projector`, ModernBERT calls it
+    `decoder`. Returning None is a real answer: a bare encoder has no head.
+    """
+    fn = getattr(root, getter, None)
+    if fn is None:
+        return None, None
+    try:
+        found = fn()
+    except Exception:
+        return None, None
+    if found is None:
+        return None, None
+    return found, _path_of(root, found)
+
+
 def find_layers(root):
     """The decoder/encoder block stack.
 
@@ -93,6 +126,9 @@ def find_layers(root):
 
 
 def find_embedding(root):
+    found, path = _ask_hf(root, "get_input_embeddings")
+    if found is not None and path is not None:
+        return found, path
     found, path = _resolve(root, _EMBED_PATHS)
     if found is not None:
         return found, path
@@ -106,10 +142,25 @@ def find_embedding(root):
 
 
 def find_norm(root):
+    """The final norm, or (None, None) for a model that has none.
+
+    BERT, DistilBERT and XLM-R normalize inside every block and end without a
+    trailing norm, so None is the correct answer for them rather than a gap
+    in the table. Callers treat the final norm as optional.
+    """
     return _resolve(root, _NORM_PATHS)
 
 
 def find_head(root):
+    """The output projection, or (None, None) for a model that has none.
+
+    A bare encoder (sentence-transformers' MiniLM is a plain BertModel) and a
+    vision classifier both legitimately answer None here; callers treat the
+    head as optional rather than assuming every architecture has one.
+    """
+    found, path = _ask_hf(root, "get_output_embeddings")
+    if found is not None and path is not None:
+        return found, path
     return _resolve(root, _HEAD_PATHS)
 
 
@@ -141,3 +192,55 @@ def find_rotary(root):
         if holder is not None and hasattr(holder, "rotary_emb"):
             return getattr(holder, "rotary_emb"), tuple(hpath) + ("rotary_emb",)
     return None, None
+
+
+# Learned absolute position tables, by the name each family gives them.
+# A model that positions with RoPE has none of these and is unbounded here.
+_POS_EMBED_PATHS = (
+    ("transformer", "wpe"),                             # GPT-2
+    ("model", "decoder", "embed_positions"),            # OPT
+    ("embeddings", "position_embeddings"),              # BERT/DistilBERT
+    ("model", "embeddings", "position_embeddings"),
+    ("bert", "embeddings", "position_embeddings"),
+    ("roberta", "embeddings", "position_embeddings"),   # RoBERTa, XLM-R
+    ("distilbert", "embeddings", "position_embeddings"),
+    ("electra", "embeddings", "position_embeddings"),
+)
+
+
+def find_position_embedding(root):
+    """The learned absolute position table, or (None, None) under RoPE.
+
+    Structural fallback: an nn.Embedding whose name says it holds positions.
+    GPT-2's `wpe` is the one that does not spell the word out.
+    """
+    found, path = _resolve(root, _POS_EMBED_PATHS)
+    if found is not None:
+        return found, path
+    for name, mod in root.named_modules():
+        if not isinstance(mod, nn.Embedding):
+            continue
+        leaf = name.rsplit(".", 1)[-1]
+        if "pos" in leaf.lower() or leaf == "wpe":
+            return mod, tuple(name.split("."))
+    return None, None
+
+
+def position_capacity(root):
+    """Longest sequence the model can position, or None if unbounded (RoPE).
+
+    This is the table size minus whatever the family reserves at the front:
+    RoBERTa/XLM-R start position ids at `padding_idx + 1`, and OPT's
+    positional embedding carries an explicit `offset`. Reading the module
+    rather than `config.max_position_embeddings` is what makes the number
+    exact -- XLM-R reports 514 there but can only address 512.
+    """
+    pos, _ = find_position_embedding(root)
+    if pos is None:
+        return None
+    reserved = getattr(pos, "offset", 0)
+    if not isinstance(reserved, int):
+        reserved = 0
+    if getattr(pos, "padding_idx", None) is not None:
+        reserved = max(reserved, pos.padding_idx + 1)
+    return pos.num_embeddings - reserved
