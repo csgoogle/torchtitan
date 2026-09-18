@@ -45,6 +45,10 @@ class ModelSpec:
     pipelining_fn: Callable | None
     post_optimizer_build_fn: Callable | None
     state_dict_adapter: type[BaseStateDictAdapter] | None
+    # Upstream's transformers_modeling_backend sets this (pytorch/torchtitan
+    # #4328). Defaulted so every existing ModelSpec construction in this fork
+    # keeps working unchanged.
+    max_context_length: int = 0
 
     def traverse(
         self, config_cls: type, *, recurse: bool = False, _prefix: str = ""

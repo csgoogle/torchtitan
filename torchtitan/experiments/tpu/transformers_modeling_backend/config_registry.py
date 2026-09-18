@@ -37,6 +37,22 @@ from .parallelize import parallelize_hf_transformers_tpu
 _DEFAULT_HF_MODEL = "Qwen/Qwen3-0.6B"
 
 
+def _set_attn_implementation(model_config, attn: str) -> None:
+  """Point HF at an attention implementation this lane can actually run.
+
+  The shared backend configures flex attention unconditionally, which has no
+  TPU lowering, and its _configure_hf_attention takes no argument. Set the
+  same three fields it sets, to the implementation this lane wants: HF selects
+  on the underscore field, update_from_config re-applies
+  _titan_injected_model_args over the loaded HF config, and the public name is
+  kept in step so the two do not disagree. splash_tpu is registered with
+  AttentionInterface by this package's attention module at import.
+  """
+  model_config._titan_injected_model_args["attn_implementation"] = attn
+  model_config.attn_implementation = attn
+  model_config._attn_implementation = attn
+
+
 def _tpu_hf_config(
     flavor: str,
     hf_model: str,
@@ -49,7 +65,7 @@ def _tpu_hf_config(
     fused_loss: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
-  model_spec = model_registry(flavor)
+  model_spec = model_registry(flavor, seq_len=seq_len)
   model_spec.parallelize_fn = parallelize_hf_transformers_tpu
   # flex attention has no TPU lowering. "sdpa" is the portable default;
   # "splash_tpu" routes attention through the TPU splash kernel via HF's
@@ -58,7 +74,7 @@ def _tpu_hf_config(
   # Go through _configure_hf_attention rather than setting the attribute:
   # it also updates _titan_injected_model_args, which update_from_config
   # re-applies afterwards and would otherwise overwrite a bare assignment.
-  model_spec.model._configure_hf_attention(attn)
+  _set_attn_implementation(model_spec.model, attn)
   # Route the vocab projection through the lane's fused Pallas CE: the model
   # hands back (hidden, lm_head.weight.T) and the kernel fuses projection,
   # softmax and cross entropy, so the B*S*vocab logits tensor is never built.

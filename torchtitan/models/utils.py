@@ -533,3 +533,37 @@ def get_moe_model_nparams_and_flops(
     )
 
     return nparams, num_flops_per_token
+
+
+def quadratic_attention_flops_per_token(
+    *,
+    num_heads: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    seq_len: int,
+    sliding_window_size: int | None = None,
+) -> int:
+    """Training FLOPs per token for quadratic or windowed attention.
+
+    Reasoning behind the factor of 6 for the self-attention part of the formula:
+    1. each self-attention has 2 matmul in the forward and 4 (counted as 2)
+       in the backward                                                      (3)
+       The 2 matmuls per token are:
+       a. tmp = q @ K^T: [1, qk_head_dim] @ [qk_head_dim, seq_len]
+       b. tmp @ V: [1, seq_len] @ [seq_len, v_head_dim]
+       so we get
+       seq_len * qk_head_dim + seq_len * v_head_dim = seq_len * (qk_head_dim + v_head_dim)
+    2. the flash attention does 1 more matmul recomputation in the backward
+       but recomputation should not be counted in calculating MFU           (+0)
+    3. each matmul performs 1 multiplication and 1 addition                 (*2)
+    4. we follow the convention and do not account for sparsity in causal attention
+
+    ``qk_head_dim`` and ``v_head_dim`` describe the two attention
+    contractions. The factor of 6 accounts for multiply-adds in forward and
+    backward. As in the existing MFU convention, causal sparsity and backward
+    recomputation are not counted.
+    """
+    attended_tokens = (
+        seq_len if sliding_window_size is None else min(seq_len, sliding_window_size)
+    )
+    return 6 * num_heads * (qk_head_dim + v_head_dim) * attended_tokens
