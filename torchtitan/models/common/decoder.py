@@ -266,6 +266,7 @@ class Decoder(BaseModel):
         tokens: torch.Tensor,
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
+        segment_ids: torch.Tensor | None = None,
     ):
         # positions is listed before attention_masks so AutoParallel's input_fn,
         # which returns (tokens, positions) and binds them positionally, maps
@@ -278,9 +279,8 @@ class Decoder(BaseModel):
         # `positions` and each layer is its own activation-checkpoint region
         # -- computing it inside an attention module would run it once per
         # layer instead of once per step.
-        segment_ids = (
-            segment_ids_from_positions(positions) if positions is not None else None
-        )
+        if segment_ids is None and positions is not None:
+            segment_ids = segment_ids_from_positions(positions)
 
         for layer in self.layers.values():
             h = layer(h, attention_masks, positions, segment_ids)

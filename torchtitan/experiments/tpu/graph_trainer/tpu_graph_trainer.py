@@ -53,6 +53,8 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     register as register_tpu_pipeline,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.models.common.attention import segment_ids_from_positions
+from torchtitan.models.common.decoder import Decoder
 from torchtitan.tools.logging import logger
 
 
@@ -85,6 +87,18 @@ def _optimizer_compile_enabled(config, tpu_extra) -> bool:
     if tpu_extra is not None and getattr(tpu_extra, "optimizer_compile", False):
         return True
     return bool(getattr(config.compile, "optimizer_compile", False))
+
+
+def _with_precomputed_segment_ids(
+    data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]],
+) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+    """Compute packed-document IDs while batches are still on CPU."""
+    for input_dict, labels in data_iterator:
+        positions = input_dict.get("positions")
+        if positions is not None and "segment_ids" not in input_dict:
+            input_dict = dict(input_dict)
+            input_dict["segment_ids"] = segment_ids_from_positions(positions)
+        yield input_dict, labels
 
 
 class TpuGraphTrainer(GraphTrainer):
@@ -173,6 +187,11 @@ class TpuGraphTrainer(GraphTrainer):
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> None:
         """Override of GraphTrainer.train_step to branch into optimizer_in_graph loop when enabled."""
+        # The base batch generator yields CPU tensors. Compute this shared
+        # packed-document metadata before train_step moves the batch to TPU;
+        # otherwise its cumsum is compiled into every training graph.
+        if isinstance(self.model_config, Decoder.Config):
+            data_iterator = _with_precomputed_segment_ids(data_iterator)
         if not self._optimizer_in_graph:
             super().train_step(data_iterator)
         else:

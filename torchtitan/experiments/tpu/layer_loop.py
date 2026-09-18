@@ -49,6 +49,7 @@ def _forward(
     tokens: torch.Tensor,
     positions: torch.Tensor | None = None,
     attention_masks: AttentionMasksType | None = None,
+    segment_ids: torch.Tensor | None = None,
 ):
     """Runs the decoder: embeddings, the layers, the final norm, the LM head.
 
@@ -60,9 +61,8 @@ def _forward(
     """
     h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
-    segment_ids = (
-        segment_ids_from_positions(positions) if positions is not None else None
-    )
+    if segment_ids is None and positions is not None:
+        segment_ids = segment_ids_from_positions(positions)
 
     # The only change from `Decoder.forward`: let the container run the layers.
     # The `else` is upstream's loop, kept for the plain, empty `ModuleDict` a

@@ -27,6 +27,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     construct_tpu_pass_pipeline,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+    _with_precomputed_segment_ids,
     TpuGraphTrainer,
 )
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
@@ -70,6 +71,36 @@ from torchtitan.models.common import ComplexRoPE, Linear
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
+
+  def test_precomputes_segment_ids_without_mutating_batch(self) -> None:
+    positions = torch.tensor([[0, 1, 0, 1, 2]])
+    input_dict = {"input": torch.ones(1, 5), "positions": positions}
+    labels = torch.ones(1, 5)
+
+    (processed, processed_labels), = _with_precomputed_segment_ids(
+        iter([(input_dict, labels)])
+    )
+
+    self.assertIs(processed_labels, labels)
+    self.assertNotIn("segment_ids", input_dict)
+    torch.testing.assert_close(
+        processed["segment_ids"], torch.tensor([[0, 0, 1, 1, 1]])
+    )
+
+  def test_preserves_explicit_segment_ids(self) -> None:
+    segment_ids = torch.tensor([[3, 3]])
+    input_dict = {
+        "input": torch.ones(1, 2),
+        "positions": torch.tensor([[0, 1]]),
+        "segment_ids": segment_ids,
+    }
+
+    (processed, _), = _with_precomputed_segment_ids(
+        iter([(input_dict, torch.ones(1, 2))])
+    )
+
+    self.assertIs(processed, input_dict)
+    self.assertIs(processed["segment_ids"], segment_ids)
 
   def test_qwen3_graph_config_preserves_maxtext_flops(self) -> None:
     config = qwen3_moe_30b()
