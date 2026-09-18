@@ -571,6 +571,10 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
 def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   """Build the common Qwen3 235B-A22B FSDP configuration."""
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  # Q30's rewrite is tuned for its full-world FP32 graph. Q235's explicit
+  # FSDP-128, HSDP, and BF16 recipes violate that pass's current validator.
+  cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
+  cfg.tpu_config.fsdp_allreduce_slice_max_input_bytes = 0
   cfg.model_spec = model_registry(
       "235B-A22B",
       attn_backend="sdpa",
