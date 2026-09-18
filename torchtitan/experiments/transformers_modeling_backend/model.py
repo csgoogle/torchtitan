@@ -534,6 +534,14 @@ class HFTransformerModel(BaseModel):
         # token objective. This adds parameters the checkpoint does not have;
         # it is for training and measurement, not for restoring a released
         # model's own head.
+        # BERT, DistilBERT and XLM-R normalize inside every block and end
+        # without a trailing norm. Callers still expect the four parts to
+        # exist -- the generic parallelize path reads .norm directly -- so
+        # stand in an Identity, which is what "no final norm" computes.
+        self._added_norm = None
+        if _structure.find_norm(self.model)[0] is None:
+            self._added_norm = nn.Identity()
+
         self._added_lm_head = None
         _head, _ = _structure.find_head(self.model)
         # A classification head is not an output projection: it maps the
@@ -852,7 +860,9 @@ class HFTransformerModel(BaseModel):
 
     @property
     def norm(self):
-        """The final norm."""
+        """The final norm, or an Identity for an architecture without one."""
+        if getattr(self, "_added_norm", None) is not None:
+            return self._added_norm
         found, _ = _structure.find_norm(self.model)
         if found is None:
             raise AttributeError(
