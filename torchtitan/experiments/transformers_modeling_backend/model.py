@@ -140,6 +140,9 @@ class SliceableModuleDict(ModuleDict):
 
 
 # Define all possible mappings organized by argument type
+# TorchTitan initializes an untied token embedding at unit std.
+_TITAN_EMBED_INIT_STD = 1.0
+
 _TT_TO_HF_MAPPINGS = {
     "dense": {
         # TorchTitan dense model mappings (always available)
@@ -378,7 +381,17 @@ class HFTransformerModel(BaseModel):
             self.attention_bias = False
             self.mlp_bias = False
             self.use_cache = False
-            self.initializer_range = 1.0  # use as std for normal init in embedding
+            # Keep the model's own initializer_range. This used to be forced to
+            # 1.0 because TorchTitan's embedding init wants std=1.0, but the
+            # field is also what HF's stock _init_weights uses as the std for
+            # every Linear/Conv1D/Embedding. Architectures the Llama-like patch
+            # does not match (GPT-2, BERT, XLM-R -- their classes are not named
+            # <Prefix>DecoderLayer) fall back to that stock init and were being
+            # built with std=1.0 instead of 0.02, which lands the initial loss
+            # near 120 instead of ln(vocab). TorchTitan's own init now states
+            # its 1.0 directly, at the one place it means it.
+            if not hasattr(self, "initializer_range"):
+                self.initializer_range = 0.02
             # FlexAttention does not support dropout (not part of PyTorch's
             # flex_attention API). Override to 0 if the model sets it.
             if hasattr(self, "attention_dropout") and self.attention_dropout > 0:
@@ -658,8 +671,9 @@ class HFTransformerModel(BaseModel):
                         b=cutoff_factor * final_out_std,
                     )
                 else:
-                    std = config.initializer_range
-                    module.weight.data.normal_(mean=0.0, std=std)
+                    # TorchTitan initializes an untied token embedding at
+                    # std=1.0, independent of the HF config's initializer_range.
+                    module.weight.data.normal_(mean=0.0, std=_TITAN_EMBED_INIT_STD)
 
                 if module.padding_idx is not None:
                     module.weight.data[module.padding_idx].zero_()
