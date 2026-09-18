@@ -51,12 +51,18 @@ def _my_fwd(
     b_block_size,
     h_block_size,
     v_block_size,
+    weights_are_transposed=False,
 ):
+  kernel_weights = (
+      jax.numpy.swapaxes(weights, -1, -2)
+      if weights_are_transposed
+      else weights
+  )
   if implementation == "xla":
     from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference  # pylint: disable=g-import-not-at-top
 
     loss, lse = reference.linear_softmax_cross_entropy_loss_fwd_reference(
-        x, labels, weights, reduction=reduction
+        x, labels, kernel_weights, reduction=reduction
     )
     return loss, lse
 
@@ -65,7 +71,7 @@ def _my_fwd(
   loss, lse = kernel.linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
       x,
       labels,
-      weights,
+      kernel_weights,
       b_block_size=b_block_size,
       h_block_size=h_block_size,
       v_block_size=v_block_size,
@@ -85,18 +91,26 @@ def _my_bwd(
     b_block_size,
     h_block_size,
     v_block_size,
+    weights_are_transposed=False,
 ):
   # The Torch custom op exposes the reduced loss as a one-element tensor, but
   # Tokamax's backward API consumes its cotangent as a scalar. Whole-graph XLA
   # can fold that distinction away; an executable boundary preserves the
   # one-element shape, so normalize it explicitly before entering Tokamax.
   dout = jax.numpy.reshape(dout, ())
+  kernel_weights = (
+      jax.numpy.swapaxes(weights, -1, -2)
+      if weights_are_transposed
+      else weights
+  )
   if implementation == "xla":
     from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference  # pylint: disable=g-import-not-at-top
 
     grad_x, grad_w = reference.linear_softmax_cross_entropy_loss_bwd_reference(
-        dout, lse, x, labels, weights, reduction=reduction
+        dout, lse, x, labels, kernel_weights, reduction=reduction
     )
+    if weights_are_transposed:
+      grad_w = jax.numpy.swapaxes(grad_w, -1, -2)
     # Match the custom-op schema and ordinary linear autograd: Tokamax may
     # accumulate in FP32, but gradients cross this boundary in the input dtype.
     return grad_x.astype(x.dtype), grad_w.astype(weights.dtype)
@@ -109,13 +123,15 @@ def _my_bwd(
           lse,
           x,
           labels,
-          weights,
+          kernel_weights,
           b_block_size=b_block_size,
           h_block_size=h_block_size,
           v_block_size=v_block_size,
           reduction=reduction,
       )
   )
+  if weights_are_transposed:
+    grad_w = jax.numpy.swapaxes(grad_w, -1, -2)
   # Keep the Pallas and reference implementations on the same autograd dtype
   # contract. The pinned Tokamax revision separately fixes where dout is
   # applied so this cast occurs after the BF16 gradient GEMMs.
@@ -127,7 +143,12 @@ _loss_op_name_cache = {}
 
 @torch._dynamo.assume_constant_result
 def _get_loss_op_names(
-    reduction, implementation, b_block_size, h_block_size, v_block_size
+    reduction,
+    implementation,
+    b_block_size,
+    h_block_size,
+    v_block_size,
+    weights_are_transposed,
 ):
   cache_key = (
       reduction,
@@ -135,12 +156,17 @@ def _get_loss_op_names(
       b_block_size,
       h_block_size,
       v_block_size,
+      weights_are_transposed,
   )
   if cache_key in _loss_op_name_cache:
     return _loss_op_name_cache[cache_key]
 
-  compiled_fwd = pallas.custom_jax_kernel(_my_fwd, static_argnums=(3, 4, 5, 6, 7))
-  compiled_bwd = pallas.custom_jax_kernel(_my_bwd, static_argnums=(5, 6, 7, 8, 9))
+  compiled_fwd = pallas.custom_jax_kernel(
+      _my_fwd, static_argnums=(3, 4, 5, 6, 7, 8)
+  )
+  compiled_bwd = pallas.custom_jax_kernel(
+      _my_bwd, static_argnums=(5, 6, 7, 8, 9, 10)
+  )
 
   def fwd_wrapped(x, labels, weights):
     return compiled_fwd(
@@ -152,6 +178,7 @@ def _get_loss_op_names(
         b_block_size,
         h_block_size,
         v_block_size,
+        weights_are_transposed,
     )
 
   def bwd_wrapped(dout, lse, x, labels, weights):
@@ -166,6 +193,7 @@ def _get_loss_op_names(
         b_block_size,
         h_block_size,
         v_block_size,
+        weights_are_transposed,
     )
 
   # Truncate SHA-256 to 16 hex characters (64 bits) for op name readability.
@@ -220,11 +248,17 @@ class TorchLinearLoss(torch.autograd.Function):
       b_block_size=1024,
       h_block_size=512,
       v_block_size=2048,
+      weights_are_transposed=False,
   ):
     labels_int32 = labels.to(torch.int32)
 
     fwd_name, _ = _get_loss_op_names(
-        reduction, implementation, b_block_size, h_block_size, v_block_size
+        reduction,
+        implementation,
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        weights_are_transposed,
     )
     torch_fwd_fn = getattr(torch.ops.pallas, fwd_name)
     loss, lse = torch_fwd_fn(x, labels_int32, weights)
@@ -234,6 +268,7 @@ class TorchLinearLoss(torch.autograd.Function):
     ctx.b_block_size = b_block_size
     ctx.h_block_size = h_block_size
     ctx.v_block_size = v_block_size
+    ctx.weights_are_transposed = weights_are_transposed
 
     return loss
 
@@ -245,14 +280,20 @@ class TorchLinearLoss(torch.autograd.Function):
     b_block_size = ctx.b_block_size
     h_block_size = ctx.h_block_size
     v_block_size = ctx.v_block_size
+    weights_are_transposed = ctx.weights_are_transposed
 
     _, bwd_name = _get_loss_op_names(
-        reduction, implementation, b_block_size, h_block_size, v_block_size
+        reduction,
+        implementation,
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        weights_are_transposed,
     )
     torch_bwd_fn = getattr(torch.ops.pallas, bwd_name)
     grad_x, grad_w = torch_bwd_fn(grad_output, lse, x, labels, weights)
 
-    return grad_x, None, grad_w, None, None, None, None, None
+    return grad_x, None, grad_w, None, None, None, None, None, None
 
 
 def linear_softmax_cross_entropy_loss(
@@ -264,6 +305,7 @@ def linear_softmax_cross_entropy_loss(
     b_block_size: int = 1024,
     h_block_size: int = 512,
     v_block_size: int = 2048,
+    weights_are_transposed: bool = False,
 ) -> torch.Tensor:
   """Linear Softmax Cross-Entropy Loss.
 
@@ -280,6 +322,9 @@ def linear_softmax_cross_entropy_loss(
       b_block_size: Block size for batch dimension.
       h_block_size: Block size for hidden dimension.
       v_block_size: Block size for vocab dimension.
+      weights_are_transposed: Whether ``weights`` has shape ``[V, H]`` rather
+        than the kernel-native ``[H, V]``. The returned gradient has the same
+        orientation as the input.
 
   Returns:
       The Cross-Entropy loss.
@@ -293,4 +338,5 @@ def linear_softmax_cross_entropy_loss(
       b_block_size,
       h_block_size,
       v_block_size,
+      weights_are_transposed,
   )

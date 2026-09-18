@@ -45,9 +45,18 @@ def pallas_cross_entropy_loss(
   if x.ndim != 2 or labels.ndim != 1 or weights.ndim != 2:
     raise ValueError(
         "Pallas loss requires x [tokens, hidden], labels [tokens], and "
-        "weights [hidden, vocab]"
+        "weights [hidden, vocab] or [vocab, hidden]"
     )
-  if x.shape[0] != labels.shape[0] or x.shape[1] != weights.shape[0]:
+  if x.shape[1] == weights.shape[0]:
+    weights_are_transposed = False
+    vocab_size = weights.shape[1]
+  elif x.shape[1] == weights.shape[1]:
+    weights_are_transposed = True
+    vocab_size = weights.shape[0]
+  else:
+    weights_are_transposed = False
+    vocab_size = -1
+  if x.shape[0] != labels.shape[0] or vocab_size < 0:
     raise ValueError(
         "Pallas loss received incompatible x, labels, and weight shapes: "
         f"{tuple(x.shape)}, {tuple(labels.shape)}, {tuple(weights.shape)}"
@@ -86,8 +95,9 @@ def pallas_cross_entropy_loss(
       b_block_size=b_block_size,
       h_block_size=h_block_size,
       v_block_size=v_block_size,
+      weights_are_transposed=weights_are_transposed,
   )
-  return loss_sum - ignored.sum().to(loss_sum.dtype) * math.log(weights.shape[-1])
+  return loss_sum - ignored.sum().to(loss_sum.dtype) * math.log(vocab_size)
 
 
 class PallasCrossEntropyLoss(components_loss.BaseLoss):

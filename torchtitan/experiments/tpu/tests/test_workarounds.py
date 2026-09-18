@@ -290,11 +290,12 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertIs(model.lm_head.weight, original_weight)
     self.assertIsInstance(model.lm_head.weight, nn.Parameter)
 
-    # And the wrapper still does its job: return (x, W^T) for the Pallas loss.
+    # The wrapper returns the ordinary checkpoint/FSDP orientation. The Pallas
+    # loss transposes only after crossing its custom-op boundary.
     x = torch.randn(2, 3, 8)
-    out, weight_t = model.lm_head(x)
+    out, weight = model.lm_head(x)
     torch.testing.assert_close(out, x)
-    self.assertEqual(tuple(weight_t.shape), (8, 16))
+    self.assertEqual(tuple(weight.shape), (16, 8))
 
   def test_fused_loss_matches_unfused_cross_entropy(self):
     """The deferred LM-head path preserves loss and gradient numerics."""
@@ -337,7 +338,7 @@ class WorkaroundsTest(parameterized.TestCase):
     # weight orientation, sum reduction, and ignored-label behavior together.
     def reference_linear_loss(x, kernel_labels, weights, **unused_kwargs):
       return F.cross_entropy(
-          x.float() @ weights.float(),
+          x.float() @ weights.float().t(),
           kernel_labels,
           reduction="sum",
       )

@@ -19,9 +19,11 @@ class FusedLossLinearWrapper(Linear):
 
   This module owns the same ``lm_head.weight`` as an ordinary ``Linear``, but
   its forward does not execute the projection or the loss. Instead, it returns
-  ``(hidden_states, weight.T)``. ``PallasCrossEntropyLoss`` consumes that pair
+  ``(hidden_states, weight)``. ``PallasCrossEntropyLoss`` consumes that pair
   and performs the deferred linear projection, softmax, and cross entropy in a
-  single fused kernel without materializing the full logits tensor.
+  single fused kernel without materializing the full logits tensor. Keeping
+  the parameter in ``[vocab, hidden]`` order at the custom-op boundary also
+  lets its backward expose the gradient in the layout consumed by FSDP.
 
   Constructing the wrapper from ``Linear.Config`` preserves the normal weight
   initialization, sharding, optimizer ownership, and checkpoint key.
@@ -37,7 +39,7 @@ class FusedLossLinearWrapper(Linear):
     super().__init__(config)
 
   def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    return x, self.weight.t()
+    return x, self.weight
 
 
 @override(

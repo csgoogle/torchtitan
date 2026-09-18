@@ -62,6 +62,43 @@ class LinearSoftmaxCrossEntropyLossUnitTest(absltest.TestCase):
 
     self.assertEqual(backward.call_args.args[0].shape, ())
 
+  def test_backward_preserves_transposed_weight_contract(self):
+    dout = jnp.ones((1,), dtype=jnp.float32)
+    lse = jnp.zeros((2,), dtype=jnp.float32)
+    x = jnp.zeros((2, 4), dtype=jnp.bfloat16)
+    labels = jnp.zeros((2,), dtype=jnp.int32)
+    weights = jnp.zeros((8, 4), dtype=jnp.bfloat16)
+    kernel = importlib.import_module(
+        "tokamax._src.ops.linear_softmax_cross_entropy_loss."
+        "pallas_mosaic_tpu_kernel"
+    )
+
+    with mock.patch.object(
+        kernel,
+        "linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu",
+        return_value=(
+            jnp.zeros_like(x),
+            jnp.zeros((4, 8), dtype=jnp.bfloat16),
+        ),
+    ) as backward:
+      # pylint: disable=protected-access
+      _, grad_weights = linear_softmax_cross_entropy_loss._my_bwd(
+          dout,
+          lse,
+          x,
+          labels,
+          weights,
+          "sum",
+          "mosaic_tpu",
+          1,
+          1,
+          1,
+          True,
+      )
+
+    self.assertEqual(backward.call_args.args[4].shape, (4, 8))
+    self.assertEqual(grad_weights.shape, weights.shape)
+
 
 class LinearSoftmaxCrossEntropyLossTest(
     base_device_test.BaseAcceleratorDeviceTest
