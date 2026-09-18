@@ -81,9 +81,9 @@ class GraphSplitterConfig:
   # changing activation-checkpoint boundaries.
   backward_layers_per_executable: int = 1
   # Reuse dead internal split-boundary buffers through XLA input donation.
-  # This remains False until TorchTPU includes donation in its compilation
-  # cache key (torch_tpu#3614).
-  donate_internal_buffers: bool = False
+  # TorchTPU includes top-level donations in its compilation cache keys as of
+  # google-pytorch/torch_tpu@21aeec9b. Keep the opt-out for diagnostics.
+  donate_internal_buffers: bool = True
   # Number of complete backward child executables by which to advance each H2D
   # reload pair relative to its first consumer.
   cpu_offload_prefetch_executables: int = 0

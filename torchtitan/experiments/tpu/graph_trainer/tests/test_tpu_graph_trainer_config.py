@@ -454,6 +454,22 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
     self.assertTrue(splitter.enabled)
 
+  def test_graph_split_donation_defaults_on_and_can_be_disabled(self) -> None:
+    default_config = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3",
+        "--config=graph_trainer_qwen3_debugmodel",
+    ])
+    disabled_config = ConfigManager().parse_args([
+        "--module=torchtitan.experiments.tpu.qwen3",
+        "--config=graph_trainer_qwen3_debugmodel",
+        "--compile.graph_split.no-donate_internal_buffers",
+    ])
+
+    self.assertTrue(default_config.compile.graph_split.donate_internal_buffers)
+    self.assertFalse(
+        disabled_config.compile.graph_split.donate_internal_buffers
+    )
+
   def test_layerwise_remat_barriers_compose_with_graph_split(self) -> None:
     config = qwen3_8b()
     config.compile.enable_remat_barriers = True
