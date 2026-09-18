@@ -38,6 +38,30 @@ from .parallelize import parallelize_hf_transformers_tpu
 _DEFAULT_HF_MODEL = "Qwen/Qwen3-0.6B"
 
 
+def _is_hf_moe(hf_model: str) -> bool:
+  """True when the HF config declares routed experts.
+
+  The backend gates its MoE replacement on the *flavor* being a
+  TitanMoeModelConfig, not on the model. Ask the model instead, so selecting a
+  MoE checkpoint is enough -- which is the same principle the phase-1 probe
+  uses once the gate is open.
+  """
+  if not hf_model:
+    return False
+  try:
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(hf_model)
+  except Exception:
+    return False
+  for attr in ("num_experts", "n_routed_experts", "num_local_experts"):
+    for holder in (cfg, getattr(cfg, "text_config", None)):
+      v = getattr(holder, attr, None) if holder is not None else None
+      if isinstance(v, int) and v > 1:
+        return True
+  return False
+
+
 def _training_config(*, local_batch_size: int, seq_len: int, steps: int) -> TrainingConfig:
   """Express the (local_batch_size, seq_len) recipe in the token budget."""
   training = TrainingConfig(steps=steps)
@@ -182,3 +206,20 @@ def hf_full_max() -> TPUTransformersBackendConfig:
   """Everything on: splash attention, fused CE, per-layer compile."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
                         attn="splash_tpu", fused_loss=True)
+
+def hf_moe() -> TPUTransformersBackendConfig:
+  """A MoE checkpoint on the TPU grouped-expert kernel.
+
+  The backend gates its MoE replacement on the flavor being a
+  TitanMoeModelConfig, and --hf-model is applied after the config is built, so
+  the flavor cannot be chosen from the model id -- pick this config explicitly
+  for a MoE checkpoint. No expert parallelism: experts stay replicated and
+  SimpleFSDP shards them, as on the qwen3 lane.
+  """
+  return _tpu_hf_config("full_moe", _DEFAULT_HF_MODEL, attn="splash_tpu")
+
+
+def hf_moe_compile() -> TPUTransformersBackendConfig:
+  """hf_moe with torch.compile enabled."""
+  return _tpu_hf_config("full_moe", _DEFAULT_HF_MODEL, attn="splash_tpu", compile=True)
+
