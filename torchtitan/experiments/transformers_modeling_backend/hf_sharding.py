@@ -164,9 +164,12 @@ def set_hf_sharding_configs(
     # Rotary embedding — distribute buffers (inv_freq) and wrap inputs
     # as DTensors so computed cos/sin are DTensors, avoiding mixed
     # plain-Tensor / DTensor ops in apply_rotary_pos_emb.
-    if hasattr(model, "rotary_emb") and not isinstance(model.rotary_emb, nn.Identity):
-        rope = model.rotary_emb
-        rope._sharding_config = _rope_config(rope, enable_sp=enable_sp)
+    # getattr, not hasattr: a learned-position architecture (GPT-2, OPT, BERT)
+    # has no rotary embedding, and the accessor answers None for it rather
+    # than raising -- hasattr is True and the module is None.
+    _rope = getattr(model, "rotary_emb", None)
+    if _rope is not None and not isinstance(_rope, nn.Identity):
+        _rope._sharding_config = _rope_config(_rope, enable_sp=enable_sp)
 
     # Per-layer modules
     for transformer_block in model.layers:
