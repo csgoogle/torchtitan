@@ -418,8 +418,15 @@ class HFTransformerModel(BaseModel):
                     )
                 self.head_dim = self.dim // self.num_attention_heads
             elif not getattr(self, "head_dim", None):
-                # HF config did not provide head_dim; use the standard derivation.
-                self.head_dim = self.dim // self.num_attention_heads
+                # HF config did not provide head_dim; use the standard
+                # derivation when there is something to derive from. A
+                # composite config (CLIP, BLIP, CLAP, SegFormer) keeps
+                # hidden_size and num_attention_heads inside its text_config /
+                # vision_config, so both read None at the top level and the
+                # derivation is not just wrong but a TypeError. Those towers
+                # carry their own head_dim; leave it unset for them.
+                if self.dim is not None and getattr(self, "num_attention_heads", None):
+                    self.head_dim = self.dim // self.num_attention_heads
 
             return self
 
@@ -512,23 +519,7 @@ class HFTransformerModel(BaseModel):
             except Exception as e:
                 logger.warning(f"Could not size the position table: {e}")
 
-        try:
-            self.model = model_cls(config=config)
-        except ValueError as e:
-            # Older architectures (Electra, the T5 family) implement only the
-            # eager attention path and reject anything else outright, before
-            # AttentionInterface gets a say. Fall back rather than lose the
-            # model: eager attention is slower, not wrong.
-            if "attention implementation" not in str(e):
-                raise
-            logger.warning(
-                f"{model_class_name} does not support "
-                f"attn_implementation={getattr(config, '_attn_implementation', None)!r}; "
-                "falling back to eager."
-            )
-            config._attn_implementation = "eager"
-            config.attn_implementation = "eager"
-            self.model = model_cls(config=config)
+        self.model = self._build_with_supported_attention(model_cls, config)
         # Resolved once: forward() compares an int, so it stays traceable.
         self._position_capacity = _structure.position_capacity(self.model)
         # T5 positions with relative bias and DistilBERT with its own
@@ -608,6 +599,45 @@ class HFTransformerModel(BaseModel):
                 layer.self_attn.register_module(
                     "_flex_kernel", HFFlexAttention(config=HFFlexAttention.Config())
                 )
+
+    @staticmethod
+    def _build_with_supported_attention(model_cls, config):
+        """Build the model, backing off to an attention path it accepts.
+
+        Registering an implementation with AttentionInterface only reaches
+        architectures that dispatch through it. The BERT family indexes a
+        fixed class dict instead -- BERT_SELF_ATTENTION_CLASSES[
+        config._attn_implementation] -- so a name it does not know is a
+        KeyError in __init__, and Electra and the T5 family raise ValueError
+        for the same reason. Neither is recoverable by registration, so try
+        the implementations every architecture does know. Attention that is
+        slower is not attention that is wrong.
+        """
+        wanted = getattr(config, "_attn_implementation", None)
+        attempts = [wanted] + [a for a in ("sdpa", "eager") if a != wanted]
+        last = None
+        for attempt in attempts:
+            if attempt != wanted:
+                config._attn_implementation = attempt
+                config.attn_implementation = attempt
+            try:
+                model = model_cls(config=config)
+            except (ValueError, KeyError) as e:
+                # Only back off when the complaint is about attention.
+                text = str(e)
+                if attempt is not None and attempt not in text and (
+                    "attention implementation" not in text
+                ):
+                    raise
+                last = e
+                continue
+            if attempt != wanted:
+                logger.warning(
+                    f"{model_cls.__name__} does not accept "
+                    f"attn_implementation={wanted!r}; built with {attempt!r}."
+                )
+            return model
+        raise last
 
     def set_cp_mesh(self, mesh):
         self.cp_mesh = mesh
