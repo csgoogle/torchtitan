@@ -79,6 +79,18 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         torch.testing.assert_close(grads[1], grads_ref[1], rtol=0, atol=0)
         torch.testing.assert_close(grads[2], grads_ref[2], rtol=0, atol=0)
 
+    @staticmethod
+    def _bounded_values(shape, modulus, scale, device):
+        """Small exactly-representable bf16 values, so comparisons can be exact."""
+        values = torch.arange(math.prod(shape), device=device, dtype=torch.float32)
+        return (
+            values.remainder(modulus)
+            .sub(modulus // 2)
+            .mul(scale)
+            .reshape(shape)
+            .bfloat16()
+        )
+
     def _paired_vs_unpaired(self, group_sizes, k, n, *, tile_m, tgmm_tile_k):
         """Paired kernel with a K-tiled dWeight against the unpaired kernels.
 
@@ -89,23 +101,11 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         total_m = int(group_sizes.sum().item())
         groups = group_sizes.shape[0]
 
-        def bounded_values(shape, modulus, scale):
-            values = torch.arange(
-                math.prod(shape), device=device, dtype=torch.float32
-            )
-            return (
-                values.remainder(modulus)
-                .sub(modulus // 2)
-                .mul(scale)
-                .reshape(shape)
-                .bfloat16()
-            )
-
-        lhs_ref = bounded_values((total_m, k), 17, 0.003).requires_grad_()
-        rhs1_ref = bounded_values((groups, k, n), 19, 0.002).requires_grad_()
-        rhs3_ref = bounded_values((groups, k, n), 23, 0.0015).requires_grad_()
-        grad1 = bounded_values((total_m, n), 29, 0.002)
-        grad3 = bounded_values((total_m, n), 31, 0.001)
+        lhs_ref = self._bounded_values((total_m, k), 17, 0.003, device).requires_grad_()
+        rhs1_ref = self._bounded_values((groups, k, n), 19, 0.002, device).requires_grad_()
+        rhs3_ref = self._bounded_values((groups, k, n), 23, 0.0015, device).requires_grad_()
+        grad1 = self._bounded_values((total_m, n), 29, 0.002, device)
+        grad3 = self._bounded_values((total_m, n), 31, 0.001, device)
         group_sizes_dev = group_sizes.to(device)
         ref_tiling = (tile_m, tgmm_tile_k, 0)
 
@@ -148,15 +148,55 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         )
 
     def test_k_tiled_dweight_at_qwen3_235b_shape(self):
-        # dim 4096 x moe_hidden 1536: full-K accumulators + output slabs are
-        # 105 MB of VMEM, over the 64 MB scoped limit on v7x; 4 K slabs fit.
-        self._paired_vs_unpaired(
-            torch.tensor([300, 0, 812, 424], dtype=torch.int32),
-            4096,
-            1536,
-            tile_m=256,
-            tgmm_tile_k=1024,
+        """The K-tiled dWeight at dim 4096 x moe_hidden 1536, four K slabs.
+
+        With full K the two fp32 accumulators and two bf16 output slabs are
+        105 MB of VMEM, over the 64 MB scoped limit on v7x; four slabs fit.
+
+        This drives the paired *backward* op directly rather than going through
+        the forward: the paired forward's two output slabs at this shape need a
+        raised ``xla_tpu_scoped_vmem_limit_kib`` (which the 235B recipe sets),
+        and that is unrelated to the dWeight tiling under test here.
+        """
+        device = self.accelerator_device
+        group_sizes = torch.tensor([300, 0, 812, 424], dtype=torch.int32)
+        k, n, tile_m, tgmm_tile_k = 4096, 1536, 256, 1024
+        total_m = int(group_sizes.sum().item())
+        groups = group_sizes.shape[0]
+
+        lhs = self._bounded_values((total_m, k), 17, 0.003, device).requires_grad_()
+        rhs1 = self._bounded_values((groups, k, n), 19, 0.002, device).requires_grad_()
+        rhs3 = self._bounded_values((groups, k, n), 23, 0.0015, device).requires_grad_()
+        grad1 = self._bounded_values((total_m, n), 29, 0.002, device)
+        grad3 = self._bounded_values((total_m, n), 31, 0.001, device)
+        group_sizes_dev = group_sizes.to(device)
+
+        # Reference: the unpaired kernels' autograd, K-tiled the same way.
+        ref_tiling = (tile_m, tgmm_tile_k, 0)
+        out1 = expert_segment_matmul.segment_matmul_pallas_2d(
+            lhs, rhs1, group_sizes_dev, tile_m=tile_m, tgmm_tiling=ref_tiling
         )
+        out3 = expert_segment_matmul.segment_matmul_pallas_2d(
+            lhs, rhs3, group_sizes_dev, tile_m=tile_m, tgmm_tiling=ref_tiling
+        )
+        want_lhs, want_rhs1, want_rhs3 = torch.autograd.grad(
+            (out1, out3), (lhs, rhs1, rhs3), (grad1, grad3)
+        )
+
+        got_lhs, got_rhs1, got_rhs3 = paired_segment_matmul._paired_grouped_mm_bwd(
+            grad1,
+            grad3,
+            lhs.detach(),
+            rhs1.detach(),
+            rhs3.detach(),
+            group_sizes_dev,
+            tile_m,
+            tile_m,
+            tgmm_tile_k,
+        )
+        torch.testing.assert_close(got_rhs1, want_rhs1, rtol=0, atol=0)
+        torch.testing.assert_close(got_rhs3, want_rhs3, rtol=0, atol=0)
+        torch.testing.assert_close(got_lhs, want_lhs, rtol=0, atol=0)
 
     def test_rejects_k_tile_that_does_not_divide_k(self):
         device = self.accelerator_device

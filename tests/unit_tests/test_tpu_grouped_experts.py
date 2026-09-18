@@ -223,8 +223,19 @@ def test_paired_grouped_mm_validates_supported_configuration():
         use_pallas_paired_grouped_mm=True,
         token_dispatcher=LocalTokenDispatcher.Config(num_experts=1, top_k=1),
     )
-    with pytest.raises(ValueError, match="requires full K/N TGMM tiles"):
+    with pytest.raises(ValueError, match="requires a full N TGMM tile"):
         config.build()
+
+    # A K tile is allowed: the paired dWeight kernel tiles K on its own grid axis.
+    TpuGroupedExperts.Config(
+        dim=16,
+        hidden_dim=24,
+        num_experts=1,
+        use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=True,
+        pallas_grouped_mm_tgmm_tiling=(128, 128, 0),
+        token_dispatcher=LocalTokenDispatcher.Config(num_experts=1, top_k=1),
+    ).build()
 
     experts = _build_experts(
         use_pallas_grouped_mm=True,
