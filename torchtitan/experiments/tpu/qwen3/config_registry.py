@@ -64,7 +64,13 @@ _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
     tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
     # Use both SparseCores for reduce-scatter in the by-layer FSDP schedule.
     tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+    # Select TPU7x's throughput-oriented operating point for this compute-bound
+    # recipe. This changes device frequency, not graph numerics.
+    tpu_flags.TPU7X_THROUGHPUT_P_STATE,
     {
+        # Raise the scoped VMEM budget to 128 MiB so the compiler can retain
+        # more Q235 kernel intermediates in VMEM instead of spilling them.
+        "xla_tpu_scoped_vmem_limit_kib": 131072,
         # Keep activation host copies off SparseCore, where they would contend
         # with the FSDP collectives above. In the isolated A/B this moved MFU
         # only from 18.425% to 18.448% and did not itself create D2H overlap.
@@ -576,6 +582,10 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
 def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   """Build the common Qwen3 235B-A22B FSDP configuration."""
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  # Q30's rewrite is tuned for its full-world FP32 graph. Q235's explicit
+  # FSDP-128, HSDP, and BF16 recipes violate that pass's current validator.
+  cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
+  cfg.tpu_config.fsdp_allreduce_slice_max_input_bytes = 0
   cfg.model_spec = model_registry(
       "235B-A22B",
       attn_backend="sdpa",
