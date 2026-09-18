@@ -114,6 +114,31 @@ def _make_full_memory_policy() -> Callable:
     return policy_fn
 
 
+def _make_full_save_attention_memory_policy() -> Callable:
+    """Full recompute while retaining attention output and LSE.
+
+    Saving the higher-order op also saves the tuple elements because
+    ``tag_sac_policy`` propagates its decision through ``getitem`` nodes. TPU
+    recipes replace FlexAttention with a dynamically named
+    ``pallas::*splash_attn_fwd*`` custom op before tracing, so recognize the
+    custom op and the Tokamax variant as well as upstream FlexAttention. Its
+    direct Q/K/V inputs remain recomputed. The generic remat rewrite feeds
+    those replayed values to the custom backward while preserving the saved
+    output/LSE.
+    """
+    full_policy = _make_full_memory_policy()
+
+    def policy_fn(node: torch.fx.Node) -> CheckpointPolicy:
+        if (
+            node.target is torch._higher_order_ops.flex_attention
+            or "splash_attn_fwd" in str(node.target)
+        ):
+            return CheckpointPolicy.MUST_SAVE
+        return full_policy(node)
+
+    return policy_fn
+
+
 def _make_eager_memory_policy(save_ops: set | None = None) -> Callable:
     """Eager-compatible SAC policy that alternates mm ops between save/recompute.
 
@@ -328,6 +353,21 @@ def _full_memory_policy_pass(
     tag_sac_policy(
         gm,
         policy_fn=_make_full_memory_policy(),
+        force_save_nodes=_configured_fsdp_force_save_nodes(gm, config),
+    )
+    return gm
+
+
+@register_memory_policy("full_save_attention")
+def _full_save_attention_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """Full recompute while retaining attention output and LSE."""
+    tag_sac_policy(
+        gm,
+        policy_fn=_make_full_save_attention_memory_policy(),
         force_save_nodes=_configured_fsdp_force_save_nodes(gm, config),
     )
     return gm

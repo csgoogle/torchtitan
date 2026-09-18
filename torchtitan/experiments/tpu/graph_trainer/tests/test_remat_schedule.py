@@ -407,6 +407,76 @@ def _describe_barriers(gm: torch.fx.GraphModule) -> dict[int, dict[str, tuple]]:
 
 
 class TestTpuRematSchedule(unittest.TestCase):
+    def _late_boundary_graph(self, *, cyclic: bool) -> tuple[
+        torch.fx.GraphModule, torch.fx.Node, torch.fx.Node
+    ]:
+        graph = torch.fx.Graph()
+        _set_tensor_meta(graph.placeholder("weight"))
+        saved = _set_tensor_meta(graph.placeholder("saved"))
+        cotangent = _set_tensor_meta(
+            graph.placeholder("cotangent"), backward=True
+        )
+
+        recompute_1 = _set_tensor_meta(
+            graph.call_function(torch.ops.aten.neg.default, args=(saved,)),
+            layer_id=1,
+            recomputed=True,
+        )
+        backward_1 = _set_tensor_meta(
+            graph.call_function(
+                torch.ops.aten.add.Tensor, args=(recompute_1, cotangent)
+            ),
+            layer_id=1,
+            backward=True,
+        )
+        recompute_0 = _set_tensor_meta(
+            graph.call_function(torch.ops.aten.neg.default, args=(saved,)),
+            layer_id=0,
+            recomputed=True,
+        )
+        gradient_1 = _set_tensor_meta(
+            graph.call_function(
+                torch.ops.aten.neg.default,
+                args=(recompute_0 if cyclic else saved,),
+            ),
+            layer_id=1,
+            backward=True,
+        )
+        gradient_1.meta["custom"][PARAMETER_GRADIENT_FQNS_META] = (
+            "layers.1.weight",
+        )
+        backward_0 = _set_tensor_meta(
+            graph.call_function(
+                torch.ops.aten.add.Tensor, args=(recompute_0, backward_1)
+            ),
+            layer_id=0,
+            backward=True,
+        )
+        graph.output((backward_0, gradient_1))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        return gm, gradient_1, recompute_0
+
+    def test_reorders_acyclic_late_boundary_before_barrier(self) -> None:
+        gm, gradient, first_recompute = self._late_boundary_graph(cyclic=False)
+
+        apply_tpu_remat_schedule(gm, (), num_static_inputs=1)
+
+        barrier = next(
+            node
+            for node in gm.graph.nodes
+            if node.meta.get(_TPU_REMAT_BARRIER_KIND_META) == "layer_entry"
+            and node.meta[_TPU_REMAT_REGION_ID_META] == 0
+        )
+        order = {node: index for index, node in enumerate(gm.graph.nodes)}
+        self.assertLess(order[gradient], order[barrier])
+        self.assertLess(order[barrier], order[first_recompute])
+
+    def test_rejects_true_late_boundary_cycle(self) -> None:
+        gm, _, _ = self._late_boundary_graph(cyclic=True)
+
+        with self.assertRaisesRegex(RuntimeError, "dependency cycle"):
+            apply_tpu_remat_schedule(gm, (), num_static_inputs=1)
+
     def test_traced_two_layer_schedule(self) -> None:
         for policy_name, policy_fn in (
             ("full", _make_full_memory_policy()),

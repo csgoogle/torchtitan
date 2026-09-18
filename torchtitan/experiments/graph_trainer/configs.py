@@ -20,7 +20,7 @@ from torchtitan.trainer import Trainer
 EpOverlapChunkDim = Literal["batch", "seq"]
 EpOverlapChunkStrategy = Literal["eager", "graph"]
 GraphTrainerMemoryPolicy = Literal[
-    "default", "full", "eager", "sac_and_offload"
+    "default", "full", "full_save_attention", "eager", "sac_and_offload"
 ]
 
 TRANSFORMER_BLOCK_FQN = "layers.*"
@@ -103,6 +103,9 @@ class GraphTrainerCompileConfig(CompileConfig):
         default: SAC — save all compute-intensive ops and FSDP all_gathers.
         full: full recompute — only layer outputs are saved. Mirrors
             eager's full AC (checkpoint_wrapper with no context_fn).
+        full_save_attention: full recompute except attention output/LSE,
+            matching MaxText's context-on-device policy while replaying the
+            Q/K/V producers.
         eager: SAC alternating mm ops between save/recompute, matching the
             eager AC policy in torchtitan.distributed.activation_checkpoint.
         sac_and_offload: SAC + CPU offload — apply default SAC first,

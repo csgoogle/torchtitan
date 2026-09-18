@@ -91,6 +91,7 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     _default_memory_policy_pass,
     _make_default_memory_policy,
     _make_full_memory_policy,
+    _make_full_save_attention_memory_policy,
     tag_sac_policy,
     tag_with_memory_policy_pass,
 )
@@ -1726,6 +1727,29 @@ class TestFullMemoryPolicy(TestCase):
         gm = self._build_gm([torch.ops.higher_order.flex_attention])
         node = self._get_call_function_nodes(gm)[0]
         self.assertEqual(policy_fn(node), CheckpointPolicy.MUST_RECOMPUTE)
+
+    def test_full_save_attention_only_saves_flex_attention(self):
+        policy_fn = _make_full_save_attention_memory_policy()
+        gm = self._build_gm(
+            [
+                torch.ops.aten.mm.default,
+                torch.ops.higher_order.flex_attention,
+                torch.ops.aten.add.Tensor,
+            ]
+        )
+        nodes = self._get_call_function_nodes(gm)
+        self.assertEqual(policy_fn(nodes[0]), CheckpointPolicy.MUST_RECOMPUTE)
+        self.assertEqual(policy_fn(nodes[1]), CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(policy_fn(nodes[2]), CheckpointPolicy.MUST_RECOMPUTE)
+
+    def test_full_save_attention_saves_tpu_custom_op(self):
+        def pallas_splash_attn_fwd(x, _):
+            return x
+
+        policy_fn = _make_full_save_attention_memory_policy()
+        gm = self._build_gm([pallas_splash_attn_fwd])
+        node = self._get_call_function_nodes(gm)[0]
+        self.assertEqual(policy_fn(node), CheckpointPolicy.MUST_SAVE)
 
     def test_layer_boundary_forced_to_must_save(self):
         """Nodes at layer boundaries should still be forced to MUST_SAVE."""

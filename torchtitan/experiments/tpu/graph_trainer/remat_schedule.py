@@ -333,15 +333,19 @@ def apply_tpu_remat_schedule(
             (user for users in redirect_users.values() for user in users),
             key=order.__getitem__,
         )
-        late_boundaries = [
-            boundary.name
+        redirected_user_set = {
+            user for users in redirect_users.values() for user in users
+        }
+        cyclic_boundaries = [
+            f"{boundary.name} -> {user.name}"
             for boundary in boundaries
-            if order[boundary] >= order[first_user]
+            for user in redirected_user_set
+            if boundary is user or _depends_on(boundary, user)
         ]
-        if late_boundaries:
+        if cyclic_boundaries:
             raise RuntimeError(
-                f"remat region {region_id} has boundary values unavailable before "
-                f"{first_user.name}: {late_boundaries}"
+                f"remat region {region_id} cannot place its entry barrier without "
+                f"a dependency cycle: {cyclic_boundaries}"
             )
 
         with gm.graph.inserting_before(first_user):
@@ -373,6 +377,10 @@ def apply_tpu_remat_schedule(
         barrier_count += 1
         gradient_count += len(ordering_gradients)
 
+    # A boundary can be textually later than the first redirected user while
+    # remaining independent of it. The new data edges define the required
+    # order; restore a valid textual order after all barriers are installed.
+    _stable_topological_sort(gm.graph, {})
     gm.graph.lint()
     gm.recompile()
     logger.info(
