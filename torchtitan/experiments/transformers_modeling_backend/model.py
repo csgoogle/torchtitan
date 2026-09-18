@@ -167,6 +167,37 @@ _TT_SPECIFIC_ATTRIBUTES = [
 ]
 
 
+def _derive_head_dim(config) -> int:
+    """head_dim for an architecture that does not state it at the top level.
+
+    Callers read config.head_dim directly, so leaving it unset raises
+    AttributeError rather than degrading. Two shapes have to be covered:
+    a composite config (CLIP, BLIP, CLAP) keeps real dims in text_config /
+    vision_config, and a staged encoder (SegFormer) keeps per-stage lists.
+    Prefer the text tower -- it is the one this lane trains.
+    """
+    for name in ("text_config", "vision_config", "audio_config"):
+        sub = getattr(config, name, None)
+        if sub is None:
+            continue
+        h = getattr(sub, "hidden_size", None)
+        n = getattr(sub, "num_attention_heads", None)
+        if h and n:
+            return h // n
+    # Staged encoders list a width and a head count per stage; the last
+    # stage is the deepest and the one that sizes the representation.
+    h = getattr(config, "hidden_sizes", None)
+    n = getattr(config, "num_attention_heads", None)
+    if isinstance(h, (list, tuple)) and h:
+        n_last = n[-1] if isinstance(n, (list, tuple)) and n else n
+        if n_last:
+            return h[-1] // n_last
+    # Nothing to derive from. This lane cannot train such a model anyway --
+    # it has no token embedding -- so return a value that lets it reach that
+    # error instead of dying on an attribute lookup.
+    return 64
+
+
 class HFTransformerModel(BaseModel):
     # TODO(#ISSUE): Remove after fixing PP backward to skip non-tensor inputs.
     _skip_lm_head: bool = False
@@ -427,6 +458,8 @@ class HFTransformerModel(BaseModel):
                 # carry their own head_dim; leave it unset for them.
                 if self.dim is not None and getattr(self, "num_attention_heads", None):
                     self.head_dim = self.dim // self.num_attention_heads
+                else:
+                    self.head_dim = _derive_head_dim(self)
 
             return self
 
@@ -609,6 +642,26 @@ class HFTransformerModel(BaseModel):
                 )
 
     @staticmethod
+    def _set_attn_everywhere(config, attn: str) -> None:
+        """Set the attention implementation on a config and its sub-configs.
+
+        A model that builds a nested backbone from its own sub-config
+        (grounding-dino's SwinBackbone from backbone_config) never sees a
+        change made only at the top level, so the back-off silently missed it
+        and the nested build raised the same error the back-off was there to
+        avoid.
+        """
+        config._attn_implementation = attn
+        config.attn_implementation = attn
+        for name in dir(config):
+            if not name.endswith("_config"):
+                continue
+            sub = getattr(config, name, None)
+            if sub is not None and hasattr(sub, "_attn_implementation"):
+                sub._attn_implementation = attn
+                sub.attn_implementation = attn
+
+    @staticmethod
     def _build_with_supported_attention(model_cls, config):
         """Build the model, backing off to an attention path it accepts.
 
@@ -626,8 +679,7 @@ class HFTransformerModel(BaseModel):
         last = None
         for attempt in attempts:
             if attempt != wanted:
-                config._attn_implementation = attempt
-                config.attn_implementation = attempt
+                HFTransformerModel._set_attn_everywhere(config, attempt)
             try:
                 model = model_cls(config=config)
             except (ValueError, KeyError) as e:
@@ -1081,6 +1133,49 @@ class HFTransformerModel(BaseModel):
         # made in __init__. HF's tie_weights only knows its own head.
         if self._added_lm_head is not None:
             self._added_lm_head.weight = self.tok_embeddings.weight
+
+        self._reassert_device()
+
+    def _reassert_device(self) -> None:
+        """Pull back anything init left on the wrong device.
+
+        Some HF initializers build a tensor without a device and assign it
+        over the materialized parameter -- Pegasus and Marian do this for
+        their sinusoidal positions:
+
+            out = torch.empty(n_pos, dim, dtype=self.weight.dtype)
+            self.weight = nn.Parameter(out, requires_grad=False)
+
+        `torch.empty` with no device= lands on CPU, so the weight that
+        to_empty() had placed on the accelerator is silently replaced by a CPU
+        one and the first forward dies mixing devices. Find the device the
+        model actually lives on and put the strays back.
+        """
+        device = None
+        for p in self.model.parameters():
+            if p.device.type != "cpu":
+                device = p.device
+                break
+        if device is None:
+            return
+        moved = []
+        for name, mod in self.model.named_modules():
+            for attr, val in list(mod._parameters.items()):
+                if val is not None and val.device != device:
+                    mod._parameters[attr] = nn.Parameter(
+                        val.data.to(device), requires_grad=val.requires_grad
+                    )
+                    moved.append(f"{name}.{attr}")
+            for attr, val in list(mod._buffers.items()):
+                if val is not None and val.device != device:
+                    mod._buffers[attr] = val.to(device)
+                    moved.append(f"{name}.{attr}")
+        if moved:
+            logger.warning(
+                f"init left {len(moved)} tensor(s) off {device}; moved back "
+                f"(first: {moved[0]}). This is an upstream initializer that "
+                "builds a tensor without a device."
+            )
 
 
     def named_children(self):

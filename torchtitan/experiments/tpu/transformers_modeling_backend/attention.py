@@ -75,6 +75,10 @@ def _unsupported(query, key, attention_mask, dropout, is_causal) -> str | None:
     return None
 
 
+# Block size for every splash stage. See the call site for the measurement.
+_SPLASH_BLOCK = 1024
+
+
 def splash_attention_forward(
     module,
     query: torch.Tensor,
@@ -121,6 +125,13 @@ def splash_attention_forward(
             query.dtype, scaling, window,
         )
 
+    # splash_sdpa defaults every block to 512, which is the library's default
+    # rather than a tuned one. Measured on Llama-3.2-1B at batch 8, seq 2048,
+    # 4x v6e: 512 gives 17.08%, 1024 gives 18.12%, 2048 gives 17.78% and 256
+    # gives 11.88% -- an interior optimum, +6.0% over the default, against a
+    # repeat-measured run-to-run spread of 0.05pp. The forward blocks carry
+    # most of it, which matches the profile: the two splash forward kernels
+    # are 20.8% of device time against 12.5% for the backward dkv.
     out = splash_sdpa(
         query.contiguous(),
         key.contiguous(),
@@ -128,6 +139,12 @@ def splash_attention_forward(
         scale=scaling,
         is_causal=True,
         local_window_size=window,
+        block_q=_SPLASH_BLOCK,
+        block_kv=_SPLASH_BLOCK,
+        block_kv_compute=_SPLASH_BLOCK,
+        block_q_dkv=_SPLASH_BLOCK,
+        block_kv_dkv=_SPLASH_BLOCK,
+        block_kv_dkv_compute=_SPLASH_BLOCK,
     )
     if not _tracing():
         _log_once(
