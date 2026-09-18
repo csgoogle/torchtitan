@@ -167,6 +167,28 @@ _TT_SPECIFIC_ATTRIBUTES = [
 ]
 
 
+def _derive_dim(config, field: str, default: int = 1) -> int:
+    """Read a structural size the top-level config does not state.
+
+    Same shapes as _derive_head_dim: a composite config keeps the real value
+    in text_config / vision_config, a staged encoder keeps a per-stage list.
+    The FLOP formula multiplies through these, so returning a number matters
+    more than returning the perfect number -- the metric is advisory, the
+    TypeError is fatal.
+    """
+    for name in ("text_config", "vision_config", "audio_config"):
+        sub = getattr(config, name, None)
+        v = getattr(sub, field, None) if sub is not None else None
+        if isinstance(v, int) and v > 0:
+            return v
+    v = getattr(config, field, None)
+    if isinstance(v, (list, tuple)) and v:
+        return v[-1]
+    if isinstance(v, int) and v > 0:
+        return v
+    return default
+
+
 def _derive_head_dim(config) -> int:
     """head_dim for an architecture that does not state it at the top level.
 
@@ -466,11 +488,15 @@ class HFTransformerModel(BaseModel):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
+            # A composite config states none of these at the top level, and
+            # the FLOP formula multiplies straight through them, so a None
+            # here is a TypeError rather than a missing metric. Take the same
+            # sub-config route head_dim takes.
             return get_dense_model_nparams_and_flops(
                 model,
-                n_layers=self.n_layers,
-                n_heads=self.n_heads,
-                head_dims=self.head_dim,
+                n_layers=self.n_layers or _derive_dim(self, "num_hidden_layers"),
+                n_heads=self.n_heads or _derive_dim(self, "num_attention_heads"),
+                head_dims=self.head_dim or _derive_head_dim(self),
                 seq_len=seq_len,
             )
 
