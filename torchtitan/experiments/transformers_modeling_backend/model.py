@@ -515,6 +515,33 @@ class HFTransformerModel(BaseModel):
         self.model = model_cls(config=config)
         # Resolved once: forward() compares an int, so it stays traceable.
         self._position_capacity = _structure.position_capacity(self.model)
+
+        # A bare encoder -- sentence-transformers ships MiniLM as a plain
+        # BertModel -- has no output projection at all, so there is nothing to
+        # compute token logits with. Give it one, tied to the token embedding,
+        # which is what any fine-tuning harness does to train such a model on a
+        # token objective. This adds parameters the checkpoint does not have;
+        # it is for training and measurement, not for restoring a released
+        # model's own head.
+        self._added_lm_head = None
+        _head, _ = _structure.find_head(self.model)
+        if _head is None:
+            _emb, _ = _structure.find_embedding(self.model)
+            if isinstance(_emb, nn.Embedding):
+                self._added_lm_head = nn.Linear(
+                    _emb.embedding_dim, _emb.num_embeddings, bias=False
+                )
+                self._added_lm_head.weight = _emb.weight
+                logger.info(
+                    f"{type(self.model).__name__} has no output projection; "
+                    f"attached an lm_head tied to the token embedding "
+                    f"({_emb.embedding_dim} -> {_emb.num_embeddings})."
+                )
+            else:
+                logger.warning(
+                    f"{type(self.model).__name__} has neither an output "
+                    "projection nor a token embedding to tie one to."
+                )
         # Carried from the Config: forward() reads it off the instance.
         self._fused_loss = bool(getattr(config, "_fused_loss", False))
         self.max_seq_len = config.max_seq_len
@@ -781,7 +808,9 @@ class HFTransformerModel(BaseModel):
 
     @property
     def lm_head(self):
-        """The output head."""
+        """The output head, native to the architecture or attached for it."""
+        if getattr(self, "_added_lm_head", None) is not None:
+            return self._added_lm_head
         found, _ = _structure.find_head(self.model)
         if found is None:
             raise AttributeError(
@@ -882,7 +911,15 @@ class HFTransformerModel(BaseModel):
             return hidden, weight.t()
 
         output = self.model(*args, **kwargs)
-        return getattr(output, "logits", output)
+        logits = getattr(output, "logits", None)
+        if logits is not None:
+            return logits
+        # A bare encoder returns hidden states and no logits; project them
+        # through the head attached in __init__.
+        hidden = getattr(output, "last_hidden_state", None)
+        if hidden is not None and self._added_lm_head is not None:
+            return self._added_lm_head(hidden)
+        return output
 
     def to_empty(self, *, device, recurse: bool = True):
         """Materialize parameters, but keep buffer values.
@@ -945,6 +982,11 @@ class HFTransformerModel(BaseModel):
             self.lm_head, nn.Identity
         ):
             self.model.tie_weights()
+
+        # to_empty() hands every parameter fresh storage, which breaks the tie
+        # made in __init__. HF's tie_weights only knows its own head.
+        if self._added_lm_head is not None:
+            self._added_lm_head.weight = self.tok_embeddings.weight
 
 
     def named_children(self):
