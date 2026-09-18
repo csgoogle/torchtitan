@@ -215,7 +215,11 @@ def find_position_embedding(root):
     GPT-2's `wpe` is the one that does not spell the word out.
     """
     found, path = _resolve(root, _POS_EMBED_PATHS)
-    if found is not None:
+    # ViT-style models keep positions in a plain Parameter under the same
+    # attribute name an encoder gives its nn.Embedding (Dinov2's
+    # embeddings.position_embeddings is a Parameter). Only a real embedding
+    # table has a capacity to report.
+    if isinstance(found, nn.Embedding):
         return found, path
     for name, mod in root.named_modules():
         if not isinstance(mod, nn.Embedding):
