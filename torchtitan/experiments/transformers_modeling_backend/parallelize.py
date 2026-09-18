@@ -93,6 +93,7 @@ def parallelize_hf_transformers(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
     """Apply parallelism to the HF model using the titan Module protocol.
 
@@ -162,11 +163,23 @@ def parallelize_hf_transformers(
 
     convert_hf_to_module(model)
 
-    # 3. Set sharding configs on all non-MoE modules
-    set_hf_sharding_configs(
-        model,
-        enable_sp=parallel_dims.tp_enabled,
-    )
+    # 3. Set sharding configs on all non-MoE modules.
+    #
+    # These describe TP/SP/EP placements and assume the Llama block naming
+    # (self_attn / mlp); GPT-2 calls its attention `attn`, BERT nests it under
+    # `attention.self`, and so on. A caller with no tensor parallelism has
+    # nothing to place, so skip rather than fail on a name -- the TPU lane
+    # runs SimpleFSDP over a 1D mesh and takes this path.
+    if parallel_dims.tp_enabled or parallel_dims.ep > 1:
+        set_hf_sharding_configs(
+            model,
+            enable_sp=parallel_dims.tp_enabled,
+        )
+    else:
+        logger.info(
+            "No tensor/expert parallelism requested; skipping HF sharding "
+            "configs (they assume Llama-style block attribute names)."
+        )
 
     # 3b. Under CP, wrap each flex kernel forward to all-gather k/v across
     # the CP axis (on the seq dim). Must run before model.parallelize so the
@@ -195,6 +208,12 @@ def parallelize_hf_transformers(
             compile_config=compile_config,
             parallel_dims=parallel_dims,
         )
+
+    # skip_dp lets a caller take everything above (TP, AC, compile) and supply
+    # its own data-parallel wrapping. The TPU lane uses it to apply SimpleFSDP
+    # instead of FSDP2 -- see experiments/tpu/.../parallelize.py.
+    if skip_dp:
+        return model
 
     dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
     edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
