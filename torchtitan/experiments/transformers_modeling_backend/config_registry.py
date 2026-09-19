@@ -143,6 +143,31 @@ def transformers_modeling_backend_full_moe(
     )
 
 
+def transformers_modeling_backend_full_moe_auto(
+    seq_len: int = 2048,
+) -> TransformersBackendConfig:
+    """A MoE checkpoint built at ITS OWN architecture.
+
+    Use this, not transformers_modeling_backend_full_moe, when passing an
+    --hf-model other than the default. The "full_moe" flavor sets
+    dim/n_layers/n_heads/n_kv_heads/num_experts/moe_intermediate_size
+    explicitly -- those values are Qwen3-30B-A3B's architecture, matching this
+    config's own hf_model default -- and _initialize_attributes records every
+    explicitly-set field into _titan_injected_model_args, which
+    update_from_config then applies OVER the loaded HF config. So the flavor is
+    correct for Qwen3-30B-A3B and silently wrong for any other checkpoint,
+    which would be built at a 30B model's shape under its own name.
+
+    "full_moe_auto" leaves the HF-mapped fields at None so AutoConfig supplies
+    them, while the config type still gates the MoE replacement -- the part
+    that genuinely cannot be inferred from --hf-model, since that is applied
+    after the config is built.
+    """
+    cfg = transformers_modeling_backend_full_moe(seq_len=seq_len)
+    cfg.model_spec = model_registry("full_moe_auto", seq_len=seq_len)
+    return cfg
+
+
 def transformers_modeling_backend_full(
     seq_len: int = 2048,
 ) -> TransformersBackendConfig:
