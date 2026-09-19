@@ -585,8 +585,12 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
+    experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 512)
+    # Four K slabs. The paired dWeight needs 105 MB at 4096 x 1536 against
+    # Mosaic's 64 MB, which the K tile this PR adds brings under 30 MB. The N
+    # tile must stay full; the unpaired alternative is (256, 0, 512).
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
     experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = 8192
