@@ -23,6 +23,7 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.experiments.tpu.activation_checkpoint import AttentionSavingSelectiveAC
 from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
                                             #  flavor Configs at import time)
@@ -160,6 +161,7 @@ def _tpu_hf_config(
     attn: str = "sdpa",
     fused_loss: bool = False,
     attn_mask_type: str = "block_causal",
+    save_attention: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
   model_spec = _model_registry(flavor, seq_len=seq_len)
@@ -215,7 +217,13 @@ def _tpu_hf_config(
           interval=10,
           last_save_model_only=False,
       ),
-      activation_checkpoint=SelectiveAC.Config(),
+      # ``save_attention`` swaps in the policy that also keeps the Pallas
+      # attention output, as upstream's default set already does for every
+      # attention implementation it knows about (SDPA variants, flex).
+      activation_checkpoint=(
+          AttentionSavingSelectiveAC.Config() if save_attention
+          else SelectiveAC.Config()
+      ),
   )
 
 
@@ -263,6 +271,12 @@ def hf_full_max() -> TPUTransformersBackendConfig:
   """Everything on: splash attention, fused CE, per-layer compile."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
                         attn="splash_tpu", fused_loss=True)
+
+def hf_full_max_saveattn() -> TPUTransformersBackendConfig:
+  """`hf_full_max` with the attention output saved instead of recomputed."""
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
+                        attn="splash_tpu", fused_loss=True, save_attention=True)
+
 
 def hf_moe() -> TPUTransformersBackendConfig:
   """A MoE checkpoint on the TPU grouped-expert kernel.
