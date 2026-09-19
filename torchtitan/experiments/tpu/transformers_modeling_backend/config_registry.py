@@ -223,3 +223,24 @@ def hf_moe_compile() -> TPUTransformersBackendConfig:
   """hf_moe with torch.compile enabled."""
   return _tpu_hf_config("full_moe", _DEFAULT_HF_MODEL, attn="splash_tpu", compile=True)
 
+
+def hf_moe_auto() -> TPUTransformersBackendConfig:
+  """A real MoE checkpoint, built at ITS OWN architecture.
+
+  Use this, not hf_moe, to run a named MoE checkpoint. hf_moe selects the
+  "full_moe" flavor, whose dims are set explicitly and therefore override the
+  loaded HF config -- every --hf-model under hf_moe builds the same synthetic
+  2048-dim / 48-layer / 128-expert model, so the checkpoint's architecture is
+  never exercised (and its expert weights are ~29 GB in fp32, which is what
+  OOMs a v6e chip before step 1). "full_moe_auto" leaves the HF-mapped fields
+  at None so AutoConfig supplies them, while still being a
+  TitanMoeModelConfig, which is what gates the MoE replacement.
+  """
+  return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu")
+
+
+def hf_moe_auto_compile() -> TPUTransformersBackendConfig:
+  """hf_moe_auto with torch.compile enabled."""
+  return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
+                        compile=True)
+
