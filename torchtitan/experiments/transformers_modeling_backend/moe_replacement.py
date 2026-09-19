@@ -19,6 +19,7 @@ Two-phase replacement:
 from dataclasses import replace
 from functools import partial
 
+import os
 import spmd_types as spmd
 import torch
 import torch.nn as nn
@@ -109,6 +110,17 @@ def _apply_expert_impl_converters(moe_config):
     replicated and lets SimpleFSDP shard them, which is what the qwen3 TPU
     lane does. The all-to-all dispatcher is an EP concern and is left alone.
     """
+    # Diagnostic escape hatch: keep the portable GroupedExperts (torch
+    # grouped_mm) instead of substituting the TPU/Pallas implementation, so a
+    # bad result can be attributed to the kernel rather than to the router or
+    # the MoE forward boundary. Off by default; this is for bisecting only.
+    if os.environ.get("TT_HF_MOE_NO_TPU_EXPERTS") == "1":
+        logger.warning(
+            "TT_HF_MOE_NO_TPU_EXPERTS=1: keeping the portable GroupedExperts "
+            "implementation (TPU grouped-expert substitution skipped)."
+        )
+        return moe_config
+
     try:
         import torch
 
