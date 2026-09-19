@@ -11,6 +11,8 @@ lane's existing ones.
         --config=hf_debugmodel
 """
 
+import os
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
@@ -73,6 +75,20 @@ def _model_registry(flavor: str, *, seq_len: int):
     spec.model = _TPU_FLAVORS[flavor]
     return spec
   return model_registry(flavor, seq_len=seq_len)
+
+def _ce_tiles() -> dict[str, int]:
+  """Fused-CE Mosaic tile sizes, overridable for a sweep.
+
+  The kernel's defaults (b=1024, h=512, v=2048) come from the muse_glimmer
+  recipe, not from this op-point. `b_block_size` must divide the token count
+  (loss.py rejects a mismatch rather than falling back to XLA silently).
+  """
+  return dict(
+      b_block_size=int(os.environ.get("TPU_HF_CE_B", "1024")),
+      h_block_size=int(os.environ.get("TPU_HF_CE_H", "512")),
+      v_block_size=int(os.environ.get("TPU_HF_CE_V", "2048")),
+  )
+
 
 # Small enough to compile and run a step on a single v6e chip.
 _DEFAULT_HF_MODEL = "Qwen/Qwen3-0.6B"
@@ -182,7 +198,7 @@ def _tpu_hf_config(
   _set_attn_implementation(model_spec.model, attn)
   return TPUTransformersBackendConfig(
       hf_model=hf_model,
-      loss=(PallasCrossEntropyLoss.Config() if fused_loss
+      loss=(PallasCrossEntropyLoss.Config(**_ce_tiles()) if fused_loss
             else CrossEntropyLoss.Config()),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
