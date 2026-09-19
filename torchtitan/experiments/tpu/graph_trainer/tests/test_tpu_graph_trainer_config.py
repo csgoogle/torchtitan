@@ -14,8 +14,10 @@ from absl.testing import parameterized
 import torch
 from torch import nn
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.config import apply_overrides
+from torchtitan.config import CompileConfig, apply_overrides
 from torchtitan.config.manager import ConfigManager
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.experiments.jax.jax_job_config import JaxJobConfig
 from torchtitan.experiments.graph_trainer import llama3 as llama3_gt
 from torchtitan.experiments.graph_trainer import qwen3 as qwen3_gt
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
@@ -60,6 +62,7 @@ from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
 from torchtitan.experiments.tpu.qwen3.config_registry import (
+    graph_trainer_qwen3_debugmodel,
     qwen3_8b,
     qwen3_8b_maxtext_parity,
     qwen3_8b_zero3,
@@ -72,10 +75,14 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_235b_scan_proxy,
     reg_trainer_qwen3_8b,
 )
-from torchtitan.experiments.tpu.tpu_job_config import TpuTrainerCompileConfig
+from torchtitan.experiments.tpu.tpu_job_config import (
+    TPUTrainerConfig,
+    TpuTrainerCompileConfig,
+)
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
 )
+from torchtitan.experiments.torchax.torchax_job_config import TorchaxJobConfig
 from torchtitan.models.common import ComplexRoPE, Linear
 from torchtitan.models.common.moe import MoE
 
@@ -209,6 +216,78 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     ):
       self.assertFalse(hasattr(regular_config.tpu_config, name))
       self.assertFalse(hasattr(graph_config.tpu_config, name))
+
+  @parameterized.parameters(JaxJobConfig, TorchaxJobConfig)
+  def test_sibling_lane_derivation_restores_generic_compile_type(
+      self, config_cls
+  ) -> None:
+    source = TPUTrainerConfig(
+        compile=TpuTrainerCompileConfig(
+            enable=True,
+            components=["model"],
+            backend="tpu",
+            materialize_forward_before_backward=True,
+            optimizer_compile="separate_graph",
+        )
+    )
+
+    config = config_cls.derive_from(source)
+
+    self.assertIs(type(config.compile), CompileConfig)
+    self.assertTrue(config.compile.enable)
+    self.assertEqual(config.compile.components, ["model"])
+    self.assertEqual(config.compile.backend, "tpu")
+    self.assertFalse(
+        hasattr(config.compile, "materialize_forward_before_backward")
+    )
+    self.assertFalse(hasattr(config.compile, "optimizer_compile"))
+
+  @parameterized.named_parameters(
+      (
+          "generic",
+          CompileConfig(enable=True, components=["model"], backend="tpu"),
+      ),
+      (
+          "graph",
+          GraphTrainerCompileConfig(
+              enable=True,
+              components=["model"],
+              backend="tpu",
+              memory_policy="full",
+          ),
+      ),
+  )
+  def test_graph_config_normalizes_upstream_compile_types(
+      self, compile_config
+  ) -> None:
+    config = TpuGraphTrainer.Config(compile=compile_config)
+
+    self.assertIsInstance(config.compile, TpuGraphTrainerCompileConfig)
+    self.assertEqual(config.compile.components, ["model"])
+    self.assertEqual(config.compile.backend, "tpu")
+    self.assertEqual(config.compile.pass_pipeline, "tpu")
+
+  @parameterized.parameters("jit", None)
+  def test_plain_non_aot_modes_remain_available(self, mode) -> None:
+    config = graph_trainer_qwen3_debugmodel()
+    config.compile.mode = mode
+
+    apply_tpu_graph_trainer_model_transforms(config)
+
+  @parameterized.named_parameters(
+      ("scan", "use_scan_layers", True),
+      ("remat", "enable_remat_barriers", True),
+      ("in_graph_optimizer", "optimizer_compile", "in_graph"),
+  )
+  def test_joint_graph_options_require_aot_fx_trace(
+      self, field_name: str, value
+  ) -> None:
+    config = graph_trainer_qwen3_debugmodel()
+    config.compile.mode = "jit"
+    setattr(config.compile, field_name, value)
+
+    with self.assertRaisesRegex(ValueError, "require compile.mode"):
+      apply_tpu_graph_trainer_model_transforms(config)
 
   def test_regular_compile_controls_are_cli_addressable(self) -> None:
     config = ConfigManager().parse_args([
@@ -831,6 +910,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         else TpuGraphTrainer.Config.from_tpu_trainer_config(
             config, module.model_registry
         )
+    )
+
+    self.assertFalse(
+        graph_config.compile.enable
+        and "loss" in graph_config.compile.components
     )
 
     self.assertIn(

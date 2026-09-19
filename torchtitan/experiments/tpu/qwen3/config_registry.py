@@ -156,7 +156,10 @@ def graph_trainer_qwen3_debugmodel() -> TpuGraphTrainer.Config:
   config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       qwen3_debugmodel(), graph_trainer_model_registry
   )
-  config.compile = TpuGraphTrainerCompileConfig(enable=True)
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+  )
   return config
 
 
@@ -411,6 +414,7 @@ def qwen3_8b() -> TpuGraphTrainer.Config:
   )
   graph_config.compile = TpuGraphTrainerCompileConfig(
       enable=True,
+      components=["model"],
       memory_policy="default",
       optimizer_compile="in_graph",
   )
@@ -485,6 +489,7 @@ def qwen3_moe_30b() -> TpuGraphTrainer.Config:
   )
   graph_config.compile = TpuGraphTrainerCompileConfig(
       enable=True,
+      components=["model"],
       memory_policy="full",
   )
   return graph_config

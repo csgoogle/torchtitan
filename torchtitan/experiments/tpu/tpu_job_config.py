@@ -214,11 +214,30 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     other state flow through unchanged — call sites typically only need to
     mutate the lane-specific bits after construction.
     """
-    dst_names = {f.name for f in dataclasses.fields(cls)}
+    dst_fields = {f.name: f for f in dataclasses.fields(cls)}
+    dst_names = set(dst_fields)
     src_names = {f.name for f in dataclasses.fields(src)}
     shared = (dst_names & src_names) - set(overrides)
+    values = {name: getattr(src, name) for name in shared}
+
+    # Sibling TPU lanes share Trainer's generic compile policy, but TorchTPU's
+    # concrete config adds execution controls that JAX and TorchAX must not
+    # inherit merely because they reuse a TorchTPU recipe. Reconstruct the
+    # destination's declared/default type and carry only the generic policy.
+    if "compile" in values:
+      compile_factory = dst_fields["compile"].default_factory
+      if compile_factory is dataclasses.MISSING:
+        raise TypeError(f"{cls.__name__}.compile must have a default factory")
+      dst_compile = compile_factory()
+      src_compile = values["compile"]
+      if type(src_compile) is not type(dst_compile):
+        values["compile"] = type(dst_compile)(
+            enable=src_compile.enable,
+            components=list(src_compile.components),
+            backend=src_compile.backend,
+        )
     return cls(
-        **{name: getattr(src, name) for name in shared},
+        **values,
         **overrides,
     )
 

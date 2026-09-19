@@ -24,7 +24,7 @@ from torchtitan.experiments.tpu.grouped_experts import (
 from torchtitan.experiments.tpu.mfu_flops import (
     get_maxtext_decoder_nparams_and_flops,
 )
-from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
+from torchtitan.experiments.tpu.qwen3_sharding import (
     configure_qwen_simple_fsdp_shard_dims,
 )
 from torchtitan.protocols.model_spec import ModelSpec

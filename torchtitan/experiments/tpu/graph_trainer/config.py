@@ -43,9 +43,9 @@ TpuGraphTrainerMemoryPolicy = Literal[
 class GraphSplitterConfig:
   """Partition a joint forward/backward trace into TPU executables.
 
-  Splitting is disabled by default. When ``enabled`` is false, all other
-  fields in this config are ignored. When enabled with
-  ``backward_partition_mode='none'``, GraphSplitter still makes separate
+  Splitting is disabled by default. When ``enabled`` is false, no split is
+  performed, although the remaining fields are still validated. When enabled
+  with ``backward_partition_mode='none'``, GraphSplitter still makes separate
   top-level forward and backward executables; the mode only controls finer
   subdivision of the backward executable.
 
@@ -91,7 +91,13 @@ class GraphSplitterConfig:
 
 @dataclass(kw_only=True, slots=True)
 class TpuGraphTrainerCompileConfig(GraphTrainerCompileConfig):
-  """Compilation and graph-transformation policy for TPU GraphTrainer."""
+  """Compilation and graph-transformation policy for TPU GraphTrainer.
+
+  ``mode='aot_fx_trace'`` captures model, loss, and backward jointly regardless
+  of ``components``. The inherited ``components`` field still controls ordinary
+  component-level ``torch.compile`` wrapping; TPU recipes therefore omit
+  ``"loss"`` unless a separately compiled loss is intentional.
+  """
 
   backend: str = "tpu"
   pass_pipeline: str = "tpu"
@@ -172,6 +178,30 @@ def apply_tpu_graph_trainer_model_transforms(
   _validate_fsdp_allreduce_slice(config)
 
   compile_config = config.compile
+  if compile_config.pass_pipeline != "tpu":
+    raise ValueError("TPU GraphTrainer requires compile.pass_pipeline='tpu'")
+
+  aot_only_options = []
+  if compile_config.use_scan_layers:
+    aot_only_options.append("compile.use_scan_layers")
+  if compile_config.graph_split.enabled:
+    aot_only_options.append("compile.graph_split.enabled")
+  if compile_config.enable_remat_barriers:
+    aot_only_options.append("compile.enable_remat_barriers")
+  if compile_config.fsdp_barrier_policy != "none":
+    aot_only_options.append("compile.fsdp_barrier_policy")
+  if compile_config.fsdp_allreduce_slice_parameter_patterns:
+    aot_only_options.append(
+        "compile.fsdp_allreduce_slice_parameter_patterns"
+    )
+  if compile_config.optimizer_compile == "in_graph":
+    aot_only_options.append("compile.optimizer_compile='in_graph'")
+  if compile_config.mode != "aot_fx_trace" and aot_only_options:
+    raise ValueError(
+        "TPU joint-graph options require compile.mode='aot_fx_trace': "
+        + ", ".join(aot_only_options)
+    )
+
   if (
       compile_config.optimizer_compile == "in_graph"
       and compile_config.compile_grad_norm

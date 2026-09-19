@@ -63,6 +63,7 @@ def _on_scan_lane(config: TPUTrainerConfig) -> TpuGraphTrainer.Config:
   )
   graph_config.compile = TpuGraphTrainerCompileConfig(
       enable=True,
+      components=["model"],
       memory_policy="full_and_scan_offload",
       use_scan_layers=True,
   )
@@ -118,7 +119,10 @@ def graph_trainer_llama3_debugmodel() -> TpuGraphTrainer.Config:
   config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       llama3_debugmodel(), graph_trainer_model_registry
   )
-  config.compile = TpuGraphTrainerCompileConfig(enable=True)
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+  )
   return config
 
 

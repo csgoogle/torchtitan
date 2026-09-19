@@ -5,14 +5,12 @@ executable via `StaticCompiler`, eliminating 300+ host dispatch roundtrips per
 step without merging the optimizer into the forward/backward graph.
 
 Used by:
-1. Regular TPUTrainer when `--compile.compile-optimizer` is enabled.
-2. TpuGraphTrainer when `--compile.optimizer-in-graph` is false and
-   `--compile.compile-optimizer` is enabled.
+1. Regular TPUTrainer when `--compile.optimizer-compile=separate_graph`.
+2. TpuGraphTrainer when `--compile.optimizer-compile=separate_graph`.
 """
 
 from typing import Any, Optional
 import torch
-from torch_tpu._internal.compile.compiler import StaticCompiler  # pytype: disable=import-error
 
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     _unwrap_subclasses,
@@ -21,6 +19,15 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
 )
 from torchtitan.experiments.tpu.compiled_optimizers.functional import functional_adamw_step
 from torchtitan.tools.logging import logger
+
+
+def _import_static_compiler():
+  """Load the optional TorchTPU compiler only when this path is selected."""
+  from torch_tpu._internal.compile.compiler import (  # pytype: disable=import-error
+      StaticCompiler,
+  )
+
+  return StaticCompiler
 
 
 def _tpu_backend_compile_pass(
@@ -47,7 +54,7 @@ def _tpu_backend_compile_pass(
     gm.graph.lint()
     gm.recompile()
 
-  executable = StaticCompiler()(gm, list(example_inputs))
+  executable = _import_static_compiler()(gm, list(example_inputs))
 
   if non_tensor_slots:
 

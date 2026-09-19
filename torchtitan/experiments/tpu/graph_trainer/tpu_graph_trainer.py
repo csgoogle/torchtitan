@@ -34,7 +34,10 @@ from torchtitan.components.optimizer import (
     collect_moe_routing_metric_tensors,
     set_moe_routing_metric_tensors,
 )
-from torchtitan.experiments.graph_trainer.configs import to_graph_trainer_config
+from torchtitan.experiments.graph_trainer.configs import (
+    GraphTrainerCompileConfig,
+    to_graph_trainer_config,
+)
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.separate_graph import (
@@ -86,6 +89,27 @@ class TpuGraphTrainer(GraphTrainer):
         compile: TpuGraphTrainerCompileConfig = field(
             default_factory=TpuGraphTrainerCompileConfig
         )
+
+        def __post_init__(self) -> None:
+            if not isinstance(self.compile, TpuGraphTrainerCompileConfig):
+                source_compile = self.compile
+                source_fields = {
+                    f.name for f in dataclasses.fields(source_compile)
+                }
+                if isinstance(source_compile, GraphTrainerCompileConfig):
+                    names = {
+                        f.name
+                        for f in dataclasses.fields(TpuGraphTrainerCompileConfig)
+                    } & source_fields
+                else:
+                    names = {"enable", "components", "backend"} & source_fields
+                values = {
+                    name: getattr(source_compile, name) for name in names
+                }
+                # A generic GraphTrainer pipeline cannot lower a TPU graph.
+                values["pass_pipeline"] = "tpu"
+                self.compile = TpuGraphTrainerCompileConfig(**values)
+            super(TpuGraphTrainer.Config, self).__post_init__()
 
         @classmethod
         def from_tpu_trainer_config(
@@ -381,7 +405,9 @@ class TpuGraphTrainer(GraphTrainer):
                         self._traced_step, self.config
                     )
                 else:
-                    pipeline_fn = PASS_PIPELINE_REGISTRY["tpu"]
+                    pipeline_fn = PASS_PIPELINE_REGISTRY[
+                        self.config.compile.pass_pipeline
+                    ]
                     passes = pipeline_fn(self._traced_step, self.config)
                 self._traced_step.gm = apply_graph_passes(
                     self._traced_step.gm,
@@ -480,7 +506,9 @@ class TpuGraphTrainer(GraphTrainer):
                     global_valid_tokens,
                     extra_kwargs,
                 )
-            pipeline_fn = PASS_PIPELINE_REGISTRY["tpu"]
+            pipeline_fn = PASS_PIPELINE_REGISTRY[
+                self.config.compile.pass_pipeline
+            ]
             passes = pipeline_fn(self._traced_step, self.config)
             self._traced_step.gm = apply_graph_passes(
                 self._traced_step.gm,

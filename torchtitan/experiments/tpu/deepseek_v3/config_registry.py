@@ -64,5 +64,8 @@ def graph_trainer_deepseek_v3_debugmodel() -> TpuGraphTrainer.Config:
   config = TpuGraphTrainer.Config.from_tpu_trainer_config(
       deepseek_v3_debugmodel(), graph_trainer_model_registry
   )
-  config.compile = TpuGraphTrainerCompileConfig(enable=True)
+  config.compile = TpuGraphTrainerCompileConfig(
+      enable=True,
+      components=["model"],
+  )
   return config

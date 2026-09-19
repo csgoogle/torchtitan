@@ -94,7 +94,7 @@ class TPUTrainer(torchtitan.train.Trainer):
           global_valid_tokens=global_valid_tokens,
       )
 
-    # Graph-split forward/backward for TPU:
+    # Materialize forward/backward separately for the regular TPUTrainer:
     # The forward pass and loss computation are materialized as one XLA graph,
     # and the backward pass is compiled separately. This reduces peak
     # compilation time vs. one monolithic forward+backward graph.
@@ -198,11 +198,12 @@ def start_trainer(
     model_spec.parallelize_fn = patched_parallelize
 
   try:
+    # TODO: Make TPUTrainerConfig owned by TPUTrainer so all TPU trainer
+    # variants can use the upstream-native ``config.build()`` construction path.
     trainer = trainer_cls(train_config)
     # Asked of the built model rather than wrapped around `parallelize_fn`:
-    # the graph trainer -- the only lane scan runs on -- builds its own config
-    # and its own parallelize_fn, so a wrapper on the one patched above is
-    # never called.
+    # graph-trainer recipes already carry their graph-specific model spec and
+    # parallelize_fn, so the regular trainer wrapper above is not installed.
     for part in trainer.model_parts:
       check_scan_was_applied(
           part,
