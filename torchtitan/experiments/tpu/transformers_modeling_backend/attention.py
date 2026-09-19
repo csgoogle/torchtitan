@@ -20,6 +20,7 @@ kernel that never fired gets reported as a speedup.
 
 import logging
 
+import os
 import torch
 from torchtitan.models.common.attention import segment_ids_from_positions
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
@@ -30,7 +31,11 @@ from torchtitan.tools.logging import logger
 _BLOCK = 512
 # Block size for every splash stage. See the call site for the measurement.
 # TODO(alekseyv): plumb this to splash_attention config
-_SPLASH_BLOCK = 1024
+_SPLASH_BLOCK = int(os.environ.get("TPU_HF_SPLASH_BLOCK", "1024"))
+# Block sizes for the two backward stages, overridable independently: the dkv
+# stage sweeps the (q, kv) grid a second time and its optimum need not match
+# the forward's.
+_SPLASH_BLOCK_DKV = int(os.environ.get("TPU_HF_SPLASH_BLOCK_DKV", str(_SPLASH_BLOCK)))
 _reported: set[str] = set()
 
 
@@ -173,9 +178,9 @@ def splash_attention_forward(
         block_q=_SPLASH_BLOCK,
         block_kv=_SPLASH_BLOCK,
         block_kv_compute=_SPLASH_BLOCK,
-        block_q_dkv=_SPLASH_BLOCK,
-        block_kv_dkv=_SPLASH_BLOCK,
-        block_kv_dkv_compute=_SPLASH_BLOCK,
+        block_q_dkv=_SPLASH_BLOCK_DKV,
+        block_kv_dkv=_SPLASH_BLOCK_DKV,
+        block_kv_dkv_compute=_SPLASH_BLOCK_DKV,
     )
     if not _tracing():
         _log_once(
