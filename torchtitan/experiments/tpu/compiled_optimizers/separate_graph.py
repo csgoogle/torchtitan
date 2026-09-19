@@ -54,7 +54,8 @@ def _tpu_backend_compile_pass(
     gm.graph.lint()
     gm.recompile()
 
-  executable = _import_static_compiler()(gm, list(example_inputs))
+  static_compiler = _import_static_compiler()
+  executable = static_compiler()(gm, list(example_inputs))
 
   if non_tensor_slots:
 

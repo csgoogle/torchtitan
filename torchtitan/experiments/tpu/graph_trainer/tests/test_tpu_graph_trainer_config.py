@@ -33,7 +33,9 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+    TpuGraphTrainerQwen3Model,
     model_registry as tpu_qwen3_graph_registry,
+    parallelize_qwen3 as tpu_graph_parallelize_qwen3,
 )
 from torchtitan.experiments.tpu.layer_loop import runs_layer_loop
 from torchtitan.experiments.tpu.llama3.config_registry import (
@@ -70,6 +72,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
+    qwen3_moe_235b_fsdp_activation_offload_maxtext,
     qwen3_moe_235b_scan,
     qwen3_moe_235b_scan_maxtext,
     qwen3_moe_235b_scan_proxy,
@@ -738,16 +741,19 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         )
     )
 
-  def test_235b_flavor_resolves_through_the_graph_trainer(self) -> None:
-    # The graph trainer discards the recipe's ModelSpec and re-resolves the
-    # flavor string against upstream's registry. A flavor that only the TPU
-    # registry knows dies there on a KeyError, after every other test passes.
-    config = qwen3_moe_235b_scan()
+  @parameterized.named_parameters(
+      ("scan", qwen3_moe_235b_scan),
+      ("activation_offload", qwen3_moe_235b_fsdp_activation_offload_maxtext),
+  )
+  def test_235b_recipes_keep_graph_trainer_model_spec(self, recipe) -> None:
+    config = recipe()
     assert config.model_spec is not None
-
-    spec = tpu_qwen3_graph_registry(config.model_spec.flavor)
-
-    self.assertIsInstance(spec.model, GraphTrainerQwen3Model.Config)
+    self.assertIsInstance(
+        config.model_spec.model, TpuGraphTrainerQwen3Model.Config
+    )
+    self.assertIs(
+        config.model_spec.parallelize_fn, tpu_graph_parallelize_qwen3
+    )
 
   def test_235b_recipe_matches_the_maxtext_shape(self) -> None:
     config = qwen3_moe_235b_scan()

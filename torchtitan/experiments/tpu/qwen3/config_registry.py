@@ -32,6 +32,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
 )
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     model_registry as graph_trainer_model_registry,
+    to_graph_trainer_model_spec,
 )
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.qkv import TpuPackedQKVConverter
@@ -627,15 +628,16 @@ def _qwen3_moe_235b_fsdp_only() -> TpuGraphTrainer.Config:
   # FSDP-128, HSDP, and BF16 recipes violate that pass's current validator.
   cfg.compile.fsdp_allreduce_slice_parameter_patterns = ()
   cfg.compile.fsdp_allreduce_slice_max_input_bytes = 0
-  cfg.model_spec = model_registry(
-      "235B-A22B",
-      attn_backend="sdpa",
-      converters=[
-          TpuTokenDispatcherConverter.Config(),
-          TpuGroupedExpertsConverter.Config(),
-      ],
+  cfg.model_spec = to_graph_trainer_model_spec(
+      model_registry(
+          "235B-A22B",
+          attn_backend="sdpa",
+          converters=[
+              TpuTokenDispatcherConverter.Config(),
+              TpuGroupedExpertsConverter.Config(),
+          ],
+      )
   )
-  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
@@ -769,15 +771,16 @@ def qwen3_moe_235b_scan() -> TpuGraphTrainer.Config:
   or config validation fails with a message that reads like a scan error.
   """
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
-  cfg.model_spec = model_registry(
-      "235B-A22B",
-      attn_backend="sdpa",
-      converters=[
-          TpuTokenDispatcherConverter.Config(),
-          TpuGroupedExpertsConverter.Config(),
-      ],
+  cfg.model_spec = to_graph_trainer_model_spec(
+      model_registry(
+          "235B-A22B",
+          attn_backend="sdpa",
+          converters=[
+              TpuTokenDispatcherConverter.Config(),
+              TpuGroupedExpertsConverter.Config(),
+          ],
+      )
   )
-  cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   # Stacking cannot share the bias scheme's per-layer buffers (#391), so
   # balance with the aux loss. 1e-3 is MaxText's weight for this model.
