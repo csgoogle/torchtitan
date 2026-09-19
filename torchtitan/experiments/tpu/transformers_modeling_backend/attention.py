@@ -21,6 +21,7 @@ kernel that never fired gets reported as a speedup.
 import logging
 
 import torch
+from torchtitan.models.common.attention import segment_ids_from_positions
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.modeling_utils import AttentionInterface
 
@@ -78,6 +79,20 @@ def _unsupported(query, key, attention_mask, dropout, is_causal) -> str | None:
     return None
 
 
+
+def _document_masked(module) -> bool:
+    """True when the flavor asked for document-causal attention.
+
+    Mirrors ``HFTransformerModel.get_attention_masks``: with
+    ``attn_mask_type == "block_causal"`` the flex path builds a document
+    BlockMask so packed samples do not attend across boundaries. Splash cannot
+    take that BlockMask, so this adapter expresses the same mask as
+    ``segment_ids`` derived from the per-document ``position_ids`` HF threads
+    through ``**kwargs``.
+    """
+    cfg = getattr(module, "config", None)
+    return getattr(cfg, "attn_mask_type", "causal") == "block_causal"
+
 def splash_attention_forward(
     module,
     query: torch.Tensor,
@@ -116,6 +131,22 @@ def splash_attention_forward(
     if not isinstance(window, int) or window <= 0:
         window = None
 
+    # The trainer hands the model one token-major stream per rank (batch
+    # folded into the sequence: 8 x 2048 arrives as [1, 16384]). Without
+    # segment ids the kernel runs ONE causal problem over the whole stream:
+    # every sample attends to every earlier sample (not the semantics the
+    # flex/GPU path has under block_causal) and the attention work grows
+    # quadratically -- measured 2026-09-19 on Llama-3.2-1B, 4x v6e: splash
+    # went from 151 ms to 618 ms per step and the step from 0.59 s to 1.15 s.
+    # ``position_ids`` restart at 0 at every document boundary; turning them
+    # into segment ids restores per-document masking AND lets the kernel skip
+    # every block whose q and kv segments do not overlap.
+    segment_ids = None
+    if _document_masked(module):
+        position_ids = kwargs.get("position_ids")
+        if position_ids is not None:
+            segment_ids = segment_ids_from_positions(position_ids)
+
     if not _tracing():
         _log_once(
             "splash_tpu args",
@@ -135,6 +166,7 @@ def splash_attention_forward(
         query.contiguous(),
         key.contiguous(),
         value.contiguous(),
+        segment_ids=segment_ids,
         scale=scaling,
         is_causal=True,
         local_window_size=window,
@@ -148,8 +180,10 @@ def splash_attention_forward(
     if not _tracing():
         _log_once(
             "splash_tpu fired",
-            "splash_tpu: kernel active (heads=%d kv_heads=%d seq=%d head_dim=%d)",
+            "splash_tpu: kernel active (heads=%d kv_heads=%d seq=%d head_dim=%d "
+            "segment_ids=%s)",
             heads, kv_heads, query.shape[-2], query.shape[-1],
+            "document" if segment_ids is not None else "none",
         )
     return out.transpose(1, 2).contiguous(), None
 

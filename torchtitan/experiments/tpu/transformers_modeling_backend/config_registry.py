@@ -125,6 +125,22 @@ def _set_attn_implementation(model_config, attn: str) -> None:
   model_config._attn_implementation = attn
 
 
+def _set_attn_mask_type(model_config, mask_type: str) -> None:
+  """Select causal vs document-causal masking for the packed token stream.
+
+  The Grain packer folds the batch into one token-major stream per rank and
+  resets ``positions`` at every document boundary. ``block_causal`` keeps each
+  sample's attention inside its own document (flex builds a document BlockMask
+  on GPU; the splash adapter turns the same positions into segment ids on
+  TPU). The backend's ``full`` flavor defaults to plain ``causal``, under which
+  a 16k-token stream is ONE causal attention problem -- 8x the work of eight
+  2k sequences and cross-sample attention. Same injection path as
+  _set_attn_implementation so update_from_config re-applies it.
+  """
+  model_config._titan_injected_model_args["attn_mask_type"] = mask_type
+  model_config.attn_mask_type = mask_type
+
+
 def _c4_test_loader() -> GrainDataLoader.Config:
   """This base replaced the HF text dataloader with Grain (upstream #4088)."""
   return GrainDataLoader.Config(
@@ -143,6 +159,7 @@ def _tpu_hf_config(
     compile: bool = False,
     attn: str = "sdpa",
     fused_loss: bool = False,
+    attn_mask_type: str = "block_causal",
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
   model_spec = _model_registry(flavor, seq_len=seq_len)
@@ -152,6 +169,7 @@ def _tpu_hf_config(
   # also leaves the shared flavors table untouched.
   model_spec.model = as_tpu_model_config(model_spec.model, fused_loss=fused_loss)
   model_spec.parallelize_fn = parallelize_hf_transformers_tpu
+  _set_attn_mask_type(model_spec.model, attn_mask_type)
   # flex attention has no TPU lowering. "sdpa" is the portable default;
   # "splash_tpu" routes attention through the TPU splash kernel via HF's
   # AttentionInterface (see attention.py), which works for any architecture
