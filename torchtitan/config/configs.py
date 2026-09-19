@@ -92,6 +92,23 @@ class ParallelismConfig:
     Whether to use the topology-aware mesh for TPU devices.
     """
 
+    enable_min_cost_redistribute: bool = False
+    """
+    Whether to use DTensor's min-cost (graph-based, Dijkstra) redistribution
+    planner instead of the default greedy one.
+
+    The greedy planner walks mesh dimensions outer-to-inner, so for an HSDP
+    gradient (Partial on both the replicate and shard dims) it emits an
+    AllReduce over the *full* tensor on the replicate dim before the
+    ReduceScatter on the shard dim. The min-cost planner compares candidate
+    collective sequences by estimated cost and instead reduce-scatters first,
+    shrinking the AllReduce payload by the shard degree. That is a large win on
+    multi-slice, where the replicate dim crosses DCN.
+
+    Off by default because graph-based planning is slower than greedy, and that
+    cost is paid per redistribute while tracing.
+    """
+
     data_parallel_replicate_degree: int = 1
     """
     The `data_parallel_replicate_degree` argument specifies the degree of
