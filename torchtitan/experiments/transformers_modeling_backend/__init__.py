@@ -152,6 +152,21 @@ flavors = {
             norm_topk_prob=True,
         ),
     ),
+    # Like "full_moe", but takes its architecture from the checkpoint instead
+    # of pinning one. "full_moe" sets dim/n_layers/n_heads/num_experts/...
+    # explicitly, and _initialize_attributes records every explicitly-set
+    # (non-default) field into _titan_injected_model_args, which
+    # update_from_config then applies OVER the loaded HF config -- so
+    # --hf-model selects the weights' name while the model is built at
+    # full_moe's fixed 2048-dim / 48-layer / 128-expert shape. Leaving the
+    # HF-mapped fields at their None defaults is what the base config already
+    # does for "full": nothing is injected, so AutoConfig's values stand. The
+    # MoE-ness still comes from the flavor (TitanMoeModelConfig is what gates
+    # the MoE replacement), which is the part that genuinely cannot be
+    # inferred from --hf-model, since that is applied after the config is built.
+    "full_moe_auto": HFTransformerModel.Config(
+        model_config=TitanMoeModelConfig(),
+    ),
     "sft_full": HFTransformerModel.Config(
         model_config=TitanModelConfig(
             attn_mask_type="block_causal",
