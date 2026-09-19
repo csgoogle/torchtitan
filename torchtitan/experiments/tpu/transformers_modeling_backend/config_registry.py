@@ -79,12 +79,18 @@ def _model_registry(flavor: str, *, seq_len: int):
 def _ce_tiles() -> dict[str, int]:
   """Fused-CE Mosaic tile sizes, overridable for a sweep.
 
-  The kernel's defaults (b=1024, h=512, v=2048) come from the muse_glimmer
+  The kernel's own defaults (b=1024, h=512, v=2048) come from the muse_glimmer
   recipe, not from this op-point. `b_block_size` must divide the token count
   (loss.py rejects a mismatch rather than falling back to XLA silently).
+
+  b defaults to 2048 here: swept on Llama-3.2-1B at 16,384 tokens per rank,
+  512 / 1024 / 2048 gave 20,342 / 21,716 / 22,161 tok/s/device and 4096 will
+  not compile (RESOURCE_EXHAUSTED). h and v stay at the recipe's values --
+  both directions on each were worse (256: 21,562; 1024: 21,535; v=1024:
+  20,892; v=4096: 20,639, which also perturbs the first-step loss).
   """
   return dict(
-      b_block_size=int(os.environ.get("TPU_HF_CE_B", "1024")),
+      b_block_size=int(os.environ.get("TPU_HF_CE_B", "2048")),
       h_block_size=int(os.environ.get("TPU_HF_CE_H", "512")),
       v_block_size=int(os.environ.get("TPU_HF_CE_V", "2048")),
   )
