@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import copy
 import importlib
 import math
@@ -1632,6 +1633,29 @@ class HFTransformerModel(BaseModel):
                 )
                 module.attention_scaling = attention_scaling
 
+        # Titan MoE modules swapped in by moe_replacement initialize themselves
+        # at parallelize time (to_empty(cpu) + init_states(cpu)), but the
+        # trainer parallelizes FIRST and materializes SECOND, so the to_empty()
+        # that precedes this call hands those expert weights fresh,
+        # uninitialized storage and the CPU values are gone. The walk above
+        # cannot restore them: HF's _init_weights dispatches on module type,
+        # and a stacked [E, *, *] expert weight is not an nn.Linear. Nothing
+        # then writes them, so training sees expert weights that read back as
+        # nan -- measured on device at the first MoE forward as finite=0.0000
+        # for w1/w2/w3, while the activations and routing counts entering the
+        # same call were healthy. This is the same failure the inv_freq
+        # recompute above exists for: a tensor whose value is established
+        # outside _init_weights and destroyed by to_empty().
+        #
+        # Re-run each swapped module's own init_states(), which consults the
+        # param_init table keyed by the real parameter names (w1_EFD/w2_EDF/...
+        # discovered dynamically by _get_expert_param_info). Must run with
+        # SimpleFSDP's parametrization disabled, otherwise reads of .w1_EFD
+        # return the computed tensor and the initializer writes into a
+        # temporary instead of the parameter -- the same trap documented for
+        # tie_weights in the TPU lane's _defer_parametrization_during_init.
+        self._init_swapped_native_modules()
+
         # TODO(3outeille): For pipeline parallel, only tie weights if both input and output embeddings are on the same device
         # Maybe better way of handling this?
         if not isinstance(self.tok_embeddings, nn.Identity) and not isinstance(
@@ -1645,6 +1669,63 @@ class HFTransformerModel(BaseModel):
             self._added_lm_head.weight = self.tok_embeddings.weight
 
         self._reassert_device()
+
+    def _init_swapped_native_modules(self) -> None:
+        """Re-initialize Titan modules swapped into the HF tree after to_empty().
+
+        Only modules that own a ``param_init`` table are touched -- that is
+        exactly the set built by ``moe_replacement``, whose parameters HF's
+        type-dispatched ``_init_weights`` cannot reach. ``init_states`` is
+        called on the outermost such module; it recurses to its own children,
+        so nested experts are covered once.
+        """
+        roots = [
+            m for m in self.model.modules()
+            if getattr(m, "_param_init", None) is not None
+        ]
+        if not roots:
+            return
+
+        # Deduplicate to outermost modules: a root that is a descendant of
+        # another root would otherwise be initialized twice.
+        inner = set()
+        for r in roots:
+            for child in r.modules():
+                if child is not r:
+                    inner.add(id(child))
+        roots = [r for r in roots if id(r) not in inner]
+
+        # Only take the guard if parametrization is actually active.
+        # disable_active_parametrization() is NOT reentrant -- its finally
+        # clause sets the flag back to True unconditionally rather than
+        # restoring the previous value -- so nesting it inside a caller that
+        # already disabled it (which the TPU lane does around this whole
+        # method, see parallelize.py's _defer_parametrization_during_init)
+        # re-enables parametrization on exit and the caller's subsequent
+        # tie_weights() fails with "`model.embed_tokens.weight` is neither a
+        # parameter, buffer, nor extra state."
+        ctx = contextlib.nullcontext()
+        try:
+            from torchtitan.experiments.graph_trainer import simple_fsdp as _sfsdp
+
+            if getattr(_sfsdp, "_active_parametrization", False):
+                ctx = _sfsdp.disable_active_parametrization()
+        except Exception:  # SimpleFSDP not in use on this lane
+            pass
+        with ctx:
+            for r in roots:
+                r.init_states(buffer_device=self._reinit_buffer_device())
+        logger.info(
+            "Re-initialized %d swapped native module(s) after materialization.",
+            len(roots),
+        )
+
+    def _reinit_buffer_device(self) -> torch.device | None:
+        """Device for buffers rebuilt during the post-materialization re-init."""
+        for param in self.model.parameters():
+            if param.device.type != "meta":
+                return param.device
+        return None
 
     def to_empty(self, *, device, recurse: bool = True):
         """Materialize parameters, but keep buffer values.

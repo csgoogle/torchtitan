@@ -165,6 +165,10 @@ def transformers_modeling_backend_full_moe_auto(
     """
     cfg = transformers_modeling_backend_full_moe(seq_len=seq_len)
     cfg.model_spec = model_registry("full_moe_auto", seq_len=seq_len)
+    # transformers_modeling_backend_full_moe leaves `loss` unset, which makes
+    # it unrunnable on its own ("Can't instantiate abstract class BaseLoss").
+    # Every other config in this file sets it; match them.
+    cfg.loss = CrossEntropyLoss.Config()
     return cfg
 
 
