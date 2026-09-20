@@ -587,10 +587,16 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
     experts.use_pallas_grouped_mm = True
     experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
-    # Four K slabs. The paired dWeight needs 105 MB at 4096 x 1536 against
-    # Mosaic's 64 MB, which the K tile this PR adds brings under 30 MB. The N
+    # Two K slabs. The paired dWeight needs 105 MB at 4096 x 1536 against
+    # Mosaic's 64 MB, which the K tile this PR adds brings to ~53 MB here. The N
     # tile must stay full; the unpaired alternative is (256, 0, 512).
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
+    #
+    # 2048 over 1024 is measured, not assumed: 20.824 -> 18.576 ms p50 (1.121x)
+    # at the 235B per-device op-point (b=524288, k=4096, n=1536, bf16, v7x),
+    # bit-exact, co-measured n=240 over both orderings.
+    # perf: see wiki/kernel_experiments/paired-grouped-matmul-dweight/pallas/
+    #       2026-09-19-v001-tgmm-tile-k-sweep.md
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 2048, 0)
     experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = 8192
