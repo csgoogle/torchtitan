@@ -26,9 +26,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 NUM_DISTRIBUTED_TPU_SHARDS = 4
-NUM_SINGLE_TPU_SHARDS = 2
-NUM_CPU_SHARDS = 2
-NUM_PYTEST_SHARDS = 2
+NUM_SINGLE_TPU_SHARDS = 3
+NUM_CPU_SHARDS = 6
+NUM_PYTEST_SHARDS = 3
 
 # Trees run under pytest even when a file has a unittest entry point. pytest
 # collects unittest.TestCase natively, so routing the whole unit test suite
@@ -192,7 +192,11 @@ def discover_tests():
     for path in _iter_test_files():
         relative = path.relative_to(REPO_ROOT)
         module = str(relative.with_suffix("")).replace("/", ".")
-        if module in DISABLED_TESTS:
+        # PROBE BRANCH: invert the filter so we run only the disabled tests.
+        if module not in DISABLED_TESTS:
+            continue
+        # Already diagnosed this run; skip to keep the probe short.
+        if module.endswith("tests.test_layer_stack_distributed"):
             continue
 
         try:
