@@ -69,9 +69,13 @@ def get_maxtext_decoder_nparams_and_flops(
                 "MaxText decoder FLOPs support routed experts without shared experts"
             )
         # Count the router and only the top-k activated expert matmuls.
+        # Upstream d771abb0 moved the grouped experts behind `RoutedExperts`.
         forward_weight_flops += (
             2 * dim * moe.num_experts
-            + 6 * dim * moe.experts.hidden_dim * moe.router.top_k
+            + 6
+            * dim
+            * moe.routed_experts.inner_experts.hidden_dim
+            * moe.router.top_k
         )
 
     # MaxText's training convention is one forward plus two backward FLOPs.

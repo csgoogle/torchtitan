@@ -506,6 +506,16 @@ def sbd_splash_attention(
     applied to the post-softmax probabilities with a single `1/(1-rate)`
     rescale; online-softmax state and logsumexp stay undropped.
   """
+  # TT-UNFLATTEN-SHIM: must stay BELOW the docstring -- code above the string
+  # literal would demote it from a docstring to a discarded expression and
+  # leave __doc__ as None. See UPSTREAM_IMPORT_NOTES.md.
+  from torchtitan.experiments.tpu.unflatten_shim import unflatten_tensor, flatten_tensor
+  q = unflatten_tensor(q, expected_flat_ndim=3)
+  k = unflatten_tensor(k, expected_flat_ndim=3)
+  v = unflatten_tensor(v, expected_flat_ndim=3)
+  if isinstance(bias, torch.Tensor):
+      bias = unflatten_tensor(bias, expected_flat_ndim=3)
+
   if q.shape[2] % k.shape[2] != 0:
     raise ValueError(
         f"num q heads ({q.shape[2]}) must be a multiple of num kv heads"
@@ -531,4 +541,5 @@ def sbd_splash_attention(
       window_val,
       *SbdConfig.static_args(),
   )
-  return out
+  # TT-UNFLATTEN-SHIM:
+  return flatten_tensor(out, original_flat_ndim=3)

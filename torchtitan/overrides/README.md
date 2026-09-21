@@ -60,11 +60,12 @@ tree and replaces matching nodes with the factory's output.
 
 ### Core principles
 
-- **Explicit opt-in.** Nothing happens unless the user lists modules in
+- **Explicit opt-in.** Nothing happens unless the user lists targets in
   `override.imports`. No auto-detection from hardware or installed packages.
-- **Strictly scoped to the request.** Only overrides *registered by the listed
-  modules* (or their submodules) are applied — not the whole global table. This
-  is enforced by provenance (the module a factory is defined in).
+- **Strictly scoped to the request.** Each target names exactly one override as
+  `module.function` (the module plus the `@override` factory's function name), so
+  only the named overrides are applied — never the whole global table. A module
+  that defines several overrides is activated by listing each function.
 - **Per-instance targeting, per-node conflicts.** An override selects *which*
   matched nodes it claims via `fqns` (FQN globs). Two overrides conflict only
   when they claim the *same node* (or one claims an ancestor of the other's
@@ -108,16 +109,21 @@ class TritonRoPE(RoPE):
     def forward(self, query, key, positions=None): ...
 
 
-@override("triton_rope", target=RoPE.Config,
+@override(target=RoPE.Config,
           description="Triton rotary embedding, ~2x faster on A100+")
-def triton_rope(cfg: RoPE.Config) -> TritonRoPE.Config:
+def triton_rope(cfg: RoPE.Config, *, block_size: int = 128) -> TritonRoPE.Config:
     # `derive` copies every field shared with RoPE.Config; the factory states
-    # only its deltas. See "Deriving the replacement config" below.
-    return derive(cfg, TritonRoPE.Config, block_size=128)
+    # only its deltas. See "Deriving the replacement config" below. `block_size`
+    # defaults to 128 but can be tuned per config tree via a per-entry kwarg
+    # (see "Optional per-entry kwargs" below).
+    return derive(cfg, TritonRoPE.Config, block_size=block_size)
 ```
 
-The factory receives the matched config and returns its replacement. *Which*
-instances it applies to is controlled declaratively by `fqns` (see
+The factory receives the matched config as its first positional argument and
+returns its replacement. It may declare keyword parameters (like `block_size`
+above) that callers fill via a `(module_path, kwargs)` import entry; a bare
+module-path entry uses their defaults. *Which* instances the factory applies to
+is controlled declaratively by `fqns` (see
 [per-instance targeting](#per-instance-targeting)), not by inspecting fields
 inside the factory.
 
@@ -134,7 +140,8 @@ target's field set at the time it was written:
 # Fragile: RoPE.Config has many fields (theta, scaling, rope_factor, beta_fast,
 # ...); hand-copying only some silently drops the rest to their defaults — and a
 # field added later would be dropped too, with no error.
-return TritonRoPE.Config(dim=cfg.dim, max_seq_len=cfg.max_seq_len,
+return TritonRoPE.Config(
+    dim=cfg.dim, max_context_length=cfg.max_context_length,
                          theta=cfg.theta, scaling=cfg.scaling)
 
 # Robust: every RoPE.Config field (including ones added later, inherited by the
@@ -150,20 +157,60 @@ the matched node is being replaced and detached. `derive` is most valuable when
 the replacement subclasses the target (the common drop-in case), where new core
 fields are inherited and thus carried over for free.
 
-**Configuration is code.** An override takes no CLI flags (it runs after CLI
-parsing), so the override module *is* its configuration: bake sensible defaults
-into the factory (above, `block_size=128`). A user who wants different values
-imports their own module that registers a factory with their deltas — e.g.
-`derive(cfg, TritonRoPE.Config, block_size=256)`. We deliberately don't add a
-CLI-settable `kwargs` dict (untyped, error-prone) or a typed override-`Config`
-parsed at config-construction time (which would re-couple the config registry to
-the override package, defeating the no-touch goal).
+**Configuration is code.** By default the override module *is* its
+configuration: the factory bakes in sensible defaults (above, `block_size=128`),
+so a bare `override.imports` entry needs no other input.
+
+**Optional per-entry kwargs.** When two config trees need the *same* override
+configured *differently*, a factory can expose keyword parameters and each
+`override.imports` entry can supply them as a `(target, kwargs)` tuple instead of
+a bare string; the `kwargs` are forwarded to the override the target names.
+For `triton_rope` above, two trees can pick different block sizes without a
+second module:
+
+```python
+# one tree tunes block_size=128 (the default), another 256:
+OverrideConfig(imports=["my_pkg.triton_rope.triton_rope"])                       # -> 128
+OverrideConfig(imports=[("my_pkg.triton_rope.triton_rope", {"block_size": 256})])
+```
+
+(The RL trainer and generator use this to activate one HybridEP dispatch override
+with opposite `capacity_factor` values — blocking `None` for the trainer, a float
+for the cudagraph-capturing generator — instead of two modules or a hardcoded
+per-actor branch.)
+
+The factory declares the keyword parameters it accepts (or `**kwargs`); a kwarg
+it does not accept raises rather than silently no-op'ing. On the CLI, attach
+kwargs to the target as `target=<json-object>` (quote it as a single shell token;
+`my_pkg.triton_rope.triton_rope` is a placeholder for your own override):
+
+```bash
+torchtitan_train --module llama3 --config llama3_8b \
+    --override.imports 'my_pkg.triton_rope.triton_rope={"block_size": 256}'
+```
+
+JSON keeps the values typed (numbers, `null`, strings, nesting), so the same
+entry works from Python or the CLI. We still avoid a typed override-`Config`
+parsed at config-construction time, which would re-couple the config registry to
+the override package and defeat the no-touch goal.
 
 ### Activation
 
 ```bash
+# One or more module.function targets, space- or comma-separated. A module that
+# defines several overrides is activated by listing each function:
 torchtitan_train --module llama3 --config llama3_8b \
-    --override.imports torchtitan.overrides.fused_swiglu
+    --override.imports torchtitan.overrides.fused_swiglu.fused_swiglu
+
+# The dist-GEMM FFN has a separate exact override so its communication overlap
+# cannot be replaced accidentally by the regular fused implementation:
+torchtitan_train --module llama3 --config llama3_debugmodel_dist_gemm \
+    --override.imports torchtitan.overrides.fused_swiglu.dist_gemm_fused_swiglu
+
+# A target with per-entry kwargs -- attached as target=<json>, quoted as one
+# shell token (my_pkg.triton_rope.triton_rope is a placeholder for your override):
+torchtitan_train --module llama3 --config llama3_8b \
+    --override.imports 'my_pkg.triton_rope.triton_rope={"block_size": 256}'
 ```
 
 ### Application
@@ -171,9 +218,10 @@ torchtitan_train --module llama3 --config llama3_8b \
 In `Trainer.__init__`, after `model_config.update_from_config()` (which sets
 sharding config on the pre-override modules) and before any component is built:
 
-1. Import the listed modules — this triggers their `@override` decorators.
-2. Resolve the *active* set: overrides whose defining module is one of the
-   listed imports (or a submodule of one).
+1. Import each target's module — this triggers its `@override` decorators.
+2. Resolve the *active* set: for each `module.function` target, the single
+   override that function registers (matched by the factory's defining module and
+   its name).
 3. Collect claims: traverse the original tree and record every `(override,
    node)` pair, filtered by each override's `fqns` selector.
 4. Check for per-node conflicts (two overrides claiming the same node, or one
@@ -207,7 +255,7 @@ from torchtitan.config import override
 from torchtitan.models.common.moe import MoE
 
 
-@override("vendor_x_fused_moe", target=MoE.Config,
+@override(target=MoE.Config,
           description="Vendor X fused MoE for XPU")
 def vendor_x_moe(cfg: MoE.Config) -> "VendorXFusedMoE.Config":
     return VendorXFusedMoE.Config(num_experts=cfg.num_experts, ...)
@@ -216,7 +264,7 @@ def vendor_x_moe(cfg: MoE.Config) -> "VendorXFusedMoE.Config":
 ```bash
 pip install torchtitan-vendor-x
 torchtitan_train --module deepseek_v3 --config dsv3_671B \
-    --override.imports vendor_x.overrides
+    --override.imports vendor_x.overrides.vendor_x_moe
 ```
 
 ### Version compatibility
@@ -257,13 +305,13 @@ Globs with `*` (which crosses `.`) keep selectors readable.
 ```python
 # NVFP4 on every in-layer linear, leaving the top-level LM head ("...output")
 # untouched (required for NVFP4; useful for MXFP8)
-@override("nvfp4_linear", target=Linear.Config,
+@override(target=Linear.Config,
           fqns=["*.layers.*.attention.*", "*.layers.*.feed_forward.*"])
 def nvfp4_linear(cfg: Linear.Config) -> "NVFP4Linear.Config":
     return NVFP4Linear.Config(in_features=cfg.in_features, ...)
 
 # Fused MoE only on the later layers
-@override("vendor_moe", target=MoE.Config, fqns=["*.layers.1[0-9].moe"])
+@override(target=MoE.Config, fqns=["*.layers.1[0-9].moe"])
 def vendor_moe(cfg: MoE.Config) -> "VendorMoE.Config":
     return VendorMoE.Config(num_experts=cfg.num_experts, ...)
 ```
@@ -292,10 +340,12 @@ This same rule answers the parent/child question directly. Say override A
 targets a parent Config (e.g. `MoE.Config`) and override B targets a Config
 nested inside it (e.g. `GroupedExperts.Config`):
 
-- **Disjoint subtrees** (A on `...layers.0.moe`, B on `...layers.1.moe.experts`)
-  — the claimed nodes are unrelated, so both apply.
-- **Overlapping** (A on `...layers.0.moe`, B on `...layers.0.moe.experts`) — B's
-  node is inside A's, the ancestor case above, so we **error**.
+- **Disjoint subtrees** (A on `...layers.0.moe`, B on
+  `...layers.1.moe.routed_experts.inner_experts`) — the claimed nodes are
+  unrelated, so both apply.
+- **Overlapping** (A on `...layers.0.moe`, B on
+  `...layers.0.moe.routed_experts.inner_experts`) — B's node is inside A's, the
+  ancestor case above, so we **error**.
 
 We error rather than pick one of the two plausible behaviors implicitly:
 
@@ -360,8 +410,8 @@ converters, not overrides.
 
 An override that changes a module's parameter layout changes its checkpoint
 FQNs. By default an override checkpoints whatever real parameters it defines, so
-a fused module that stores a single `w13` parameter would save/load
-`...feed_forward.w13` rather than the stock `w1.weight` / `w3.weight`.
+a fused module that stores a `w13` linear would save/load
+`...feed_forward.w13.weight` rather than the stock `w1.weight` / `w3.weight`.
 
 **Bridge layout differences with module-level `state_dict` hooks.** A replacement
 module can present its weights in the *stock* layout by registering two hooks:
@@ -371,12 +421,13 @@ module can present its weights in the *stock* layout by registering two hooks:
 - `register_load_state_dict_pre_hook` to recombine them before the default load,
   so the real parameter is loaded with normal DTensor/`strict` handling.
 
-The fused example (`fused_swiglu.py`) does exactly this: it stores `w13` but
-checkpoints `w1.weight` / `w3.weight`, so its checkpoints are a drop-in for the
-stock `FeedForward` (and for the HF adapter, which targets the stock layout),
-while still accepting a native `w13` key for back-compat. This is the symmetric
-use of the same hook mechanism the activation-checkpoint wrapper uses to strip
-its `_checkpoint_wrapped_module` prefix.
+The fused example (`fused_swiglu.py`) does exactly this: it stores
+`w13.weight` but checkpoints `w1.weight` / `w3.weight`, so its checkpoints are a
+drop-in for the stock `FeedForward` (and for the HF adapter, which targets the
+stock layout), while still accepting the former native `w13` key for
+back-compat. This is the symmetric use of the same hook mechanism the
+activation-checkpoint wrapper uses to strip its `_checkpoint_wrapped_module`
+prefix.
 
 For mappings too complex for module hooks, a model-level `BaseStateDictAdapter`
 (the mechanism used for HF conversion, e.g. `Llama3StateDictAdapter`) remains an
@@ -395,16 +446,12 @@ per-model parallelization code.
 One thing worth stating plainly:
 
 - **Fusion under TP.** Fusing weights can interact subtly with tensor
-  parallelism — the fused tensor's layout must admit a correct shard. A *flat*
-  fused gate+up weight `(2*hidden, dim)` has none (`spmd.S(0)` would hand one rank
-  all of `w1` and another all of `w3`). The fix is a layout whose TP-sharded axis
-  gives each rank matching slices: `fused_swiglu` stores `w13` as
-  `(hidden, 2, dim)` and shards `spmd.S(0)` on `hidden`, so each rank holds
-  `(hidden/tp, 2, dim)` — a slice of both gate and up (the Megatron
-  column-parallel layout). `hidden` is also dim 0, so FSDP shards it cleanly at
-  any degree. The single GEMM is an `einsum` that keeps `hidden` sharded, so it
-  never reshapes across the sharded axis. This composes with FSDP and TP through
-  the ordinary `ShardingConfig`; no model-specific code.
+  parallelism -- the fused tensor's row order must admit a correct shard.
+  `fused_swiglu` stores a standard Linear weight `(2*hidden, dim)` with gate/up
+  rows interleaved. Sharding row axis 0 therefore gives each TP rank matching
+  slices of both projections (the Megatron column-parallel layout). The output
+  unflattens to `(hidden, 2)` to recover gate and up. This composes with FSDP and
+  TP through the ordinary `Linear` `ShardingConfig`; no model-specific code.
 
 ## Custom kernels and `torch.compile`
 
@@ -449,16 +496,20 @@ for the full recipe.
 
 - `torchtitan/overrides/fused_swiglu.py` — **the parametrization example.** A
   fused SwiGLU feed-forward demonstrating custom `__init__` parametrization (one
-  fused `(hidden, 2, dim)` `w13` weight, one GEMM), `param_init`, and a
-  `sharding_config` that composes with both FSDP and TP (see "Fusion under TP"
-  above). Needs no prerequisite. See "Checkpoint Compatibility" for why it is not
-  interoperable with stock checkpoints.
+  fused `(2*hidden, dim)` `w13` Linear with interleaved gate/up rows, one GEMM),
+  `param_init`, and a `sharding_config` that composes with both FSDP and TP (see
+  "Fusion under TP" above). Needs no prerequisite. See "Checkpoint
+  Compatibility" for how it interoperates with stock checkpoints.
 - `torchtitan/overrides/helion_rope.py` — **the custom-kernel example.** Swaps
   `CosSinRoPE` for a fused Helion kernel (forward + backward) wrapped in a
   `torch.library.custom_op` (with `register_fake` / `register_autograd`), the
   recipe from "Custom kernels and `torch.compile`". `helion` is an optional
   dependency, so the module imports without it and falls back to the PyTorch RoPE
   when it (or CUDA) is unavailable; it is checkpoint-compatible with stock.
+- `torchtitan/overrides/offset_rmsnorm.py` — replaces Qwen3.5
+  `OffsetRMSNorm` with fused Triton forward and backward kernels while preserving
+  the stock zero-centered weight and checkpoint layout. Activate it with
+  `--override.imports torchtitan.overrides.offset_rmsnorm.triton_offset_rmsnorm`.
 
 The `TritonRoPE` snippets above are illustrative — no `triton_rope.py` is
 shipped — but RoPE is a fully valid override target (`helion_rope.py` is a real
@@ -474,7 +525,7 @@ RoPE is an ordinary component override.
 | `torchtitan/protocols/model_spec.py` | `ModelSpec.traverse` exposes the nested model config to the traversal. |
 | `torchtitan/trainer.py` | Holds the `override` config field; applies overrides after `update_from_config`, before builds. |
 | `torchtitan/overrides/` | In-repo example implementations (`fused_swiglu.py`, `helion_rope.py`). |
-| `tests/unit_tests/test_override.py` | Unit tests: registration, provenance, FQN / exact targeting, per-node conflicts, `derive`. |
+| `tests/unit_tests/cpu/test_override.py` | Unit tests: registration, provenance, FQN / exact targeting, per-node conflicts, per-entry kwargs, `derive`. |
 
 Overriding a component requires no changes to any model's `config_registry.py`
 or `__init__.py` — that is the point of the design.
@@ -482,7 +533,10 @@ or `__init__.py` — that is the point of the design.
 ## At a Glance
 
 - **Activation.** Explicit opt-in via `override.imports`; only overrides
-  registered by the listed modules (provenance-checked) are applied.
+  registered by the listed modules (provenance-checked) are applied. An entry
+  may carry kwargs (a `(module_path, kwargs)` tuple in Python, or
+  `module=<json>` on the CLI) to configure the same module differently per
+  config tree.
 - **Conflicts.** Per-node, not per-class: overrides may share a target class as
   long as their claimed nodes are disjoint; same-node or ancestor/descendant
   claims error.

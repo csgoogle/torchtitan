@@ -15,7 +15,7 @@ from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.model import ModelConfigConverter
-from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
+from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.logging import logger
 
 
@@ -26,8 +26,23 @@ _CANONICAL_TO_NATIVE_WEIGHT = {
 }
 
 
-def _transpose_last_two_dims(layout: SpmdLayout, *, ndim: int = 3) -> SpmdLayout:
-    """Transpose tensor-dimension references in an SPMD layout."""
+def _transpose_last_two_dims(
+    layout: spmd.SpmdType, *, ndim: int = 3
+) -> spmd.SpmdType:
+    """Transpose tensor-dimension references in an SPMD layout.
+
+    Upstream d771abb0 deleted `torchtitan.protocols.sharding.SpmdLayout` in
+    favour of `spmd_types.SpmdType`, renaming the per-axis field
+    `axis_types` -> `local_type`.
+
+    This reads the RAW fields rather than upstream's `_per_axis_types()`
+    helper. That helper flattens `partition_spec` entries into `S(dim)`
+    per-axis types, which is fine for inspection but cannot be fed back into
+    `local_type`: `SpmdType.__post_init__` rejects a value that carries both
+    `S(i)` entries and an explicit `PartitionSpec`. Permuting the raw fields
+    independently keeps the two representations mutually exclusive, exactly as
+    they arrived.
+    """
 
     if ndim < 2:
         raise ValueError(f"Expected rank of at least 2, got {ndim}")
@@ -35,15 +50,15 @@ def _transpose_last_two_dims(layout: SpmdLayout, *, ndim: int = 3) -> SpmdLayout
     permutation = list(range(ndim))
     permutation[-2], permutation[-1] = permutation[-1], permutation[-2]
 
-    axis_types = {}
-    for axis, axis_type in layout.axis_types.items():
+    local_type = {}
+    for axis, axis_type in layout.local_type.items():
         if isinstance(axis_type, spmd.Shard):
             if not 0 <= axis_type.dim < ndim:
                 raise ValueError(
                     f"Tensor dimension {axis_type.dim} is invalid for rank {ndim}"
                 )
             axis_type = spmd.S(permutation[axis_type.dim])
-        axis_types[axis] = axis_type
+        local_type[axis] = axis_type
 
     partition_spec = layout.partition_spec
     if partition_spec is not None:
@@ -54,7 +69,7 @@ def _transpose_last_two_dims(layout: SpmdLayout, *, ndim: int = 3) -> SpmdLayout
         partition_spec = tuple(partition_spec[dim] for dim in permutation)
     return replace(
         layout,
-        axis_types=axis_types,
+        local_type=local_type,
         partition_spec=partition_spec,
     )
 
@@ -116,7 +131,8 @@ class TpuGroupedExperts(GroupedExperts):
             self.w3_EDF = torch.nn.Parameter(
                 torch.empty(config.num_experts, config.dim, config.hidden_dim)
             )
-            self.token_dispatcher = config.token_dispatcher.build()
+            # `token_dispatcher` moved to the enclosing `RoutedExperts` in
+            # upstream d771abb0; `GroupedExperts` is now dispatch-free.
         else:
             super().__init__(config)
 

@@ -86,7 +86,7 @@ def _verify_dtensor_llama3_tp_forward_worker(
 
   runner.run_forward_parity(
       batch_size=TEST_BATCH_SIZE,
-      seq_len=config.layers[0].attention.rope.max_seq_len,
+      seq_len=config.layers[0].attention.rope.max_context_length,
       atol=5e-2,
       rtol=5e-2,
   )
@@ -136,7 +136,7 @@ def _verify_dtensor_llama3_tp_backward_worker(
   runner.run_backward_parity(
       num_steps=1,
       batch_size=TEST_BATCH_SIZE,
-      seq_len=config.layers[0].attention.rope.max_seq_len,
+      seq_len=config.layers[0].attention.rope.max_context_length,
       atol_loss=3e-2,
       rtol_loss=3e-2,
       atol_grad=5e-3,
@@ -188,7 +188,7 @@ def _verify_dtensor_llama3_fsdp_training_loop_worker(
   runner.run_backward_parity(
       num_steps=TEST_TRAINING_STEPS,
       batch_size=TEST_BATCH_SIZE,
-      seq_len=config.layers[0].attention.rope.max_seq_len,
+      seq_len=config.layers[0].attention.rope.max_context_length,
       atol_loss=3,  # TODO(tbajpai): investigate tolerance issues b/495494788
       rtol_loss=3,
       atol_grad=9e-1,

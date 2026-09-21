@@ -44,7 +44,7 @@ def _testmodel(
       non_blocking_capacity_factor=None,
       rope=common_models.ComplexRoPE.Config(
           dim=head_dim,
-          max_seq_len=128,
+          max_context_length=128,
           theta=10000.0,
           scaling="yarn",
           rope_factor=40.0,
@@ -104,7 +104,7 @@ def _testmodel_moe(
       non_blocking_capacity_factor=None,
       rope=common_models.ComplexRoPE.Config(
           dim=head_dim,
-          max_seq_len=128,
+          max_context_length=128,
           theta=10000.0,
           scaling="yarn",
           rope_factor=40.0,
@@ -134,22 +134,31 @@ def _testmodel_moe(
   )
 
 
+def _upstream_flavor(flavor: str, attn_backend: str):
+  """Builds an upstream deepseek-v3 flavor at its full context length.
+
+  Upstream d771abb0 changed
+  `deepseek_v3_models.deepseekv3_configs[flavor]` from a callable into a
+  `(builder, max_context_length)` pair, and made `seq_len` a required
+  keyword-only argument of the builder. Passing the flavor's own
+  `max_context_length` reproduces what the old callable produced.
+  """
+  build_config, max_context_length = deepseek_v3_models.deepseekv3_configs[
+      flavor
+  ]
+  return build_config(
+      attn_backend=attn_backend,
+      moe_comm_backend="standard",
+      seq_len=max_context_length,
+  )
+
+
 deepseekv3_configs = {
     "testmodel": _testmodel(),
     "testmodel_moe": _testmodel_moe(),
-    "debugmodel": deepseek_v3_models.deepseekv3_configs["debugmodel"](
-        attn_backend="sdpa", moe_comm_backend="standard"
-    ),
-    "debugmodel_flex_attn": deepseek_v3_models.deepseekv3_configs["debugmodel"](
-        attn_backend="flex", moe_comm_backend="standard"
-    ),
-    "16B": deepseek_v3_models.deepseekv3_configs["16B"](
-        attn_backend="flex", moe_comm_backend="standard"
-    ),
-    "236B": deepseek_v3_models.deepseekv3_configs["236B"](
-        attn_backend="flex", moe_comm_backend="standard"
-    ),
-    "671B": deepseek_v3_models.deepseekv3_configs["671B"](
-        attn_backend="flex", moe_comm_backend="standard"
-    ),
+    "debugmodel": _upstream_flavor("debugmodel", "sdpa"),
+    "debugmodel_flex_attn": _upstream_flavor("debugmodel", "flex"),
+    "16B": _upstream_flavor("16B", "flex"),
+    "236B": _upstream_flavor("236B", "flex"),
+    "671B": _upstream_flavor("671B", "flex"),
 }

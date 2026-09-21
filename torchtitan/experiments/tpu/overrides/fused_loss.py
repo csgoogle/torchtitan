@@ -41,7 +41,9 @@ class FusedLossLinearWrapper(Linear):
 
 
 @override(
-    "tpu_fused_loss_lm_head",
+    # Upstream d771abb0 made `override()` keyword-only and removed the separate
+    # name argument: an override is now identified by the decorated factory's
+    # import path, which is what `override.imports` lists.
     target=Linear.Config,
     fqns=["model_spec.model.lm_head"],
     exact=True,

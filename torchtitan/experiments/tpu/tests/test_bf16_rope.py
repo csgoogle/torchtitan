@@ -19,23 +19,28 @@ from torchtitan.models.common import CosSinRoPE
 class TpuActivationDtypeCosSinRoPETest(absltest.TestCase):
 
   def test_override_preserves_config_and_builds_tpu_rope(self):
-    source = CosSinRoPE.Config(dim=8, max_seq_len=16, theta=5000.0)
+    source = CosSinRoPE.Config(dim=8, max_context_length=16, theta=5000.0)
     replacement = tpu_activation_dtype_cossin_rope(source)
 
     self.assertIsInstance(replacement, TpuActivationDtypeCosSinRoPE.Config)
     self.assertEqual(replacement.dim, source.dim)
-    self.assertEqual(replacement.max_seq_len, source.max_seq_len)
+    self.assertEqual(
+        replacement.max_context_length, source.max_context_length
+    )
     self.assertEqual(replacement.theta, source.theta)
     self.assertIsInstance(replacement.build(), TpuActivationDtypeCosSinRoPE)
 
   def test_forward_matches_explicit_bf16_rotation(self):
     torch.manual_seed(0)
     rope = TpuActivationDtypeCosSinRoPE.Config(
-        dim=8, max_seq_len=16
+        dim=8, max_context_length=16
     ).build()
-    query = torch.randn(2, 4, 3, 8, dtype=torch.bfloat16)
-    key = torch.randn(2, 4, 1, 8, dtype=torch.bfloat16)
-    positions = torch.arange(4).expand(2, -1)
+    # Upstream d771abb0 folds the batch axis away: RoPE now takes rank-3
+    # `[T, H, Dh]` query/key and 1-D `[T]` positions.
+    num_tokens = 8
+    query = torch.randn(num_tokens, 3, 8, dtype=torch.bfloat16)
+    key = torch.randn(num_tokens, 1, 8, dtype=torch.bfloat16)
+    positions = torch.arange(4).repeat(2)
 
     query_out, key_out = rope(query, key, positions)
     cache = rope._reshape_cache(query, positions).bfloat16()

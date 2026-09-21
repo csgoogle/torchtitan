@@ -112,8 +112,12 @@ def train_step(
 
 
 def build_random_dataloader(train_config, vocab_size, device):
-  local_batch_size = train_config.training.local_batch_size
-  seq_len = train_config.training.seq_len
+  # Upstream d771abb0 renamed training.seq_len -> training.max_context_length
+  # and replaced training.local_batch_size with the token-based
+  # training.num_tokens_per_microbatch_per_dp_rank.
+  seq_len = train_config.training.max_context_length
+  local_batch_size = (
+      train_config.training.num_tokens_per_microbatch_per_dp_rank // seq_len)
   # Inputs should be token IDs for the embedding layer
   x = torch.randint(0, vocab_size, (local_batch_size, seq_len), device=device)
 
@@ -236,12 +240,18 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
         train_config, model_args.vocab_size, device  # pytype: disable=attribute-error
     )
   else:
+    # Upstream d771abb0 renamed training.seq_len -> training.max_context_length
+    # and replaced training.local_batch_size with the token-based
+    # training.num_tokens_per_microbatch_per_dp_rank; the dataloader is now
+    # components.data.GrainDataLoader, which takes max_context_length /
+    # num_tokens_per_batch instead of seq_len / local_batch_size.
     dataloader = train_config.dataloader.build(
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=tokenizer,
-        seq_len=train_config.training.seq_len,
-        local_batch_size=train_config.training.local_batch_size,
+        max_context_length=train_config.training.max_context_length,
+        num_tokens_per_batch=(
+            train_config.training.num_tokens_per_microbatch_per_dp_rank),
     )
 
   logger.info(
@@ -265,8 +275,9 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
   ):
     model = model_args.build()
 
+  # Upstream d771abb0 renamed training.seq_len -> training.max_context_length.
   model_param_count, _ = model_args.get_nparams_and_flops(
-      model, train_config.training.seq_len
+      model, train_config.training.max_context_length
   )
   logger.info(
       "Model %s %s size: %d total parameters",
@@ -360,13 +371,18 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
     torch.distributed.barrier()
 
   steps = train_config.training.steps
-  local_batch_size = train_config.training.local_batch_size
-  seq_len = train_config.training.seq_len
+  # Upstream d771abb0 replaced training.local_batch_size * training.seq_len
+  # with the single token-based training.num_tokens_per_microbatch_per_dp_rank.
+  num_tokens_per_step = (
+      train_config.training.num_tokens_per_microbatch_per_dp_rank)
 
+  # Upstream d771abb0 renamed training.seq_len -> training.max_context_length.
   (
       model_param_count,
       num_flops_per_token,
-  ) = model_args.get_nparams_and_flops(model, train_config.training.seq_len)
+  ) = model_args.get_nparams_and_flops(
+      model, train_config.training.max_context_length
+  )
   metrics_processor.num_flops_per_token = num_flops_per_token
 
   device_name = utils.device_module.get_device_name()
@@ -396,7 +412,7 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
     data_iterator = iter(dataloader)
     for step in range(steps):
       step_start = time.perf_counter()
-      step_tokens = local_batch_size * seq_len
+      step_tokens = num_tokens_per_step
       ntokens_seen += step_tokens
       metrics_processor.ntokens_since_last_log += step_tokens
 
@@ -450,7 +466,12 @@ def start_trainer(train_config: TPUTrainerConfig) -> None:
             ),
         )
 
-      if (step + 1) % log_freq == 0 or step == (steps - 1):
+      should_log_step = (
+          metrics_processor.should_log(step + 1)
+          or (step + 1) % log_freq == 0
+          or step == (steps - 1)
+      )
+      if should_log_step:
         with jax_profiler.TraceAnnotation("D2H", step_num=step):
           loss_cpu = loss.cpu().item()
         should_log = True

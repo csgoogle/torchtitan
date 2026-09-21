@@ -267,6 +267,12 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
   )
 
   def __post_init__(self):
+    # Upstream d771abb0 validates CUDA-graph capturability in
+    # `Trainer.Config.__post_init__`, and rejects any MoE token dispatcher it
+    # does not recognize -- which is all of the TPU ones. There is no CUDA
+    # graph to capture in this lane, so opt out before the check runs. Must
+    # come before `super()`, which is what calls `_validate_cuda_graphs`.
+    self.training.disable_cuda_graphs = True
     # NOTE: explicit ``super(...)`` (rather than zero-arg ``super()``) is
     # required because ``@dataclass(slots=True)`` replaces the class object
     # after decoration, leaving the ``__class__`` cell that zero-arg

@@ -4,11 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer, default_adamw
+from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer.optimizer import (
+    default_adamw,
+    OptimizersContainer,
+)
 from torchtitan.components.validate import Validator
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.config.configs import (
@@ -22,10 +25,16 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUConfig,
     TPUTrainerConfig,
 )
-from torchtitan.hf_datasets.text_datasets import (
-    ChatDataLoader,
-    HuggingFaceTextDataLoader,
-)
+# Imported from the defining submodules rather than the
+# `torchtitan.components.data` package: [internal link] cannot tell a
+# package attribute from an unlisted submodule, so the package-level form
+# is reported as an ambiguous import.
+from torchtitan.components.data.dataset import SingleDatasetConfig
+from torchtitan.components.data.loader import GrainDataLoader
+from torchtitan.components.data.packing import FirstFitPackingConfig
+from torchtitan.components.data.sources import HuggingFaceRandomAccessSource
+from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.hf_datasets.text_datasets import ChatProcessor
 from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama as tpu_parallelize_llama
 from torchtitan.models.llama3.config_registry import model_registry
 
@@ -33,8 +42,15 @@ from torchtitan.models.llama3.config_registry import model_registry
 # Llama3's `ComplexRoPE` calls `view_as_complex`, which cannot be traced inside
 # a higher-order op such as `scan`; see `overrides/real_rope.py`. The rewrite is
 # bit-identical and perf-neutral, so every recipe carries it.
-_REAL_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.real_rope"
-_FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
+# Upstream d771abb0 identifies an override by the import path of its decorated
+# `@override` factory, so each target is `module.function`, not just `module`.
+_REAL_ROPE_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.real_rope"
+    ".tpu_real_arithmetic_complex_rope"
+)
+_FUSED_LOSS_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
+)
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
@@ -75,13 +91,11 @@ def llama3_debugmodel() -> TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=TrainingConfig(
-          local_batch_size=8,
-          seq_len=2048,
+          num_tokens_per_microbatch_per_dp_rank=8 * 2048,
+          max_context_length=2048,
           steps=10,
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           pipeline_parallel_schedule="Interleaved1F1B"
@@ -116,13 +130,11 @@ def llama3_1b() -> TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=TrainingConfig(
-          local_batch_size=4,
-          seq_len=128,
+          num_tokens_per_microbatch_per_dp_rank=4 * 128,
+          max_context_length=128,
           steps=3,
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           pipeline_parallel_schedule="Interleaved1F1B"
@@ -157,13 +169,11 @@ def llama3_8b() -> TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=TrainingConfig(
-          local_batch_size=1,
-          seq_len=8192,
+          num_tokens_per_microbatch_per_dp_rank=1 * 8192,
+          max_context_length=8192,
           steps=1000,
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=5),
       parallelism=ParallelismConfig(use_simple_fsdp=True),
       checkpoint=CheckpointManager.Config(
@@ -176,9 +186,7 @@ def llama3_8b() -> TPUTrainerConfig:
           enable=False,
           freq=500,
           steps=1200,
-          dataloader=HuggingFaceTextDataLoader.Config(
-              dataset="c4_test",
-          ),
+          dataloader=c4_test_dataloader(),
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -225,13 +233,11 @@ def llama3_70b() -> TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=TrainingConfig(
-          local_batch_size=1,
-          seq_len=8192,
+          num_tokens_per_microbatch_per_dp_rank=1 * 8192,
+          max_context_length=8192,
           steps=1000,
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=5),
       parallelism=ParallelismConfig(use_simple_fsdp=True),
       checkpoint=CheckpointManager.Config(
@@ -244,9 +250,7 @@ def llama3_70b() -> TPUTrainerConfig:
           enable=False,
           freq=500,
           steps=1200,
-          dataloader=HuggingFaceTextDataLoader.Config(
-              dataset="c4_test",
-          ),
+          dataloader=c4_test_dataloader(),
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -293,13 +297,11 @@ def llama3_405b() -> TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=TrainingConfig(
-          local_batch_size=1,
-          seq_len=8192,
+          num_tokens_per_microbatch_per_dp_rank=1 * 8192,
+          max_context_length=8192,
           steps=1000,
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=5),
       parallelism=ParallelismConfig(use_simple_fsdp=True),
       checkpoint=CheckpointManager.Config(
@@ -312,9 +314,7 @@ def llama3_405b() -> TPUTrainerConfig:
           enable=False,
           freq=500,
           steps=1200,
-          dataloader=HuggingFaceTextDataLoader.Config(
-              dataset="c4_test",
-          ),
+          dataloader=c4_test_dataloader(),
       ),
       tpu_config=TPUConfig(
           eager_mode="DEFER_AND_FUSE",
@@ -372,14 +372,21 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
           min_lr_factor=0.1,
       ),
       training=TrainingConfig(
-          local_batch_size=2,
-          seq_len=8192,
+          num_tokens_per_microbatch_per_dp_rank=2 * 8192,
+          max_context_length=8192,
           steps=500,
       ),
-      dataloader=ChatDataLoader.Config(
-          dataset_path="meta-math/MetaMathQA",
-          load_dataset_kwargs={"split": "train"},
-          sample_processor=process_sample,
+      dataloader=GrainDataLoader.Config(
+          dataset=FirstFitPackingConfig(
+              dataset=SingleDatasetConfig(
+                  source=HuggingFaceRandomAccessSource.Config(
+                      path="meta-math/MetaMathQA",
+                      split="train",
+                  ),
+                  processor=ChatProcessor.Config(messages_fn=process_sample),
+                  post_filters=(lambda sample: sample is not None,),
+              ),
+          ),
       ),
       metrics=MetricsProcessor.Config(
           log_freq=5,

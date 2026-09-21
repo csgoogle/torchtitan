@@ -29,6 +29,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
 )
 from torchtitan.experiments.tpu.train import TPUTrainer
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
+from torchtitan.models.llama3.config_registry import model_registry
 
 
 class CompiledGradNormUnitTest(absltest.TestCase):
@@ -71,7 +72,10 @@ class CompiledGradNormUnitTest(absltest.TestCase):
       with self.subTest(parallelism=parallelism), self.assertRaisesRegex(
           ValueError, message
       ):
+        # Upstream d771abb0 made `model_spec` required; the topology checks
+        # under test do not look at it.
         TPUTrainerConfig(
+            model_spec=model_registry("debugmodel", attn_backend="sdpa"),
             parallelism=ParallelismConfig(**parallelism),
             tpu_config=TPUConfig(
                 compile_grad_norm=True,

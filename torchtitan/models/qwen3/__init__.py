@@ -21,10 +21,10 @@ from torchtitan.models.common import (
 )
 from torchtitan.models.common.config_utils import (
     get_attention_config,
-    make_experts_config,
     make_ffn_config,
     make_gqa_config,
     make_moe_config,
+    make_routed_experts_config,
     make_router_config,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
@@ -174,7 +174,6 @@ def _build_qwen3_moe_layers(
                 moe=make_moe_config(
                     num_experts=num_experts,
                     load_balance_coeff=load_balance_coeff,
-                    aux_loss_type="batch_wise" if aux_loss_coeff is not None else None,
                     aux_loss_coeff=aux_loss_coeff,
                     router=make_router_config(
                         dim=dim,
@@ -184,7 +183,7 @@ def _build_qwen3_moe_layers(
                         score_func="softmax",
                         route_norm=True,
                     ),
-                    experts=make_experts_config(
+                    routed_experts=make_routed_experts_config(
                         dim=dim,
                         hidden_dim=moe_hidden_dim,
                         num_experts=num_experts,
@@ -199,7 +198,7 @@ def _build_qwen3_moe_layers(
     return layers
 
 
-def _debugmodel(attn_backend: str) -> Qwen3Model.Config:
+def _debugmodel(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 256
     head_dim = 128
     n_layers = 8
@@ -230,17 +229,17 @@ def _debugmodel(attn_backend: str) -> Qwen3Model.Config:
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=4096,
+                max_context_length=seq_len,
                 theta=1000000.0,
             ),
         ),
     )
 
 
-def _debugmodel_non_fused_qkv(attn_backend: str) -> Qwen3Model.Config:
+def _debugmodel_non_fused_qkv(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     # Reverse of the default fused QKV: keeps coverage for the separate
     # wq/wk/wv path now that fuse_qkv defaults to True.
-    config = _debugmodel(attn_backend)
+    config = _debugmodel(attn_backend, seq_len=seq_len)
     config.layers = _build_qwen3_layers(
         fuse_qkv=False,
         n_layers=8,
@@ -250,12 +249,12 @@ def _debugmodel_non_fused_qkv(attn_backend: str) -> Qwen3Model.Config:
         head_dim=128,
         hidden_dim=3072,
         attn_backend=attn_backend,
-        rope=CosSinRoPE.Config(dim=128, max_seq_len=4096, theta=1000000.0),
+        rope=CosSinRoPE.Config(dim=128, max_context_length=seq_len, theta=1000000.0),
     )
     return config
 
 
-def _0_6b(attn_backend: str) -> Qwen3Model.Config:
+def _0_6b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 1024
     head_dim = 128
     n_layers = 28
@@ -286,14 +285,14 @@ def _0_6b(attn_backend: str) -> Qwen3Model.Config:
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=40960,
+                max_context_length=seq_len,
                 theta=1000000.0,
             ),
         ),
     )
 
 
-def _1_7b(attn_backend: str) -> Qwen3Model.Config:
+def _1_7b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 2048
     head_dim = 128
     n_layers = 28
@@ -324,14 +323,14 @@ def _1_7b(attn_backend: str) -> Qwen3Model.Config:
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=40960,
+                max_context_length=seq_len,
                 theta=1000000.0,
             ),
         ),
     )
 
 
-def _4b(attn_backend: str) -> Qwen3Model.Config:
+def _4b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 2560
     head_dim = 128
     n_layers = 36
@@ -362,14 +361,14 @@ def _4b(attn_backend: str) -> Qwen3Model.Config:
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=40960,
+                max_context_length=seq_len,
                 theta=1000000.0,
             ),
         ),
     )
 
 
-def _8b(attn_backend: str) -> Qwen3Model.Config:
+def _8b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 4096
     head_dim = 128
     n_layers = 36
@@ -397,14 +396,14 @@ def _8b(attn_backend: str) -> Qwen3Model.Config:
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=40960,
+                max_context_length=seq_len,
                 theta=1000000.0,
             ),
         ),
     )
 
 
-def _14b(attn_backend: str) -> Qwen3Model.Config:
+def _14b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 5120
     head_dim = 128
     n_layers = 40
@@ -432,14 +431,14 @@ def _14b(attn_backend: str) -> Qwen3Model.Config:
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=40960,
+                max_context_length=seq_len,
                 theta=1000000.0,
             ),
         ),
     )
 
 
-def _32b(attn_backend: str) -> Qwen3Model.Config:
+def _32b(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
     dim = 5120
     head_dim = 128
     n_layers = 64
@@ -467,7 +466,7 @@ def _32b(attn_backend: str) -> Qwen3Model.Config:
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=40960,
+                max_context_length=seq_len,
                 theta=1000000.0,
             ),
         ),
@@ -480,6 +479,8 @@ def _32b(attn_backend: str) -> Qwen3Model.Config:
 def _debugmodel_moe(
     attn_backend: str,
     moe_comm_backend: str = "standard",
+    *,
+    seq_len: int,
 ) -> Qwen3Model.Config:
     dim = 256
     head_dim = 128
@@ -510,7 +511,7 @@ def _debugmodel_moe(
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=4096,
+                max_context_length=seq_len,
                 theta=1000000.0,
             ),
             moe_comm_backend=moe_comm_backend,
@@ -522,6 +523,7 @@ def _30b_a3b(
     attn_backend: str,
     moe_comm_backend: str = "standard",
     *,
+    seq_len: int,
     load_balance_coeff: float | None = 1e-3,
     aux_loss_coeff: float | None = None,
 ) -> Qwen3Model.Config:
@@ -554,7 +556,7 @@ def _30b_a3b(
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=40960,
+                max_context_length=seq_len,
                 theta=1000000.0,
             ),
             moe_comm_backend=moe_comm_backend,
@@ -567,10 +569,13 @@ def _30b_a3b(
 def _30b_a3b_global_aux(
     attn_backend: str,
     moe_comm_backend: str = "standard",
+    *,
+    seq_len: int,
 ) -> Qwen3Model.Config:
     return _30b_a3b(
         attn_backend,
         moe_comm_backend,
+        seq_len=seq_len,
         load_balance_coeff=None,
         aux_loss_coeff=1e-3,
     )
@@ -579,6 +584,8 @@ def _30b_a3b_global_aux(
 def _235b_a22b(
     attn_backend: str,
     moe_comm_backend: str = "standard",
+    *,
+    seq_len: int,
 ) -> Qwen3Model.Config:
     dim = 4096
     head_dim = 128
@@ -609,7 +616,7 @@ def _235b_a22b(
             attn_backend=attn_backend,
             rope=CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=40960,
+                max_context_length=seq_len,
                 theta=5000000.0,
             ),
             moe_comm_backend=moe_comm_backend,
@@ -617,32 +624,80 @@ def _235b_a22b(
     )
 
 
+def _testmodel(attn_backend: str, *, seq_len: int) -> Qwen3Model.Config:
+    dim = 128
+    head_dim = 16
+    n_layers = 3
+    vocab_size = 2048
+    return Qwen3Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        norm=_qwen3_norm(dim),
+        enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_SKIP_INIT,
+        ),
+        lm_head=Linear.Config(
+            in_features=dim, out_features=vocab_size, param_init=_LINEAR_INIT
+        ),
+        layers=_build_qwen3_layers(
+            fuse_qkv=True,
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=8,
+            n_kv_heads=8,
+            head_dim=head_dim,
+            hidden_dim=256,
+            attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=head_dim,
+                max_context_length=seq_len,
+                theta=1000000.0,
+            ),
+        ),
+    )
+
 qwen3_configs = {
-    "debugmodel": _debugmodel,
-    "debugmodel_non_fused_qkv": _debugmodel_non_fused_qkv,
-    "0.6B": _0_6b,
-    "1.7B": _1_7b,
-    "4B": _4b,
-    "8B": _8b,
-    "14B": _14b,
-    "32B": _32b,
-    "debugmodel_moe": _debugmodel_moe,
-    "30B-A3B": _30b_a3b,
-    "30B-A3B-global-aux": _30b_a3b_global_aux,
-    "235B-A22B": _235b_a22b,
+    "testmodel": (_testmodel, 128),
+    "debugmodel": (_debugmodel, 4096),
+    "debugmodel_non_fused_qkv": (_debugmodel_non_fused_qkv, 4096),
+    "0.6B": (_0_6b, 40960),
+    "1.7B": (_1_7b, 40960),
+    "4B": (_4b, 40960),
+    "8B": (_8b, 40960),
+    "14B": (_14b, 40960),
+    "32B": (_32b, 40960),
+    "debugmodel_moe": (_debugmodel_moe, 4096),
+    "30B-A3B": (_30b_a3b, 40960),
+    "30B-A3B-global-aux": (_30b_a3b_global_aux, 40960),
+    "235B-A22B": (_235b_a22b, 40960),
 }
 
 
 def model_registry(
     flavor: str,
+    *,
+    seq_len: int | None = None,
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
-    kwargs = dict(attn_backend=attn_backend)
-    if moe_comm_backend is not None:
-        kwargs["moe_comm_backend"] = moe_comm_backend
-    config = qwen3_configs[flavor](**kwargs)
+    get_config, max_context_len = qwen3_configs[flavor]
+    context_len = seq_len or max_context_len
+    if context_len > max_context_len:
+        raise ValueError(
+            f"Requested seq_len {context_len} exceeds max context length "
+            f"{max_context_len} for flavor {flavor}"
+        )
+    config = get_config(
+        attn_backend=attn_backend,
+        seq_len=context_len,
+        **{"moe_comm_backend": moe_comm_backend}
+        if moe_comm_backend is not None
+        else {},
+    )
     if converters is not None:
         validate_converter_order(converters)
         for c in converters:
@@ -651,6 +706,7 @@ def model_registry(
         name="qwen3",
         flavor=flavor,
         model=config,
+        max_context_length=context_len,
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=register_moe_load_balancing_hook,

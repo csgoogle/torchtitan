@@ -7,15 +7,23 @@
 
 # pylint: disable=invalid-name,unused-argument
 
-from torchtitan.components import checkpoint
+# Upstream d771abb0 split `components/checkpoint.py` into the
+# `components/checkpointer/` package and moved `components/lr_scheduler.py`
+# under `components/optimizer/`. Alias both back to their historical local
+# names so the `checkpoint.CheckpointManager` / `lr_scheduler.*` call sites
+# below are unchanged.
+from torchtitan.components import checkpointer as checkpoint
 from torchtitan.components import loss
-from torchtitan.components import lr_scheduler
+from torchtitan.components.optimizer import lr_scheduler
 from torchtitan.components import metrics
 from torchtitan.components import optimizer
 from torchtitan.config import configs
 from torchtitan.distributed import activation_checkpoint
 from torchtitan.experiments.tpu import tpu_job_config
-from torchtitan.hf_datasets import text_datasets
+# Upstream d771abb0 migrated the data stack to Grain and deleted
+# `HuggingFaceTextDataLoader`; `c4_test_dataloader` is the fork's
+# internal-path-corrected replacement. See `experiments/tpu/datasets.py`.
+from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.protocols import model_spec
 from . import model
 from . import parallelize
@@ -110,16 +118,27 @@ mamba2_configs = {
 }
 
 
+# Mamba-2 is a state-space model: it has no positional embedding and no
+# attention window, so no flavor has an architectural context limit and
+# `Mamba2Config` carries no context field to read one from. The longest context
+# any recipe in this file trains at is `mamba2_2_7b_256k`'s 262144, so declare
+# that for every flavor; callers wanting a different bound pass `seq_len`.
+_DEFAULT_MAX_CONTEXT_LENGTH = 262144
+
+
 def model_registry(
     flavor: str,
     ssm_backend: str = "pallas",
+    seq_len: int | None = None,
     **kwargs,
 ) -> model_spec.ModelSpec:
   config = mamba2_configs[flavor](ssm_backend=ssm_backend, **kwargs)
+  # Upstream d771abb0 made ModelSpec.max_context_length required.
   return model_spec.ModelSpec(
       name="mamba2",
       flavor=flavor,
       model=config,
+      max_context_length=seq_len or _DEFAULT_MAX_CONTEXT_LENGTH,
       parallelize_fn=parallelize.parallelize_mamba2,
       pipelining_fn=None,
       post_optimizer_build_fn=None,
@@ -133,9 +152,7 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=1),
       model_spec=model_registry("debugmodel"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
-      ),
+      dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=2,
@@ -144,7 +161,7 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=8, seq_len=512, steps=10
+          num_tokens_per_microbatch_per_dp_rank=8 * 512, max_context_length=512, steps=10
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -160,9 +177,7 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
       model_spec=model_registry("130M"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
-      ),
+      dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=8e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
@@ -171,7 +186,7 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=16, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=16 * 2048, max_context_length=2048, steps=10000
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -187,9 +202,7 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
       model_spec=model_registry("370M"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
-      ),
+      dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=6e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
@@ -198,7 +211,7 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=8, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=8 * 2048, max_context_length=2048, steps=10000
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -214,9 +227,7 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
       model_spec=model_registry("780M"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
-      ),
+      dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=5e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
@@ -225,7 +236,7 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=4, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=4 * 2048, max_context_length=2048, steps=10000
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -241,9 +252,7 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
       model_spec=model_registry("1.3B"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
-      ),
+      dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=4e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
@@ -252,7 +261,7 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=2, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=2 * 2048, max_context_length=2048, steps=10000
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -268,9 +277,7 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=10),
       model_spec=model_registry("2.7B"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
-      ),
+      dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=1000,
@@ -279,7 +286,7 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=2, seq_len=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=2 * 2048, max_context_length=2048, steps=10000
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -295,9 +302,7 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
       hf_assets_path="./tests/assets/tokenizer",
       metrics=metrics.MetricsProcessor.Config(log_freq=1),
       model_spec=model_registry("2.7B"),
-      dataloader=text_datasets.HuggingFaceTextDataLoader.Config(
-          dataset="c4_test"
-      ),
+      dataloader=c4_test_dataloader(),
       optimizer=optimizer.default_adamw(lr=3e-4, implementation="foreach"),
       lr_scheduler=lr_scheduler.LRSchedulersContainer.Config(
           warmup_steps=100,
@@ -306,7 +311,7 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          local_batch_size=8, seq_len=262144, steps=1000
+          num_tokens_per_microbatch_per_dp_rank=8 * 262144, max_context_length=262144, steps=1000
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(

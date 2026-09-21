@@ -87,27 +87,19 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
 
   def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
     """Replaces [redacted]'s native SDPA with splash_sdpa.
-
-    This function replaces ScaledDotProductAttention._sdpa_native_torch with
-    `splash_sdpa`. Like TorchTitan's wrapper, [redacted] operates on inputs of shape
-    (B, S, H, D) and requires transposing to (B, H, S, D) for splash_sdpa.
-    However, [redacted] requires special handling because it handles GQA by tiling
-    k/v heads before invoking SDPA. This wrapper aligns with [redacted]'s GQA
-    mechanics, transposes inputs for splash_sdpa, and transposes the output
-    back to (B, S, H, D).
-
-    For mixed local/global attention models (e.g. REDACTED PT MoE with
-    ``attention_layer_pattern=[local_rope, local_rope, local_rope, global_nope]``
-    and ``local_attention_window_size=N``), reads
-    ``self.sliding_window_size`` per-layer:
-      * None  → full causal (CausalMask) — same as before, identical to the
-                old redacted path where every layer is global causal.
-      * int N → causal sliding-window (LocalMask with window_size=(N, 0)).
-                The splash kernel's per-window cache means each unique window
-                size compiles its own kernel; mixing windowed and non-windowed
-                layers in one model is supported.
+    ...
     """
+    # TT-UNFLATTEN-SHIM: Unflatten to [B, S, H, D]
+    from torchtitan.experiments.tpu.unflatten_shim import unflatten_tensor, flatten_tensor
+    query = unflatten_tensor(query, expected_flat_ndim=3)
+    key = unflatten_tensor(key, expected_flat_ndim=3)
+    value = unflatten_tensor(value, expected_flat_ndim=3)
+    for kw, val in kwargs.items():
+        if isinstance(val, torch.Tensor) and kw in ("positions", "segment_ids"):
+            kwargs[kw] = unflatten_tensor(val, expected_flat_ndim=1)
+
     query, key, value = self._maybe_tile_qkv_for_gqa(query, key, value)
+
     # Transpose from (B, S, H, D) to (B, H, S, D).
     query = query.transpose(-3, -2)
     key = key.transpose(-3, -2)
@@ -137,8 +129,10 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
         enable_gqa=False,
         **sa_kwargs,
     )
-    # Transpose back to match [redacted]'s expected layout
-    return out.transpose(-3, -2).contiguous()
+    # Transpose back to match [redacted]'s expected layout (B, S, H, D)
+    out = out.transpose(-3, -2).contiguous()
+    # TT-UNFLATTEN-SHIM: Flatten back to [T, H, D]
+    return flatten_tensor(out, original_flat_ndim=3)
 
   # Patch all attention modules in the model. For [redacted] modules, also note
   # whether each layer has a local sliding-window — useful for mixed
@@ -157,7 +151,11 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     for child_name, child_module in parent_module.named_children():
       cls_name = type(child_module).__name__
 
-      if "ScaledDotProductAttention" in cls_name:
+      # NOTE: matches both [redacted]'s ScaledDotProductAttention and
+      # torchtitan's ScaledDotProductInnerAttention (renamed upstream
+      # in d771abb0); the latter does not contain the old name as a
+      # substring, so the old check silently matched nothing.
+      if "ScaledDotProduct" in cls_name:
         if "[redacted]" in type(child_module).__module__:
           # [redacted] patching (in-place method replacement)
           child_module._sdpa_native_torch = types.MethodType(
@@ -191,6 +189,9 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
         original_module=child_module,
         **sa_kwargs,
     )
+    # TT-UNFLATTEN-SHIM:
+    from torchtitan.experiments.tpu.unflatten_shim import UnflattenShim
+    splash_attn = UnflattenShim(splash_attn)
 
     setattr(parent_module, child_name, splash_attn)
     _patched += 1
@@ -203,7 +204,7 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
     raise ValueError(
         "Splash attention patch was requested but NO matching attention"
-        " modules (ScaledDotProductAttention, FlexAttention) were found in the"
+        " modules (ScaledDotProduct*, FlexAttention) were found in the"
         f" model. Found module types: {all_classes}"
     )
   else:
@@ -258,6 +259,15 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
       is_causal=True,
       **extra_args,
   ):
+    # TT-UNFLATTEN-SHIM:
+    from torchtitan.experiments.tpu.unflatten_shim import unflatten_tensor, flatten_tensor
+    q = unflatten_tensor(q, expected_flat_ndim=3)
+    k = unflatten_tensor(k, expected_flat_ndim=3)
+    v = unflatten_tensor(v, expected_flat_ndim=3)
+    for kw, val in extra_args.items():
+        if isinstance(val, torch.Tensor) and kw in ("positions", "segment_ids"):
+            extra_args[kw] = unflatten_tensor(val, expected_flat_ndim=1)
+
     if extra_args.get("attention_masks") is not None:
       raise ValueError(
           "TPU SplashAttention Pallas kernel does not support runtime"
@@ -282,9 +292,19 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         enable_gqa=enable_gqa,
         **forward_kwargs,
     )
-    return out
+    # TT-UNFLATTEN-SHIM:
+    return flatten_tensor(out, original_flat_ndim=3)
 
   def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
+    # TT-UNFLATTEN-SHIM:
+    from torchtitan.experiments.tpu.unflatten_shim import unflatten_tensor, flatten_tensor
+    query = unflatten_tensor(query, expected_flat_ndim=3)
+    key = unflatten_tensor(key, expected_flat_ndim=3)
+    value = unflatten_tensor(value, expected_flat_ndim=3)
+    for kw, val in kwargs.items():
+        if isinstance(val, torch.Tensor) and kw in ("positions", "segment_ids"):
+            kwargs[kw] = unflatten_tensor(val, expected_flat_ndim=1)
+
     query, key, value = self._maybe_tile_qkv_for_gqa(query, key, value)
     local_window_size = getattr(self, "sliding_window_size", None)
 
@@ -304,14 +324,19 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         enable_gqa=False,
         **forward_kwargs,
     )
-    return out
+    # TT-UNFLATTEN-SHIM:
+    return flatten_tensor(out, original_flat_ndim=3)
 
   _patched = 0
   _windowed = 0
   _causal = 0
   for _, module in model.named_modules():
     cls_name = type(module).__name__
-    if "ScaledDotProductAttention" in cls_name:
+    # NOTE: matches both [redacted]'s ScaledDotProductAttention and
+    # torchtitan's ScaledDotProductInnerAttention (renamed upstream
+    # in d771abb0); the latter does not contain the old name as a
+    # substring, so the old check silently matched nothing.
+    if "ScaledDotProduct" in cls_name:
       if "[redacted]" in type(module).__module__:
         module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
       else:
@@ -326,7 +351,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     all_classes = sorted(list({type(m).__name__ for _, m in model.named_modules()}))
     raise ValueError(
         "Tokamax splash attention patch was requested but NO matching "
-        f"attention modules (ScaledDotProductAttention) were found in the model. Found module types: {all_classes}"
+        f"attention modules (ScaledDotProduct*) were found in the model. Found module types: {all_classes}"
     )
   else:
     logger.info(
@@ -485,89 +510,12 @@ def use_cpu_safe_histc_patch() -> None:
   logger.info("Monkey-patched torch.histc to support int dtypes on CPU")
 
 
-def use_rope_tpu_optimization_patch() -> None:
-  """Monkey patches torchtitan.models.common.rope._reshape_for_broadcast with a TPU-optimized path.
-
-  Why upstream torch.gather is slow on TPU:
-  1. Index Tensor Bloat: Upstream expands the 2D `positions` tensor into a
-     massive 4D index tensor, multiplying its memory size by `cache_width`
-     (e.g., 33.5 MB vs 262 KB).
-  2. Forced Scalar Memory Lookups: The mathematical API of `torch.gather`
-     requires an independent scalar index for every single element in the
-     output tensor. Because XLA cannot assume the indices are identical at
-     runtime, it must generate machine code that computes a dynamic memory
-     address and fetches exactly 1 scalar number at a time (millions of
-     scattered scalar fetches), destroying memory bandwidth.
-
-  Why direct 2D advanced indexing is fast on TPU:
-  1. 128x Smaller Index: Uses the 2D `positions` tensor directly without
-     expanding it.
-  2. Fast Contiguous Vector Loads: By writing `rope_cache[positions]`, we
-     semantically request entire rows of the matrix. Because XLA knows the
-     elements of a row are stored contiguously in physical memory
-     (Row-Major order), it compiles a single Vector Load instruction
-     (HLO Gather with slice_sizes=[1, cache_width]). The TPU calculates just
-     one dynamic address per row and scoops up the entire vector block in a
-     single fast hardware cycle.
-  3. O(1) Metadata Unsqueeze: We reshape the 3D result to 4D via
-     `.unsqueeze(2)`, which only modifies shape metadata and does zero
-     memory work.
-
-  Equivalence: Both methods mathematically compute
-  `rope_cache[positions[b, s], k]`, providing exact bitwise parity while
-  eliminating the TPU scalar lookup bottleneck.
-  """
-  try:
-    import torchtitan.models.common.rope as rope
-    import spmd_types as spmd
-    from torch.fx.experimental.symbolic_shapes import guard_or_false  # pylint: disable=g-import-not-at-top,g-importing-member
-  except ImportError:
-    return
-
-  @spmd.local_map(out_types={"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R})
-  def _reshape_for_broadcast_patched(
-      rope_cache: torch.Tensor,
-      query_shape: torch.Size | tuple[int, ...],
-      positions: torch.Tensor | None = None,
-  ) -> torch.Tensor:
-    ndim = len(query_shape)
-    assert ndim > 1
-    bsz, seqlen = query_shape[:2]
-    cache_width = rope_cache.shape[-1]
-
-    # Case 1: No positions (sequential). Unchanged from original.
-    if positions is None:
-      rope_cache = rope_cache[0:seqlen]
-      shape = [
-          d if i == 1 else cache_width if i == ndim - 1 else 1
-          for i, d in enumerate(query_shape)
-      ]
-      return rope_cache.view(*shape)
-
-    # Case 2: Singleton positions (bsz=1). Unchanged from original.
-    if guard_or_false(positions.size(0) == 1):
-      rope_cache = rope_cache[positions.squeeze(0)]
-      shape = [
-          d if i == 1 else cache_width if i == ndim - 1 else 1
-          for i, d in enumerate(query_shape)
-      ]
-      return rope_cache.view(*shape)
-    # Case 3: Per-batch positions (bsz > 1).
-    # Replaces slow 4D torch.gather (33.5 MB index, scalar HLO lookups)
-    # with fast 2D indexing rope_cache[positions].unsqueeze(2) (262 KB index,
-    # native TPU 2D embedding lookup copying contiguous vector rows).
-    else:
-      # Index 2D cache [max_seqlen, cache_width] with 2D positions [bsz, seqlen]:
-      # yields [bsz, seqlen, cache_width]. unsqueeze(2) inserts head
-      # dimension, returning shape [bsz, seqlen, 1, cache_width].
-      return rope_cache[positions].unsqueeze(2)
-
-  rope._reshape_for_broadcast = _reshape_for_broadcast_patched
-  logger.info(
-      "Monkey-patched "
-      "torchtitan.models.common.rope._reshape_for_broadcast "
-      "with TPU optimized path"
-  )
+# NOTE: `use_rope_tpu_optimization_patch` was removed in the d771abb0 upstream
+# import. It monkey-patched `torchtitan.models.common.rope._reshape_for_broadcast`
+# to replace a `cache_width`-expanded 4D `torch.gather` with direct 2D advanced
+# indexing. Upstream now does precisely that itself (`models/common/rope.py`
+# `_reshape_for_broadcast`), over the folded `[T]` token stream, so the patch is
+# obsolete -- and actively harmful, because it still returned `[B, S, 1, W]`.
 
 
 def apply_patches(model: nn.Module, job_config: Any) -> None:
@@ -596,5 +544,3 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   if hasattr(job_config, "qwen3") and job_config.qwen3.use_fill_indices_kernel:
     use_fill_indices_patch(model)
 
-  # Apply RoPE TPU Optimization Patch
-  use_rope_tpu_optimization_patch()

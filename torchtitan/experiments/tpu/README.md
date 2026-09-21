@@ -171,7 +171,7 @@ torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.llama3 \
     --config=llama3_1b \
     --hf_assets_path=assets/hf/Llama-3.2-1B/ \
-    --training.seq_len=128 \
+    --training.max_context_length=128 \
     --training.steps=10 \
     --training.dtype=bfloat16 \
     --training.mixed_precision_param=bfloat16
@@ -180,7 +180,7 @@ torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
 **Notes:**
 
 * Currently, only the `llama3_tpu` configuration is supported.
-* You must limit `seq_len` to 128 at this time; support for the full context length is coming soon.
+* You must limit `max_context_length` (formerly `seq_len`) to 128 at this time; support for the full context length is coming soon.
 * Memory and Model Flops Utilization (MFU) metrics might be inaccurate in the current version.
 
 ---
@@ -419,7 +419,7 @@ xpk workload create \
         -m torchtitan.experiments.tpu.train \
         --module=torchtitan.experiments.tpu.llama3 \
         --config=llama3_8b \
-        --training.seq_len=512 \
+        --training.max_context_length=512 \
         --dataloader.dataset=c4_test \
         --training.dtype=bfloat16 \
         --training.mixed_precision_param=bfloat16 \
@@ -438,7 +438,7 @@ xpk workload create \
 
 * This configuration was tested on `v6e-16` and `v6e-32`.
 * Currently, only the `llama3_tpu` configuration is supported.
-* You must limit `seq_len` to 512 at this time; support for the full context length is coming soon.
+* You must limit `max_context_length` (formerly `seq_len`) to 512 at this time; support for the full context length is coming soon.
 * Memory and MFU metrics might be inaccurate in the current version.
 
 ---

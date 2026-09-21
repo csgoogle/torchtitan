@@ -48,9 +48,13 @@ class TpuActivationDtypeCosSinRoPE(CosSinRoPE):
   def forward(
       self,
       query: torch.Tensor,
-      key: torch.Tensor,
+      key: torch.Tensor | None = None,
       positions: torch.Tensor | None = None,
-  ) -> tuple[torch.Tensor, torch.Tensor]:
+      *,
+      inverse: bool = False,
+  ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if inverse:
+      raise NotImplementedError("CosSinRoPE does not support inverse rotation.")
     rope_cache = self._reshape_cache(query, positions)
     head_dim = query.shape[-1]
     cos = rope_cache[..., :head_dim]
@@ -58,15 +62,19 @@ class TpuActivationDtypeCosSinRoPE(CosSinRoPE):
 
     query_cos = cos.to(query.dtype)
     query_sin = sin.to(query.dtype)
+    query_out = query * query_cos + self._rotate_half(query) * query_sin
+    if key is None:
+      return query_out
     key_cos = cos.to(key.dtype)
     key_sin = sin.to(key.dtype)
-    query_out = query * query_cos + self._rotate_half(query) * query_sin
     key_out = key * key_cos + self._rotate_half(key) * key_sin
     return query_out, key_out
 
 
 @override(
-    "tpu_activation_dtype_cossin_rope",
+    # Upstream d771abb0 made `override()` keyword-only and removed the separate
+    # name argument: an override is now identified by the decorated factory's
+    # import path, which is what `override.imports` lists.
     target=CosSinRoPE.Config,
     exact=True,
     description="Evaluate cos/sin RoPE in the activation dtype on TPU.",

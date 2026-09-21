@@ -16,7 +16,7 @@ from torchtitan.experiments.tpu.qkv import (
     TpuPackedQKVConverter,
     TpuPackedQKVLinear,
 )
-from torchtitan.models.common.attention import FusedQKVLinear, ScaledDotProductAttention
+from torchtitan.models.common.attention import FusedQKVLinear, ScaledDotProductInnerAttention
 from torchtitan.models.common.config_utils import make_gqa_config
 from torchtitan.models.common.rope import CosSinRoPE
 
@@ -35,9 +35,9 @@ def _attention_config():
       head_dim=HEAD_DIM,
       wqkv_param_init=init,
       wo_param_init=init,
-      inner_attention=ScaledDotProductAttention.Config(),
+      inner_attention=ScaledDotProductInnerAttention.Config(),
       fuse_qkv=True,
-      rope=CosSinRoPE.Config(dim=HEAD_DIM, max_seq_len=16, theta=10000.0),
+      rope=CosSinRoPE.Config(dim=HEAD_DIM, max_context_length=16, theta=10000.0),
   )
 
 
@@ -105,7 +105,7 @@ def test_packed_qkv_matches_fused_semantics_and_checkpoint():
       "wqkv_packed.weight"
   ]
 
-  fused_input = torch.randn(2, 3, DIM, requires_grad=True)
+  fused_input = torch.randn(6, DIM, requires_grad=True)
   packed_input = fused_input.detach().clone().requires_grad_()
   fused_outputs = fused(fused_input)
   packed_outputs = packed(packed_input)
@@ -130,7 +130,7 @@ def test_packed_qkv_matches_fused_semantics_and_checkpoint():
 
 def test_packed_qkv_backward_concatenates_one_gradient():
   _, packed = _build_fused_and_packed()
-  x = torch.randn(2, 3, DIM)
+  x = torch.randn(6, DIM)
 
   def loss(weight):
     outputs = torch.func.functional_call(

@@ -12,8 +12,20 @@ __all__ = [
     "parallelize_flux",
 ]
 
+
+def _upstream_flavor(flavor: str):
+  """Builds an upstream flux flavor.
+
+  Upstream d771abb0 changed `native_flux_models.flux_configs[flavor]` from a
+  bare callable into a `(builder, max_context_length)` pair. Flux builders take
+  no arguments, so only the unpack changes here.
+  """
+  build_config, _ = native_flux_models.flux_configs[flavor]
+  return build_config()
+
+
 flux_configs = {
-    "flux-dev": native_flux_models.flux_configs["flux-dev"](),
-    "flux-schnell": native_flux_models.flux_configs["flux-schnell"](),
-    "flux-debug": native_flux_models.flux_configs["flux-debug"](),
+    "flux-dev": _upstream_flavor("flux-dev"),
+    "flux-schnell": _upstream_flavor("flux-schnell"),
+    "flux-debug": _upstream_flavor("flux-debug"),
 }

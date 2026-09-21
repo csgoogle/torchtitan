@@ -29,7 +29,7 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
 )
 from torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack import (
     _build,
-    SEQ_LEN,
+    TOKENS,
 )
 
 
@@ -49,7 +49,7 @@ def forward_matches_unrolled(device, rank, world_size):
     """One batched matmul per op must give the same bits as n separate ones."""
     del rank
     plain, stacked = _models(device, world_size)
-    tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN), device=device)
+    tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,), device=device)
     torch.testing.assert_close(stacked(tokens), plain(tokens), rtol=0, atol=0)
 
 

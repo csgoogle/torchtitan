@@ -38,13 +38,16 @@ class TrainMinimalDistributedTest(
   ):
     """Runs execution test specifically for Conformer's minimal trainer."""
 
+    # Upstream replaced seq_len/local_batch_size with a token budget:
+    # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 4 * 128.
     config_args = [
         "--module=torchtitan.experiments.tpu.conformer",
         "--config=conformer_test",
-        "--training.seq_len=128",  # Override to smaller length for test speed
+        # Override to smaller length for test speed
+        "--training.max_context_length=128",
         "--dataloader.dataset=random",
         "--training.steps=5",
-        "--training.local_batch_size=4",
+        "--training.num_tokens_per_microbatch_per_dp_rank=512",
     ]
     if extra_args:
       config_args.extend(extra_args)

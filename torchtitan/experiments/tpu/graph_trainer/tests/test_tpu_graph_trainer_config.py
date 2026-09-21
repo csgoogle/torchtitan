@@ -76,6 +76,9 @@ from torchtitan.experiments.tpu.token_dispatcher import (
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
 from torchtitan.models.common import ComplexRoPE, Linear
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.llama3.config_registry import (
+    model_registry as llama3_model_registry,
+)
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
@@ -158,9 +161,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_scanning_needs_the_graph_trainer(self) -> None:
     """Off the graph-trainer lane nothing applies the flag, so it must not be
     silently accepted."""
+    # Upstream d771abb0 made `model_spec` required; the flag check under test
+    # does not look at it.
     with self.assertRaisesRegex(ValueError, "use-graph-trainer"):
       TPUTrainerConfig(
-          tpu_config=TPUConfig(use_scan_layers=True, use_graph_trainer=False)
+          model_spec=llama3_model_registry("debugmodel", attn_backend="sdpa"),
+          tpu_config=TPUConfig(use_scan_layers=True, use_graph_trainer=False),
       )
 
   @parameterized.parameters("sac_and_offload", "full_and_offload")
@@ -433,7 +439,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(config.training.mixed_precision_reduce, "bfloat16")
     self.assertFalse(config.tpu_config.use_scan_layers)
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.bf16_rope",
+        "torchtitan.experiments.tpu.overrides.bf16_rope"
+        ".tpu_activation_dtype_cossin_rope",
         config.override.imports,
     )
     splash = config.splash_attention_kernel
@@ -587,7 +594,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_attention_parity_recipe_adds_bf16_rope(self) -> None:
     config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.bf16_rope",
+        "torchtitan.experiments.tpu.overrides.bf16_rope"
+        ".tpu_activation_dtype_cossin_rope",
         config.override.imports,
     )
     assert config.model_spec is not None
@@ -656,8 +664,14 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_235b_recipe_matches_the_maxtext_shape(self) -> None:
     config = qwen3_moe_235b_scan()
 
-    self.assertEqual(config.training.local_batch_size, 16)
-    self.assertEqual(config.training.seq_len, 4096)
+    # local_batch_size is now
+    # num_tokens_per_microbatch_per_dp_rank // max_context_length.
+    self.assertEqual(
+        config.training.num_tokens_per_microbatch_per_dp_rank
+        // config.training.max_context_length,
+        16,
+    )
+    self.assertEqual(config.training.max_context_length, 4096)
     self.assertTrue(config.tpu_config.use_scan_layers)
     self.assertEqual(
         config.tpu_config.graph_trainer_memory_policy, "full_and_scan_offload"
@@ -669,8 +683,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     assert proxy.model_spec is not None
     self.assertLen(proxy.model_spec.model.layers, 12)
+    # The 32x global-to-local ratio, now in token counts: both sides scale by
+    # the same max_context_length, so the ratio carries over unchanged.
     self.assertEqual(
-        proxy.training.global_batch_size, 32 * proxy.training.local_batch_size
+        proxy.training.num_tokens_per_train_step,
+        32 * proxy.training.num_tokens_per_microbatch_per_dp_rank,
     )
 
   def test_235b_maxtext_twin_changes_only_the_three_numerics_knobs(self) -> None:
@@ -681,7 +698,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(maxtext.training.mixed_precision_reduce, "bfloat16")
     self.assertEqual(
         set(maxtext.override.imports) - set(base.override.imports),
-        {"torchtitan.experiments.tpu.overrides.bf16_rope"},
+        {
+            "torchtitan.experiments.tpu.overrides.bf16_rope"
+            ".tpu_activation_dtype_cossin_rope"
+        },
     )
     assert base.model_spec is not None and maxtext.model_spec is not None
     for config, expected in ((base, False), (maxtext, True)):
@@ -694,7 +714,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       )
     # Everything the base recipe works around is inherited, not re-derived.
     self.assertEqual(maxtext.model_spec.flavor, base.model_spec.flavor)
-    self.assertEqual(maxtext.training.local_batch_size, 16)
+    self.assertEqual(
+        maxtext.training.num_tokens_per_microbatch_per_dp_rank
+        // maxtext.training.max_context_length,
+        16,
+    )
     self.assertTrue(maxtext.tpu_config.use_scan_layers)
 
   def test_optimizer_implementation_cli_override_is_authoritative(self) -> None:
@@ -783,7 +807,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.real_rope",
+        "torchtitan.experiments.tpu.overrides.real_rope"
+        ".tpu_real_arithmetic_complex_rope",
         graph_config.override.imports,
     )
     apply_overrides(graph_config.override, graph_config)
@@ -812,7 +837,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.fused_loss",
+        "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head",
         graph_config.override.imports,
     )
     apply_overrides(graph_config.override, graph_config)

@@ -24,7 +24,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 
-from torchtitan.components.checkpoint_utils import (
+from torchtitan.components.optimizer.utils import (
     get_flat_optim_state_dict,
     init_optim_state,
 )

@@ -88,48 +88,63 @@ class TPUTrainer(torchtitan.train.Trainer):
   def forward_backward_step(
       self,
       *,
-      input_dict: dict[str, torch.Tensor],
-      labels: torch.Tensor,
-      global_valid_tokens: float,
+      input_dict: dict[str, Any] | list[dict[str, Any]],
+      global_valid_tokens: torch.Tensor,
   ) -> torch.Tensor:
+    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
+    from torchtitan.protocols.model import BaseModel  # pylint: disable=g-import-not-at-top
+
     config = self.config
-    use_graph_split = (
-        isinstance(config, tpu_job_config_module.TPUTrainerConfig)
-        and config.tpu_config.use_graph_split
-        and not self.parallel_dims.pp_enabled
-    )
-    if not use_graph_split:
-      return super().forward_backward_step(
-          input_dict=input_dict,
-          labels=labels,
-          global_valid_tokens=global_valid_tokens,
+    with set_unflatten_seq_len(config.training.max_context_length):
+      use_graph_split = (
+          isinstance(config, tpu_job_config_module.TPUTrainerConfig)
+          and config.tpu_config.use_graph_split
+          and not self.parallel_dims.pp_enabled
+      )
+      if not use_graph_split:
+        return super().forward_backward_step(
+            input_dict=input_dict,
+            global_valid_tokens=global_valid_tokens,
+        )
+
+      # Graph-split forward/backward for TPU:
+      # The forward pass and loss computation are materialized as one XLA graph,
+      # and the backward pass is compiled separately. This reduces peak
+      # compilation time vs. one monolithic forward+backward graph.
+      from torch_tpu._internal.sync import synchronize  # pylint: disable=g-import-not-at-top
+
+      assert len(self.model_parts) == 1
+      assert isinstance(input_dict, dict)
+      inputs, labels, extra_kwargs = cast(
+          BaseModel, self.model_parts[0]
+      ).preprocess_inputs(
+          input_dict,
+          parallel_dims=self.parallel_dims,
+          parallelism=self.config.parallelism,
+          max_num_documents=self.dataloader.max_num_documents,
+          max_context_length=self.config.training.max_context_length,
+      )
+      self.ntokens_seen += (
+          labels[0].numel() if isinstance(labels, tuple) else labels.numel()
       )
 
-    # Graph-split forward/backward for TPU:
-    # The forward pass and loss computation are materialized as one XLA graph,
-    # and the backward pass is compiled separately. This reduces peak
-    # compilation time vs. one monolithic forward+backward graph.
-    from torch_tpu._internal.sync import synchronize  # pylint: disable=g-import-not-at-top
+      with self.train_context():
+        pred = self.model_parts[0](inputs, **extra_kwargs)
+        loss_kwargs = {}
+        if "positions" in extra_kwargs:
+          loss_kwargs["positions"] = extra_kwargs["positions"]
+        loss, _ = self.loss_fn(pred, labels, global_valid_tokens, **loss_kwargs)
+        del pred
 
-    assert len(self.model_parts) == 1
-    inputs, labels, extra_kwargs = self.post_dataloading_process(
-        input_dict, labels
-    )
+        # Materialize the forward graph without waiting for execution to
+        # complete. This splits the deferred-op graph so the backward pass
+        # compiles as a separate (smaller) XLA program. Autograd state is
+        # unaffected — loss.backward() can still propagate gradients.
+        synchronize(loss, wait=False)
 
-    with self.train_context():
-      pred = self.model_parts[0](inputs, **extra_kwargs)
-      loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
-      del pred
+        loss.backward()
 
-      # Materialize the forward graph without waiting for execution to
-      # complete. This splits the deferred-op graph so the backward pass
-      # compiles as a separate (smaller) XLA program. Autograd state is
-      # unaffected — loss.backward() can still propagate gradients.
-      synchronize(loss, wait=False)
-
-      loss.backward()
-
-    return loss
+      return loss
 
 
 def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
@@ -325,7 +340,12 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
             "Training with config: %s",
             json.dumps(train_config.to_dict(), indent=2),
         )
-      trainer.train()
+      # TT-UNFLATTEN-SHIM:
+      from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+      # Upstream d771abb0 renamed training.seq_len ->
+      # training.max_context_length.
+      with set_unflatten_seq_len(train_config.training.max_context_length):
+        trainer.train()
   except Exception:
     if trainer:
       trainer.close()

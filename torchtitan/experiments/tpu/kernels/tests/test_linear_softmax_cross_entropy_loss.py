@@ -99,7 +99,9 @@ class LinearSoftmaxCrossEntropyLossTest(
     logits = x_tpu @ weights_tpu
 
     if reduction == "sum":
-      expected_out = loss.cross_entropy_loss(logits, labels_tpu)
+      expected_out = loss.cross_entropy_loss(
+          logits.view(-1, v), labels_tpu.view(-1)
+      )
     else:
       expected_out = torch.nn.functional.cross_entropy(
           logits.view(-1, v).float(),

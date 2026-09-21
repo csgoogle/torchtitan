@@ -23,7 +23,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.models.common.moe_sharding import expert_param_placement_dense
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
-from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
+from torchtitan.protocols.sharding import ShardingConfig
 
 
 def _build_experts(
@@ -369,13 +369,16 @@ def test_kernel_native_layout_transposes_tp_sharding_axes():
     )
     native = _native_weight_sharding(config)
     assert set(native.state_shardings) == {"w1_EDF", "w2_EFD", "w3_EDF"}
-    assert native.state_shardings["w1_EDF"].axis_types[MeshAxisName.TP] == spmd.S(2)
-    assert native.state_shardings["w2_EFD"].axis_types[MeshAxisName.TP] == spmd.S(1)
-    assert native.state_shardings["w3_EDF"].axis_types[MeshAxisName.TP] == spmd.S(2)
+    assert native.state_shardings["w1_EDF"].local_type[MeshAxisName.TP] == spmd.S(2)
+    assert native.state_shardings["w2_EFD"].local_type[MeshAxisName.TP] == spmd.S(1)
+    assert native.state_shardings["w3_EDF"].local_type[MeshAxisName.TP] == spmd.S(2)
 
 
 def test_kernel_native_layout_transposes_rank_aware_partition_spec():
-    layout = SpmdLayout(
+    # Upstream d771abb0 deleted `protocols.sharding.SpmdLayout` in favour of
+    # `spmd_types.SpmdType`, renaming the per-axis field `axis_types` ->
+    # `local_type`.
+    layout = spmd.SpmdType(
         {
             MeshAxisName.DP_SHARD: spmd.V,
             MeshAxisName.TP: spmd.V,

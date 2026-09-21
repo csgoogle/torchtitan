@@ -19,20 +19,27 @@ from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
 from torchtitan.models.common.attention import (
-    FlexAttention,
+    FlexInnerAttention,
     FusedQKVLinear,
     GQAttention,
     QKVLinear,
-    ScaledDotProductAttention,
-    VarlenAttention,
+    ScaledDotProductInnerAttention,
+    VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.dist_gemm import (
+    AllGatherFusedQKVLinear,
+    DistGEMMFeedForward,
+    RowParallelLinear,
+)
 from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import Linear, RouterGateLinear
 from torchtitan.models.common.moe import (
     GroupedExperts,
+    MicrobatchWiseLoadBalanceLoss,
     MoE,
     MoELoadBalanceAuxLoss,
+    RoutedExperts,
     TokenChoiceTopKRouter,
 )
 from torchtitan.models.common.nn_modules import RMSNorm
@@ -48,11 +55,23 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
 
 
+DEFAULT_DEBUG_MODEL_SEQ_LEN = 2048
+
+
 def decoder_vocab_size(model_spec: ModelSpec) -> int:
     """Assert Decoder.Config type so lint is not annoyed."""
     model_config = model_spec.model
     assert isinstance(model_config, Decoder.Config)
     return model_config.vocab_size
+
+
+# Which implementation runs the TP-parallel linear layers. "default" leaves the
+# collectives to the framework, as separate all-gather / reduce-scatter either side
+# of an ordinary GEMM. "dist_gemm" folds each collective into its adjacent GEMM
+# over symmetric memory, so communication overlaps compute -- the technique
+# Megatron exposes as --tp-comm-overlap. Further implementations (CuTeDSL, Triton)
+# would be additional values here.
+TpGemmBackend = Literal["default", "dist_gemm"]
 
 
 def get_attention_config(
@@ -62,27 +81,27 @@ def get_attention_config(
 
     Language models always use block_causal masking (the dataloaders always
     emit per-document positions), so every backend here is a masked attention
-    backend. ``ScaledDotProductAttention`` only supports a boolean ``is_causal``
+    backend. ``ScaledDotProductInnerAttention`` only supports a boolean ``is_causal``
     flag and cannot consume per-document positions, so it is not a valid
     language-model backend (it remains available for Flux, which builds it
     directly).
     """
     if backend == "sdpa":
-        return ScaledDotProductAttention.Config()
+        return ScaledDotProductInnerAttention.Config()
     elif backend == "flex":
-        return FlexAttention.Config()
+        return FlexInnerAttention.Config()
     elif backend == "flex_flash":
         from torchtitan.tools.utils import has_cuda_capability
 
         if not has_cuda_capability(9, 0):
             raise ValueError(
-                "Flash backend of FlexAttention is only supported on Hopper or Blackwell"
+                "Flash backend of FlexInnerAttention is only supported on Hopper or Blackwell"
             )
-        return FlexAttention.Config(
+        return FlexInnerAttention.Config(
             block_size=(256, 128), kernel_options={"BACKEND": "FLASH"}
         )
     elif backend == "varlen":
-        return VarlenAttention.Config()
+        return VarlenInnerAttention.Config()
 
     else:
         raise ValueError(f"Unknown backend: {backend}")
@@ -155,19 +174,48 @@ def make_gqa_config(
     wqkv_param_init: dict[str, Callable],
     wo_param_init: dict[str, Callable],
     inner_attention: Module.Config,
-    rope: RoPE.Config,
+    rope: RoPE.Config | None,
     n_kv_heads: int | None = None,
     head_dim: int | None = None,
     fuse_qkv: bool = False,
     qk_norm: RMSNorm.Config | None = None,
+    tp_gemm_backend: TpGemmBackend = "default",
 ) -> GQAttention.Config:
-    """Build a fully-specified GQAttention.Config."""
+    """Build a fully-specified GQAttention.Config.
+
+    ``rope=None`` builds a NoPE layer (no positional encoding); see
+    :class:`GQAttention`.
+
+    ``tp_gemm_backend`` selects which implementation runs the QKV and output
+    projections. ``"default"`` leaves the TP collectives to the framework, either
+    side of an ordinary GEMM. ``"dist_gemm"`` folds each into its adjacent GEMM
+    over symmetric memory.
+
+    ``"dist_gemm"`` raises here unless ``fuse_qkv=True`` -- the all-gather feeds a
+    single wqkv GEMM, so there is no separate wq/wk/wv schedule. It also needs CUDA
+    and the spmd_types backend; those are rejected by
+    ``validate_dist_gemm_preconditions`` at sharding time, which is the first point
+    that sees the parallelism settings.
+    """
     n_kv = n_kv_heads if n_kv_heads is not None else n_heads
     per_head_dim = head_dim if head_dim is not None else dim // n_heads
-    rope = dataclasses.replace(rope)
+    rope = dataclasses.replace(rope) if rope is not None else None
+
+    # The backend picks the classes; everything below builds the same shapes into
+    # whichever was chosen.
+    fused_qkv_cls, wo_cls = FusedQKVLinear, Linear
+    if tp_gemm_backend == "dist_gemm":
+        if not fuse_qkv:
+            raise ValueError(
+                "tp_gemm_backend='dist_gemm' requires fuse_qkv=True: the all-gather "
+                "feeds a single wqkv GEMM, so there is no separate wq/wk/wv "
+                "schedule to fall back on."
+            )
+        fused_qkv_cls = AllGatherFusedQKVLinear
+        wo_cls = RowParallelLinear
 
     if fuse_qkv:
-        qkv = FusedQKVLinear.Config(
+        qkv = fused_qkv_cls.Config(
             head_dim=per_head_dim,
             n_heads=n_heads,
             n_kv_heads=n_kv,
@@ -205,7 +253,7 @@ def make_gqa_config(
         head_dim=head_dim,
         dim=dim,
         qkv_linear=qkv,
-        wo=Linear.Config(
+        wo=wo_cls.Config(
             in_features=n_heads * per_head_dim,
             out_features=dim,
             param_init=wo_param_init,
@@ -222,9 +270,16 @@ def make_ffn_config(
     hidden_dim: int,
     w1_param_init: dict[str, Callable],
     w2w3_param_init: dict[str, Callable],
+    tp_gemm_backend: TpGemmBackend = "default",
 ) -> FeedForward.Config:
-    """Build a fully-specified FeedForward.Config."""
-    return FeedForward.Config(
+    """Build a fully-specified FeedForward.Config.
+
+    ``tp_gemm_backend="dist_gemm"`` overlaps the TP collectives with the GEMMs by
+    folding them in: one all-gather feeds w1 and w3, and w2 reduce-scatters. A bias
+    on w1/w3 is rejected by the config. See make_gqa_config.
+    """
+    ffn_cls = DistGEMMFeedForward if tp_gemm_backend == "dist_gemm" else FeedForward
+    return ffn_cls.Config(
         w1=Linear.Config(
             in_features=dim, out_features=hidden_dim, param_init=w1_param_init
         ),
@@ -251,67 +306,24 @@ def make_moe_config(
     *,
     num_experts: int = 8,
     router: TokenChoiceTopKRouter.Config,
-    experts: GroupedExperts.Config,
+    routed_experts: RoutedExperts.Config,
     shared_experts: FeedForward.Config | None = None,
     load_balance_coeff: float | None = 1e-3,
-    aux_loss_type: str | None = None,
     aux_loss_coeff: float | None = None,
 ) -> MoE.Config:
     """Build a fully-specified MoE.Config."""
-    aux_loss = None
-    if aux_loss_type is not None:
-        assert (
-            aux_loss_coeff is not None
-        ), "aux_loss_coeff required when aux_loss_type is set"
-        aux_loss = make_aux_loss_config(
-            type=aux_loss_type,  # pyrefly: ignore [bad-argument-type]
-            coeff=aux_loss_coeff,
-            top_k=router.top_k,
+    if aux_loss_coeff is not None:
+        router = dataclasses.replace(
+            router,
+            aux_loss=MicrobatchWiseLoadBalanceLoss.Config(coeff=aux_loss_coeff),
         )
-
     return MoE.Config(
         num_experts=num_experts,
         load_balance_coeff=load_balance_coeff,
-        aux_loss=aux_loss,
         router=router,
-        experts=experts,
+        routed_experts=routed_experts,
         shared_experts=shared_experts,
     )
-
-
-def update_moe_aux_loss_configs(
-    layers: list,
-    *,
-    pp_enabled: bool,
-    local_global_batch_size: int,
-    global_batch_size: int,
-) -> None:
-    """Update aux loss configs for all MoE layers from trainer config.
-
-    Call this from each model's ``update_from_config`` to set
-    ``global_batch_size`` for gradient normalization across PP microbatches,
-    gradient accumulation steps, and DP ranks (FSDP sum). Also validates
-    that batch-wise aux loss is not used with PP or gradient accumulation.
-    """
-    for layer_cfg in layers:
-        moe_cfg = getattr(layer_cfg, "moe", None)
-        if moe_cfg is None:
-            continue
-        aux_loss = moe_cfg.aux_loss
-        if aux_loss is None:
-            continue
-        if aux_loss.type == "batch_wise" and pp_enabled:
-            raise ValueError(
-                "batch_wise MoE aux loss is incompatible with pipeline "
-                "parallelism. Use sequence_wise instead."
-            )
-        if aux_loss.type == "batch_wise" and global_batch_size != local_global_batch_size:
-            raise ValueError(
-                "batch_wise MoE aux loss is incompatible with gradient "
-                "accumulation. Use sequence_wise instead or set "
-                "training.global_batch_size to local_batch_size * data-parallel degree."
-            )
-        aux_loss.global_batch_size = global_batch_size
 
 
 def make_router_config(
@@ -320,7 +332,7 @@ def make_router_config(
     num_experts: int,
     gate_param_init: dict[str, Callable],
     top_k: int = 1,
-    score_func: Literal["sigmoid", "softmax"] = "sigmoid",
+    score_func: Literal["sigmoid", "softmax", "sqrtsoftplus"] = "sigmoid",
     route_norm: bool = False,
     route_scale: float = 1.0,
     num_expert_groups: int | None = None,
@@ -330,7 +342,7 @@ def make_router_config(
     """Build a fully-specified TokenChoiceTopKRouter.Config."""
     return TokenChoiceTopKRouter.Config(
         num_experts=num_experts,
-        gate=Linear.Config(
+        gate=RouterGateLinear.Config(
             in_features=dim,
             out_features=num_experts,
             bias=bias,
@@ -350,8 +362,8 @@ def make_token_dispatcher_config(
     num_experts: int,
     top_k: int,
     comm_backend: str,
+    hidden_dim: int,
     non_blocking_capacity_factor: float | None = None,
-    hidden_dim: int | None = None,
     num_max_tokens_per_rank: int | None = None,
     cudagraphable: bool = False,
 ) -> LocalTokenDispatcher.Config:
@@ -377,9 +389,9 @@ def make_token_dispatcher_config(
         # DeepEP v2: a single ElasticBuffer handles training and inference. ``hidden_dim``
         # (model dim) sizes the buffer; wire_meshes creates it eagerly. ``cudagraphable``
         # selects the static no-host-sync expand layout (set on the generator by the
-        # deepep_inference override). ``num_max_tokens_per_rank`` is the per-rank EXPAND
-        # capacity: training infers it (the compact path auto-sizes), inference must set it
-        # >= the largest per-rank token count for droplessness.
+        # deepep_override). ``num_max_tokens_per_rank`` is the hard per-rank input-token
+        # bound. Runtime config derives it from the fixed training shape or inference
+        # scheduler/cudagraph limits before the dispatcher is built.
         return DeepEPTokenDispatcher.Config(
             num_experts=num_experts,
             top_k=top_k,
@@ -392,11 +404,15 @@ def make_token_dispatcher_config(
             num_experts=num_experts,
             top_k=top_k,
             non_blocking_capacity_factor=non_blocking_capacity_factor,
+            hidden_dim=hidden_dim,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
         )
     elif comm_backend == "minimal_async_ep":
         return MinimalAsyncEPTokenDispatcher.Config(
             num_experts=num_experts,
             top_k=top_k,
+            hidden_dim=hidden_dim,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
         )
     elif comm_backend == "standard":
         return AllToAllTokenDispatcher.Config(
@@ -410,7 +426,7 @@ def make_token_dispatcher_config(
         )
 
 
-def make_experts_config(
+def make_routed_experts_config(
     *,
     dim: int,
     hidden_dim: int,
@@ -421,13 +437,15 @@ def make_experts_config(
     non_blocking_capacity_factor: float | None = None,
     num_max_tokens_per_rank: int | None = None,
     cudagraphable: bool = False,
-) -> GroupedExperts.Config:
-    """Build a fully-specified GroupedExperts.Config."""
-    return GroupedExperts.Config(
-        dim=dim,
-        hidden_dim=hidden_dim,
-        num_experts=num_experts,
-        param_init=param_init,
+) -> RoutedExperts.Config:
+    """Build a fully-specified RoutedExperts.Config (inner_experts + token_dispatcher)."""
+    return RoutedExperts.Config(
+        inner_experts=GroupedExperts.Config(
+            dim=dim,
+            hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            param_init=param_init,
+        ),
         token_dispatcher=make_token_dispatcher_config(
             num_experts=num_experts,
             top_k=top_k,
@@ -438,3 +456,41 @@ def make_experts_config(
             cudagraphable=cudagraphable,
         ),
     )
+
+
+def update_moe_aux_loss_configs(
+    layers: list,
+    *,
+    pp_enabled: bool,
+    local_global_batch_size: int,
+    global_batch_size: int,
+) -> None:
+    """Update aux loss configs for all MoE layers from trainer config.
+
+    Call this from each model's ``update_from_config`` to set
+    ``global_batch_size`` for gradient normalization across PP microbatches,
+    gradient accumulation steps, and DP ranks (FSDP sum). Also validates
+    that batch-wise aux loss is not used with PP or gradient accumulation.
+    """
+    for layer_cfg in layers:
+        moe_cfg = getattr(layer_cfg, "moe", None)
+        if moe_cfg is None:
+            continue
+        aux_loss = getattr(moe_cfg, "aux_loss", None)
+        if aux_loss is None and hasattr(moe_cfg, "router"):
+            aux_loss = getattr(moe_cfg.router, "aux_loss", None)
+        if aux_loss is None:
+            continue
+        if aux_loss.type == "batch_wise" and pp_enabled:
+            raise ValueError(
+                "batch_wise MoE aux loss is incompatible with pipeline "
+                "parallelism. Use sequence_wise instead."
+            )
+        if aux_loss.type == "batch_wise" and global_batch_size != local_global_batch_size:
+            raise ValueError(
+                "batch_wise MoE aux loss is incompatible with gradient "
+                "accumulation. Use sequence_wise instead or set "
+                "training.global_batch_size to local_batch_size * data-parallel degree."
+            )
+        aux_loss.global_batch_size = global_batch_size
+

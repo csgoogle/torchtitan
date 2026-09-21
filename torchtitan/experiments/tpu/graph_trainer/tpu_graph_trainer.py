@@ -29,7 +29,7 @@ from typing import Any, Optional
 import torch
 
 from torchtitan.components.loss import ChunkedLossWrapper
-from torchtitan.components.optimizer import (
+from torchtitan.components.optimizer.optimizer import (
     collect_moe_routing_metric_tensors,
     set_moe_routing_metric_tensors,
 )
@@ -244,12 +244,23 @@ class TpuGraphTrainer(GraphTrainer):
         model = self.model_parts[0]
         model._optstate_lr.fill_(lr)
 
+        should_log = self.metrics_processor.should_log(self.step)
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
         for _ in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
-            local_valid_tokens += (labels != IGNORE_INDEX).sum()
-            microbatches.append((input_dict, labels))
+            batch = next(data_iterator)
+            if isinstance(batch, tuple):
+                input_dict, labels = batch
+                input_dict = dict(input_dict)
+                input_dict["labels"] = labels
+            else:
+                input_dict = dict(batch)
+            num_valid = input_dict.pop("num_valid_tokens", None)
+            if num_valid is not None:
+                local_valid_tokens += int(num_valid)
+            else:
+                local_valid_tokens += (input_dict["labels"] != IGNORE_INDEX).sum()
+            microbatches.append(input_dict)
         local_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
@@ -260,14 +271,12 @@ class TpuGraphTrainer(GraphTrainer):
             global_valid_tokens = local_valid_tokens.float()
 
         accumulated_losses = []
-        for input_dict, labels in microbatches:
+        for input_dict in microbatches:
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):
                     input_dict[k] = v.to(self.device)
-            labels = labels.to(self.device)
             loss = self.forward_backward_step(
                 input_dict=input_dict,
-                labels=labels,
                 global_valid_tokens=global_valid_tokens,  # type: ignore[arg-type]
             )
             accumulated_losses.append(loss.detach())
@@ -275,7 +284,7 @@ class TpuGraphTrainer(GraphTrainer):
         self.lr_schedulers.step()
         loss = torch.sum(torch.stack(accumulated_losses))
 
-        if not self.metrics_processor.should_log(self.step):
+        if not should_log:
             return
 
         if parallel_dims.dp_cp_enabled:
@@ -296,22 +305,23 @@ class TpuGraphTrainer(GraphTrainer):
     def forward_backward_step(
         self,
         *,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
+        input_dict: dict[str, Any] | list[dict[str, Any]],
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Override of GraphTrainer.forward_backward_step to branch into AdamW step when optimizer_in_graph is set."""
-        if not self._optimizer_in_graph:
-            return super().forward_backward_step(
+        from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+
+        with set_unflatten_seq_len(self.config.training.max_context_length):
+            if not self._optimizer_in_graph:
+                return super().forward_backward_step(
+                    input_dict=input_dict,
+                    global_valid_tokens=global_valid_tokens,
+                )
+            assert isinstance(input_dict, dict)
+            return self._fwd_bwd_adamw_step(
                 input_dict=input_dict,
-                labels=labels,
                 global_valid_tokens=global_valid_tokens,
             )
-        return self._fwd_bwd_adamw_step(
-            input_dict=input_dict,
-            labels=labels,
-            global_valid_tokens=global_valid_tokens,
-        )
 
     def _make_fx_forward_backward_step(
         self,
@@ -416,9 +426,8 @@ class TpuGraphTrainer(GraphTrainer):
     def _fwd_bwd_adamw_step(
         self,
         *,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
-        global_valid_tokens: float,
+        input_dict: dict[str, Any],
+        global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """TPU/PJRT addition: lowers and runs joint forward, backward, and AdamW optimizer FX graph step."""
         from torchtitan.experiments.graph_trainer.common_utils import (
@@ -429,11 +438,21 @@ class TpuGraphTrainer(GraphTrainer):
             minimal_fx_tracer,
         )
         from torchtitan.experiments.graph_trainer.passes import apply_graph_passes
+        from torchtitan.protocols.model import BaseModel
+        from typing import cast
+
         assert len(self.model_parts) == 1
         model = self.model_parts[0]
 
-        inputs, labels, extra_kwargs = self.post_dataloading_process(
-            input_dict, labels
+        inputs, labels, extra_kwargs = cast(BaseModel, model).preprocess_inputs(
+            input_dict,
+            parallel_dims=self.parallel_dims,
+            parallelism=self.config.parallelism,
+            max_num_documents=self.dataloader.max_num_documents,
+            max_context_length=self.config.training.max_context_length,
+        )
+        self.ntokens_seen += (
+            labels[0].numel() if isinstance(labels, tuple) else labels.numel()
         )
 
         if self._traced_step is None:

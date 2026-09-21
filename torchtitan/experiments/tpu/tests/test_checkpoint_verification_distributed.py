@@ -77,13 +77,15 @@ class TrainCheckpointVerificationTest(
     continuous_output = os.path.join(test_tmp_dir, "continuous_losses.pt")
     checkpointed_output = os.path.join(test_tmp_dir, "checkpointed_losses.pt")
 
+    # Upstream replaced seq_len/local_batch_size with a token budget:
+    # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 4 * 128.
     base_args = [
         "--module", "torchtitan.experiments.tpu.llama3",
         "--config", "llama3_debugmodel",
         "--dataloader.dataset_path=tests/assets/c4_test",
         "--hf_assets_path=tests/assets/tokenizer",
-        "--training.seq_len=128",
-        "--training.local_batch_size=4",
+        "--training.max_context_length=128",
+        "--training.num_tokens_per_microbatch_per_dp_rank=512",
         "--debug.deterministic",
         "--debug.seed=42",
     ]

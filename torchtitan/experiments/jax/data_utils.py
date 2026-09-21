@@ -10,8 +10,16 @@ def fake_dataloader(size, seqlen, batch_size):
         yield x, (x + 1) % 32000
 
 
-def torch_loader_to_jax(train_loader):
+def torch_loader_to_jax(train_loader, seq_len=None):
     """Wrap a torchtitan dataloader to yield numpy arrays."""
     for batch in train_loader:
-        inputs, labels = batch[0]['input'], batch[1]
-        yield inputs.numpy().astype(np.int32), labels.numpy().astype(np.int32)
+        if isinstance(batch, dict):
+            inputs, labels = batch['input'], batch['labels']
+        else:
+            inputs, labels = batch[0]['input'], batch[1]
+        inputs_np = inputs.numpy().astype(np.int32)
+        labels_np = labels.numpy().astype(np.int32)
+        if inputs_np.ndim == 1 and seq_len is not None:
+            inputs_np = inputs_np.reshape(-1, seq_len)
+            labels_np = labels_np.reshape(-1, seq_len)
+        yield inputs_np, labels_np

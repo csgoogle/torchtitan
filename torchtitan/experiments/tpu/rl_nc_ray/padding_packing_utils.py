@@ -17,7 +17,7 @@ TPU vs GPU Compilation & Shape Semantics:
 
 import torch
 import torch.nn.functional as F
-from torchtitan.models.common.attention import VarlenAttention
+from torchtitan.models.common.attention import VarlenInnerAttention
 
 
 def patch_create_varlen_metadata(max_seqs: int = 64) -> None:
@@ -59,7 +59,7 @@ def patch_create_varlen_metadata(max_seqs: int = 64) -> None:
 
 def patch_varlen_attention(target_device: str) -> None:
     """
-    Monkey-patch VarlenAttention for CPU and TPU execution.
+    Monkey-patch VarlenInnerAttention for CPU and TPU execution.
     - CPU: Fallback to scaled_dot_product_attention per sequence.
     - TPU: Implement static token/sequence-safe padding SDPA since aten::_flash_attention_forward is not implemented.
     """
@@ -97,7 +97,7 @@ def patch_varlen_attention(target_device: str) -> None:
                 )
                 out = torch.cat([out, pad], dim=1)
             return out
-        VarlenAttention.forward = cpu_varlen_forward
+        VarlenInnerAttention.forward = cpu_varlen_forward
     else:
         def tpu_varlen_forward(self, q_BLNH, k_BLNH, v_BLNH, *, attention_masks, scale=None, **kwargs):
             B, L, N, H = q_BLNH.shape
@@ -132,7 +132,7 @@ def patch_varlen_attention(target_device: str) -> None:
             )
             return attn_out.transpose(1, 2).view(B, L, N, H)
             
-        VarlenAttention.forward = tpu_varlen_forward
+        VarlenInnerAttention.forward = tpu_varlen_forward
 
 
 def pad_train_batch_to_static(local_batch, device, pad_len: int, max_seqs: int):

@@ -52,10 +52,14 @@ class TpuRealArithmeticComplexRoPE(ComplexRoPE):
   @staticmethod
   def apply_rotary_emb(
       query: torch.Tensor,
-      key: torch.Tensor,
+      key: torch.Tensor | None,
       rope_cache: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor]:
+      *,
+      inverse: bool = False,
+  ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Apply complex RoPE using adjacent-dim pairs, in real arithmetic."""
+    if inverse:
+      rope_cache = rope_cache.conj()
     cache = torch.view_as_real(rope_cache)
     cos, sin = cache[..., 0], cache[..., 1]
 
@@ -65,13 +69,17 @@ class TpuRealArithmeticComplexRoPE(ComplexRoPE):
       rotated = torch.stack(
           [real * cos - imag * sin, real * sin + imag * cos], dim=-1
       )
-      return rotated.flatten(3).type_as(x)
+      return rotated.flatten(-2).type_as(x)
 
+    if key is None:
+      return rotate(query)
     return rotate(query), rotate(key)
 
 
 @override(
-    "tpu_real_arithmetic_complex_rope",
+    # Upstream d771abb0 made `override()` keyword-only and removed the separate
+    # name argument: an override is now identified by the decorated factory's
+    # import path, which is what `override.imports` lists.
     target=ComplexRoPE.Config,
     exact=True,
     description=(

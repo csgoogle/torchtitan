@@ -89,6 +89,54 @@ def remove_parameter_gradient_markers_pass(
     return gm
 
 
+def remove_parameter_gradient_markers_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+) -> torch.fx.GraphModule:
+    """Move gradient identities onto their values and erase marker aliases.
+
+    Ordinary dead-code elimination cannot remove a marker that feeds a graph
+    output or optimizer. For each marker, this pass merges its parameter FQNs
+    onto the original gradient node, rewires all users to that node, and erases
+    the view-only ``aten.alias``. A tuple is used because tied parameters may
+    produce distinct markers for the same gradient value. This remains
+    separate from optional canonicalization because markers must be removed
+    even when the rest of the compile-time pass pipeline is disabled.
+    """
+    del example_inputs
+    markers = [
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target is torch.ops.aten.alias.default
+        and PARAMETER_GRADIENT_FQNS_META in node.meta.get("custom", {})
+    ]
+    for marker in markers:
+        gradient = marker.args[0]
+        if not isinstance(gradient, torch.fx.Node):
+            raise RuntimeError(
+                f"Parameter-gradient marker {marker.name} has no FX value input"
+            )
+        gradient_custom = gradient.meta.setdefault("custom", {})
+        existing_fqns = gradient_custom.get(PARAMETER_GRADIENT_FQNS_META, ())
+        marker_fqns = marker.meta["custom"][PARAMETER_GRADIENT_FQNS_META]
+        if not isinstance(existing_fqns, tuple) or not isinstance(marker_fqns, tuple):
+            raise RuntimeError("Parameter-gradient metadata must be a tuple of FQNs")
+        gradient_custom.update(
+            {
+                PARAMETER_GRADIENT_FQNS_META: tuple(
+                    dict.fromkeys((*existing_fqns, *marker_fqns))
+                )
+            }
+        )
+        marker.replace_all_uses_with(gradient)
+        gm.graph.erase_node(marker)
+    if markers:
+        gm.graph.lint()
+        gm.recompile()
+    return gm
+
+
 def _is_impure_for_dce(node: torch.fx.Node) -> bool:
     """``is_impure_node`` for DCE that forces :data:`_FORCE_PURE_TARGETS` pure.
 

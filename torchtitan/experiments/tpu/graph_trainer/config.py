@@ -98,10 +98,10 @@ def to_tpu_graph_trainer_config(
   graph_config.compile.cpu_offload_budget_gb = budget
   if tpu_config.use_scan_layers:
     check_scan_parallelism(train_config.parallelism)
-    # Expert parallelism shards `moe.experts` on a mesh of its own. A stack is
-    # one tensor sharded once, so there is nowhere to put that. Refusing MoE
-    # already covers every model that can set this; the check is here so the
-    # flag gets named instead of failing somewhere further in.
+    # Expert parallelism shards the routed experts on a mesh of their own. A
+    # stack is one tensor sharded once, so there is nowhere to put that.
+    # Refusing MoE already covers every model that can set this; the check is
+    # here so the flag gets named instead of failing somewhere further in.
     if train_config.parallelism.expert_parallel_degree > 1:
       raise ValueError(
           "--tpu-config.use-scan-layers cannot be combined with "

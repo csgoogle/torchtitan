@@ -37,6 +37,8 @@ def _train_args(
     dataset: str = "c4_test",
 ) -> list[str]:
   """The flags every case here shares, so the arms differ only in what they test."""
+  # Upstream replaced seq_len/local_batch_size with a token budget:
+  # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 4 * 128.
   return [
       f"--module={module}",
       f"--config={config}",
@@ -44,11 +46,11 @@ def _train_args(
       f"--dataloader.dataset_path={dataset_path}",
       f"--dataloader.dataset={dataset}",
       "--hf_assets_path=tests/assets/tokenizer",
-      "--training.seq_len=128",
+      "--training.max_context_length=128",
       "--training.steps=3",
       "--training.mixed_precision_param=float32",
       "--training.mixed_precision_reduce=float32",
-      "--training.local_batch_size=4",
+      "--training.num_tokens_per_microbatch_per_dp_rank=512",
       "--splash_attention_kernel.use_splash_attention_kernel",
       "--tpu_config.use_graph_trainer",
       "--tpu_config.compile_mode=aot_fx_trace",

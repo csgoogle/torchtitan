@@ -71,10 +71,17 @@ def main():
     tokenizer = config.tokenizer.build()
 
     logger.info("Building dataset...")
+    # Upstream d771abb0 deleted training.local_batch_size and retokenized the
+    # dataloader interface. FluxCollator divides num_tokens_per_batch by
+    # max_context_length to recover the image-row count, so pass the pair
+    # straight through from the training config.
     dataloader = config.dataloader.build(
         dp_world_size=1,
         dp_rank=0,
-        local_batch_size=config.training.local_batch_size,
+        max_context_length=config.training.max_context_length,
+        num_tokens_per_batch=(
+            config.training.num_tokens_per_microbatch_per_dp_rank
+        ),
         tokenizer=tokenizer,
     )
 
