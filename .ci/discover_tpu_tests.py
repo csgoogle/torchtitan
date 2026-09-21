@@ -14,16 +14,23 @@ test is classified along two independent axes:
     under ``PYTEST_ONLY_DIRS``, run as ``pytest <path>``. These are the tests
     from upstream under tests/unit_tests.
 
-The resulting shards are emitted as JSON for the GitHub Actions matrix.
+Shards are balanced by measured runtime rather than by test count, so one slow
+module does not stack up behind another. The resulting shards are emitted as
+JSON for the GitHub Actions matrix.
 """
 
 import ast
 import json
-import math
+import statistics
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Measured wall-clock seconds per test target, used to balance the shards.
+# Refresh from a nightly run's logs when shard times drift; targets absent from
+# the file are treated as median-cost rather than free.
+DURATIONS_PATH = Path(__file__).with_name("test_durations.json")
 
 NUM_DISTRIBUTED_TPU_SHARDS = 4
 NUM_SINGLE_TPU_SHARDS = 2
@@ -217,26 +224,39 @@ def discover_tests():
         
     return categorized_tests
 
-def chunk_tests(tests, num_shards):
+def chunk_tests(tests, num_shards, durations):
+    """Split tests into shards of roughly equal estimated runtime.
+
+    Longest-processing-time-first: walk the targets slowest to fastest, adding
+    each to whichever shard is lightest so far.
+    """
     if not tests:
         return []
-        
-    tests_per_shard = math.ceil(len(tests) / num_shards)
+
+    known = [durations[test] for test in tests if test in durations]
+    fallback = statistics.median(known) if known else 1
+    weights = {test: durations.get(test, fallback) for test in tests}
+    # Name breaks ties so the same input always yields the same layout.
+    ordered = sorted(tests, key=lambda test: (-weights[test], test))
+
+    buckets = [[] for _ in range(num_shards)]
+    loads = [0] * num_shards
+    for test in ordered:
+        lightest = min(range(num_shards), key=lambda index: (loads[index], index))
+        buckets[lightest].append(test)
+        loads[lightest] += weights[test]
+
     shards = []
-    
-    for i in range(num_shards):
-        start_idx = i * tests_per_shard
-        end_idx = min((i + 1) * tests_per_shard, len(tests))
-        shard_tests = tests[start_idx:end_idx]
-        
-        if shard_tests:
+    for bucket in buckets:
+        if bucket:
             # Store tests as a space-separated string so bash can iterate easily
             shards.append({
-                "shard": f"shard_{i+1}",
-                "modules": " ".join(shard_tests)
+                "shard": f"shard_{len(shards) + 1}",
+                "modules": " ".join(sorted(bucket)),
             })
-            
+
     return shards
+
 
 def main():
     if not (REPO_ROOT / "torchtitan").is_dir():
@@ -247,11 +267,17 @@ def main():
         sys.exit("Error: No tests found")
 
 
+    durations = json.loads(DURATIONS_PATH.read_text())
+
     matrix = {
-        "distributed_shards": chunk_tests(tests["distributed"], NUM_DISTRIBUTED_TPU_SHARDS),
-        "single_tpu_shards": chunk_tests(tests["single_tpu"], NUM_SINGLE_TPU_SHARDS),
-        "cpu_shards": chunk_tests(tests["cpu"], NUM_CPU_SHARDS),
-        "pytest_shards": chunk_tests(tests["pytest"], NUM_PYTEST_SHARDS),
+        "distributed_shards": chunk_tests(
+            tests["distributed"], NUM_DISTRIBUTED_TPU_SHARDS, durations
+        ),
+        "single_tpu_shards": chunk_tests(
+            tests["single_tpu"], NUM_SINGLE_TPU_SHARDS, durations
+        ),
+        "cpu_shards": chunk_tests(tests["cpu"], NUM_CPU_SHARDS, durations),
+        "pytest_shards": chunk_tests(tests["pytest"], NUM_PYTEST_SHARDS, durations),
     }
     
     # We output a JSON object of shard arrays to stdout
