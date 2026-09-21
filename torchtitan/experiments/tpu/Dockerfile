@@ -1,4 +1,8 @@
-FROM python:3.12
+# Must match PYTHON_VERSION in .github/workflows/nightly-torchtitan-image.yml,
+# which is what the torch_tpu wheel is built against; the workflow passes it as
+# a build arg. The default only serves manual `docker build` invocations.
+ARG PYTHON_VERSION=3.14
+FROM python:${PYTHON_VERSION}
 
 ARG CACHE_BUSTER=1
 
