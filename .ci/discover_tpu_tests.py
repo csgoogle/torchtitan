@@ -52,14 +52,7 @@ EXCLUDED_DIR_NAMES = {
 
 # Tests that are temporarily disabled.
 DISABLED_TESTS = {
-    "torchtitan.experiments.tpu.kernels.tests.test_linear_softmax_cross_entropy_loss",
-    "torchtitan.experiments.tpu.kernels.tests.test_gmm",
-    "torchtitan.experiments.tpu.kernels.tests.test_fill_indices",
     "torchtitan.experiments.tpu.kernels.tests.test_segment_matmul",
-    "torchtitan.experiments.tpu.qwen3.tests.test_qwen3",
-    "torchtitan.experiments.tpu.redacted.tests.test_kernels",
-    # TODO: Unknown command line flag 'device'
-    "torchtitan.experiments.tpu.conformer.tests.test_jax_ctc_loss",
     # RL Ray non-colocated tests (require multi-host Ray TPU cluster)
     "torchtitan.experiments.tpu.rl_nc_ray.tests.test_mini_rl",
     "torchtitan.experiments.tpu.rl_nc_ray.tests.test_varlen_attn_tpu",
@@ -69,10 +62,6 @@ DISABLED_TESTS = {
     "torchtitan.experiments.tpu.kernels.tests.test_kernel_name_determinism_distributed",
     # TODO: SyntaxError: invalid syntax (from jaxtyping)
     "torchtitan.experiments.tpu.redacted.tests.test_train_minimal_distributed",
-    # TODO: Unknown command line flag 'device'
-    "torchtitan.experiments.tpu.tests.test_workarounds",
-    # TODO: AssertionError: test_deepseek_complete_model_training_steps_cpu_device_parity_MOE
-    "torchtitan.experiments.tpu.deepseek_v3.tests.test_deepseek_v3",
     # TODO: RuntimeError: create_process_group(): PjRtClient is not initialized.
     "torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack_distributed",
     # TODO: imports torchtitan.scripts; this fork keeps scripts/ at the repo root.
