@@ -51,7 +51,7 @@ jobs:
       matrix:
         test_shard: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).distributed_shards }}
     runs-on: linux-x86-tpu7x-224-4tpu
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     container:
       image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
@@ -103,7 +103,7 @@ jobs:
       matrix:
         test_shard: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).single_tpu_shards }}
     runs-on: linux-x86-tpu7x-56-1tpu
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     container:
       image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
@@ -155,7 +155,7 @@ jobs:
       matrix:
         test_shard: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).cpu_shards }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     container:
       image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
@@ -206,7 +206,7 @@ jobs:
       matrix:
         test_shard: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).pytest_shards }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     container:
       image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
