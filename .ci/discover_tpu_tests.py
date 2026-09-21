@@ -73,6 +73,8 @@ DISABLED_TESTS = {
     "torchtitan.experiments.tpu.tests.test_workarounds",
     # TODO: AssertionError: test_deepseek_complete_model_training_steps_cpu_device_parity_MOE
     "torchtitan.experiments.tpu.deepseek_v3.tests.test_deepseek_v3",
+    # TODO: RuntimeError: create_process_group(): PjRtClient is not initialized.
+    "torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack_distributed",
     # TODO: imports torchtitan.scripts; this fork keeps scripts/ at the repo root.
     "tests.unit_tests.test_download_hf_assets",
     "tests.unit_tests.test_tokenizer",

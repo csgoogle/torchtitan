@@ -286,8 +286,9 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
             ((torch.zeros(2),), {"attention_masks": block_mask})
         )
 
-        # Sanity: the raw TreeSpec itself is NOT picklable (the bug).
-        with self.assertRaises((TypeError, AttributeError)):
+        # Sanity: the raw TreeSpec itself is NOT picklable (the bug). Python
+        # 3.14 raises PicklingError here; earlier versions raise AttributeError.
+        with self.assertRaises((TypeError, AttributeError, pickle.PicklingError)):
             pickle.dumps(blockmask_spec)
 
         # Build a TracedResult with the unpicklable spec, then create
