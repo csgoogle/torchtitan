@@ -143,13 +143,16 @@ def _shard_dim(param: torch.Tensor, degree: int) -> int:
     # Dim 0 is the scan axis; sharding it would split one layer across ranks.
     if param.ndim < 2:
         return 0  # No other axis exists.
-    if param.shape[1] % degree == 0:
-        return 1  # Keeping dim 1 leaves every mesh that already worked alone.
-    axes = range(1, param.ndim)
-    even = [d for d in axes if param.shape[d] % degree == 0]
+    # Outermost first: it leaves the minor axis whole, so the body's all-gather
+    # stays a contiguous copy, and it picks the same axis the unrolled path
+    # would. Preferring the *widest* divisible axis instead would send w2_EFD to
+    # dim 3 while w1_EDF goes to dim 2, which no other lane does.
+    for d in range(1, param.ndim):
+        if param.shape[d] % degree == 0:
+            return d
     # Nothing divides: the widest axis. `data_parallel` replicates it if it is
     # narrower than the mesh, and `plan_stacked_gathers` refuses it if not.
-    return max(even or axes, key=lambda d: param.shape[d])
+    return max(range(1, param.ndim), key=lambda d: param.shape[d])
 
 
 class LayerStackHolder(Module):

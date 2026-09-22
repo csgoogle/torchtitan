@@ -36,6 +36,7 @@ N_LAYERS = 94
 Q235_STACKS = {
     "moe__experts__w1_EDF": (N_LAYERS, 128, 4096, 1536),
     "moe__experts__w2_EFD": (N_LAYERS, 128, 1536, 4096),
+    "moe__experts__w3_EDF": (N_LAYERS, 128, 4096, 1536),
     "moe__router__gate__weight": (N_LAYERS, 128, 4096),
     "attention__qkv_linear__wqkv": (N_LAYERS, 9216, 4096),
     "attention_norm__weight": (N_LAYERS, 4096),
@@ -75,8 +76,17 @@ class TestShardDimPicker(unittest.TestCase):
             if shape[1] % 128 == 0:
                 self.assertEqual(_pick(shape, 128), 1, name)
 
+    def test_every_expert_stack_takes_the_same_axis_at_512_ranks(self):
+        # Both hidden axes of every expert stack divide 512, and the unrolled
+        # path puts all three on the same one (its dim 1, this dim 2). Taking
+        # the widest instead would send w2_EFD to dim 3 by itself.
+        for name in Q235_STACKS:
+            if name.startswith("moe__experts__"):
+                self.assertEqual(_pick(Q235_STACKS[name], 512), 2, name)
+
     def test_an_expert_stack_moves_off_num_experts_past_128_ranks(self):
-        # Dim 1 is the 128 experts; which hidden axis is wide differs per weight.
+        # Dim 1 is the 128 experts. By 2048 only w2_EFD's minor axis still
+        # divides, so it is the one stack that has to leave dim 2.
         self.assertEqual(_pick(Q235_STACKS["moe__experts__w1_EDF"], 2048), 2)
         self.assertEqual(_pick(Q235_STACKS["moe__experts__w2_EFD"], 2048), 3)
 
