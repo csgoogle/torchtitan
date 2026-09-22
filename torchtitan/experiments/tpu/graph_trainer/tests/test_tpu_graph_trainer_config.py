@@ -66,6 +66,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
+    qwen3_moe_235b_fsdp_activation_offload_4x4x4,
     qwen3_moe_235b_scan,
     qwen3_moe_235b_scan_maxtext,
     qwen3_moe_235b_scan_proxy,
@@ -641,6 +642,20 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             for _, moe, _, _ in config.model_spec.model.traverse(MoE.Config)
         )
     )
+
+  def test_235b_splitter_uses_global_aux_loss(self) -> None:
+    config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
+
+    assert config.model_spec is not None
+    moes = list(config.model_spec.model.traverse(MoE.Config))
+    self.assertLen(moes, 94)
+    for _, moe, _, _ in moes:
+      self.assertIsNone(moe.load_balance_coeff)
+      self.assertIsNotNone(moe.aux_loss)
+      assert moe.aux_loss is not None
+      self.assertEqual(moe.aux_loss.type, "batch_wise")
+      self.assertEqual(moe.aux_loss.coeff, 1e-3)
+      self.assertEqual(moe.aux_loss.top_k, moe.router.top_k)
 
   def test_235b_flavor_resolves_through_the_graph_trainer(self) -> None:
     # The graph trainer discards the recipe's ModelSpec and re-resolves the
