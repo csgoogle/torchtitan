@@ -57,13 +57,8 @@ _DISCARDED_TOKEN_COUNTER_OVERRIDE = (
 )
 
 
-# Compiler policy shared by the FP32 and MaxText-parity offload recipes.
-_Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
-    # Aggregate SparseCore collectives and enable layer-level latency hiding so
-    # FSDP communication can be scheduled alongside independent layer compute.
-    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
-    # Use both SparseCores for reduce-scatter in the by-layer FSDP schedule.
-    tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+# Shared by both Qwen3-235B lines, the scan loop and the graph splitter.
+_Q235_SHARED_FLAGS = tpu_flags.merge_flags(
     # Select TPU7x's throughput-oriented operating point for this compute-bound
     # recipe. This changes device frequency, not graph numerics.
     tpu_flags.TPU7X_THROUGHPUT_P_STATE,
@@ -72,9 +67,21 @@ _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
         # more Q235 kernel intermediates in VMEM instead of spilling them.
         "xla_tpu_scoped_vmem_limit_kib": 131072,
         # Keep activation host copies off SparseCore, where they would contend
-        # with the FSDP collectives above. In the isolated A/B this moved MFU
-        # only from 18.425% to 18.448% and did not itself create D2H overlap.
+        # with the FSDP collectives. In the isolated A/B this moved MFU only
+        # from 18.425% to 18.448% and did not itself create D2H overlap.
         "xla_tpu_enable_offloading_copy_to_sparsecore": False,
+    },
+)
+
+# What the graph-splitter line adds on top.
+_Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
+    _Q235_SHARED_FLAGS,
+    # Aggregate SparseCore collectives and enable layer-level latency hiding so
+    # FSDP communication can be scheduled alongside independent layer compute.
+    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    # Use both SparseCores for reduce-scatter in the by-layer FSDP schedule.
+    tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+    {
         # Prove the true copy/overwrite ordering across donated aliases. This
         # removed the defensive activation snapshot, moved all 93 measured D2H
         # waits to zero, and improved MFU from 18.528% to 19.490% in the A/B.
@@ -803,6 +810,12 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   # do (https://github.com/google-pytorch/torchtitan/issues/399).
   cfg.metrics.enable_moe_routing = False
   cfg.metrics.log_freq = 1
+  # Left to the command line these get forgotten, and a scan step measured
+  # without them runs ~10% slow.
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      _Q235_SHARED_FLAGS,
+  )
   return cfg
 
 
