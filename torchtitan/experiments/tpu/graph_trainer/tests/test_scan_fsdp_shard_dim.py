@@ -114,8 +114,9 @@ class TestShardDimPicker(unittest.TestCase):
         for name, shape in Q235_STACKS.items():
             for degree in (128, 1024, 2048, 4096):
                 self.assertNotEqual(_pick(shape, degree), 0, f"{name} @ {degree}")
-        # Unless it is the only axis there is.
-        self.assertEqual(_pick((N_LAYERS,), 128), 0)
+        # And a stack with no other axis is refused, not sharded on dim 0.
+        with self.assertRaises(ValueError):
+            _pick((N_LAYERS,), 128)
 
 
 class TestQ235Placements(unittest.TestCase):

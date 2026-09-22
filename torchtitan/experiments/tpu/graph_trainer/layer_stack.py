@@ -142,7 +142,10 @@ def _shard_dim(param: torch.Tensor, degree: int) -> int:
     """Which axis of one stack `degree` ranks should split it on."""
     # Dim 0 is the scan axis; sharding it would split one layer across ranks.
     if param.ndim < 2:
-        return 0  # No other axis exists.
+        # A stack is [n_layers, *weight.shape], so this needs a 0-D weight.
+        raise ValueError(
+            f"cannot shard a {param.ndim}-D stack; dim 0 is the scan axis"
+        )
     # Outermost first: it leaves the minor axis whole, so the body's all-gather
     # stays a contiguous copy, and it picks the same axis the unrolled path
     # would. Preferring the *widest* divisible axis instead would send w2_EFD to
