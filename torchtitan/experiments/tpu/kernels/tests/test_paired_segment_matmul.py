@@ -1,28 +1,5 @@
 """Accelerator parity tests for the paired expert gate/up kernel."""
 
-import os
-
-# The Qwen3-235B-shape test drives grouped matmuls whose RHS block is the whole
-# K x N expert slab (4096 x 1536 bf16 = 12.6 MB); double-buffered, the kernel
-# needs ~29.5 MB of scoped VMEM. How much it gets is generation-dependent: v6e
-# and v7x default to 64 MB, but v5e defaults to 16 MB, so there the kernel fails
-# to compile with CompileTimeScopedVmemOom. Raise it to the larger generations'
-# default so the suite is hardware-portable -- the production 235B recipe raises
-# the same flag for the same reason. libtpu parses this once at init, so it has
-# to be set before torch_tpu is imported, i.e. before `import torch` below.
-_SCOPED_VMEM_LIMIT_KIB = 65536
-
-
-def _raise_scoped_vmem_limit(kib: int = _SCOPED_VMEM_LIMIT_KIB) -> None:
-    """Requests `kib` of scoped VMEM unless the caller already asked for some."""
-    flag = "--xla_tpu_scoped_vmem_limit_kib"
-    args = os.environ.get("LIBTPU_INIT_ARGS", "")
-    if flag not in args:
-        os.environ["LIBTPU_INIT_ARGS"] = f"{args} {flag}={kib}".strip()
-
-
-_raise_scoped_vmem_limit()
-
 import math
 
 from absl.testing import absltest
@@ -170,23 +147,36 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
             tgmm_tile_k=128,
         )
 
-    def test_k_tiled_dweight_at_qwen3_235b_shape(self):
-        """The K-tiled dWeight at dim 4096 x moe_hidden 1536, four K slabs.
+    def test_k_tiled_dweight_at_qwen3_235b_like_shape(self):
+        """The K-tiled dWeight at a 235B-*like* dim 2048 x moe_hidden 768.
 
-        With full K the two fp32 accumulators and two bf16 output slabs are
-        105 MB of VMEM, over the scoped limit on every current generation (64 MB
-        on v6e/v7x, 16 MB on v5e); four slabs fit. The surrounding forward and
-        dLHS matmuls need ~29.5 MB, which is why this module raises the scoped
-        limit at import.
+        Half of Qwen3-235B's 4096 x 1536 on each axis, so the 8:3 ratio and the
+        four K slabs are the production ones, but every buffer is a quarter of
+        the size. That is deliberate: the scoped VMEM limit is generation
+        dependent -- 64 MB on v6e/v7x but only 16 MB on v5e -- and at the true
+        235B shape the surrounding forward and dLHS matmuls want 29.50 MB, so
+        they fail to compile on v5e with CompileTimeScopedVmemOom.
+
+        Measured on v5e, halving both dims leaves real headroom on both axes:
+
+          scoped VMEM   8.75 MB needed vs the 16 MB default   (1.8x)
+                        verified: passes at 10 MB, fails at 8 MB
+          HBM           138 MiB of live tensors vs 15.75 GiB  (>100x)
+
+        The tiling under test stays load-bearing at this size rather than
+        becoming a formality: with full K the dWeight wants 27.50 MB, over
+        v5e's limit, so ``tgmm_tile_k=0`` here fails to compile while
+        ``tgmm_tile_k=512`` runs. This is the smallest 235B-ratio shape that
+        keeps that true.
 
         This drives the paired *backward* op directly rather than going through
-        the forward: the paired forward's two output slabs at this shape need a
-        raised ``xla_tpu_scoped_vmem_limit_kib`` (which the 235B recipe sets),
-        and that is unrelated to the dWeight tiling under test here.
+        the forward: the paired forward's two output slabs need a raised
+        ``xla_tpu_scoped_vmem_limit_kib`` (which the 235B recipe sets), and that
+        is unrelated to the dWeight tiling under test here.
         """
         device = self.accelerator_device
         group_sizes = torch.tensor([300, 0, 812, 424], dtype=torch.int32)
-        k, n, tile_m, tgmm_tile_k = 4096, 1536, 256, 1024
+        k, n, tile_m, tgmm_tile_k = 2048, 768, 256, 512
         total_m = int(group_sizes.sum().item())
         groups = group_sizes.shape[0]
 
