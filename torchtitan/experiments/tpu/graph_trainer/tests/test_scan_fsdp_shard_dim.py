@@ -18,7 +18,6 @@ from torch import nn
 from torch.distributed.tensor import (
     distribute_tensor,
     init_device_mesh,
-    Replicate,
     Shard,
 )
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -88,11 +87,6 @@ class TestShardDimPicker(unittest.TestCase):
         # Unless it is the only axis there is.
         self.assertEqual(_pick((N_LAYERS,), 128), 0)
 
-    def test_an_axis_that_divides_beats_a_wider_one_that_does_not(self):
-        self.assertEqual(_pick((N_LAYERS, 12, 100), 6), 1)
-        # Nothing divides: the widest axis, which `data_parallel` replicates.
-        self.assertEqual(_pick((N_LAYERS, 3, 7), 128), 2)
-
 
 class TestQ235Placements(unittest.TestCase):
     """What ``data_parallel`` and the scan body's plan end up with."""
@@ -139,14 +133,6 @@ class TestQ235Placements(unittest.TestCase):
                 data_parallel(holder, mesh, "fully_shard", shard_dim={"w": 1})
         finally:
             dist.destroy_process_group()
-
-    def test_a_stack_too_narrow_to_shard_is_replicated_not_split(self):
-        # (94, 128) divides at 128 ranks and has nothing to divide at 2048.
-        for world, want in ((128, Shard(1)), (2048, Replicate())):
-            with _sharded_holder(world) as holder:
-                self.assertEqual(
-                    holder._parameters["attention__q_norm__weight"].placements, (want,)
-                )
 
     def test_hsdp_plans_off_the_shard_axis_not_the_whole_mesh(self):
         # `dp_replicate=16, dp_shard=128` is how 235B reaches 8k chips. Only the

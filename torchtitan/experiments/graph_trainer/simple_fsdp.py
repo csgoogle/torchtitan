@@ -309,18 +309,15 @@ def data_parallel(
 
         for p_name, p in params_dict.items():
             if p is not None and p.numel() > 0:
-                if not isinstance(shard_dim, dict):
-                    dim = shard_dim
-                elif isinstance(p, DTensor):
+                dim = shard_dim[p_name] if isinstance(shard_dim, dict) else shard_dim
+                if isinstance(p, DTensor) and dim != default_dim:
                     # Under EP/TP, `ReplicateComputation` re-wraps the parameter
-                    # with the module-level `param_sharding`, which a
-                    # per-parameter axis never reaches.
+                    # with `param_sharding`, which carries `default_dim` and so
+                    # would drop this axis.
                     raise NotImplementedError(
-                        f"{p_name} is already a DTensor, so a per-parameter "
-                        "shard_dim would be dropped on the EP/TP path"
+                        f"{p_name} is already a DTensor, so sharding it on dim "
+                        f"{dim} would be dropped on the EP/TP path"
                     )
-                else:
-                    dim = shard_dim[p_name]
                 # Check if the parameter is smaller than the device mesh dimension.
                 # If so, replicate it instead of sharding it.
                 actual_sharding = [
