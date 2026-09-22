@@ -27,6 +27,12 @@ def configure_qwen_simple_fsdp_shard_dims(
   if fsdp_degree <= 1:
     return
 
+  # Layer stacking moves the layer weights into a holder, which plans an axis
+  # per stack -- dim 1 of a stack is one axis further in than dim 1 of a layer.
+  stacks = [m for m in model.modules() if hasattr(m, "plan_shard_dims")]
+  for holder in stacks:
+    holder._fsdp_shard_dim = holder.plan_shard_dims(fsdp_degree)
+
   hidden_axis_modules: list[str] = []
   for module_fqn in ("tok_embeddings", "lm_head"):
     module = getattr(model, module_fqn)
@@ -57,6 +63,8 @@ def configure_qwen_simple_fsdp_shard_dims(
 
       parameters = list(module.named_parameters(recurse=False))
       if not parameters:
+        if stacks:
+          continue  # Stacking took them; the holder above shards them instead.
         raise ValueError(f"{module_fqn} has no direct parameters to FSDP-shard")
       incompatible = [
           f"{name}{tuple(parameter.shape)}"
