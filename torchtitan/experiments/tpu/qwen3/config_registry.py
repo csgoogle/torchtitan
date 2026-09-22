@@ -100,6 +100,16 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
     config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
+def _use_global_batch_aux_loss(config: TPUTrainerConfig) -> None:
+  """Use Qwen's global auxiliary load-balancing loss for every MoE layer."""
+  assert config.model_spec is not None
+  for _, moe, _, _ in config.model_spec.model.traverse(MoE.Config):
+    moe.load_balance_coeff = None
+    moe.aux_loss = make_aux_loss_config(
+        type="batch_wise", coeff=1e-3, top_k=moe.router.top_k
+    )
+
+
 def qwen3_debugmodel() -> TPUTrainerConfig:
   """Qwen3 debug model configuration for TPU."""
 
@@ -634,6 +644,9 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  # Replacing model_spec also replaces nested MoE policy inherited from the
+  # 30B base recipe, so apply the intended Q235 routing policy afterwards.
+  _use_global_batch_aux_loss(cfg)
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
@@ -773,13 +786,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
-  # Stacking cannot share the bias scheme's per-layer buffers (#391), so
-  # balance with the aux loss. 1e-3 is MaxText's weight for this model.
-  for _, moe, _, _ in model_config.traverse(MoE.Config):
-    moe.load_balance_coeff = None
-    moe.aux_loss = make_aux_loss_config(
-        type="batch_wise", coeff=1e-3, top_k=moe.router.top_k
-    )
+  _use_global_batch_aux_loss(cfg)
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.
   # TODO(#391): delete once `MoE.forward` guards that write.
