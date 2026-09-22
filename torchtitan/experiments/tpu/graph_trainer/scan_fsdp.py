@@ -265,17 +265,4 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
         n_sharded,
         len(plan),
     )
-    # SimpleFSDP replicates a stack when no axis of it divides the mesh. That is
-    # right for a per-layer norm and a memory cliff for anything bigger, and it
-    # raises nothing either way, so name the cost.
-    replicated = [name for name, spec in plan.items() if not spec.sharded]
-    mib = sum(
-        holder._parameters[name].to_local().nbytes for name in replicated
-    ) / 2**20
-    if mib >= 1024:
-        logger.warning(
-            "%.0f MiB/rank of stacked weights are replicated, not sharded: %s",
-            mib,
-            replicated,
-        )
     return plan

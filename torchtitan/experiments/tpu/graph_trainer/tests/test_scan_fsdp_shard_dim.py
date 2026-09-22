@@ -148,15 +148,6 @@ class TestQ235Placements(unittest.TestCase):
                     holder._parameters["attention__q_norm__weight"].placements, (want,)
                 )
 
-    def test_a_mesh_too_wide_for_any_axis_says_what_it_replicated(self):
-        # The ceiling: at 8192 no axis of an expert stack divides, so SimpleFSDP
-        # replicates it. Nothing raises, so the plan has to name the cost.
-        experts = {k: v for k, v in Q235_STACKS.items() if k.startswith("moe")}
-        with _sharded_holder(8192, experts) as holder:
-            with self.assertLogs(level="WARNING") as logs:
-                plan_stacked_gathers(holder)
-        self.assertIn("moe__experts__w1_EDF", "".join(logs.output))
-
     def test_hsdp_plans_off_the_shard_axis_not_the_whole_mesh(self):
         # `dp_replicate=16, dp_shard=128` is how 235B reaches 8k chips. Only the
         # shard axis splits the tensor, so only its width may pick the dim.
