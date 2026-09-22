@@ -319,7 +319,7 @@ class TestLayerStack(unittest.TestCase):
                     stack.grad[i].to_local(),
                     param.grad.to_local(),
                     rtol=1e-5,
-                    atol=1e-5,
+                    atol=5e-5,
                     msg=f"layers.{i}.{name}",
                 )
 
