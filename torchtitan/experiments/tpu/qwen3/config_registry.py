@@ -610,6 +610,35 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+# Widest FSDP mesh Qwen3-235B is planned for is 2048 ranks. 151936 is 2^7 x
+# 1187 with 1187 prime, so past 128 ranks nothing but padding makes dim 0
+# divide. 153600 is the first multiple of 2048 above it.
+_VOCAB_MULTIPLE = 2048
+
+
+def _pad_embedding_rows(model_config: Qwen3Model.Config, multiple: int) -> None:
+  """Round the embedding table up so FSDP can shard it on dim 0.
+
+  Off dim 0, DTensor gathers the table with `cat(chunk(t, world_size))` -- 2048
+  slices and a concat at 2048 ranks, because `funcol`'s fast path needs every
+  axis before the gather axis to be size 1 and dim 0 here is the vocabulary.
+  Padding moves the shard back to dim 0 and the gather back onto the fast path.
+
+  Only the embedding table grows. Rows are selected by token id and every id is
+  below the real vocabulary, so the padded rows are never read and never
+  receive gradient. `lm_head` deliberately keeps the true width: its rows are
+  all multiplied out into logits, and the fused Pallas loss computes the
+  softmax inside the kernel without ever materializing them, so a padded row
+  there would enter the denominator with nothing able to mask it out.
+
+  151936 -> 153600 costs 13 MiB of embedding weights and changes no math.
+  """
+  if model_config.enable_weight_tying:
+    raise ValueError("A tied lm_head would inherit the padded rows")
+  padded = -(-model_config.vocab_size // multiple) * multiple
+  model_config.tok_embeddings.num_embeddings = padded
+
+
 def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   """Build the common Qwen3 235B-A22B FSDP configuration."""
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
@@ -627,6 +656,7 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  _pad_embedding_rows(model_config, _VOCAB_MULTIPLE)
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
@@ -766,6 +796,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
+  _pad_embedding_rows(model_config, _VOCAB_MULTIPLE)
   # Stacking cannot share the bias scheme's per-layer buffers (#391), so
   # balance with the aux loss. 1e-3 is MaxText's weight for this model.
   for _, moe, _, _ in model_config.traverse(MoE.Config):

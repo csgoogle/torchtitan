@@ -113,6 +113,25 @@ class Qwen3_235BScaleTest(absltest.TestCase):
           if spec.sharded:
             self.assertEqual(spec.gather_dim, placement.dim - 1, name)
 
+  def test_the_embedding_table_stays_on_dim_zero_at_2048_ranks(self) -> None:
+    # Off dim 0 the gather is `cat(chunk(t, 2048))`: `funcol`'s fast path needs
+    # every axis before the gather axis to be size 1, and dim 0 here is the
+    # vocabulary. The padded 153600 is what keeps dim 0 divisible.
+    with _placed_235b(2048) as model:
+      table = dict(model.named_parameters())["tok_embeddings.weight"]
+      self.assertEqual(table.shape[0], 153600)
+      self.assertEqual(table.placements[-1], Shard(0))
+
+  def test_the_lm_head_keeps_the_true_vocabulary_at_2048_ranks(self) -> None:
+    # Padding the head would widen the softmax denominator with no way to undo
+    # it: the fused loss projects and normalizes inside one Pallas kernel, so a
+    # padded column never becomes a logit anything outside the kernel can mask.
+    # The head keeps 151936 rows and pays the off-dim-0 gather instead.
+    with _placed_235b(2048) as model:
+      head = dict(model.named_parameters())["lm_head.weight"]
+      self.assertEqual(head.shape[0], 151936)
+      self.assertEqual(head.placements[-1], Shard(1))
+
   def test_128_ranks_still_shards_every_stack_on_dim_one(self) -> None:
     # Every published 235B number was taken here. If any stack moves off dim 1
     # at 128 ranks this stops being the same run, measured or not.
