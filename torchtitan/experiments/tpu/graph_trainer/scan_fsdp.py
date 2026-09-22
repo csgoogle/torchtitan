@@ -61,6 +61,36 @@ class ScanFSDPSpec:
     gather_dim: int = 0
 
 
+def _gather_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
+    """All-gather `x` along `dim`, always collecting on dim 0.
+
+    Off dim 0, `funcol` falls back to `cat(chunk(t, world_size))` unless every
+    axis before `dim` has size 1. A layer slice starts with `num_experts`, so it
+    never qualifies, and a 2048-rank gather would emit 2048 slices and a concat.
+    A transpose either side is two ops instead.
+    """
+    if dim == 0:
+        return funcol.all_gather_tensor(x, gather_dim=0, group=group_name)
+    out = funcol.all_gather_tensor(x.movedim(dim, 0), gather_dim=0, group=group_name)
+    return out.movedim(0, dim)
+
+
+def _scatter_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
+    """Reduce-scatter `x` along `dim`, always scattering on dim 0.
+
+    `reduce_scatter` has no fast path off dim 0 at all, so this is the same
+    trade as `_gather_on`.
+    """
+    if dim == 0:
+        return funcol.reduce_scatter_tensor(
+            x, reduceOp="sum", scatter_dim=0, group=group_name
+        )
+    out = funcol.reduce_scatter_tensor(
+        x.movedim(dim, 0), reduceOp="sum", scatter_dim=0, group=group_name
+    )
+    return out.movedim(0, dim)
+
+
 class _AllGatherReduceScatter(torch.autograd.Function):
     """Gathers one sharded layer's weight, and reduces its gradient back.
 
@@ -90,15 +120,13 @@ class _AllGatherReduceScatter(torch.autograd.Function):
         ctx.gather_dim = gather_dim
         if param_dtype is not None:
             shard = shard.to(param_dtype)
-        return funcol.all_gather_tensor(shard, gather_dim=gather_dim, group=group_name)
+        return _gather_on(shard, gather_dim, group_name)
 
     @staticmethod
     def backward(ctx: Any, grad: torch.Tensor):
         if ctx.reduce_dtype is not None:
             grad = grad.to(ctx.reduce_dtype)
-        out = funcol.reduce_scatter_tensor(
-            grad, reduceOp="sum", scatter_dim=ctx.gather_dim, group=ctx.group_name
-        )
+        out = _scatter_on(grad, ctx.gather_dim, ctx.group_name)
         if ctx.replicate_group_name is not None:
             # HSDP: the gradient is Partial on the replicate axis too. Reduce it
             # after the scatter, not before -- same sum, on a tensor that is

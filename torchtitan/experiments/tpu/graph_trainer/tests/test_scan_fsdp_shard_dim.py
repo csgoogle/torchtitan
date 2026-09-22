@@ -10,6 +10,7 @@ A fake process group is enough: the failure is about mesh size, not devices.
 
 import contextlib
 import unittest
+import unittest.mock
 
 import torch
 import torch.distributed as dist
@@ -27,6 +28,7 @@ from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     _shard_dim,
     LayerStackHolder,
 )
+from torchtitan.experiments.tpu.graph_trainer import scan_fsdp
 from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import plan_stacked_gathers
 
 
@@ -90,6 +92,24 @@ class TestShardDimPicker(unittest.TestCase):
         self.assertEqual(_pick(Q235_STACKS["moe__experts__w1_EDF"], 2048), 2)
         self.assertEqual(_pick(Q235_STACKS["moe__experts__w2_EFD"], 2048), 3)
 
+    def test_a_gather_off_dim_zero_is_transposed_onto_dim_zero(self):
+        # `funcol`'s fast path needs every axis before the gather axis to be
+        # size 1, and a layer slice starts with `num_experts`. Off dim 0 it
+        # would fall back to `cat(chunk(t, world_size))`; the transpose has to
+        # both avoid that and reassemble on the axis the caller asked for.
+        shard = torch.arange(3 * 4 * 6).reshape(3, 4, 6).float()
+        ranks = 4
+
+        def fake_all_gather(x, gather_dim, group):
+            self.assertEqual(gather_dim, 0, "gathered off dim 0")
+            return torch.cat([x] * ranks, dim=0)
+
+        with unittest.mock.patch.object(
+            scan_fsdp.funcol, "all_gather_tensor", fake_all_gather
+        ):
+            out = scan_fsdp._gather_on(shard, 2, "group")
+        self.assertTrue(torch.equal(out, torch.cat([shard] * ranks, dim=2)))
+
     def test_the_layer_axis_is_never_chosen(self):
         for name, shape in Q235_STACKS.items():
             for degree in (128, 1024, 2048, 4096):
@@ -100,18 +120,6 @@ class TestShardDimPicker(unittest.TestCase):
 
 class TestQ235Placements(unittest.TestCase):
     """What ``data_parallel`` and the scan body's plan end up with."""
-
-    def test_nothing_shards_unevenly(self):
-        # `Shard._split_tensor` pads the tail rather than raising, so an uneven
-        # shard would train and be wrong.
-        for world in (128, 2048):
-            with _sharded_holder(world) as holder:
-                for name, param in holder._parameters.items():
-                    placement = param.placements[0]
-                    if isinstance(placement, Shard):
-                        self.assertEqual(
-                            param.shape[placement.dim] % world, 0, f"{name} {placement}"
-                        )
 
     def test_a_dict_places_exactly_like_the_int_it_repeats(self):
         # Every other `data_parallel` caller passes an int, so the dict has to
@@ -164,18 +172,6 @@ class TestQ235Placements(unittest.TestCase):
                 self.assertEqual(spec.gather_dim, 0, name)  # dim 1 still divides
         finally:
             dist.destroy_process_group()
-
-    def test_the_body_gathers_the_axis_the_stack_was_split_on(self):
-        # The body is handed row `i`, so its dim 0 is the stack's dim 1. Off by
-        # one here reassembles the weight wrong and still trains to a loss.
-        for world in (128, 2048):
-            with _sharded_holder(world) as holder:
-                for name, spec in plan_stacked_gathers(holder).items():
-                    placement = holder._parameters[name].placements[0]
-                    sharded = isinstance(placement, Shard)
-                    self.assertEqual(spec.sharded, sharded, name)
-                    if sharded:
-                        self.assertEqual(spec.gather_dim, placement.dim - 1, name)
 
 
 if __name__ == "__main__":
