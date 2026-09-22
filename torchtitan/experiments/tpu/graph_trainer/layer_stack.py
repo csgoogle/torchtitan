@@ -138,6 +138,20 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
             )
 
 
+def _shard_dim(param: torch.Tensor, degree: int) -> int:
+    """Which axis of one stack `degree` ranks should split it on."""
+    # Dim 0 is the scan axis; sharding it would split one layer across ranks.
+    if param.ndim < 2:
+        return 0  # No other axis exists.
+    if param.shape[1] % degree == 0:
+        return 1  # Keeping dim 1 leaves every mesh that already worked alone.
+    axes = range(1, param.ndim)
+    even = [d for d in axes if param.shape[d] % degree == 0]
+    # Nothing divides: the widest axis. `data_parallel` replicates it if it is
+    # narrower than the mesh, and `plan_stacked_gathers` refuses it if not.
+    return max(even or axes, key=lambda d: param.shape[d])
+
+
 class LayerStackHolder(Module):
     """``model.layer_stacks``: the stacks, and nothing else.
 
@@ -153,11 +167,24 @@ class LayerStackHolder(Module):
     so anything else parked here would silently go unsharded.
     """
 
-    # Dim 0 is the layer axis, so FSDP shards dim 1. Sharding dim 0 would split
-    # one layer's weight across ranks, and with `n_layers` below the mesh size
-    # it would quietly fall back to `Replicate`. `apply_simple_fsdp` reads this
-    # off the module; it is the whole interface between stacking and sharding.
-    _fsdp_shard_dim = 1
+    # Dim 1 for every stack, until someone calls `plan_shard_dims` with the mesh
+    # width and replaces this with an axis per stack.
+    _fsdp_shard_dim: int | dict[str, int] = 1
+
+    def plan_shard_dims(self, degree: int) -> dict[str, int]:
+        """The axis `apply_simple_fsdp` shards each stack on.
+
+        One axis cannot serve them all: dim 1 of an expert stack is
+        `num_experts` = 128, which caps FSDP at 128 ranks, while dim 1 of a
+        dense stack divides fine.
+
+        Covers every stack, so a missing key downstream is a bug, not a default.
+        """
+        return {
+            name: _shard_dim(param, degree)
+            for name, param in self._parameters.items()
+            if param is not None
+        }
 
 
 class StackedLayers(TpuLayerLoop):

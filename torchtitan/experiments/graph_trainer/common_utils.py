@@ -446,7 +446,9 @@ def apply_simple_fsdp(
     For MoE-enabled models, ``moe.experts`` submodules are separately wrapped
     on the EDP mesh when expert parallelism is enabled.
 
-    A submodule can carry ``_fsdp_shard_dim`` to be sharded on a different axis.
+    A submodule can carry ``_fsdp_shard_dim`` to be sharded on a different axis:
+    an ``int`` for the whole submodule, or a ``{parameter name: axis}`` dict when
+    its parameters do not all divide on the same one.
     """
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:

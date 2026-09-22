@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 
+import torch
 from absl.testing import absltest
 from torch import nn
 
@@ -15,6 +16,7 @@ from torchtitan.config import TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
 from torchtitan.experiments.tpu.graph_trainer import qwen3 as graph_trainer_qwen3
+from torchtitan.experiments.tpu.graph_trainer.layer_stack import LayerStackHolder
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
     configure_qwen_simple_fsdp_shard_dims,
@@ -83,6 +85,29 @@ class SimpleFSDPShardingTest(absltest.TestCase):
         model.layers["0"].inner.moe.experts._fsdp_shard_dim,
         1,
     )
+
+  def test_plans_an_axis_per_stack_when_layers_are_stacked(self) -> None:
+    model = _model()
+    model.layer_stacks = LayerStackHolder()
+    # Layer axis in front, so dim 1 is num_experts and dim 2 is the hidden dim.
+    model.layer_stacks.register_parameter(
+        "moe__experts__w1_EDF", nn.Parameter(torch.empty(2, 2, 8, 8))
+    )
+    # The expert modules are empty shells once stacking has taken their weights.
+    model.layers["0"].moe.experts._parameters.clear()
+
+    configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
+
+    self.assertEqual(
+        model.layer_stacks._fsdp_shard_dim, {"moe__experts__w1_EDF": 2}
+    )
+
+  def test_rejects_an_empty_expert_module_when_nothing_is_stacked(self) -> None:
+    model = _model()
+    model.layers["0"].moe.experts._parameters.clear()
+
+    with self.assertRaisesRegex(ValueError, "no direct parameters"):
+      configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
 
   def test_rejects_when_hidden_axis_is_not_divisible(self) -> None:
     model = _model(hidden_dim=6)

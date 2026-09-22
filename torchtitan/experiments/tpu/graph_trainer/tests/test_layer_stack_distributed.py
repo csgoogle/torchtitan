@@ -8,6 +8,8 @@ repeated here on ``--device``, across ``--num_devices`` ranks, with the stacks
 actually sharded.
 """
 
+import functools
+
 from absl import logging
 from absl.testing import absltest
 import torch
@@ -101,7 +103,9 @@ def a_replicated_stack_still_sums_its_gradient(device, rank, world_size):
     )
 
 
-def a_sharded_stack_gathers_and_reduces_like_unrolled(device, rank, world_size):
+def a_sharded_stack_gathers_and_reduces_like_unrolled(
+    device, rank, world_size, shard_dim=1
+):
     """The body's gather must compute what SimpleFSDP's does unrolled.
 
     ``_AllGatherReduceScatter`` hand-writes the pair ``redistribute`` gives the
@@ -115,26 +119,27 @@ def a_sharded_stack_gathers_and_reduces_like_unrolled(device, rank, world_size):
         return
     mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
     holder = nn.Module()
-    # Two layers, and a dim 1 the mesh splits evenly.
+    # Two layers, and two axes the mesh splits evenly.
     holder.register_parameter(
-        "stack", nn.Parameter(torch.randn(2, 4 * world_size, 8, device=device))
+        "stack",
+        nn.Parameter(torch.randn(2, 4 * world_size, 2 * world_size, device=device)),
     )
     data_parallel(
         holder,
         mesh,
         "fully_shard",
-        shard_dim=1,
+        shard_dim=shard_dim,
         mp_policy=MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32
         ),
     )
     param = holder._parameters["stack"]
-    assert param.placements == (Shard(1),), param.placements
+    assert param.placements == (Shard(shard_dim),), param.placements
 
     # Unrolled: the weight SimpleFSDP hands layer 0, straight off the DTensor.
     want_shard = param.to_local().detach().clone().requires_grad_(True)
     want = (
-        DTensor.from_local(want_shard, mesh, (Shard(1),))
+        DTensor.from_local(want_shard, mesh, (Shard(shard_dim),))
         .redistribute(
             placements=[Replicate()],
             forward_dtype=torch.bfloat16,
@@ -345,6 +350,14 @@ class TestLayerStackDistributed(
 
     def test_a_sharded_stack_gathers_and_reduces_like_unrolled(self):
         self._on_devices(a_sharded_stack_gathers_and_reduces_like_unrolled)
+
+    def test_a_stack_sharded_off_dim_one_gathers_the_same_way(self):
+        # What an expert stack falls back to once the mesh outgrows num_experts.
+        self._on_devices(
+            functools.partial(
+                a_sharded_stack_gathers_and_reduces_like_unrolled, shard_dim=2
+            )
+        )
 
     def test_an_unevenly_sharded_stack_is_refused(self):
         self._on_devices(an_unevenly_sharded_stack_is_refused)

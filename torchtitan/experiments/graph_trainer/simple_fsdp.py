@@ -266,18 +266,22 @@ def data_parallel(
     device_mesh: DeviceMesh,
     mode: str = "replicate",
     mp_policy: MixedPrecisionPolicy | None = None,
-    shard_dim: int = 0,
+    shard_dim: int | dict[str, int] = 0,
     full_dtensor: bool = False,
     ignored_params: set[nn.Parameter] | None = None,
 ) -> nn.Module:
+    # A dict `shard_dim` names an axis per parameter, for a module whose
+    # parameters do not all divide on the same one.
+    default_dim = 0 if isinstance(shard_dim, dict) else shard_dim
+
     param_sharding: tuple[Placement, ...]
     if mode == "replicate":
         param_sharding = (Replicate(),)
     elif mode == "fully_shard":
-        param_sharding = (Shard(shard_dim),)
+        param_sharding = (Shard(default_dim),)
     elif mode == "hybrid_shard":
         # replicate inter-host, fully shard intra-host
-        param_sharding = (Replicate(), Shard(shard_dim))
+        param_sharding = (Replicate(), Shard(default_dim))
         assert (
             device_mesh.ndim == 2
         ), "hybrid sharded data parallel requires 2D DeviceMesh"
@@ -305,9 +309,23 @@ def data_parallel(
 
         for p_name, p in params_dict.items():
             if p is not None and p.numel() > 0:
+                if not isinstance(shard_dim, dict):
+                    dim = shard_dim
+                elif isinstance(p, DTensor):
+                    # Under EP/TP, `ReplicateComputation` re-wraps the parameter
+                    # with the module-level `param_sharding`, which a
+                    # per-parameter axis never reaches.
+                    raise NotImplementedError(
+                        f"{p_name} is already a DTensor, so a per-parameter "
+                        "shard_dim would be dropped on the EP/TP path"
+                    )
+                else:
+                    dim = shard_dim[p_name]
                 # Check if the parameter is smaller than the device mesh dimension.
                 # If so, replicate it instead of sharding it.
-                actual_sharding = list(param_sharding)
+                actual_sharding = [
+                    Shard(dim) if isinstance(pl, Shard) else pl for pl in param_sharding
+                ]
                 for i, placement in enumerate(actual_sharding):
                     if isinstance(placement, Shard) and p.shape[placement.dim] < device_mesh.size(i):
                         actual_sharding[i] = Replicate()
