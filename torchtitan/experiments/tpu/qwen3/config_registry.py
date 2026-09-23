@@ -741,6 +741,13 @@ def qwen3_moe_235b_fsdp_activation_offload_4x4x4() -> TPUTrainerConfig:
   """
   cfg = _qwen3_moe_235b_fsdp_activation_offload()
   _configure_qwen3_moe_235b_fsdp_128(cfg, replicate_degree=1)
+  # This topology's large FSDP reductions benefit from libtpu's hierarchical
+  # n-D lowering. Keep the unvalidated HSDP and MaxText-numerics variants on
+  # their existing policy.
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+  )
   return cfg
 
 

@@ -28,6 +28,8 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 LIBTPU_INIT_FLAGS="xla_tpu_enable_sparse_core_collective_aggregator=true \
 xla_tpu_enable_latency_hiding_layer_scheduler=true \
 xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false \
+xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true \
+xla_tpu_enable_sparse_core_hierarchical_reduce_scatter=true \
 xla_tpu_dvfs_p_state=7"
 
 xpk workload create \
@@ -62,10 +64,14 @@ In matched 30-step TPU7x runs, enabling the pair improved throughput by about
 5% at both GBS768/2K and GBS1024/2K. The runs retained FP32 FSDP reductions and
 completed with finite loss and gradient norms on all 16 hosts.
 
+On top of that schedule, hierarchical n-D reduce-scatter improved throughput
+by another 1.09% and raised ring-equivalent reduce-scatter bus bandwidth from
+351.29 to 364.57 GB/s.
+
 ## Benchmark Results
-Run Date: 9/8/2026
-* **MFU:** 12.76%
-* **TPS (Tokens Per Second):** 7,121
-* **TFLOPS:** 147.16
-* **Memory Usage:** 65.33 GiB (68.05%)
-* **Step Time (end-to-end):** 1.73s
+Run Date: 9/23/2026
+* **MFU:** 15.00%
+* **TPS (Tokens Per Second):** 8,374
+* **TFLOPS:** 173.05
+* **Memory Usage:** 65.12 GiB (67.83%)
+* **Step Time (end-to-end):** 1.467s

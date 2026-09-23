@@ -19,6 +19,7 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.graph_trainer import llama3 as llama3_gt
 from torchtitan.experiments.graph_trainer import qwen3 as qwen3_gt
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.graph_trainer.config import (
     to_tpu_graph_trainer_config,
 )
@@ -656,6 +657,17 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       self.assertEqual(moe.aux_loss.type, "batch_wise")
       self.assertEqual(moe.aux_loss.coeff, 1e-3)
       self.assertEqual(moe.aux_loss.top_k, moe.router.top_k)
+
+  def test_235b_4x4x4_uses_hierarchical_reduce_scatter(self) -> None:
+    config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
+
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
+            for name in tpu_flags.HIERARCHICAL_REDUCE_SCATTER
+        },
+        tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+    )
 
   def test_235b_flavor_resolves_through_the_graph_trainer(self) -> None:
     # The graph trainer discards the recipe's ModelSpec and re-resolves the
