@@ -61,6 +61,60 @@ class ScanFSDPSpec:
     gather_dim: int = 0
 
 
+_orig_all_gather_single = funcol.all_gather_single
+_orig_reduce_scatter_single = funcol.reduce_scatter_single
+
+
+def _movedim_all_gather_tensor(
+    self: torch.Tensor,
+    gather_dim: int,
+    group: Any,
+    tag: str = "",
+) -> torch.Tensor:
+    """All-gather `self` along `gather_dim`, always collecting on dim 0.
+
+    Off dim 0, `funcol` falls back to `cat(chunk(t, world_size))` unless every
+    axis before `gather_dim` has size 1. Patching `funcol` ensures unstacked
+    `SimpleFSDP` parameters on `Shard(1)` (such as `tok_embeddings` and
+    `lm_head` at 2,048 ranks) also transpose onto dim 0 instead of emitting
+    `world_size` slices and a concat.
+    """
+    if gather_dim < 0:
+        gather_dim += self.ndim
+    if gather_dim != 0:
+        t = self.movedim(gather_dim, 0).contiguous()
+        out = _orig_all_gather_single(t, gather_dim=0, group=group, tag=tag)
+        return out.movedim(0, gather_dim)
+    return _orig_all_gather_single(self, gather_dim=0, group=group, tag=tag)
+
+
+def _movedim_reduce_scatter_tensor(
+    self: torch.Tensor,
+    reduceOp: str,
+    scatter_dim: int,
+    group: Any,
+    tag: str = "",
+) -> torch.Tensor:
+    """Reduce-scatter `self` along `scatter_dim`, always scattering on dim 0."""
+    if scatter_dim < 0:
+        scatter_dim += self.ndim
+    if scatter_dim != 0:
+        t = self.movedim(scatter_dim, 0).contiguous()
+        out = _orig_reduce_scatter_single(
+            t, reduceOp=reduceOp, scatter_dim=0, group=group, tag=tag
+        )
+        return out.movedim(0, scatter_dim)
+    return _orig_reduce_scatter_single(
+        self, reduceOp=reduceOp, scatter_dim=0, group=group, tag=tag
+    )
+
+
+funcol.all_gather_single = _movedim_all_gather_tensor
+funcol.all_gather_tensor = _movedim_all_gather_tensor
+funcol.reduce_scatter_single = _movedim_reduce_scatter_tensor
+funcol.reduce_scatter_tensor = _movedim_reduce_scatter_tensor
+
+
 def _gather_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
     """All-gather `x` along `dim`, always collecting on dim 0.
 
