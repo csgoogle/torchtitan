@@ -269,8 +269,8 @@ jobs:
       GAR_JSON_KEY: ${{ secrets.GAR_JSON_KEY }}
 
   promote-latest:
-    name: Promote validated image to :latest
-    needs: [build-and-push-image, validate-image]
+    name: Promote nightly image to :latest
+    needs: [build-and-push-image]
     if: ${{ needs.build-and-push-image.outputs.promote_latest == 'true' && github.event.inputs.push_image != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
