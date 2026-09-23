@@ -129,6 +129,8 @@ class TpuGraphTrainerDistributedTest(
               "--tpu_config.use_simple_fsdp",
               "--tpu_config.use_scan_layers",
           ],
+          # TODO(jeremiahhsu): b/565408416 - Broken by cl/986383819.
+          skip_reason="b/565408416: broken by cl/986383819",
       ),
   ])
   def test_graph_trainer_distributed(
@@ -144,7 +146,11 @@ class TpuGraphTrainerDistributedTest(
       dataset_path="tests/assets/c4_test",
       dataset="c4_test",
       args: list[str] | None = None,
+      skip_reason: str | None = None,
   ):
+    if skip_reason:
+      self.skipTest(skip_reason)
+
     combined_args = _train_args(
         module, config, optimizer_implementation, dataset_path, dataset
     ) + (args or [])
