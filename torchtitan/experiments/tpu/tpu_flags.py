@@ -161,6 +161,17 @@ DUAL_SPARSECORE_REDUCE_SCATTER: FlagMap = {
     "xla_tpu_use_single_sparse_core_for_reduce_scatter_offload": "false",
 }
 
+# Split eligible multi-dimensional reduce-scatter operations into hierarchical
+# stages and run those stages across both SparseCores. This lowering is
+# available in libtpu 0.0.47 and newer. Keep the three flags together: the ND
+# offload path exposes the topology to the hierarchical lowering, while using
+# both SparseCores provides the measured throughput gain.
+HIERARCHICAL_REDUCE_SCATTER: FlagMap = {
+    "xla_tpu_use_single_sparse_core_for_reduce_scatter_offload": "false",
+    "xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter": "true",
+    "xla_tpu_enable_sparse_core_hierarchical_reduce_scatter": "true",
+}
+
 # Offload FSDP all-gather and reduce-scatter onto the SparseCores, queued by the
 # latency-hiding scheduler. Broader than
 # SPARSECORE_LATENCY_HIDING_SCHEDULER: this moves the collectives themselves off

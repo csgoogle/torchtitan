@@ -18,7 +18,8 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 
 - **Devices vs chips**: an ironwood chip exposes two TensorCores, and torchtitan runs one process per core. `tpu7x-4x4x4` is therefore 128 devices on 64 chips, run as 16 hosts x 8 processes. 
 - **SparseCore Offloading**: This configuration achieves high MFU by utilizing
-  SparseCore collective offloading for FSDP, requested through the config's
+  SparseCore collective offloading for FSDP, including the hierarchical
+  reduce-scatter lowering, requested through the config's
   `--libtpu-init-flags` and exported before PJRT initialization.
 - **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--tpu_config.compile_optimizer` and `--tpu_config.optimizer_in_graph`.
 - **Splash Attention**: Q/K/V layouts and backward tiles are tuned for this
@@ -70,18 +71,19 @@ xpk workload create \
     --tpu_config.compile_mode=aot_fx_trace \
     --tpu_config.compile_optimizer \
     --tpu_config.optimizer_in_graph \
-    --libtpu-init-flags='xla_tpu_dvfs_p_state=7 xla_tpu_scoped_vmem_limit_kib=65472 xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_latency_hiding_layer_scheduler=true xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false'"
+    --libtpu-init-flags='xla_tpu_dvfs_p_state=7 xla_tpu_scoped_vmem_limit_kib=65472 xla_tpu_enable_sparse_core_collective_aggregator=true xla_tpu_enable_latency_hiding_layer_scheduler=true xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true xla_tpu_enable_sparse_core_hierarchical_reduce_scatter=true'"
 ```
 
 ## Expected Metrics
 
-With this configuration, you should observe the following metrics around step 30 (as of 9/16/2026):
+With this configuration, you should observe the following metrics around step
+30 (as of 9/23/2026):
 
-- **TPS (Tokens per second)**: ~12,389
-- **TFLOPS**: ~585.01
-- **MFU**: ~50.72%
-- **Step Time (time_end_to_end)**: ~0.992s
-- **Physical peak HBM (XProf)**: 86.81GiB
+- **TPS (Tokens per second)**: ~12,446
+- **TFLOPS**: ~587.69
+- **MFU**: ~50.95%
+- **Step Time (time_end_to_end)**: ~0.987s
+- **Physical peak HBM**: 81.70GiB
 
 ## Alternative configurations
 
