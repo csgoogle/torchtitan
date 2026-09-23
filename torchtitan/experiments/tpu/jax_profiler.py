@@ -20,8 +20,8 @@ class JaxProfiler:
   def start(self) -> None:
     if not jax:
       return
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if local_rank == 0:
+    rank = int(os.environ.get("RANK", 0))
+    if rank == 0:
       # pytype: disable=attribute-error
       # pylint: disable=protected-access
       save_folder = self.prof._config.save_traces_folder
@@ -44,13 +44,14 @@ class JaxProfiler:
           # pytype: enable=attribute-error
           curr_trace_dir,
       )
-      os.makedirs(curr_trace_dir, exist_ok=True)
+      if "://" not in curr_trace_dir:
+        os.makedirs(curr_trace_dir, exist_ok=True)
       jax.profiler.start_trace(curr_trace_dir)
 
   def stop(self) -> None:
     if jax:
-      local_rank = int(os.environ.get("LOCAL_RANK", 0))
-      if local_rank == 0:
+      rank = int(os.environ.get("RANK", 0))
+      if rank == 0:
         logger.info(
             "Stopping JAX profiler at step %d",
             # pytype: disable=attribute-error
