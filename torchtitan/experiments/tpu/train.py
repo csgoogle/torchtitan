@@ -7,6 +7,7 @@
 """Trainer compatible with TorchTpu."""
 
 import argparse
+import contextlib
 import functools
 import json
 import tempfile
@@ -298,34 +299,39 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   model_spec.parallelize_fn = patched_parallelize
 
   try:
-    trainer = trainer_cls(train_config)
-    # Asked of the built model rather than wrapped around `parallelize_fn`:
-    # the graph trainer -- the only lane scan runs on -- builds its own config
-    # and its own parallelize_fn, so a wrapper on the one patched above is
-    # never called.
-    for part in trainer.model_parts:
-      check_scan_was_applied(
-          part, use_scan_layers=train_config.tpu_config.use_scan_layers
+    with contextlib.ExitStack() as stack:
+      torchtitan.train._maybe_enable_min_cost_redistribute(  # pylint: disable=protected-access
+          stack,
+          train_config.parallelism,
       )
-    train_config.maybe_log()
-
-    if train_config.checkpoint.create_seed_checkpoint:
-      assert int(os.environ["WORLD_SIZE"]) == 1, (
-          "Must create seed checkpoint using a single device, to disable"
-          " sharding."
-      )
-      assert (
-          train_config.checkpoint.enable
-      ), "Must enable checkpointing when creating a seed checkpoint."
-      trainer.checkpointer.save(curr_step=0, last_step=True)
-      logger.info("Created seed checkpoint")
-    else:
-      if rank == 0:
-        logger.info(
-            "Training with config: %s",
-            json.dumps(train_config.to_dict(), indent=2),
+      trainer = trainer_cls(train_config)
+      # Asked of the built model rather than wrapped around `parallelize_fn`:
+      # the graph trainer -- the only lane scan runs on -- builds its own config
+      # and its own parallelize_fn, so a wrapper on the one patched above is
+      # never called.
+      for part in trainer.model_parts:
+        check_scan_was_applied(
+            part, use_scan_layers=train_config.tpu_config.use_scan_layers
         )
-      trainer.train()
+      train_config.maybe_log()
+
+      if train_config.checkpoint.create_seed_checkpoint:
+        assert int(os.environ["WORLD_SIZE"]) == 1, (
+            "Must create seed checkpoint using a single device, to disable"
+            " sharding."
+        )
+        assert (
+            train_config.checkpoint.enable
+        ), "Must enable checkpointing when creating a seed checkpoint."
+        trainer.checkpointer.save(curr_step=0, last_step=True)
+        logger.info("Created seed checkpoint")
+      else:
+        if rank == 0:
+          logger.info(
+              "Training with config: %s",
+              json.dumps(train_config.to_dict(), indent=2),
+          )
+        trainer.train()
   except Exception:
     if trainer:
       trainer.close()
