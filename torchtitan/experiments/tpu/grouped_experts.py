@@ -136,9 +136,9 @@ class TpuGroupedExperts(GroupedExperts):
         if self.use_pallas_paired_grouped_mm:
             if not self.use_pallas_grouped_mm:
                 raise ValueError("Paired grouped matmul requires Pallas")
-            if self.pallas_grouped_mm_tgmm_tiling[1:] != (0, 0):
+            if self.pallas_grouped_mm_tgmm_tiling[2] != 0:
                 raise ValueError(
-                    "Paired grouped matmul requires full K/N TGMM tiles"
+                    "Paired grouped matmul requires a full N TGMM tile"
                 )
 
         if not self.use_kernel_native_weight_layout:
@@ -254,6 +254,7 @@ class TpuGroupedExperts(GroupedExperts):
                 num_tokens_per_expert_E,
                 tile_m=tile_m,
                 tgmm_tile_m=tgmm_tiling[0],
+                tgmm_tile_k=tgmm_tiling[1],
             )
         else:
             gate_RF = segment_matmul_pallas_2d(
