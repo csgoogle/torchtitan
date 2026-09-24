@@ -12,6 +12,11 @@ on:
         required: false
         type: boolean
         default: true
+      with_c4:
+        description: 'Also build and push a -c4 image variant with the C4 subset at tests/assets/c4'
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "0 9 * * *" # 01:00 PST / 09:00 UTC
 
@@ -243,6 +248,24 @@ jobs:
           echo "image_ref=${IMAGE_REPO}@${DIGEST}" >> "${GITHUB_OUTPUT}"
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: Build and push C4 image variant
+        if: ${{ inputs.with_c4 == true && github.event.inputs.push_image != 'false' }}
+        run: |
+          set -euo pipefail
+          C4_GCS_PREFIX="gs://tpu-pytorch-scale-testing/dataset/c4/en"
+          C4_CTX="$(mktemp -d)"
+          mkdir -p "${C4_CTX}/c4"
+          gcloud storage cp "${C4_GCS_PREFIX}/c4-train.0000[0-4]-of-01024.json.gz" "${C4_GCS_PREFIX}/SHA256SUMS" "${C4_CTX}/c4/"
+          grep -E 'c4-train\.0000[0-4]-of-01024\.json\.gz$' "${C4_CTX}/c4/SHA256SUMS" > "${C4_CTX}/c4/SHA256SUMS.subset"
+          mv "${C4_CTX}/c4/SHA256SUMS.subset" "${C4_CTX}/c4/SHA256SUMS"
+          docker build \
+            --build-arg BASE_IMAGE="${{ steps.meta.outputs.candidate_tag }}" \
+            -f torchtitan/experiments/tpu/_internal/docker/Dockerfile.c4 \
+            -t "${{ steps.meta.outputs.candidate_tag }}-c4" \
+            "${C4_CTX}"
+          docker push "${{ steps.meta.outputs.candidate_tag }}-c4"
+          rm -rf "${C4_CTX}"
 
       - name: Print published tags
         run: |
