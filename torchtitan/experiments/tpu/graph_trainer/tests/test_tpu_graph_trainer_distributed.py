@@ -129,8 +129,6 @@ class TpuGraphTrainerDistributedTest(
               "--tpu_config.use_simple_fsdp",
               "--tpu_config.use_scan_layers",
           ],
-          # TODO(jeremiahhsu): b/565408416 - Broken by cl/986383819.
-          skip_reason="b/565408416: broken by cl/986383819",
       ),
   ])
   def test_graph_trainer_distributed(
