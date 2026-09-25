@@ -824,6 +824,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   _use_global_batch_aux_loss(cfg)
+  cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.
   # TODO(#391): delete once `MoE.forward` guards that write.
