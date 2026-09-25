@@ -334,18 +334,20 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
   )
 
 
-def qwen3_8b() -> TPUTrainerConfig:
-  """Qwen3 8B model configuration for TPU."""
-  model_spec = model_registry("8B", attn_backend="sdpa")
+def _qwen3_dense_model_spec(flavor: str) -> ModelSpec:
+  model_spec = model_registry(flavor, attn_backend="sdpa")
   model_config = cast(Qwen3Model.Config, model_spec.model)
   model_config.enable_weight_tying = False
   model_config.tok_embeddings.param_init = {
       "weight": partial(nn.init.normal_, std=1.0)
   }
   model_spec.parallelize_fn = tpu_parallelize_qwen3
+  return model_spec
 
-  # Optionally override any model config settings here
-  # model_config = cast(Qwen3Model.Config, model_spec.model)
+
+def qwen3_8b() -> TPUTrainerConfig:
+  """Qwen3 8B model configuration for TPU."""
+  model_spec = _qwen3_dense_model_spec("8B")
 
   config = TPUTrainerConfig(
       hf_assets_path="./tests/assets/tokenizer",
@@ -450,6 +452,47 @@ def qwen3_8b_maxtext_parity() -> TPUTrainerConfig:
   policy but not the loop representation.
   """
   cfg = qwen3_8b_zero3()
+  cfg.training.mixed_precision_reduce = "bfloat16"
+  cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
+  return cfg
+
+
+# The Qwen3-8B tpu7x-4x4x4 launch flags, carried by the 32B config.
+_QWEN3_DENSE_4X4X4_FLAGS = tpu_flags.merge_flags(
+    tpu_flags.TPU7X_THROUGHPUT_P_STATE,
+    {"xla_tpu_scoped_vmem_limit_kib": 65472},
+    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+)
+
+
+def qwen3_32b() -> TPUTrainerConfig:
+  """Qwen3 32B recipe for a tpu7x-4x4x4 slice.
+
+  Uses the tuned Qwen3-8B Zero-3 policy: Zero-2 would keep all ~61 GiB of
+  gathered BF16 weights resident.
+  """
+  cfg = qwen3_8b_zero3()
+  cfg.model_spec = _qwen3_dense_model_spec("32B")
+  # Packed QKV removes the fused projection's interleaved-output relayouts:
+  # -3.5% step time and -19.7 GiB peak HBM at local batch 8.
+  cfg.model_spec.model = (
+      TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
+  )
+  cfg.training.local_batch_size = 8
+  cfg.training.global_batch_size = 1024
+  cfg.training.seq_len = 4096
+  # Prefetch beats interleave by 0.3-0.6% here for ~4 GiB more peak HBM.
+  cfg.tpu_config.graph_trainer_fsdp_schedule = "prefetch"
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags, _QWEN3_DENSE_4X4X4_FLAGS
+  )
+  return cfg
+
+
+def qwen3_32b_maxtext_parity() -> TPUTrainerConfig:
+  """Qwen3 32B recipe with MaxText's BF16 reductions and BF16 RoPE."""
+  cfg = qwen3_32b()
   cfg.training.mixed_precision_reduce = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
   return cfg

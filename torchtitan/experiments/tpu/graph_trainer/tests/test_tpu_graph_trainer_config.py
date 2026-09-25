@@ -6,6 +6,7 @@
 
 """Tests for TPU GraphTrainer config conversion."""
 
+import dataclasses
 import typing
 from types import SimpleNamespace
 
@@ -59,10 +60,13 @@ from torchtitan.experiments.tpu.overrides.real_rope import (
 from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
 )
+from torchtitan.experiments.tpu.qkv import TpuPackedQKVLinear
 from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b,
     qwen3_8b_maxtext_parity,
     qwen3_8b_zero3,
+    qwen3_32b,
+    qwen3_32b_maxtext_parity,
     qwen3_moe_30b,
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
@@ -459,6 +463,62 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             for rope in ropes
         )
     )
+
+  @parameterized.named_parameters(
+      ("fp32_reduce", qwen3_32b, "float32", False),
+      ("maxtext_parity", qwen3_32b_maxtext_parity, "bfloat16", True),
+  )
+  def test_qwen3_32b_recipes_reuse_8b_zero3_policy(
+      self, recipe, reduce_dtype: str, bf16_rope: bool
+  ) -> None:
+    config = recipe()
+    zero3 = qwen3_8b_zero3()
+
+    assert config.model_spec is not None
+    self.assertEqual(config.model_spec.flavor, "32B")
+    self.assertFalse(config.model_spec.model.enable_weight_tying)
+    self.assertLen(config.model_spec.model.layers, 64)
+    self.assertLen(
+        list(config.model_spec.model.traverse(TpuPackedQKVLinear.Config)), 64
+    )
+    self.assertEqual(config.training.local_batch_size, 8)
+    self.assertEqual(config.training.global_batch_size, 1024)
+    self.assertEqual(config.training.seq_len, 4096)
+    self.assertEqual(config.training.mixed_precision_reduce, reduce_dtype)
+    self.assertEqual(config.parallelism, zero3.parallelism)
+    self.assertEqual(
+        config.tpu_config,
+        dataclasses.replace(
+            zero3.tpu_config, graph_trainer_fsdp_schedule="prefetch"
+        ),
+    )
+    self.assertEqual(
+        config.splash_attention_kernel, zero3.splash_attention_kernel
+    )
+    self.assertEqual(
+        "torchtitan.experiments.tpu.overrides.bf16_rope"
+        in config.override.imports,
+        bf16_rope,
+    )
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
+            for name in tpu_flags.HIERARCHICAL_REDUCE_SCATTER
+        },
+        tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+    )
+    self.assertEqual(config.libtpu_init_flags["xla_tpu_dvfs_p_state"], "7")
+
+    graph_config = self._qwen3_graph_config(config)
+    assert graph_config.model_spec is not None
+    self.assertFalse(graph_config.model_spec.model.enable_weight_tying)
+    self.assertLen(
+        list(
+            graph_config.model_spec.model.traverse(TpuPackedQKVLinear.Config)
+        ),
+        64,
+    )
+    self.assertEqual(graph_config.compile.memory_policy, "full")
 
   def test_fsdp_only_recipe_uses_fused_adamw_and_attention_tuning(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
