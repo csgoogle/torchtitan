@@ -454,39 +454,61 @@ def splash_sdpa(
     is_causal: bool = True,
     local_window_size: Optional[int] = None,
     enable_gqa: bool = False,
-    block_q: int = 512,
-    block_kv: int = 512,
-    block_dkv: int = 512,
-    block_kv_compute: int = 512,
-    block_q_dkv: int = 512,
-    block_kv_dkv: int = 512,
-    block_kv_dkv_compute: int = 512,
+    block_q: Optional[int] = None,
+    block_kv: Optional[int] = None,
+    block_dkv: Optional[int] = None,
+    block_kv_compute: Optional[int] = None,
+    block_q_dkv: Optional[int] = None,
+    block_kv_dkv: Optional[int] = None,
+    block_kv_dkv_compute: Optional[int] = None,
     block_q_dq: Optional[int] = None,
     block_kv_dq: Optional[int] = None,
-    use_fused_bwd_kernel: bool = True,
-    use_vmap_bwd: bool = False,
-    q_layout: str = "HEAD_DIM_MINOR",
-    k_layout: str = "HEAD_DIM_MINOR",
-    v_layout: str = "HEAD_DIM_MINOR",
+    use_fused_bwd_kernel: Optional[bool] = None,
+    use_vmap_bwd: Optional[bool] = None,
+    q_layout: Optional[str] = None,
+    k_layout: Optional[str] = None,
+    v_layout: Optional[str] = None,
 ) -> torch.Tensor:
   """Replacement for F.scaled_dot_product_attention using Tokamax splash attention."""
-  del (  # pyrefly: ignore[unsupported-delete]
-      enable_gqa,
-      block_q,
-      block_kv,
-      block_dkv,
-      block_kv_compute,
-      block_q_dkv,
-      block_kv_dkv,
-      block_kv_dkv_compute,
-      block_q_dq,
-      block_kv_dq,
-      use_fused_bwd_kernel,
-      use_vmap_bwd,
-      q_layout,
-      k_layout,
-      v_layout,
-  )
+  # These are accepted for signature compatibility with the JAX splash wrapper
+  # but are NOT the channel that reaches the kernel: splash_op reads the
+  # process-global TokamaxConfig, which the patch populates once at setup.
+  # Passing a value here that disagrees with TokamaxConfig would silently do
+  # nothing, so refuse it rather than discard it -- a caller who tiles through
+  # this path is wrong about how the kernel is configured.
+  _passed = {
+      "block_q": block_q, "block_kv": block_kv, "block_dkv": block_dkv,
+      "block_kv_compute": block_kv_compute, "block_q_dkv": block_q_dkv,
+      "block_kv_dkv": block_kv_dkv, "block_kv_dkv_compute": block_kv_dkv_compute,
+      "block_q_dq": block_q_dq, "block_kv_dq": block_kv_dq,
+      "use_fused_bwd_kernel": use_fused_bwd_kernel, "use_vmap_bwd": use_vmap_bwd,
+      "q_layout": q_layout, "k_layout": k_layout, "v_layout": v_layout,
+  }
+  _conflicts = {
+      k: (v, getattr(TokamaxConfig, k))
+      for k, v in _passed.items()
+      if v is not None and hasattr(TokamaxConfig, k) and v != getattr(TokamaxConfig, k)
+  }
+  if _conflicts:
+    raise ValueError(
+        "splash_sdpa received per-call tiling that disagrees with the active"
+        " TokamaxConfig; this path cannot honor per-call tiles, so the values"
+        " would be silently ignored. Set them on the SplashAttentionKernelConfig"
+        f" instead. Conflicts (passed, active): {_conflicts}"
+    )
+  # Validate enable_gqa rather than ignore it. The stock splash_sdpa in
+  # splash_attention.py enforces this same invariant, and the two functions are
+  # meant to be interchangeable via a config flag -- so silently accepting a
+  # wrong value here would make the two kernels disagree on identical input:
+  # stock raises, tokamax runs on. That check catches a real mistake (passing
+  # enable_gqa=False for a GQA shape); dropping it when the flag is flipped
+  # would lose the assertion precisely when the kernel changes underneath you.
+  n_heads, n_kv_heads = q.shape[2], k.shape[2]
+  if enable_gqa != (n_heads != n_kv_heads):
+    raise ValueError(
+        f"enable_gqa ({enable_gqa}) does not match inputs: "
+        f"n_heads={n_heads}, n_kv_heads={n_kv_heads}"
+    )
 
   head_dim = q.shape[-1]
 
