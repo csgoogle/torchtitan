@@ -392,6 +392,12 @@ def qwen3_8b() -> TPUTrainerConfig:
           optimizer_in_graph=True,
           graph_trainer_memory_policy="default",
       ),
+      # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
+      # libtpu 0.0.48; see cl/979992733), which segfaults in
+      # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
+      xla_flags=tpu_flags.merge_flags(
+          xla_enable_hlo_sharding_v3=False,
+      ),
       compile=CompileConfig(
           enable=True,
           backend="tpu",
@@ -474,6 +480,13 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
       use_graph_trainer=True,
       compile_mode="aot_fx_trace",
       graph_trainer_memory_policy="full",
+  )
+  # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
+  # libtpu 0.0.48; see cl/979992733), which segfaults in
+  # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
+  cfg.xla_flags = tpu_flags.merge_flags(
+      cfg.xla_flags,
+      xla_enable_hlo_sharding_v3=False,
   )
   cfg.compile = CompileConfig(
       enable=True,

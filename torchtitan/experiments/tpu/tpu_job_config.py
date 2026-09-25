@@ -241,7 +241,12 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
       default_factory=tpu_flags.FlagMap
   )
   libtpu_init_flags: tpu_flags.FlagMap = dataclasses.field(
-      default_factory=tpu_flags.FlagMap
+      # TODO(jeremiahhsu): This is enabled by default in libtpu 0.44 which
+      # causes a crash during teardown for any jobs with XLA compile time
+      # >5 mins where the diagnostic coordinator is called
+      default_factory=lambda: tpu_flags.FlagMap(
+          {"xla_tpu_enable_diagnostic_coordinator": "false"}
+      )
   )
   extra_xla_flags: tpu_flags.FlagMap = dataclasses.field(
       default_factory=tpu_flags.FlagMap

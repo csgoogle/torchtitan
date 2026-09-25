@@ -56,6 +56,10 @@ def _on_scan_lane(config: TPUTrainerConfig) -> TPUTrainerConfig:
   # bf16 Adam moments halve the optimizer state, which is 12.7 GiB at 405B and
   # the difference between sequence 8192 fitting and not.
   config.optimizer.implementation = "fused_opt_states_bf16"
+  # Disable Shardy HLO sharding v3 (enabled by default in XLA cl/979222288 /
+  # libtpu 0.0.48; see cl/979992733), which segfaults in
+  # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
+  config.xla_flags["xla_enable_hlo_sharding_v3"] = "false"
   return config
 
 
