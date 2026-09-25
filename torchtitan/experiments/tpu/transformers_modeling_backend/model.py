@@ -21,6 +21,7 @@ from torchtitan.experiments.tpu.workarounds import _extract_splash_kwargs
 from torchtitan.experiments.transformers_modeling_backend.model import (
     HFTransformerModel,
 )
+from torchtitan.tools.logging import logger
 
 
 class TPUHFTransformerModel(HFTransformerModel):
@@ -77,9 +78,12 @@ class TPUHFTransformerModel(HFTransformerModel):
             " backend lane; use use_splash_attention_kernel."
         )
       # HF picks the attention function from `_attn_implementation`; the
-      # backend's update_from_config never rewrites underscore fields.
+      # backend's update_from_config never rewrites underscore fields. None
+      # rather than "sdpa": HF then resolves sdpa where the class supports it
+      # and eager where it does not (T5, DeBERTa-v2, LayoutLM, GIT, ...),
+      # while an explicit "sdpa" makes those classes raise.
       self._attn_implementation = (
-          "splash_tpu" if sa.use_splash_attention_kernel else "sdpa"
+          "splash_tpu" if sa.use_splash_attention_kernel else None
       )
       sa.use_splash_attention_kernel = False
       # The HF model keeps this Config as its `config`, so attention modules
@@ -95,6 +99,12 @@ class TPUHFTransformerModel(HFTransformerModel):
 
   def __init__(self, config: Config):
     super().__init__(config)
+    attn = self.model.config._attn_implementation
+    if attn not in ("sdpa", "splash_tpu"):
+      logger.warning(
+          "%s has no sdpa support; attention runs HF's %r implementation.",
+          type(self.model).__name__, attn,
+      )
     self._tpu_fused_loss = getattr(config, "_tpu_fused_loss", False)
     self._skip_lm_head = self._tpu_fused_loss
 

@@ -158,7 +158,13 @@ def parallelize_hf_transformers_tpu(
 
     build_and_swap_native_moe(model, parallel_dims)
   convert_hf_to_module(model)
-  set_hf_sharding_configs(model, enable_sp=parallel_dims.tp_enabled)
+  # These configs describe TP/SP/EP placements and name each module's inputs
+  # after the Llama classes' forward arguments (an embedding's is "input";
+  # Gemma3TextScaledWordEmbedding calls it "input_ids" and fails the module
+  # protocol's check). Without TP or EP there is nothing to place: SimpleFSDP
+  # shards parameters itself.
+  if parallel_dims.tp_enabled or parallel_dims.ep > 1:
+    set_hf_sharding_configs(model, enable_sp=parallel_dims.tp_enabled)
   model.parallelize(parallel_dims)
 
   if ac_config is not None:
