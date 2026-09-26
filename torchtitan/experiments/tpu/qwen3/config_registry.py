@@ -866,6 +866,9 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
       # Each layer's expert-gradient reduce-scatters land at the end of the scan
       # body with little compute left to hide them.
       tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+      # As the splitter does. Without it the expert-weight all-gathers wait
+      # twice as long once SparseCore also runs the relayout copies.
+      tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
   )
   # Let SparseCore do the relayouts around the activation offload, as MaxText
   # does; on the TensorCore they cost ~0.9 s/step of copies here.
