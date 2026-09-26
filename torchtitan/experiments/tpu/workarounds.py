@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Any, Optional
 import torch
@@ -223,29 +224,82 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
   import types
 
   # Update core JAX trace compilation configs internally from config registry
-  TokamaxConfig.update(
-      block_q=getattr(sa_config, "block_q", None),
-      block_kv=getattr(sa_config, "block_kv", None),
-      block_kv_compute=getattr(sa_config, "block_kv_compute", None),
-      block_q_dkv=getattr(sa_config, "block_q_dkv", None),
-      block_kv_dkv=getattr(sa_config, "block_kv_dkv", None),
-      block_kv_dkv_compute=getattr(sa_config, "block_kv_dkv_compute", None),
-      block_q_dq=getattr(sa_config, "block_q_dq", None),
-      block_kv_dq=getattr(sa_config, "block_kv_dq", None),
-      use_fused_bwd_kernel=getattr(sa_config, "use_fused_bwd_kernel", None),
-      q_layout=getattr(sa_config, "q_layout", None),
-      k_layout=getattr(sa_config, "k_layout", None),
-      v_layout=getattr(sa_config, "v_layout", None),
+  # Every SplashAttentionKernelConfig field is sa_-prefixed with no unprefixed
+  # alias, so an unprefixed getattr returns None for all of them and
+  # TokamaxConfig.update -- which skips None -- silently keeps its own defaults,
+  # discarding the recipe's entire tuned block config. Read the sa_ names and
+  # validate that something resolved. Listing the fields explicitly also makes
+  # this call the whitelist: it cannot forward a key TokamaxConfig lacks.
+  def _sa(name):
+    return getattr(sa_config, f"sa_{name}", getattr(sa_config, name, None))
+
+  _tokamax_values = dict(
+      block_q=_sa("block_q"),
+      block_kv=_sa("block_kv"),
+      block_kv_compute=_sa("block_kv_compute"),
+      block_q_dkv=_sa("block_q_dkv"),
+      block_kv_dkv=_sa("block_kv_dkv"),
+      block_kv_dkv_compute=_sa("block_kv_dkv_compute"),
+      block_q_dq=_sa("block_q_dq"),
+      block_kv_dq=_sa("block_kv_dq"),
+      use_fused_bwd_kernel=_sa("use_fused_bwd_kernel"),
+      use_vmap_bwd=_sa("use_vmap_bwd"),
+      q_layout=_sa("q_layout"),
+      k_layout=_sa("k_layout"),
+      v_layout=_sa("v_layout"),
+  )
+  # Guard the bug above, without rejecting a caller that deliberately passes an empty
+  # config to mean "just use the kernel's defaults" (redacted's parity test does exactly
+  # that). The two are distinguishable: a real SplashAttentionKernelConfig exposes
+  # sa_-prefixed attributes, so if those exist and still nothing resolved, the reader
+  # is broken; if none exist, the caller genuinely wants defaults - log it so the
+  # fallback is visible rather than silent.
+  _is_splash_config = any(a.startswith("sa_") for a in dir(sa_config))
+  if _is_splash_config and all(v is None for v in _tokamax_values.values()):
+    raise ValueError(
+        "Tokamax splash attention was requested but no splash_attention_kernel "
+        f"values resolved from {type(sa_config).__name__}, which does expose "
+        "sa_-prefixed fields. The kernel would silently run at library defaults "
+        "instead of the recipe's tiles."
+    )
+  if not _is_splash_config:
+    logger.info(
+        "Tokamax splash: %s exposes no sa_-prefixed fields; running at the "
+        "kernel's default tiling.", type(sa_config).__name__,
+    )
+  TokamaxConfig.update(**_tokamax_values)
+  logger.info(
+      "Tokamax splash: applied %s",
+      {k: v for k, v in _tokamax_values.items() if v is not None},
   )
 
   def _get_kwargs(**kwargs):
     return {k: v for k, v in kwargs.items() if v is not None}
 
+  # _SPLASH_KEYS is the union over splash implementations; tokamax's splash_sdpa
+  # accepts a strict subset of it (e.g. it has no use_document_aware_block_skipping),
+  # so filtering against the static set passes kwargs the callee rejects with
+  # "Unexpected keyword arguments". Derive the filter from the callee's actual
+  # signature instead, so it tracks the kernel rather than drifting from it.
+  _tokamax_sdpa_params = frozenset(
+      inspect.signature(tokamax_splash_sdpa).parameters
+  )
+
   def _filter_splash_kwargs(kwargs_dict):
-    return {k: v for k, v in kwargs_dict.items() if k in _SPLASH_KEYS}
+    # PURE: this runs inside the traced forward (scan body). A logger call here
+    # graph-breaks Dynamo with "logging.Logger method not supported for
+    # non-export cases" - log once at patch time instead, below.
+    return {k: v for k, v in kwargs_dict.items() if k in _tokamax_sdpa_params}
 
   # Extract parameters dynamically using our shared prefix mapper helper!
   sa_kwargs = _extract_splash_kwargs(sa_config)
+  _dropped_sa = sorted(set(sa_kwargs) - _tokamax_sdpa_params)
+  if _dropped_sa:
+    logger.info(
+        "Tokamax splash: %d/%d config kwargs forwarded; dropping %s"
+        " (not in tokamax splash_sdpa's signature)",
+        len(sa_kwargs) - len(_dropped_sa), len(sa_kwargs), _dropped_sa,
+    )
 
   def _splash_forward(
       self,

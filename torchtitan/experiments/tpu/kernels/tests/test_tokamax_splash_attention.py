@@ -5,6 +5,7 @@ import functools
 import logging
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import torch
 from torch.nn import attention
 import torch.nn.functional as F
@@ -97,13 +98,24 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     )
 
   def test_block_sizes_parity(self):
+    # Block sizes reach this kernel through the process-global TokamaxConfig, not
+    # through per-call kwargs - splash_sdpa never forwards the per-call values. This
+    # test previously passed them per-call, so it ran at the 512 defaults and
+    # asserted nothing about block sizes; set them the way the kernel actually reads
+    # them, and restore afterwards since the config is process-global.
+    cfg = tokamax_splash_attention.TokamaxConfig
+    saved = (cfg.block_q, cfg.block_kv, cfg.block_kv_compute)
+    self.addCleanup(
+        lambda: cfg.update(
+            block_q=saved[0], block_kv=saved[1], block_kv_compute=saved[2]
+        )
+    )
+    cfg.update(block_q=128, block_kv=128, block_kv_compute=128)
+
     splash_fn = functools.partial(
         tokamax_splash_attention.splash_sdpa,
         is_causal=True,
         enable_gqa=False,
-        block_q=128,
-        block_kv=128,
-        block_kv_compute=128,
     )
 
     self.check_forward_parity(
@@ -114,6 +126,35 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         seq_len=128,
         head_dim=64,
     )
+
+  @parameterized.named_parameters(
+      ("gqa_shapes_flag_false_raises", 8, 2, False, True),
+      ("gqa_shapes_flag_true_ok", 8, 2, True, False),
+      ("mha_shapes_flag_false_ok", 8, 8, False, False),
+      ("mha_shapes_flag_true_raises", 8, 8, True, True),
+  )
+  def test_enable_gqa_is_validated(self, n_heads, n_kv_heads, flag, should_raise):
+    """enable_gqa must be enforced, not ignored.
+
+    The stock splash_sdpa enforces `enable_gqa == (n_heads != n_kv_heads)`, and the
+    two kernels are interchangeable via a config flag - so accepting a wrong value
+    here would make them disagree on identical input: stock raises, tokamax runs on.
+    Shapes are token-major (B, S, H, D); validation happens before any device work.
+    """
+    b, seq_len, head_dim = 2, 128, 64
+    mk = lambda h: torch.zeros(b, seq_len, h, head_dim, dtype=torch.bfloat16)
+    q, k, v = mk(n_heads), mk(n_kv_heads), mk(n_kv_heads)
+
+    if should_raise:
+      with self.assertRaisesRegex(ValueError, "enable_gqa"):
+        tokamax_splash_attention.splash_sdpa(q, k, v, enable_gqa=flag)
+    else:
+      try:
+        tokamax_splash_attention.splash_sdpa(q, k, v, enable_gqa=flag)
+      except ValueError as e:
+        self.assertNotIn("enable_gqa", str(e))
+      except Exception:  # pylint: disable=broad-except
+        pass  # got past validation; device/kernel errors are not this test's concern
 
   def test_custom_scale_backward(self):
     """Regression: dq must carry the chain-rule factor for the custom-scale

@@ -460,5 +460,105 @@ class WorkaroundsTest(parameterized.TestCase):
     torch.testing.assert_close(patched, baseline)
 
 
+  def _tokamax_patch_fixture(self):
+    """A module with one ScaledDotProductAttention, and a populated splash config."""
+    from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig  # pylint: disable=g-import-not-at-top
+    from torchtitan.models.common.attention import ScaledDotProductAttention  # pylint: disable=g-import-not-at-top
+
+    class _Tiny(torch.nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        attn = ScaledDotProductAttention.__new__(ScaledDotProductAttention)
+        torch.nn.Module.__init__(attn)
+        self.attn = attn
+
+    sa = SplashAttentionKernelConfig(
+        use_tokamax_splash_attention_kernel=True,
+        sa_block_q=1024,
+        sa_block_kv=1024,
+        sa_block_kv_compute=512,
+        sa_block_q_dkv=2048,
+        sa_block_kv_dkv=2048,
+        sa_block_kv_dkv_compute=1024,
+        sa_q_layout="SEQ_MINOR",
+        sa_k_layout="SEQ_MINOR",
+        sa_v_layout="HEAD_DIM_MINOR",
+    )
+    sa.use_vmap_bwd = True
+    return _Tiny(), sa
+
+  def test_tokamax_patch_forwards_splash_config(self):
+    """The splash config must actually reach TokamaxConfig.
+
+    Regression test. SplashAttentionKernelConfig declares its fields sa_-prefixed;
+    reading them unprefixed returns None for every one, and TokamaxConfig.update
+    skips None, so the patch silently kept tokamax's library defaults and the kernel
+    ran at the wrong tiles. Nothing failed - it was just slower, which is exactly why
+    this needs a test rather than a runtime error.
+    """
+    from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import TokamaxConfig  # pylint: disable=g-import-not-at-top
+
+    model, sa = self._tokamax_patch_fixture()
+    self.assertEqual(TokamaxConfig.block_q, 512, "precondition: class default")
+
+    workarounds.use_tokamax_splash_attention_patch(model, sa)
+
+    self.assertEqual(TokamaxConfig.block_q, 1024)
+    self.assertEqual(TokamaxConfig.block_kv, 1024)
+    self.assertEqual(TokamaxConfig.block_kv_compute, 512)
+    self.assertEqual(TokamaxConfig.block_q_dkv, 2048)
+    self.assertEqual(TokamaxConfig.block_kv_dkv, 2048)
+    self.assertEqual(TokamaxConfig.block_kv_dkv_compute, 1024)
+    self.assertEqual(TokamaxConfig.q_layout, "SEQ_MINOR")
+    self.assertEqual(TokamaxConfig.k_layout, "SEQ_MINOR")
+    self.assertEqual(TokamaxConfig.v_layout, "HEAD_DIM_MINOR")
+    self.assertTrue(TokamaxConfig.use_vmap_bwd)
+
+  def test_tokamax_patch_raises_when_a_splash_config_resolves_nothing(self):
+    """A real splash config whose fields resolve to nothing must fail loudly."""
+    model, _ = self._tokamax_patch_fixture()
+
+    class _BrokenSplash:  # exposes sa_ fields, so it IS a splash config
+      use_tokamax_splash_attention_kernel = True
+      sa_block_q = None
+      sa_block_kv = None
+
+    with self.assertRaisesRegex(ValueError, "no splash_attention_kernel values"):
+      workarounds.use_tokamax_splash_attention_patch(model, _BrokenSplash())
+
+  def test_tokamax_patch_accepts_a_config_with_no_splash_fields(self):
+    """An empty config means "use the kernel defaults" and must not raise.
+
+    redacted's parity test passes a bare `class MockConfig: pass`. The guard above has to
+    distinguish that from a real splash config read incorrectly - the discriminator is
+    whether sa_-prefixed attributes exist at all. Caught by CI, not by me.
+    """
+    model, _ = self._tokamax_patch_fixture()
+
+    class _NotASplashConfig:
+      pass
+
+    workarounds.use_tokamax_splash_attention_patch(model, _NotASplashConfig())
+
+  def test_tokamax_patch_drops_kwargs_the_kernel_does_not_accept(self):
+    """_SPLASH_KEYS is the union over splash implementations.
+
+    tokamax's splash_sdpa accepts a strict subset - it has no
+    use_document_aware_block_skipping - so forwarding the whole set made every run
+    die at first compile with "Unexpected keyword arguments".
+    """
+    import inspect  # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import splash_sdpa  # pylint: disable=g-import-not-at-top
+
+    accepted = set(inspect.signature(splash_sdpa).parameters)
+    self.assertNotIn("use_document_aware_block_skipping", accepted)
+    # every key the patch may forward must be one the callee accepts
+    self.assertContainsSubset(
+        workarounds._SPLASH_KEYS & accepted, accepted,
+        "the forwarded set must be a subset of the callee signature",
+    )
+
+
 if __name__ == "__main__":
   absltest.main()
