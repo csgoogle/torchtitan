@@ -57,7 +57,8 @@ _DISCARDED_TOKEN_COUNTER_OVERRIDE = (
 )
 
 
-# Shared by both Qwen3-235B lines, the scan loop and the graph splitter.
+# Shared by both Qwen3-235B lines, the scan loop and the graph splitter. The
+# scan recipe drops the SparseCore copy flag.
 _Q235_SHARED_FLAGS = tpu_flags.merge_flags(
     # Select TPU7x's throughput-oriented operating point for this compute-bound
     # recipe. This changes device frequency, not graph numerics.
@@ -831,8 +832,10 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.override.imports.append(_DISCARDED_TOKEN_COUNTER_OVERRIDE)
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
+    # The splitter's expert kernels: W1/W3 paired, with its K-tiled dWeight.
+    experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 512)
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
     experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = 8192
@@ -860,7 +863,13 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       _Q235_SHARED_FLAGS,
+      # Each layer's expert-gradient reduce-scatters land at the end of the scan
+      # body with little compute left to hide them.
+      tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
   )
+  # Let SparseCore do the relayouts around the activation offload, as MaxText
+  # does; on the TensorCore they cost ~0.9 s/step of copies here.
+  cfg.libtpu_init_flags.pop("xla_tpu_enable_offloading_copy_to_sparsecore")
   return cfg
 
 
