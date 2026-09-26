@@ -339,10 +339,11 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     return out
 
   def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
-    query, key, value = self._maybe_tile_qkv_for_gqa(query, key, value)
+    # K/V stay at num_kv_heads: the kernel groups q head h onto kv head
+    # h // (num_heads // num_kv_heads), the same mapping [redacted]'s GQA tiling
+    # builds, without materializing num_heads copies of K/V.
     local_window_size = getattr(self, "sliding_window_size", None)
 
-    # Tokamax JAX-side transpositions path (Direct pass-through of GQA tiled buffers)
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
@@ -355,7 +356,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         scale=scale,
         is_causal=True,
         local_window_size=local_window_size,
-        enable_gqa=False,
+        enable_gqa=query.shape[2] != key.shape[2],
         **forward_kwargs,
     )
     return out
