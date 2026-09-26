@@ -831,8 +831,14 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.override.imports.append(_DISCARDED_TOKEN_COUNTER_OVERRIDE)
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
+    experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 512)
+    # Four K slabs. The paired dWeight needs 105 MB at 4096 x 1536 against
+    # Mosaic's 64 MB scoped limit; four slabs bring it under 30 MB. The N tile
+    # must stay full, so the unpaired alternative is (256, 0, 512). 2048 is
+    # faster for this kernel in isolation but OOMs the unpaired dW2, whose
+    # corresponding axis is 1536 rather than 4096 (see _qwen3_moe_235b_fsdp_only).
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
     experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = 8192
@@ -857,9 +863,29 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.metrics.log_freq = 1
   # Left to the command line these get forgotten, and a scan step measured
   # without them runs ~10% slow.
+  #
+  # The collective-scheduling flags are not independent of the paired grouped
+  # matmul above: pairing's win is a scheduling effect, not arithmetic. It lowers
+  # dWeight VMEM pressure, and the compiler only turns that into throughput when
+  # FSDP collectives can be overlapped with layer compute. Measured on 64 v7x
+  # (4x4x4), lbs 16, seq 4096, steps 20-30, both arms from one image, losses
+  # bit-identical:
+  #
+  #   flags        paired         unpaired       paired effect
+  #   absent       2,022.1        2,068.7        -2.25 %
+  #   present      2,165.9        2,077.0        +4.28 %  (27.3 sigma)
+  #
+  # So they ship together; enabling the paired path on its own is a regression.
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       _Q235_SHARED_FLAGS,
+      tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+      {
+          "xla_tpu_enable_layer_scheduler_for_dependent_collectives": True,
+          "xla_tpu_enable_sparse_core_reduce_scatter_v2": True,
+          "xla_tpu_enable_sparse_core_collective_offload_reduce_scatter": True,
+          "xla_tpu_prefer_async_allgather_to_allreduce": True,
+      },
   )
   return cfg
 
