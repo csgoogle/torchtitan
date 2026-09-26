@@ -248,12 +248,24 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
       k_layout=_sa("k_layout"),
       v_layout=_sa("v_layout"),
   )
-  if sa_config is not None and all(v is None for v in _tokamax_values.values()):
+  # Guard the bug above, without rejecting a caller that deliberately passes an empty
+  # config to mean "just use the kernel's defaults" (redacted's parity test does exactly
+  # that). The two are distinguishable: a real SplashAttentionKernelConfig exposes
+  # sa_-prefixed attributes, so if those exist and still nothing resolved, the reader
+  # is broken; if none exist, the caller genuinely wants defaults - log it so the
+  # fallback is visible rather than silent.
+  _is_splash_config = any(a.startswith("sa_") for a in dir(sa_config))
+  if _is_splash_config and all(v is None for v in _tokamax_values.values()):
     raise ValueError(
         "Tokamax splash attention was requested but no splash_attention_kernel "
-        f"values resolved from {type(sa_config).__name__}. The kernel would "
-        "silently run at library defaults instead of the recipe's tiles. "
-        "Expected sa_-prefixed fields (sa_block_q, sa_block_kv, ...)."
+        f"values resolved from {type(sa_config).__name__}, which does expose "
+        "sa_-prefixed fields. The kernel would silently run at library defaults "
+        "instead of the recipe's tiles."
+    )
+  if not _is_splash_config:
+    logger.info(
+        "Tokamax splash: %s exposes no sa_-prefixed fields; running at the "
+        "kernel's default tiling.", type(sa_config).__name__,
     )
   TokamaxConfig.update(**_tokamax_values)
   logger.info(

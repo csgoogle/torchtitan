@@ -515,15 +515,31 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertEqual(TokamaxConfig.v_layout, "HEAD_DIM_MINOR")
     self.assertTrue(TokamaxConfig.use_vmap_bwd)
 
-  def test_tokamax_patch_raises_when_config_resolves_nothing(self):
-    """A config whose fields resolve to nothing must fail loudly, not silently."""
+  def test_tokamax_patch_raises_when_a_splash_config_resolves_nothing(self):
+    """A real splash config whose fields resolve to nothing must fail loudly."""
     model, _ = self._tokamax_patch_fixture()
 
-    class _Empty:
+    class _BrokenSplash:  # exposes sa_ fields, so it IS a splash config
       use_tokamax_splash_attention_kernel = True
+      sa_block_q = None
+      sa_block_kv = None
 
     with self.assertRaisesRegex(ValueError, "no splash_attention_kernel values"):
-      workarounds.use_tokamax_splash_attention_patch(model, _Empty())
+      workarounds.use_tokamax_splash_attention_patch(model, _BrokenSplash())
+
+  def test_tokamax_patch_accepts_a_config_with_no_splash_fields(self):
+    """An empty config means "use the kernel defaults" and must not raise.
+
+    redacted's parity test passes a bare `class MockConfig: pass`. The guard above has to
+    distinguish that from a real splash config read incorrectly - the discriminator is
+    whether sa_-prefixed attributes exist at all. Caught by CI, not by me.
+    """
+    model, _ = self._tokamax_patch_fixture()
+
+    class _NotASplashConfig:
+      pass
+
+    workarounds.use_tokamax_splash_attention_patch(model, _NotASplashConfig())
 
   def test_tokamax_patch_drops_kwargs_the_kernel_does_not_accept(self):
     """_SPLASH_KEYS is the union over splash implementations.
