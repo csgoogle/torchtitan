@@ -490,6 +490,27 @@ def qwen3_32b() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_32b_4x8x8() -> TPUTrainerConfig:
+  """Qwen3 32B recipe for a tpu7x-4x8x8 slice (512 devices).
+
+  At world 512 the w1/w3 gradient shards are 25600 / 512 = 50 rows. That is
+  not a multiple of 8, so their reduce-scatters run on the TensorCore instead
+  of SparseCore (~2.5 s/step). All-reduce plus a local slice keeps them on
+  SparseCore: 14.33 -> 12.34 s, for +49 GiB peak HBM.
+  """
+  cfg = qwen3_32b()
+  cfg.training.global_batch_size = 4096
+  # Before the w1/w3 rewrite, interleave beat prefetch here by 2.3% step time
+  # and 56 GiB peak HBM.
+  cfg.tpu_config.graph_trainer_fsdp_schedule = "interleave"
+  cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = (
+      "layers.*.feed_forward.w1.weight",
+      "layers.*.feed_forward.w3.weight",
+  )
+  cfg.tpu_config.fsdp_allreduce_slice_max_input_bytes = 25600 * 5120 * 4
+  return cfg
+
+
 def qwen3_32b_maxtext_parity() -> TPUTrainerConfig:
   """Qwen3 32B recipe with MaxText's BF16 reductions and BF16 RoPE."""
   cfg = qwen3_32b()

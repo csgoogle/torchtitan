@@ -66,6 +66,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_8b_maxtext_parity,
     qwen3_8b_zero3,
     qwen3_32b,
+    qwen3_32b_4x8x8,
     qwen3_32b_maxtext_parity,
     qwen3_moe_30b,
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
@@ -519,6 +520,26 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         64,
     )
     self.assertEqual(graph_config.compile.memory_policy, "full")
+
+  def test_qwen3_32b_4x8x8_reduces_ffn_gradients_with_allreduce(self) -> None:
+    config = qwen3_32b_4x8x8()
+    base = qwen3_32b()
+
+    self.assertEqual(config.training.global_batch_size, 4096)
+    self.assertEqual(
+        config.tpu_config,
+        dataclasses.replace(
+            base.tpu_config,
+            graph_trainer_fsdp_schedule="interleave",
+            fsdp_allreduce_slice_parameter_patterns=(
+                "layers.*.feed_forward.w1.weight",
+                "layers.*.feed_forward.w3.weight",
+            ),
+            fsdp_allreduce_slice_max_input_bytes=25600 * 5120 * 4,
+        ),
+    )
+    self.assertEqual(config.libtpu_init_flags, base.libtpu_init_flags)
+    self._qwen3_graph_config(config)
 
   def test_fsdp_only_recipe_uses_fused_adamw_and_attention_tuning(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
