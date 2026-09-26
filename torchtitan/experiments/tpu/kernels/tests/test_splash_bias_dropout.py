@@ -18,6 +18,7 @@ from torch.nn import attention
 import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu.kernels import splash_bias_dropout
+from torchtitan.experiments.tpu.kernels.sbd_splash import splash_attention_kernel
 from torchtitan.experiments.tpu.kernels import tokamax_splash_attention
 
 
@@ -372,6 +373,53 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
         self.assertGreater(grad.abs().sum().item(), 0.0, f"{name} is all zeros")
     finally:
       splash_bias_dropout.SbdConfig.update(dropout_rate=0.0)
+
+
+
+class SplashBiasDropoutPlumbingTest(absltest.TestCase):
+  """The wrapper must forward what SplashAttentionKernelConfig configures.
+
+  No device needed: this only checks that values reach SplashConfig. Regression test -
+  the wrapper previously dropped the layout and dq-tiling knobs, pinning the kernel to
+  its own defaults with no way to override them. Nothing failed; it was just a hidden
+  default (worth ~4 % on the layout axis), which is exactly the kind of bug a parity
+  test cannot see.
+  """
+
+  def _build(self, **overrides):
+    saved = {k: getattr(splash_bias_dropout.SbdConfig, k) for k in overrides}
+    self.addCleanup(lambda: splash_bias_dropout.SbdConfig.update(**saved))
+    splash_bias_dropout.SbdConfig.update(**overrides)
+    cfg, _ = splash_bias_dropout._build_kernel(  # pylint: disable=protected-access
+        128, True, 1.0, -1, False, False,
+        *splash_bias_dropout.SbdConfig.static_args(),
+    )
+    return cfg
+
+  def test_qkv_layout_reaches_the_kernel(self):
+    cfg = self._build(q_layout="SEQ_MINOR", k_layout="SEQ_MINOR",
+                      v_layout="HEAD_DIM_MINOR")
+    layout = splash_attention_kernel.QKVLayout
+    self.assertEqual(cfg.q_layout, layout.SEQ_MINOR)
+    self.assertEqual(cfg.k_layout, layout.SEQ_MINOR)
+    self.assertEqual(cfg.v_layout, layout.HEAD_DIM_MINOR)
+
+  def test_dq_tiling_reaches_the_kernel(self):
+    cfg = self._build(block_q_dq=1024, block_kv_dq=1024)
+    self.assertEqual(cfg.block_q_dq, 1024)
+    self.assertEqual(cfg.block_kv_dq, 1024)
+
+  def test_unknown_layout_is_rejected(self):
+    with self.assertRaisesRegex(ValueError, "Unknown QKV layout"):
+      splash_bias_dropout._qkv_layout("NOT_A_LAYOUT")  # pylint: disable=protected-access
+
+  def test_static_arg_count_matches_the_op_signature(self):
+    """An off-by-N here silently corrupts the custom op's argument binding."""
+    n_static = len(splash_bias_dropout.SbdConfig.static_args())
+    # the op also carries causal, scale and local_window_size
+    self.assertEqual(
+        splash_bias_dropout._NUM_STATIC_ARGS, n_static + 3  # pylint: disable=protected-access
+    )
 
 
 if __name__ == "__main__":

@@ -91,6 +91,11 @@ class SbdConfig:
   bias_per_key_dbias: bool = False
   bias_per_key_dbias_mxu_reduce: bool = True
   attn_logits_soft_cap: Optional[float] = None
+  block_q_dq: Optional[int] = None
+  block_kv_dq: Optional[int] = None
+  q_layout: str = "HEAD_DIM_MINOR"
+  k_layout: str = "HEAD_DIM_MINOR"
+  v_layout: str = "HEAD_DIM_MINOR"
 
   @classmethod
   def update(cls, **kwargs):
@@ -117,7 +122,21 @@ class SbdConfig:
         cls.bias_per_key_rows,
         cls.bias_per_key_dbias,
         cls.bias_per_key_dbias_mxu_reduce,
+        cls.block_q_dq,
+        cls.block_kv_dq,
+        cls.q_layout,
+        cls.k_layout,
+        cls.v_layout,
     )
+
+
+def _qkv_layout(name: str) -> "sbd_kernel.QKVLayout":
+  """Map the config's layout string onto the kernel's QKVLayout enum."""
+  try:
+    return getattr(sbd_kernel.QKVLayout, name)
+  except AttributeError as e:
+    valid = [m.name for m in sbd_kernel.QKVLayout]
+    raise ValueError(f"Unknown QKV layout {name!r}; expected one of {valid}") from e
 
 
 def _build_kernel(
@@ -142,6 +161,11 @@ def _build_kernel(
     bias_per_key_rows: int,
     bias_per_key_dbias: bool,
     bias_per_key_dbias_mxu_reduce: bool,
+    block_q_dq: Optional[int],
+    block_kv_dq: Optional[int],
+    q_layout: str,
+    k_layout: str,
+    v_layout: str,
 ):
   """Constructs the fork kernel + static mask infos for one configuration."""
   cfg = sbd_kernel.SplashConfig(
@@ -161,6 +185,11 @@ def _build_kernel(
       bias_per_key_rows=bias_per_key_rows if use_bias else 0,
       bias_per_key_dbias=bias_per_key_dbias and use_bias,
       bias_per_key_dbias_mxu_reduce=bias_per_key_dbias_mxu_reduce,
+      block_q_dq=block_q_dq,
+      block_kv_dq=block_kv_dq,
+      q_layout=_qkv_layout(q_layout),
+      k_layout=_qkv_layout(k_layout),
+      v_layout=_qkv_layout(v_layout),
   )
   del scale  # applied to q by the callers; not part of the mask/config
   if local_window_size >= 0:
@@ -222,6 +251,11 @@ def sbd_attention_fwd(
     bias_per_key_rows: int,
     bias_per_key_dbias: bool,
     bias_per_key_dbias_mxu_reduce: bool,
+    block_q_dq: Optional[int],
+    block_kv_dq: Optional[int],
+    q_layout: str,
+    k_layout: str,
+    v_layout: str,
 ) -> tuple[jax.Array, jax.Array]:
   """Forward. Layouts: q `(B, S, H, D)` torch-standard; k/v `(B, S, H_kv, D)`
   with `H_kv == H` (MHA), `H % H_kv == 0` (grouped KV), or `H_kv == 1`
@@ -256,6 +290,11 @@ def sbd_attention_fwd(
       bias_per_key_rows,
       bias_per_key_dbias,
       bias_per_key_dbias_mxu_reduce,
+      block_q_dq,
+      block_kv_dq,
+      q_layout,
+      k_layout,
+      v_layout,
   )
   fwd_mi, _, mask_value, mask_fn, fwd_sp, _ = _kernel_statics(kernel)
 
@@ -324,6 +363,11 @@ def sbd_attention_bwd(
     bias_per_key_rows: int,
     bias_per_key_dbias: bool,
     bias_per_key_dbias_mxu_reduce: bool,
+    block_q_dq: Optional[int],
+    block_kv_dq: Optional[int],
+    q_layout: str,
+    k_layout: str,
+    v_layout: str,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
   """Backward from saved residuals -- no forward re-run. Returns
   `(dq, dk, dv, dbias)`; `dbias` is a `(0,)` placeholder when bias is None
@@ -354,6 +398,11 @@ def sbd_attention_bwd(
       bias_per_key_rows,
       bias_per_key_dbias,
       bias_per_key_dbias_mxu_reduce,
+      block_q_dq,
+      block_kv_dq,
+      q_layout,
+      k_layout,
+      v_layout,
   )
   _, dkv_mi, mask_value, mask_fn, fwd_sp, dkv_sp = _kernel_statics(kernel)
 
@@ -422,7 +471,7 @@ def sbd_attention_bwd(
 _sbd_fwd = pallas.jax_op("pallas::sbd_splash_attn_fwd", sbd_attention_fwd)
 _sbd_bwd = pallas.jax_op("pallas::sbd_splash_attn_bwd", sbd_attention_bwd)
 
-_NUM_STATIC_ARGS = 18  # causal, scale, window + the 15 SbdConfig values
+_NUM_STATIC_ARGS = 23  # causal, scale, window + the 20 SbdConfig values
 
 
 def _setup_context(ctx, inputs, output):
