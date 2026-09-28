@@ -831,8 +831,10 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.override.imports.append(_DISCARDED_TOKEN_COUNTER_OVERRIDE)
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
+    # The splitter's expert kernels: W1/W3 paired, with its K-tiled dWeight.
+    experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 512)
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
     experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = 8192
@@ -860,6 +862,11 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       _Q235_SHARED_FLAGS,
+      # Each layer's expert-gradient reduce-scatters land at the end of the scan
+      # body with little compute left to hide them.
+      tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+      # As the splitter does: it halves the expert-weight all-gather wait.
+      tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
   )
   return cfg
 
