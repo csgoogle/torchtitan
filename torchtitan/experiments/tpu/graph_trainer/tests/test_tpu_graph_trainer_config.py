@@ -464,6 +464,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
 
     self.assertEqual(config.optimizer.implementation, "fused")
+    self.assertTrue(
+        config.splash_attention_kernel.use_tokamax_splash_attention_kernel
+    )
     self.assertTrue(config.splash_attention_kernel.use_vmap_bwd)
     self.assertFalse(
         config.splash_attention_kernel.sa_use_document_aware_block_skipping

@@ -69,10 +69,16 @@ On top of that schedule, hierarchical n-D reduce-scatter improved throughput
 by another 1.09% and raised ring-equivalent reduce-scatter bus bandwidth from
 351.29 to 364.57 GB/s.
 
+Switching the recipe's splash attention kernel to Tokamax
+(`use_tokamax_splash_attention_kernel=True`) with the recipe's tuned block
+sizes improved steady-state throughput (steps 10-30) by 9.60% (from 8,900 to
+9,755 tokens/s/device and 15.94% to 17.48% MFU), reducing mean step time from
+1.381s to 1.260s.
+
 ## Benchmark Results
-Run Date: 9/23/2026
-* **MFU:** 15.00%
-* **TPS (Tokens Per Second):** 8,374
-* **TFLOPS:** 173.05
-* **Memory Usage:** 65.12 GiB (67.83%)
-* **Step Time (end-to-end):** 1.467s
+Run Date: 9/28/2026
+* **MFU:** 17.48%
+* **TPS (Tokens Per Second):** 9,755
+* **TFLOPS:** 201.58
+* **Memory Usage:** 65.11 GiB (67.82%)
+* **Step Time (end-to-end):** 1.260s

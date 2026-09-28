@@ -562,6 +562,7 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   )
   cfg.splash_attention_kernel = SplashAttentionKernelConfig(
       use_splash_attention_kernel=True,
+      use_tokamax_splash_attention_kernel=True,
       # Batch-native masking lets the always-vmapped forward avoid a serial
       # batch loop; use_vmap_bwd applies the same optimization to backward.
       # Runtime segment IDs still preserve exact packed-document boundaries.
