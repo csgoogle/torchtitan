@@ -491,6 +491,88 @@ class TestTpuRematSchedule(unittest.TestCase):
                 ):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    def test_shared_recomputed_input_is_not_a_cotangent(self) -> None:
+        """A value recomputed once for every layer's backward is no cotangent.
+
+        Saving the Splash forwards leaves their segment IDs, computed once
+        outside the layers, to be recomputed once before the last layer's
+        Splash backward. Every layer's Splash backward reads that one value.
+        It enters each region from outside and precedes each region's real
+        incoming gradient, so it must not be taken as the cotangent.
+        """
+        graph = torch.fx.Graph()
+        x = _set_tensor_meta(graph.placeholder("x"))
+        saved = [
+            _set_tensor_meta(graph.call_function(torch.ops.aten.neg.default, args=(x,)))
+            for _ in range(3)
+        ]
+        cotangent = _set_tensor_meta(
+            graph.call_function(torch.ops.aten.neg.default, args=(x,)), backward=True
+        )
+        segment_ids = None
+        cotangents = {}
+        splash_backwards = set()
+        gradients = {}
+        for layer_id in (2, 1, 0):
+            recompute = _set_tensor_meta(
+                graph.call_function(
+                    torch.ops.aten.neg.default, args=(saved[layer_id],)
+                ),
+                layer_id=layer_id,
+                recomputed=True,
+            )
+            if segment_ids is None:
+                segment_ids = _set_tensor_meta(
+                    graph.call_function(torch.ops.aten.neg.default, args=(x,)),
+                    backward=True,
+                    recomputed=True,
+                )
+            cotangents[layer_id] = cotangent
+            splash_backward = _set_tensor_meta(
+                graph.call_function(
+                    torch.ops.aten.add.Tensor, args=(cotangent, segment_ids)
+                ),
+                layer_id=layer_id,
+                backward=True,
+            )
+            splash_backwards.add(splash_backward)
+            gradients[layer_id] = _set_tensor_meta(
+                graph.call_function(
+                    torch.ops.aten.neg.default, args=(splash_backward,)
+                ),
+                layer_id=layer_id,
+                backward=True,
+            )
+            gradients[layer_id].meta["custom"][PARAMETER_GRADIENT_FQNS_META] = (
+                f"layers.{layer_id}.weight",
+            )
+            cotangent = _set_tensor_meta(
+                graph.call_function(
+                    torch.ops.aten.add.Tensor, args=(recompute, splash_backward)
+                ),
+                layer_id=layer_id,
+                backward=True,
+            )
+        graph.output((cotangent, *gradients.values()))
+        gm = torch.fx.GraphModule(nn.Module(), graph)
+
+        apply_tpu_remat_schedule(gm, (), num_static_inputs=0)
+
+        barriers = {
+            node.meta[_TPU_REMAT_REGION_ID_META]: node
+            for node in gm.graph.nodes
+            if node.meta.get(_TPU_REMAT_BARRIER_KIND_META) == "layer_entry"
+        }
+        self.assertEqual(
+            {region_id: barrier.args for region_id, barrier in barriers.items()},
+            {
+                0: (saved[0], cotangents[0], gradients[1]),
+                1: (saved[1], cotangents[1], gradients[2]),
+                2: (saved[2], cotangents[2]),
+            },
+        )
+        self.assertEqual(set(segment_ids.users), splash_backwards)
+
 
 class TestScanRecomputePolicy(unittest.TestCase):
 

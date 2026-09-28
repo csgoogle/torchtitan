@@ -281,6 +281,10 @@ def apply_tpu_remat_schedule(
             },
             key=order.__getitem__,
         )
+        # A recomputed forward value is tagged as backward but is not a
+        # cotangent. One read by every layer's backward, such as Splash segment
+        # IDs once the Splash outputs are saved, is recomputed once before the
+        # last layer's backward and would otherwise anchor every region there.
         cotangent_candidates = sorted(
             {
                 inp
@@ -288,6 +292,7 @@ def apply_tpu_remat_schedule(
                 for inp in node.all_input_nodes
                 if inp not in recompute_nodes
                 and inp not in backward_nodes
+                and not inp.name.endswith("_recomputed")
                 and _is_backward_node(inp)
                 and _is_tensor_node(inp)
             },
