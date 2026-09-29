@@ -51,7 +51,6 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     _TPU_FSDP_RS_DEADLINE_META,
     _TPU_REMAT_BARRIER_KIND_META,
     _TPU_REMAT_LAYER_ENTRY_ANCHOR_META,
-    _TPU_REMAT_REGION_ID_META,
     _collect_fsdp_all_gather_barriers,
     _optimization_barrier,
     apply_tpu_fsdp_rs_deadline_schedule,
@@ -82,8 +81,11 @@ class _Projection(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(dim, dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.weight.to(torch.bfloat16)
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        output = x @ self.weight.to(torch.bfloat16)
+        return output if mask is None else output * mask
 
 
 class _Block(nn.Module):
@@ -93,8 +95,10 @@ class _Block(nn.Module):
         self.moe.experts = _Projection(dim)
         self.attention = _Projection(dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.relu(self.moe.experts(x)) + self.attention(x)
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return torch.relu(self.moe.experts(x)) + self.attention(x, mask)
 
 
 class _Epilogue(nn.Module):
@@ -103,14 +107,20 @@ class _Epilogue(nn.Module):
 
 
 class _ToyModel(nn.Module):
-    def __init__(self, dim: int = 4, n_layers: int = 2) -> None:
+    def __init__(
+        self, dim: int = 4, n_layers: int = 2, masked: bool = False
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(_Block(dim) for _ in range(n_layers))
         self.norm = _Epilogue()
+        self.masked = masked
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Like Splash segment IDs, the mask is made once outside the layers
+        # and read by every layer's attention.
+        mask = (x > 0).to(x.dtype) if self.masked else None
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, mask)
         return self.norm(x)
 
 
@@ -408,13 +418,17 @@ def _describe_barriers(gm: torch.fx.GraphModule) -> dict[int, dict[str, tuple]]:
 
 class TestTpuRematSchedule(unittest.TestCase):
     def test_traced_two_layer_schedule(self) -> None:
-        for policy_name, policy_fn in (
-            ("full", _make_full_memory_policy()),
-            ("sac", _make_default_memory_policy(set())),
+        for policy_name, policy_fn, masked in (
+            ("full", _make_full_memory_policy(), False),
+            ("sac", _make_default_memory_policy(set()), False),
+            # Saving each layer's masked attention output leaves the mask to be
+            # recomputed once, before its first reader, for every layer's
+            # backward. That shared recompute must not be taken as a cotangent.
+            ("full, saved masked attention", _make_full_memory_policy(), True),
         ):
             with self.subTest(policy=policy_name):
                 torch.manual_seed(0)
-                model = _ToyModel()
+                model = _ToyModel(masked=masked)
                 annotate_module_fqns(model)
 
                 def step(x: torch.Tensor) -> list[torch.Tensor]:
@@ -444,8 +458,29 @@ class TestTpuRematSchedule(unittest.TestCase):
                 remove_parameter_gradient_markers_pass(
                     traced.gm, traced.example_inputs
                 )
-                tag_sac_policy(traced.gm, policy_fn=policy_fn)
+                saved_attention = {
+                    node
+                    for node in traced.gm.graph.nodes
+                    if masked
+                    and node.target is torch.ops.aten.mul.Tensor
+                    and not _is_backward_node(node)
+                    and node.meta.get("custom", {})
+                    .get("module_fqn", "")
+                    .endswith(".attention")
+                }
+                tag_sac_policy(
+                    traced.gm, policy_fn=policy_fn, force_save_nodes=saved_attention
+                )
                 selective_activation_remat_pass(traced.gm)
+                # The masked case only guards the fix while the mask is
+                # recomputed once and read by both layers' backward.
+                shared_recomputes = [
+                    node
+                    for node in traced.gm.graph.nodes
+                    if node.name.endswith("_recomputed")
+                    and {_get_layer_id(user) for user in node.users} == {0, 1}
+                ]
+                self.assertEqual(len(shared_recomputes), 1 if masked else 0)
                 apply_tpu_remat_schedule(
                     traced.gm,
                     traced.example_inputs,
@@ -490,88 +525,6 @@ class TestTpuRematSchedule(unittest.TestCase):
                     actual_outputs, expected_outputs, strict=True
                 ):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-    def test_shared_recomputed_input_is_not_a_cotangent(self) -> None:
-        """A value recomputed once for every layer's backward is no cotangent.
-
-        Saving the Splash forwards leaves their segment IDs, computed once
-        outside the layers, to be recomputed once before the last layer's
-        Splash backward. Every layer's Splash backward reads that one value.
-        It enters each region from outside and precedes each region's real
-        incoming gradient, so it must not be taken as the cotangent.
-        """
-        graph = torch.fx.Graph()
-        x = _set_tensor_meta(graph.placeholder("x"))
-        saved = [
-            _set_tensor_meta(graph.call_function(torch.ops.aten.neg.default, args=(x,)))
-            for _ in range(3)
-        ]
-        cotangent = _set_tensor_meta(
-            graph.call_function(torch.ops.aten.neg.default, args=(x,)), backward=True
-        )
-        segment_ids = None
-        cotangents = {}
-        splash_backwards = set()
-        gradients = {}
-        for layer_id in (2, 1, 0):
-            recompute = _set_tensor_meta(
-                graph.call_function(
-                    torch.ops.aten.neg.default, args=(saved[layer_id],)
-                ),
-                layer_id=layer_id,
-                recomputed=True,
-            )
-            if segment_ids is None:
-                segment_ids = _set_tensor_meta(
-                    graph.call_function(torch.ops.aten.neg.default, args=(x,)),
-                    backward=True,
-                    recomputed=True,
-                )
-            cotangents[layer_id] = cotangent
-            splash_backward = _set_tensor_meta(
-                graph.call_function(
-                    torch.ops.aten.add.Tensor, args=(cotangent, segment_ids)
-                ),
-                layer_id=layer_id,
-                backward=True,
-            )
-            splash_backwards.add(splash_backward)
-            gradients[layer_id] = _set_tensor_meta(
-                graph.call_function(
-                    torch.ops.aten.neg.default, args=(splash_backward,)
-                ),
-                layer_id=layer_id,
-                backward=True,
-            )
-            gradients[layer_id].meta["custom"][PARAMETER_GRADIENT_FQNS_META] = (
-                f"layers.{layer_id}.weight",
-            )
-            cotangent = _set_tensor_meta(
-                graph.call_function(
-                    torch.ops.aten.add.Tensor, args=(recompute, splash_backward)
-                ),
-                layer_id=layer_id,
-                backward=True,
-            )
-        graph.output((cotangent, *gradients.values()))
-        gm = torch.fx.GraphModule(nn.Module(), graph)
-
-        apply_tpu_remat_schedule(gm, (), num_static_inputs=0)
-
-        barriers = {
-            node.meta[_TPU_REMAT_REGION_ID_META]: node
-            for node in gm.graph.nodes
-            if node.meta.get(_TPU_REMAT_BARRIER_KIND_META) == "layer_entry"
-        }
-        self.assertEqual(
-            {region_id: barrier.args for region_id, barrier in barriers.items()},
-            {
-                0: (saved[0], cotangents[0], gradients[1]),
-                1: (saved[1], cotangents[1], gradients[2]),
-                2: (saved[2], cotangents[2]),
-            },
-        )
-        self.assertEqual(set(segment_ids.users), splash_backwards)
 
 
 class TestScanRecomputePolicy(unittest.TestCase):
