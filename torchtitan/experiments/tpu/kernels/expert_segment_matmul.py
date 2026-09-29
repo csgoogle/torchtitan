@@ -48,9 +48,8 @@ def _grouped_mm_fwd(
     tgmm_tile_m: int,
     tgmm_tile_k: int,
     tgmm_tile_n: int,
-    dweight_output_is_bfloat16: bool,
 ) -> jax.Array:
-    del tgmm_tile_m, tgmm_tile_k, tgmm_tile_n, dweight_output_is_bfloat16
+    del tgmm_tile_m, tgmm_tile_k, tgmm_tile_n
     _, k_dim, n_dim = rhs.shape
     return megablox_gmm(
         lhs,
@@ -73,7 +72,6 @@ def _grouped_mm_bwd(
     tgmm_tile_m: int,
     tgmm_tile_k: int,
     tgmm_tile_n: int,
-    dweight_output_is_bfloat16: bool,
 ) -> tuple[jax.Array, jax.Array]:
     _, k_dim, n_dim = rhs.shape
     grad_lhs = megablox_gmm(
@@ -94,13 +92,13 @@ def _grouped_mm_bwd(
         jnp.swapaxes(lhs, 0, 1),
         dout,
         group_sizes=group_sizes,
-        # MegaBlox still accumulates each tile with an FP32 dot into FP32 VMEM.
-        # This option changes only the final HBM store. For BF16 FSDP
-        # reductions it folds the otherwise separate FP32-to-BF16 cast into
-        # that store, without changing the reduce-scatter payload.
-        preferred_element_type=(
-            jnp.bfloat16 if dweight_output_is_bfloat16 else jnp.float32
-        ),
+        # Store the dWeight in the weight's own dtype. Autograd casts a
+        # gradient to the dtype of the input it belongs to, so a wider store
+        # would be rounded to this dtype right after the kernel and only add
+        # an HBM write and a cast round trip. MegaBlox still accumulates each
+        # tile with an FP32 dot into FP32 VMEM; only the final store rounds,
+        # so the values equal an FP32 store cast to this dtype.
+        preferred_element_type=rhs.dtype,
         tiling=_tiling(
             tgmm_tile_m,
             tgmm_tile_k,
@@ -125,7 +123,7 @@ def _backward(ctx, grad_output):
     grad_lhs, grad_rhs = _grouped_mm_bwd(
         grad_output, lhs, rhs, group_sizes, *ctx.static_args
     )
-    return grad_lhs, grad_rhs, None, None, None, None, None, None, None, None
+    return grad_lhs, grad_rhs, None, None, None, None, None, None, None
 
 
 _grouped_mm_fwd.register_autograd(_backward, setup_context=_setup_context)
@@ -140,20 +138,14 @@ def segment_matmul_pallas_2d(
     tile_k: int = 0,
     tile_n: int = 0,
     tgmm_tiling: tuple[int, int, int] = (128, 128, 128),
-    dweight_output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Compute per-expert matmuls without moving group sizes to the host.
 
     Zero-valued K/N tile dimensions select the corresponding full matrix
-    dimension. Distinct tiling values and dWeight output dtypes produce
-    distinct compiled specializations. dWeight accumulation remains FP32;
-    ``dweight_output_dtype`` controls only its final store.
+    dimension. Distinct tiling values produce distinct compiled
+    specializations. dWeight accumulation is FP32 and its final store is in
+    the dtype of ``rhs``.
     """
-    if dweight_output_dtype not in (torch.float32, torch.bfloat16):
-        raise ValueError(
-            "dweight_output_dtype must be torch.float32 or torch.bfloat16, "
-            f"got {dweight_output_dtype}"
-        )
     if group_sizes.dtype != torch.int32:
         group_sizes = group_sizes.to(torch.int32)
     return _grouped_mm_fwd(
@@ -164,7 +156,6 @@ def segment_matmul_pallas_2d(
         tile_k,
         tile_n,
         *tgmm_tiling,
-        dweight_output_dtype == torch.bfloat16,
     )
 
 

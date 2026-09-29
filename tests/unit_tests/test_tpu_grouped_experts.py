@@ -122,21 +122,13 @@ def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
     assert benchmark.tpu_config.mfu_benchmark_start_step == 10
 
 
-@pytest.mark.parametrize(
-    ("weight_dtype", "output_is_bfloat16", "expected_dweight_dtype"),
-    [
-        (jnp.bfloat16, False, jnp.float32),
-        (jnp.bfloat16, True, jnp.bfloat16),
-    ],
-)
-def test_pallas_dweight_output_dtype_contract(
-    weight_dtype, output_is_bfloat16, expected_dweight_dtype
-):
+@pytest.mark.parametrize("weight_dtype", [jnp.bfloat16, jnp.float32])
+def test_pallas_dweight_is_stored_in_the_weight_dtype(weight_dtype):
     backward = expert_segment_matmul._grouped_mm_bwd._init_fn.jit_fn
     grad_lhs, grad_rhs = jax.eval_shape(
         backward,
-        jax.ShapeDtypeStruct((128, 64), jnp.bfloat16),
-        jax.ShapeDtypeStruct((128, 32), jnp.bfloat16),
+        jax.ShapeDtypeStruct((128, 64), weight_dtype),
+        jax.ShapeDtypeStruct((128, 32), weight_dtype),
         jax.ShapeDtypeStruct((2, 32, 64), weight_dtype),
         jax.ShapeDtypeStruct((2,), jnp.int32),
         128,
@@ -145,43 +137,55 @@ def test_pallas_dweight_output_dtype_contract(
         128,
         32,
         64,
-        output_is_bfloat16,
     )
 
     assert grad_lhs.shape == (128, 32)
-    assert grad_lhs.dtype == jnp.bfloat16
+    assert grad_lhs.dtype == weight_dtype
     assert grad_rhs.shape == (2, 32, 64)
-    assert grad_rhs.dtype == expected_dweight_dtype
+    assert grad_rhs.dtype == weight_dtype
 
 
-@pytest.mark.parametrize(
-    ("reduce_dtype", "expected_dtype"),
-    [
-        (torch.float32, torch.float32),
-        (torch.bfloat16, torch.bfloat16),
-    ],
-)
-def test_unpaired_dweight_output_matches_fsdp_dtype(reduce_dtype, expected_dtype):
-    experts = _build_experts(use_pallas_grouped_mm=True)
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float32])
+def test_unpaired_kernels_get_bf16_weights_whatever_the_param_dtype(param_dtype):
+    """The dWeight store follows the kernel's weight dtype, which is always BF16.
 
-    experts.configure_dweight_output_dtype(reduce_dtype)
+    Neither ``mixed_precision_param`` nor ``mixed_precision_reduce`` reaches the
+    kernel: the experts cast to BF16 themselves, so the gradient autograd wants
+    is BF16 in every configuration.
+    """
+    experts = _build_experts(num_experts=2, use_pallas_grouped_mm=True).to(
+        param_dtype
+    )
+    counts = torch.tensor([3, 5], dtype=torch.int32)
+    x = torch.randn(8, experts.w1_EFD.shape[-1], dtype=param_dtype)
 
-    assert experts._unpaired_dweight_output_dtype == expected_dtype
+    def grouped_mm(x, weight, counts, **kwargs):
+        del kwargs
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        return torch._grouped_mm(x, weight, offs=offsets)
+
+    with patch(
+        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
+        side_effect=grouped_mm,
+    ) as unpaired:
+        out = experts._experts_forward(x, counts)
+
+    assert out.dtype == param_dtype
+    assert unpaired.call_count == 3
+    for call in unpaired.call_args_list:
+        assert call.args[0].dtype == torch.bfloat16
+        assert call.args[1].dtype == torch.bfloat16
+        assert "dweight_output_dtype" not in call.kwargs
 
 
-def test_expert_dweight_output_rejects_unsupported_dtype():
-    experts = _build_experts(use_pallas_grouped_mm=True)
-
-    with pytest.raises(ValueError, match="supports only float32 or bfloat16"):
-        experts.configure_dweight_output_dtype(torch.float16)
-
-
-def test_graph_trainer_parallelize_configures_dweight_output_dtype():
+def test_graph_trainer_parallelize_forwards_to_the_graph_trainer():
     experts = _build_experts(
         use_pallas_grouped_mm=True,
     )
     model = torch.nn.Sequential(experts)
-    training = SimpleNamespace(mixed_precision_reduce="bfloat16")
+    training = SimpleNamespace(
+        mixed_precision_param="bfloat16", mixed_precision_reduce="float32"
+    )
     parallel_dims = SimpleNamespace(dp_shard=1, cp=1, ep_enabled=False)
 
     with patch.object(
@@ -197,7 +201,6 @@ def test_graph_trainer_parallelize_configures_dweight_output_dtype():
         )
 
     assert result is model
-    assert experts._unpaired_dweight_output_dtype == torch.bfloat16
     delegate.assert_called_once_with(
         model,
         training=training,
