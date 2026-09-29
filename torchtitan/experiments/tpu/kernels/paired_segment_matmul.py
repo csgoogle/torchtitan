@@ -3,8 +3,8 @@
 Calling grouped matmul separately for W1 and W3 reloads the same routed-token
 rows and walks the same expert metadata twice. This kernel keeps the canonical
 weights and outputs separate while sharing that work in forward and dWeight.
-dInput keeps two grouped matmuls, but the second accumulates into the first's
-output in place instead of materializing a second routed-row tensor and adding.
+dInput keeps two grouped matmuls, but the second adds into the first's output
+in place instead of materializing a second routed-row tensor, bit-exactly.
 
 The implementation intentionally targets the exact-row, BF16 Qwen TPU path.
 It uses full N tiles and requires the total routed-row count to be a multiple
@@ -163,7 +163,7 @@ def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
 
 
 def _accumulate_dinput(dout, rhs, existing, group_sizes, *, tile_m):
-    """Return ``existing + dout @ rhs^T`` per expert group, writing in place.
+    """Return ``existing + bf16(dout @ rhs^T)`` per expert group, in place.
 
     ``existing`` is aliased to the output, so the sum never holds a second
     ``(m, k)`` routed-row tensor. Each output tile is seeded from ``existing``
@@ -194,12 +194,14 @@ def _accumulate_dinput(dout, rhs, existing, group_sizes, *, tile_m):
         def _seed():
             out[...] = existing[...]
 
+        # Round the product to the output dtype before adding: this reproduces
+        # the two-GMM path's bf16(bf16(g1) + bf16(g3)) bit for bit.
         acc = lax.dot_general(
             dout[...],
             rhs[...],
             (((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
-        )
+        ).astype(out.dtype).astype(jnp.float32)
         mask = _get_store_mask(
             grid_id=grid_id,
             group_metadata=group_metadata,
@@ -243,9 +245,8 @@ def _accumulate_dinput(dout, rhs, existing, group_sizes, *, tile_m):
 def _dinput(dout1, dout3, rhs1, rhs3, group_sizes, *, tile_m):
     """dInput = dout1 @ W1^T + dout3 @ W3^T, the second term added in place.
 
-    The first term keeps the MegaBlox call and its BF16 output; the second adds
-    its FP32 product to that BF16 value before one final rounding, so the sum
-    differs from rounding both terms separately at BF16 roundoff.
+    Both terms are rounded to BF16 before the add, exactly as when two MegaBlox
+    GMMs produced them and XLA added the outputs, so the result is bit-identical.
     """
     k, n = rhs1.shape[1:]
     grad_lhs = megablox_gmm(
