@@ -33,6 +33,7 @@ which is always before FSDP shards anything.
 """
 
 import contextlib
+import os
 import functools
 from collections.abc import Iterator
 
@@ -546,7 +547,15 @@ class LayerStack:
             #
             # The patch is process-global, so it has to be a window; it closes
             # when this call returns. `test_layer_stack.py` checks both halves.
-            with torch._functorch.config.patch(activation_memory_budget=0.0):
+            #
+            # A small nonzero budget (TORCHTITAN_SCAN_ACTIVATION_MEMORY_BUDGET)
+            # lets the partitioner keep only the cheapest-per-byte saves -- small
+            # tensors that are costly to recompute -- while the gathered weights
+            # stay out of reach.
+            budget = float(
+                os.environ.get("TORCHTITAN_SCAN_ACTIVATION_MEMORY_BUDGET", "0.0")
+            )
+            with torch._functorch.config.patch(activation_memory_budget=budget):
                 carry, _ = scan(scan_body, h, xs)
             return carry
 
