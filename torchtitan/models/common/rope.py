@@ -342,9 +342,10 @@ class CosSinRoPE(RoPE):
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
         # Same values as cat((-x2, x1)), but a reverse and a sign multiply fuse
         # into the consumer, where slice + concat make XLA materialize both
-        # halves.
+        # halves. The sign comes from a factory op: a tensor built from Python
+        # data here becomes a graph input that TPU compiled mode never gets.
         half = x.shape[-1] // 2
-        sign = x.new_tensor([-1.0, 1.0]).view(2, 1)
+        sign = (torch.arange(2, dtype=x.dtype, device=x.device) * 2 - 1).view(2, 1)
         return (x.unflatten(-1, (2, half)).flip(-2) * sign).flatten(-2)
 
 
