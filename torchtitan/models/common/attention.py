@@ -895,6 +895,28 @@ def segment_ids_from_positions(positions: torch.Tensor) -> torch.Tensor:
     return (torch.cumsum((positions == 0).int(), dim=1) - 1).int()
 
 
+class _LayoutBarrier(torch.autograd.Function):
+    """Materialize q/k in (B, L, N, H) before the attention kernel's relayout.
+
+    Without it, XLA propagates the kernel's sequence-minor input layout back
+    through RoPE and QK-norm, so each FP32 intermediate of that elementwise
+    chain is materialized transposed. The barrier ends that propagation in
+    both directions; values are unchanged.
+    """
+
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor):
+        q, k = torch.ops.tpu.optimization_barrier.default([q, k])
+        return q, k
+
+    @staticmethod
+    def backward(ctx, grad_q: torch.Tensor, grad_k: torch.Tensor):
+        grad_q, grad_k = torch.ops.tpu.optimization_barrier.default(
+            [grad_q, grad_k]
+        )
+        return grad_q, grad_k
+
+
 class GQAttention(BaseAttention):
     """Grouped-Query Attention with pluggable Q/K/V projection.
 
@@ -962,6 +984,8 @@ class GQAttention(BaseAttention):
 
         # Apply rotary embeddings
         xq_BLNH, xk_BLNH = self.rope(xq_BLNH, xk_BLNH, positions)
+        if xq_BLNH.device.type == "tpu":
+            xq_BLNH, xk_BLNH = _LayoutBarrier.apply(xq_BLNH, xk_BLNH)
 
         # inner_attention returns (B, L, N, H)
         out_BLNH = self.inner_attention(
