@@ -3,7 +3,8 @@
 Calling grouped matmul separately for W1 and W3 reloads the same routed-token
 rows and walks the same expert metadata twice. This kernel keeps the canonical
 weights and outputs separate while sharing that work in forward and dWeight.
-dInput retains the two-call MegaBlox path and its BF16 rounding order.
+dInput keeps two grouped matmuls, but the second adds into the first's output
+in place instead of materializing a second routed-row tensor, bit-exactly.
 
 The implementation intentionally targets the exact-row, BF16 Qwen TPU path.
 It uses full N tiles and requires the total routed-row count to be a multiple
@@ -161,34 +162,102 @@ def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
     )(group_metadata, group_offset, lhs, rhs1, rhs3)
 
 
-def _separate_dinput(dout1, dout3, rhs1, rhs3, group_sizes, *, tile_m):
-    """Use two MegaBlox GMMs to preserve the baseline dInput behavior.
+def _accumulate_dinput(dout, rhs, existing, group_sizes, *, tile_m):
+    """Return ``existing + bf16(dout @ rhs^T)`` per expert group, in place.
 
-    The two terms share neither large input operand, so pairing them provides
-    little reuse and was slower in the full model. It also accumulated both
-    products in FP32 before one BF16 cast, whereas this path rounds each GMM to
-    BF16 before adding them. Retaining the two calls is therefore both faster
-    and bit-exact with the baseline.
+    ``existing`` is aliased to the output, so the sum never holds a second
+    ``(m, k)`` routed-row tensor. Each output tile is seeded from ``existing``
+    the first time the grid visits it; later visits of the same tile (the next
+    expert's boundary rows) keep adding to the resident block.
+    """
+    m, n = dout.shape
+    groups, k, _ = rhs.shape
+    group_metadata, num_active_tiles = _metadata(
+        group_sizes,
+        m=m,
+        tile_m=tile_m,
+        groups=groups,
+        visit_empty_groups=False,
+    )
+    group_offset = jnp.array([0], dtype=jnp.int32)
+
+    def kernel(group_metadata, group_offset, dout, rhs, existing, out):
+        del group_offset
+        _, _, m_tile_ids = group_metadata
+        grid_id = pl.program_id(1)
+        prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
+        first_visit = jnp.logical_or(
+            grid_id == 0, m_tile_ids[grid_id] != m_tile_ids[prev_grid_id]
+        )
+
+        @pl.when(first_visit)
+        def _seed():
+            out[...] = existing[...]
+
+        # Round the product to the output dtype before adding: this reproduces
+        # the two-GMM path's bf16(bf16(g1) + bf16(g3)) bit for bit.
+        acc = lax.dot_general(
+            dout[...],
+            rhs[...],
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).astype(out.dtype).astype(jnp.float32)
+        mask = _get_store_mask(
+            grid_id=grid_id,
+            group_metadata=group_metadata,
+            tm=tile_m,
+            tn=k,
+        )
+        current = out[...].astype(jnp.float32)
+        out[...] = lax.select(mask[...], current + acc, current).astype(
+            out.dtype
+        )
+
+    def row_indices(n_i, grid_id, k_i, group_metadata, group_offset):
+        del n_i, k_i, group_offset
+        return group_metadata[2][grid_id], 0
+
+    def rhs_indices(n_i, grid_id, k_i, group_metadata, group_offset):
+        del n_i, k_i, group_offset
+        return group_metadata[1][grid_id], 0, 0
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((m, k), existing.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[
+                pl.BlockSpec((tile_m, n), row_indices),
+                pl.BlockSpec((None, k, n), rhs_indices),
+                pl.BlockSpec((tile_m, k), row_indices),
+            ],
+            out_specs=pl.BlockSpec((tile_m, k), row_indices),
+            grid=(1, num_active_tiles, 1),
+        ),
+        # Operand 6 counts the three group-metadata arrays and group_offset.
+        input_output_aliases={6: 0},
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "arbitrary", "arbitrary")
+        ),
+    )(group_metadata, group_offset, dout, rhs, existing)
+
+
+def _dinput(dout1, dout3, rhs1, rhs3, group_sizes, *, tile_m):
+    """dInput = dout1 @ W1^T + dout3 @ W3^T, the second term added in place.
+
+    Both terms are rounded to BF16 before the add, exactly as when two MegaBlox
+    GMMs produced them and XLA added the outputs, so the result is bit-identical.
     """
     k, n = rhs1.shape[1:]
-    tiling = (tile_m, n, k)
-    grad_lhs1 = megablox_gmm(
+    grad_lhs = megablox_gmm(
         dout1,
         rhs1,
         group_sizes=group_sizes,
         preferred_element_type=dout1.dtype,
-        tiling=tiling,
+        tiling=(tile_m, n, k),
         transpose_rhs=True,
     )
-    grad_lhs3 = megablox_gmm(
-        dout3,
-        rhs3,
-        group_sizes=group_sizes,
-        preferred_element_type=dout3.dtype,
-        tiling=tiling,
-        transpose_rhs=True,
-    )
-    return grad_lhs1 + grad_lhs3
+    return _accumulate_dinput(dout3, rhs3, grad_lhs, group_sizes, tile_m=tile_m)
 
 
 def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
@@ -374,7 +443,7 @@ def _paired_grouped_mm_bwd(
     tgmm_tile_m: int,
     tgmm_tile_k: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    grad_lhs = _separate_dinput(
+    grad_lhs = _dinput(
         dout1, dout3, rhs1, rhs3, group_sizes, tile_m=tile_m
     )
     grad_rhs1, grad_rhs3 = _paired_dweight(
