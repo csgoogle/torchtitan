@@ -4,7 +4,9 @@ Wraps Tokamax's splash_attention_kernel for use with PyTorch tensors on TPU.
 Uses torch_tpu._internal.pallas.pallas.jax_op to bridge JAX -> PyTorch.
 """
 
+import inspect
 import math
+import types
 from typing import Optional
 
 # JAX imports
@@ -34,6 +36,76 @@ def _dummy_jaxtyped(*args, **kwargs):
 jaxtyping.jaxtyped = _dummy_jaxtyped
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel  # noqa: E402  pylint: disable=g-import-not-at-top
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask  # noqa: E402  pylint: disable=g-import-not-at-top
+
+
+# With ``fuse_reciprocal`` (the default) the forward kernel still writes a
+# ``max_logits`` residual - an f32 [heads, seq, 128] lane-broadcast tensor as
+# large as ``logsumexp`` - that neither this wrapper nor the backward reads.
+# Re-execute the kernel module with that output dropped. Each edit must match
+# exactly once so a tokamax upgrade fails loudly instead of silently.
+_MAX_LOGITS_EDITS = (
+    (
+        """        # max_logits
+        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32),
+    ]""",
+        """        # max_logits
+        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
+        if not fuse_reciprocal
+        else None,
+    ]""",
+    ),
+    (
+        """        pl.BlockSpec(
+            (num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map
+        ),
+    ]
+  else:
+    out_shapes += [None, None, None]""",
+        """        pl.BlockSpec(
+            (num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map
+        )
+        if not fuse_reciprocal
+        else None,
+    ]
+  else:
+    out_shapes += [None, None, None]""",
+    ),
+    (
+        """    assert max_logits is not None
+    max_logits = init_if_empty(max_logits[..., 0], mask_value)
+""",
+        """    if max_logits is not None:
+      max_logits = init_if_empty(max_logits[..., 0], mask_value)
+""",
+    ),
+)
+
+
+def _without_max_logits(module):
+  source = inspect.getsource(module)
+  for old, new in _MAX_LOGITS_EDITS:
+    if source.count(old) != 1:
+      raise RuntimeError(
+          f"tokamax splash kernel changed; edit anchor found {source.count(old)} times"
+      )
+    source = source.replace(old, new)
+  old = 'stats["max_logits"] = stats["max_logits"] / LOG2E'
+  if source.count(old) != 2:
+    raise RuntimeError("tokamax splash kernel changed; max_logits rescale not found")
+  source = source.replace(
+      old,
+      'stats["max_logits"] = None if stats["max_logits"] is None '
+      'else stats["max_logits"] / LOG2E',
+  )
+  patched = types.ModuleType(module.__name__)
+  patched.__dict__.update(
+      __file__=module.__file__, __package__=module.__package__
+  )
+  exec(compile(source, module.__file__, "exec"), patched.__dict__)
+  return patched
+
+
+splash_attention_kernel = _without_max_logits(splash_attention_kernel)
 
 jaxtyping.jaxtyped = _real_jaxtyped
 
