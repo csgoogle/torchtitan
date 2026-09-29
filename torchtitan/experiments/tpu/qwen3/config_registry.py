@@ -838,7 +838,8 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
     # the K tile that measures best for W1/W3 does not fit W2. Tile them
     # independently.
     experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
-    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 1024, 0)
+    # A K tile that does not divide F leaves a masked remainder tile.
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 1536, 0)
     experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = 8192
