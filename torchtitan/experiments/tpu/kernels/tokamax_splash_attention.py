@@ -81,9 +81,53 @@ _MAX_LOGITS_EDITS = (
 )
 
 
-def _without_max_logits(module):
+# The ``logsumexp`` residual is also lane-broadcast: every one of its 128 lanes
+# holds the row's value, and the wrapper keeps only lane 0. Store it transposed
+# instead, as [heads, 8, seq] with the sequence along lanes (1/16 of the
+# bytes). The values are unchanged; the backward reads the same [heads, seq].
+_COMPACT_LOGSUMEXP_EDITS = (
+    (
+        """        # logsumexp
+        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
+        if fuse_reciprocal""",
+        """        # logsumexp
+        jax.ShapeDtypeStruct((num_q_heads, NUM_SUBLANES, q_seq_len), jnp.float32)
+        if fuse_reciprocal""",
+    ),
+    (
+        """    out_specs += [
+        pl.BlockSpec(
+            (num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map
+        )
+        if fuse_reciprocal""",
+        """    out_specs += [
+        pl.BlockSpec(
+            (num_stacked_q_heads, NUM_SUBLANES, bq),
+            unravel(lambda h_block, i, j, *_: (h_block, 0, i)),
+        )
+        if fuse_reciprocal""",
+    ),
+    (
+        """      assert logsumexp_ref.shape == (num_stacked_q_heads, bq, NUM_LANES)
+      log = jnp.log2 if config.use_base2_exp else jnp.log
+      logsumexp = m + log(l)
+      logsumexp_ref[...] = logsumexp.astype(logsumexp_ref.dtype)""",
+        """      assert logsumexp_ref.shape == (num_stacked_q_heads, NUM_SUBLANES, bq)
+      log = jnp.log2 if config.use_base2_exp else jnp.log
+      logsumexp = m + log(l)
+      logsumexp = jnp.swapaxes(logsumexp, -1, -2)[:, :NUM_SUBLANES, :]
+      logsumexp_ref[...] = logsumexp.astype(logsumexp_ref.dtype)""",
+    ),
+    (
+        """      logsumexp = init_if_empty(logsumexp[..., 0], mask_value)""",
+        """      logsumexp = init_if_empty(logsumexp[..., 0, :], mask_value)""",
+    ),
+)
+
+
+def _patched_splash_kernel(module):
   source = inspect.getsource(module)
-  for old, new in _MAX_LOGITS_EDITS:
+  for old, new in _MAX_LOGITS_EDITS + _COMPACT_LOGSUMEXP_EDITS:
     if source.count(old) != 1:
       raise RuntimeError(
           f"tokamax splash kernel changed; edit anchor found {source.count(old)} times"
@@ -105,7 +149,7 @@ def _without_max_logits(module):
   return patched
 
 
-splash_attention_kernel = _without_max_logits(splash_attention_kernel)
+splash_attention_kernel = _patched_splash_kernel(splash_attention_kernel)
 
 jaxtyping.jaxtyped = _real_jaxtyped
 
