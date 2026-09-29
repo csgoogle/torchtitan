@@ -114,12 +114,15 @@ class Qwen3_235BScaleTest(absltest.TestCase):
             self.assertEqual(spec.gather_dim, placement.dim - 1, name)
 
   def test_128_ranks_still_shards_every_stack_on_dim_one(self) -> None:
-    # Every published 235B number was taken here. If any stack moves off dim 1
-    # at 128 ranks this stops being the same run, measured or not.
+    # Every published 235B number was taken here. If any weight stack moves
+    # off dim 1 at 128 ranks this stops being the same run, measured or not.
+    # The per-layer vectors (norm weights) are the one exception: replicated,
+    # so the scan body stops gathering a few KB back on every layer.
     with _placed_235b(128) as model:
       for holder in [m for m in model.modules() if hasattr(m, "plan_shard_dims")]:
         for name, param in holder._parameters.items():
-          self.assertEqual(param.placements[-1], Shard(1), name)
+          expected = Replicate() if param.ndim == 2 else Shard(1)
+          self.assertEqual(param.placements[-1], expected, name)
 
 
 if __name__ == "__main__":

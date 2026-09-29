@@ -138,14 +138,23 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
             )
 
 
-def _shard_dim(param: torch.Tensor, degree: int) -> int:
-    """Which axis of one stack `degree` ranks should split it on."""
+def _shard_dim(param: torch.Tensor, degree: int) -> int | None:
+    """Which axis of one stack `degree` ranks should split it on.
+
+    ``None`` leaves the stack replicated.
+    """
     # Dim 0 is the scan axis; sharding it would split one layer across ranks.
     if param.ndim < 2:
         # A stack is [n_layers, *weight.shape], so this needs a 0-D weight.
         raise ValueError(
             f"cannot shard a {param.ndim}-D stack; dim 0 is the scan axis"
         )
+    if param.ndim == 2:
+        # A per-layer vector (a norm weight). Sharding it saves nothing
+        # measurable, and every layer of the scan body then pays a
+        # latency-bound collective to gather a few KB back: 3.9 ms per gather
+        # at 128 ranks, twice a layer under full rematerialization.
+        return None
     # Outermost first: it leaves the minor axis whole, so the body's all-gather
     # stays a contiguous copy, and it picks the same axis the unrolled path
     # would. Preferring the *widest* divisible axis instead would send w2_EFD to
@@ -175,10 +184,10 @@ class LayerStackHolder(Module):
 
     # Dim 1 for every stack, until someone calls `plan_shard_dims` with the mesh
     # width and replaces this with an axis per stack.
-    _fsdp_shard_dim: int | dict[str, int] = 1
+    _fsdp_shard_dim: int | dict[str, int | None] = 1
 
-    def plan_shard_dims(self, degree: int) -> dict[str, int]:
-        """The axis `apply_simple_fsdp` shards each stack on.
+    def plan_shard_dims(self, degree: int) -> dict[str, int | None]:
+        """The axis `apply_simple_fsdp` shards each stack on; `None` replicates.
 
         One axis cannot serve them all: dim 1 of an expert stack is
         `num_experts` = 128, which caps FSDP at 128 ranks, while dim 1 of a

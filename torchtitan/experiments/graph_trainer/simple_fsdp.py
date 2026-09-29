@@ -266,12 +266,13 @@ def data_parallel(
     device_mesh: DeviceMesh,
     mode: str = "replicate",
     mp_policy: MixedPrecisionPolicy | None = None,
-    shard_dim: int | dict[str, int] = 0,
+    shard_dim: int | dict[str, int | None] = 0,
     full_dtensor: bool = False,
     ignored_params: set[nn.Parameter] | None = None,
 ) -> nn.Module:
     # A dict `shard_dim` names an axis per parameter, for a module whose
-    # parameters do not all divide on the same one. It has no single axis to
+    # parameters do not all divide on the same one (`None` replicates that
+    # parameter outright). It has no single axis to
     # build `param_sharding` from, so the tuples below carry a placeholder:
     # every parameter overrides it, and the one reader that would see it
     # through -- `ReplicateComputation`'s EP/TP path -- is refused outright.
@@ -324,7 +325,10 @@ def data_parallel(
                 # Check if the parameter is smaller than the device mesh dimension.
                 # If so, replicate it instead of sharding it.
                 actual_sharding = [
-                    Shard(dim) if isinstance(pl, Shard) else pl for pl in param_sharding
+                    (Replicate() if dim is None else Shard(dim))
+                    if isinstance(pl, Shard)
+                    else pl
+                    for pl in param_sharding
                 ]
                 for i, placement in enumerate(actual_sharding):
                     if isinstance(placement, Shard) and p.shape[placement.dim] < device_mesh.size(i):

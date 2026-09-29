@@ -19,6 +19,7 @@ from torch import nn
 from torch.distributed.tensor import (
     distribute_tensor,
     init_device_mesh,
+    Replicate,
     Shard,
 )
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -75,8 +76,16 @@ class TestShardDimPicker(unittest.TestCase):
         # Every published 235B number was taken at 128 ranks on dim 1. Moving a
         # stack off dim 1 there would make the comparison not one.
         for name, shape in Q235_STACKS.items():
-            if shape[1] % 128 == 0:
+            if len(shape) > 2 and shape[1] % 128 == 0:
                 self.assertEqual(_pick(shape, 128), 1, name)
+
+    def test_a_per_layer_vector_is_replicated(self):
+        # A norm weight sharded 128 ways is 32 elements a rank, and the scan
+        # body then gathers them back with a latency-bound collective on
+        # every layer. Replicating it costs nothing worth counting.
+        for name, shape in Q235_STACKS.items():
+            if len(shape) == 2:
+                self.assertIsNone(_pick(shape, 128), name)
 
     def test_every_expert_stack_takes_the_same_axis_at_512_ranks(self):
         # Both hidden axes of every expert stack divide 512, and the unrolled
@@ -133,6 +142,13 @@ class TestQ235Placements(unittest.TestCase):
             placements(1), placements({name: 1 for name in Q235_STACKS})
         )
 
+    def test_a_none_in_the_dict_replicates_that_parameter(self):
+        with _sharded_holder(128) as holder:
+            placements = {n: p.placements for n, p in holder._parameters.items()}
+        for name, shape in Q235_STACKS.items():
+            expected = (Replicate(),) if len(shape) == 2 else (Shard(1),)
+            self.assertEqual(placements[name], expected, name)
+
     def test_an_already_distributed_parameter_is_refused(self):
         # A DTensor here means EP or TP ran first, and `ReplicateComputation`
         # would re-wrap it with the module-level axis, losing the per-stack one.
@@ -169,6 +185,9 @@ class TestQ235Placements(unittest.TestCase):
             plan = holder.plan_shard_dims(mesh.size(mesh.ndim - 1))
             data_parallel(holder, mesh, "hybrid_shard", shard_dim=plan)
             for name, spec in plan_stacked_gathers(holder).items():
+                if len(Q235_STACKS[name]) == 2:
+                    self.assertFalse(spec.sharded, name)  # replicated vector
+                    continue
                 self.assertTrue(spec.sharded, name)
                 self.assertEqual(spec.gather_dim, 0, name)  # dim 1 still divides
         finally:
