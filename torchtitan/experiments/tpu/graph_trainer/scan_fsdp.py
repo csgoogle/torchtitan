@@ -145,6 +145,19 @@ def _scatter_on(x: torch.Tensor, dim: int, group_name: str) -> torch.Tensor:
     return out.movedim(0, dim)
 
 
+def _cast_in_body(shard: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Cast one layer's shard, keeping the cast inside the scan body.
+
+    Left bare, XLA rewrites ``convert(dynamic_slice(stack))`` into
+    ``dynamic_slice(convert(stack))`` and hoists the now loop-invariant convert
+    out of the loop: a low-precision copy of every layer's shard, live across
+    the forward and backward loops. The barrier pins the cast to the slice.
+    """
+    if shard.device.type == "tpu":
+        (shard,) = torch.ops.tpu.optimization_barrier.default([shard])
+    return shard.to(dtype)
+
+
 class _AllGatherReduceScatter(torch.autograd.Function):
     """Gathers one sharded layer's weight, and reduces its gradient back.
 
@@ -173,7 +186,7 @@ class _AllGatherReduceScatter(torch.autograd.Function):
         ctx.shard_dtype = shard.dtype
         ctx.gather_dim = gather_dim
         if param_dtype is not None:
-            shard = shard.to(param_dtype)
+            shard = _cast_in_body(shard, param_dtype)
         return _gather_on(shard, gather_dim, group_name)
 
     @staticmethod
