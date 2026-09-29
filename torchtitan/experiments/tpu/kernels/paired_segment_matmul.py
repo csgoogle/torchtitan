@@ -194,14 +194,20 @@ def _accumulate_dinput(dout, rhs, existing, group_sizes, *, tile_m):
         def _seed():
             out[...] = existing[...]
 
-        # Round the product to the output dtype before adding: this reproduces
-        # the two-GMM path's bf16(bf16(g1) + bf16(g3)) bit for bit.
         acc = lax.dot_general(
             dout[...],
             rhs[...],
             (((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
-        ).astype(out.dtype).astype(jnp.float32)
+        )
+        # Not a no-op: acc is already FP32, and the cast to out.dtype is the
+        # rounding. The path this replaces is two GMMs, each rounding its output
+        # to bf16, then XLA's bf16 add (FP32 sum, one final rounding), i.e.
+        # bf16(bf16(g1) + bf16(g3)). Rounding this product to bf16 first and
+        # widening it back for the FP32 add below reproduces that bit for bit;
+        # adding the unrounded product would keep extra mantissa bits and
+        # change the result (and the training trajectory).
+        acc = acc.astype(out.dtype).astype(jnp.float32)
         mask = _get_store_mask(
             grid_id=grid_id,
             group_metadata=group_metadata,
