@@ -6,6 +6,7 @@
 
 """TPU-only GraphTrainer memory policies."""
 
+import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
@@ -104,9 +105,95 @@ ROUTE_PERMUTATION_CLASS = SaveCandidateClass(
     budgeted=False,
 )
 
+ATTENTION_INNER_ATTENTION = "attention.inner_attention"
+
+# The forward ops of both TPU Splash kernels. Stock Splash
+# (``kernels/splash_attention.py``) registers one op per kernel configuration,
+# ``pallas::splash_attn_fwd_<16 hex digits>``; Tokamax Splash
+# (``kernels/tokamax_splash_attention.py``) registers
+# ``pallas::tokamax_splash_attn_fwd``.
+_SPLASH_FORWARD_OP_NAME = re.compile(
+    r"pallas::(?:splash_attn_fwd_[0-9a-f]{16}|tokamax_splash_attn_fwd)"
+)
+
+
+def is_splash_forward_op_name(name: str) -> bool:
+    """Whether ``name`` (``namespace::op``) is a Splash forward op."""
+    return _SPLASH_FORWARD_OP_NAME.fullmatch(name) is not None
+
+
+def _is_splash_forward_op(target: object) -> bool:
+    return isinstance(target, torch._ops.OpOverload) and is_splash_forward_op_name(
+        target.name()
+    )
+
+
+def _is_splash_output(value: object) -> bool:
+    """Whether ``value`` is a (4-D BF16 output, 3-D FP32 LSE) pair.
+
+    The LSE is (batch, heads, seq) for both kernels. Stock Splash returns the
+    output in kernel layout (batch, heads, seq, head_dim); Tokamax returns it
+    in model layout (batch, seq, heads, head_dim).
+    """
+    if not (isinstance(value, (tuple, list)) and len(value) == 2):
+        return False
+    output, lse = value
+    if not (
+        isinstance(output, torch.Tensor)
+        and isinstance(lse, torch.Tensor)
+        and output.ndim == 4
+        and lse.ndim == 3
+        and output.dtype == torch.bfloat16
+        and lse.dtype == torch.float32
+    ):
+        return False
+    kernel_layout = tuple(output.shape[:3])
+    model_layout = (output.shape[0], output.shape[2], output.shape[1])
+    return tuple(lse.shape) in (kernel_layout, model_layout)
+
+
+def select_splash_attention(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return the Splash forward nodes, whose output and LSE backward reads.
+
+    Matched by op rather than by module FQN: the Splash patches install their
+    module or forward after ``annotate_module_fqns`` has run, so the op carries
+    its parent's ``layers.N.attention`` FQN, not
+    ``layers.N.attention.inner_attention``. Raises if a Splash op does not
+    return the expected pair, so a kernel change fails loudly instead of
+    silently saving the wrong thing.
+    """
+    nodes = []
+    for node in _forward_call_nodes(gm):
+        if not _is_splash_forward_op(node.target):
+            continue
+        if not _is_splash_output(node.meta.get("val")):
+            raise ValueError(
+                f"Splash forward {node.name} ({node.target}) does not return a "
+                "(4-D BF16 output, 3-D FP32 LSE) pair; update "
+                "select_splash_attention for this kernel."
+            )
+        nodes.append(node)
+    return nodes
+
+
+# Saving the output and LSE lets backward skip re-running the Splash forward.
+# It is large, so it competes for the budget, from the last layer backward.
+#
+# This is not the same as an eager ``RegionAC`` save region of the same name.
+# Here only what the Splash backward reads is saved (output and LSE); its
+# q/k/v inputs are still recomputed from the layer boundary. An eager save
+# region also keeps the region's inputs. The difference is on purpose, so
+# don't "align" the two.
+SPLASH_ATTENTION_CLASS = SaveCandidateClass(
+    name=ATTENTION_INNER_ATTENTION,
+    select=select_splash_attention,
+    required=True,
+    budgeted=True,
+)
+
 SAVE_REGIONS: dict[str, SaveCandidateClass] = {
     candidate_class.name: candidate_class
-    for candidate_class in (ROUTE_PERMUTATION_CLASS,)
+    for candidate_class in (ROUTE_PERMUTATION_CLASS, SPLASH_ATTENTION_CLASS)
 }
 
 
