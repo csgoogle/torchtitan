@@ -895,6 +895,25 @@ def segment_ids_from_positions(positions: torch.Tensor) -> torch.Tensor:
     return (torch.cumsum((positions == 0).int(), dim=1) - 1).int()
 
 
+class _NormOutputBarrier(torch.autograd.Function):
+    """Materialize the QK-norm output in its own dtype before RoPE.
+
+    RoPE widens q/k to FP32 and reads them three ways, so XLA writes the norm
+    output once, and without this it folds that widening into the producer and
+    writes it as FP32. The barrier keeps the write in bf16. Values are
+    unchanged; the backward is left as it was.
+    """
+
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor):
+        q, k = torch.ops.tpu.optimization_barrier.default([q, k])
+        return q, k
+
+    @staticmethod
+    def backward(ctx, grad_q: torch.Tensor, grad_k: torch.Tensor):
+        return grad_q, grad_k
+
+
 class GQAttention(BaseAttention):
     """Grouped-Query Attention with pluggable Q/K/V projection.
 
@@ -959,6 +978,8 @@ class GQAttention(BaseAttention):
             assert self.q_norm is not None and self.k_norm is not None
             xq_BLNH = self.q_norm(xq_BLNH)
             xk_BLNH = self.k_norm(xk_BLNH)
+            if xq_BLNH.device.type == "tpu":
+                xq_BLNH, xk_BLNH = _NormOutputBarrier.apply(xq_BLNH, xk_BLNH)
 
         # Apply rotary embeddings
         xq_BLNH, xk_BLNH = self.rope(xq_BLNH, xk_BLNH, positions)
