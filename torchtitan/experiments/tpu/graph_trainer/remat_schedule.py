@@ -54,6 +54,11 @@ def _is_tensor_node(node: torch.fx.Node) -> bool:
     return isinstance(node.meta.get("val"), torch.Tensor)
 
 
+def _is_recomputed(node: torch.fx.Node) -> bool:
+    """Whether selective_activation_remat_pass added this node as a recompute."""
+    return node.name.endswith("_recomputed")
+
+
 def _find_local_grad_before_reduce_dtype_cast(
     reduce_grad_input: torch.fx.Node,
 ) -> torch.fx.Node | None:
@@ -201,7 +206,7 @@ def apply_tpu_remat_schedule(
         region_id = _get_layer_id(node)
         if region_id == _NOT_IN_LAYERS:
             continue
-        if node.name.endswith("_recomputed"):
+        if _is_recomputed(node):
             recompute_by_region[region_id].add(node)
         elif _is_backward_node(node):
             backward_by_region[region_id].add(node)
@@ -281,13 +286,17 @@ def apply_tpu_remat_schedule(
             },
             key=order.__getitem__,
         )
+        # A recomputed forward value is tagged as backward but is not a
+        # cotangent. A recomputed value shared across layers is recomputed
+        # once, before its first reader, so it would otherwise come before the
+        # real incoming gradient of every later region.
         cotangent_candidates = sorted(
             {
                 inp
                 for node in backward_nodes
                 for inp in node.all_input_nodes
-                if inp not in recompute_nodes
-                and inp not in backward_nodes
+                if inp not in backward_nodes
+                and not _is_recomputed(inp)
                 and _is_backward_node(inp)
                 and _is_tensor_node(inp)
             },
@@ -445,7 +454,7 @@ def apply_tpu_remat_fsdp_all_gather_schedule(
     # layer 0 as their anchor; loss-side parameters should use the loss anchor.
     for node in gm.graph.nodes:
         region_id = _get_layer_id(node)
-        if region_id != _NOT_IN_LAYERS and node.name.endswith("_recomputed"):
+        if region_id != _NOT_IN_LAYERS and _is_recomputed(node):
             recompute_by_region[region_id].add(node)
 
     region_ids = sorted(recompute_by_region)
