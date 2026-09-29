@@ -133,7 +133,9 @@ class SimpleFSDPShardingTest(absltest.TestCase):
     parallel_dims = _parallel_dims(4)
     training = cast(
         TrainingConfig,
-        SimpleNamespace(mixed_precision_reduce="bfloat16"),
+        SimpleNamespace(
+            mixed_precision_param="bfloat16", mixed_precision_reduce="float32"
+        ),
     )
 
     with (

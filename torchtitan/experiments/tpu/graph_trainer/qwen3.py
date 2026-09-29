@@ -47,8 +47,11 @@ def parallelize_qwen3(
     **kwargs,
 ) -> nn.Module:
     """Apply TPU expert dtype and uneven-FSDP policy before setup."""
+    # The dWeight is the gradient of the weight cast to the compute dtype, so
+    # autograd rounds it to that dtype whatever the kernel stores; an FP32
+    # store only adds an f32 -> bf16 -> f32 round trip before the reduce.
     configure_expert_dweight_output_dtype(
-        model, TORCH_DTYPE_MAP[training.mixed_precision_reduce]
+        model, TORCH_DTYPE_MAP[training.mixed_precision_param]
     )
     configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
     model = graph_trainer_parallelize_qwen3(
