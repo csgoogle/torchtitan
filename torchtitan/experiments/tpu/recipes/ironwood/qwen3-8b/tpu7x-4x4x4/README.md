@@ -1,8 +1,8 @@
 # Recipe for training Qwen3-8B model on a 128 device TPU ironwood cluster (tpu7x-4x4x4)
 
-These are instructions for deploying Qwen3-8B training to a 128 device (64 chip) tpu7x cluster using `xpk`.
+These are instructions for deploying Qwen3-8B training to a 128 device (64 chip) tpu7x cluster using Cluster Toolkit (`gcluster`).
 
-For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
 
 After setting up your cluster, the following variables should be set:
 
@@ -11,7 +11,6 @@ export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
 export TORCHTITAN_IMAGE=YOUR_TORCHTITAN_IMAGE # Artifact Registry repo holding torchtitan-container
-export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ```
 
 ## Notes
@@ -30,19 +29,21 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ```bash
 export WORKLOAD_NAME="qwen3-8b-tpu7x-4x4x4-$(date +%Y%m%d-%H%M%S)"
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --tpu-type="tpu7x-4x4x4" \
-  --num-slices=1 \
-  --zone="$ZONE" \
-  --project="$PROJECT_ID" \
-  --base-docker-image="$TORCHTITAN_IMAGE" \
-  --script-dir="$SCRIPT_DIR" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type tpu7x \
+  --topology 4x4x4 \
+  --node-constraint cloud.google.com/placement-policy-name=tpu7x-128-4x4x4-placement-policy \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "$TORCHTITAN_IMAGE" \
+  --gke-disable-parallel-containers \
   --env="PYTHONUNBUFFERED=1" \
-  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
+  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-main-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
-  --command="torchrun \
+  --command "torchrun \
     --nnodes=16 \
     --nproc_per_node=8 \
     --rdzv_backend=static \
@@ -77,13 +78,13 @@ xpk workload create \
 ## Expected Metrics
 
 With this configuration, you should observe the following metrics around step
-30 (as of 9/23/2026):
+30 (as of 9/28/2026):
 
-- **TPS (Tokens per second)**: ~12,446
-- **TFLOPS**: ~587.69
-- **MFU**: ~50.95%
-- **Step Time (time_end_to_end)**: ~0.987s
-- **Physical peak HBM**: 81.70GiB
+- **TPS (Tokens per second)**: ~11,850
+- **TFLOPS**: ~559.58
+- **MFU**: ~48.51%
+- **Step Time (time_end_to_end)**: ~1.037s
+- **Physical peak HBM**: 79.26GiB (82.56%)
 
 ## Alternative configurations
 

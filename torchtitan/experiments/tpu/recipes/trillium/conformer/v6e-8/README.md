@@ -1,8 +1,8 @@
 # Recipe for training Conformer model on 8 TPU trillium cluster (v6e-8)
 
-These are instructions for deploying Conformer training to an 8 chip v6e cluster using `xpk`.
+These are instructions for deploying Conformer training to an 8 chip v6e cluster using Cluster Toolkit (`gcluster`).
 
-For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
 
 After setting up your cluster, the following variables should be set:
 
@@ -22,16 +22,18 @@ export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 
-xpk workload create \
---workload=$WORKLOAD_NAME \
---cluster=$CLUSTER_NAME \
---zone=$ZONE \
---project=$PROJECT_ID \
---tpu-type="v6e-8" \
---num-slices=1 \
---docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
---env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
---command "
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type ct6e-standard-4t \
+  --topology 2x4 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest" \
+  --gke-disable-parallel-containers \
+  --env=WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
+  --command "
     torchrun \
     --nnodes=2 \
     --nproc_per_node=4 \
@@ -71,16 +73,18 @@ xpk workload create \
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 
-xpk workload create \
---workload=$WORKLOAD_NAME \
---cluster=$CLUSTER_NAME \
---zone=$ZONE \
---project=$PROJECT_ID \
---tpu-type="v6e-8" \
---num-slices=1 \
---docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
---env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
---command "
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type ct6e-standard-4t \
+  --topology 2x4 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest" \
+  --gke-disable-parallel-containers \
+  --env=WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
+  --command "
     torchrun \
     --nnodes=2 \
     --nproc_per_node=4 \
