@@ -21,8 +21,12 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
 )
+from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
+    resolve_save_regions,
+    save_budget_bytes,
+)
 from torchtitan.experiments.tpu.layer_loop import builds_layer_loop
-from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
 from torchtitan.protocols.model_spec import ModelSpec
 
 
@@ -58,6 +62,29 @@ def _validate_fsdp_allreduce_slice(
     )
 
 
+def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
+  save_regions = tpu_config.graph_trainer_save_regions
+  save_budget_gb = tpu_config.graph_trainer_memory_policy_save_budget_gb
+  if tpu_config.graph_trainer_memory_policy != "tpu_selective":
+    if save_regions or save_budget_gb is not None:
+      raise ValueError(
+          "graph_trainer_save_regions and "
+          "graph_trainer_memory_policy_save_budget_gb only apply to "
+          "graph_trainer_memory_policy='tpu_selective'"
+      )
+    return
+  if tpu_config.use_scan_layers:
+    # A scan node stands for the whole layer loop and is always saved; the
+    # values these classes select live inside its body, where the policy
+    # cannot see them.
+    raise ValueError(
+        "graph_trainer_memory_policy='tpu_selective' does not support "
+        "--tpu-config.use-scan-layers"
+    )
+  resolve_save_regions(save_regions)
+  save_budget_bytes(save_budget_gb)
+
+
 def to_tpu_graph_trainer_config(
     train_config: TPUTrainerConfig,
     model_registry: Callable[[str], ModelSpec],
@@ -91,6 +118,7 @@ def to_tpu_graph_trainer_config(
     )
   if budget < 0:
     raise ValueError("CPU-offload budget must be nonnegative")
+  _validate_tpu_selective(tpu_config)
   graph_config = to_graph_trainer_config(
       train_config, model_registry, target_cls=target_cls
   )

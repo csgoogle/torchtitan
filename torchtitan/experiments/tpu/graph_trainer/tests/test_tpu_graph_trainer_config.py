@@ -275,6 +275,74 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           target_cls=TpuGraphTrainer.Config,
       )
 
+  def test_tpu_selective_cli_is_propagated(self) -> None:
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_debugmodel",
+            "--tpu_config.graph_trainer_memory_policy=tpu_selective",
+            "--tpu_config.graph_trainer_save_regions",
+            "moe.route_permutation",
+            "--tpu_config.graph_trainer_memory_policy_save_budget_gb=4.2",
+        ]),
+    )
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    self.assertEqual(graph_config.compile.memory_policy, "tpu_selective")
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_save_regions,
+        ("moe.route_permutation",),
+    )
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_memory_policy_save_budget_gb, 4.2
+    )
+
+  @parameterized.named_parameters(
+      ("no_classes", "tpu_selective", (), None, False, "needs"),
+      ("unknown_class", "tpu_selective", ("moe.nope",), None, False, "Unknown"),
+      (
+          "negative_budget",
+          "tpu_selective",
+          ("moe.route_permutation",),
+          -1.0,
+          False,
+          "nonnegative",
+      ),
+      (
+          "scan",
+          "tpu_selective",
+          ("moe.route_permutation",),
+          None,
+          True,
+          "use-scan-layers",
+      ),
+      (
+          "classes_without_policy",
+          "full",
+          ("moe.route_permutation",),
+          None,
+          False,
+          "only apply",
+      ),
+      ("budget_without_policy", "full", (), 1.0, False, "only apply"),
+  )
+  def test_tpu_selective_rejects_bad_settings(
+      self, policy, save_regions, budget_gb, scanned, message
+  ) -> None:
+    config = qwen3_8b()
+    config.tpu_config.graph_trainer_memory_policy = policy
+    config.tpu_config.graph_trainer_save_regions = save_regions
+    config.tpu_config.graph_trainer_memory_policy_save_budget_gb = budget_gb
+    config.tpu_config.use_scan_layers = scanned
+
+    with self.assertRaisesRegex(ValueError, message):
+      self._qwen3_graph_config(config)
+
   def test_negative_cpu_offload_executable_prefetch_is_rejected(self) -> None:
     config = qwen3_8b()
     config.tpu_config.graph_split.cpu_offload_prefetch_executables = -1

@@ -18,7 +18,10 @@ BackwardPartitionMode = Literal[
 # These policies are registered by TPU-only modules, so keep their CLI/config
 # type out of the shared GraphTrainer policy Literal.
 TpuGraphTrainerMemoryPolicy = Literal[
-    GraphTrainerMemoryPolicy, "full_and_offload", "full_and_scan_offload"
+    GraphTrainerMemoryPolicy,
+    "full_and_offload",
+    "full_and_scan_offload",
+    "tpu_selective",
 ]
 
 
@@ -96,6 +99,15 @@ class TPUConfig:
   graph_trainer_memory_policy: TpuGraphTrainerMemoryPolicy = "default"
   # CPU-offload controls propagated into GraphTrainer's compile config.
   graph_trainer_cpu_offload_budget_gb: float = 100.0
+  # ``tpu_selective`` only: full recompute, except these save regions, whose
+  # values are saved for backward. Names follow upstream ``RegionAC`` regions
+  # and are the keys of ``SAVE_REGIONS`` in
+  # ``graph_trainer/tpu_memory_policy.py``, e.g. ("moe.route_permutation",).
+  graph_trainer_save_regions: tuple[str, ...] = ()
+  # ``tpu_selective`` only: GiB that the saved regions may use. Always-saved
+  # regions are charged first; budgeted ones fill the rest from the last layer
+  # backward. None means unlimited.
+  graph_trainer_memory_policy_save_budget_gb: float | None = None
   # Run the decoder layers as a single scan instead of a Python loop, so the
   # compiler sees one loop body rather than n_layers copies of it. Each layer's
   # weights become a row of one stacked tensor, which is what gives the scan

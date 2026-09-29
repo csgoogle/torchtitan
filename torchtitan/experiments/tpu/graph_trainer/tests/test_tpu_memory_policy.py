@@ -22,19 +22,38 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
     compute_parameter_gradients,
 )
-from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
+from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    minimal_fx_tracer,
+    run_traced,
+)
 from torchtitan.experiments.graph_trainer.memory_policy import (
     _find_fsdp_unshard_save_nodes,
+)
+from torchtitan.experiments.graph_trainer.registry import MEMORY_POLICY_REGISTRY
+from torchtitan.experiments.graph_trainer.remove_noop_passes import (
+    remove_parameter_gradient_markers_pass,
+)
+from torchtitan.experiments.graph_trainer.selective_activation_remat import (
+    selective_activation_remat_pass,
 )
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
     MixedPrecisionPolicy,
 )
+from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
+    _optimization_barrier,
+    apply_tpu_remat_schedule,
+)
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
+    _saved_bytes,
     full_remat_with_saves,
     MOE_ROUTE_PERMUTATION,
     REMAT_REGION,
+    resolve_save_regions,
+    ROUTE_PERMUTATION_CLASS,
+    save_budget_bytes,
     select_route_permutations,
+    select_saves,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
     local_reorder,
@@ -212,6 +231,125 @@ class TestRoutePermutationClass(unittest.TestCase):
         self.assertEqual([_get_layer_id(node) for node in routes], [0, 1])
         for node in routes:
             self.assertEqual(node.meta["val"].shape, (_TOKENS * _TOP_K,))
+            self.assertEqual(
+                node.meta["custom"][REMAT_REGION], MOE_ROUTE_PERMUTATION
+            )
+
+
+def _selective_config(
+    save_regions: tuple[str, ...], budget_gb: float | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        tpu_config=SimpleNamespace(
+            graph_trainer_save_regions=save_regions,
+            graph_trainer_memory_policy_save_budget_gb=budget_gb,
+        ),
+        parallelism=_parallelism("always"),
+    )
+
+
+class TestSelectSaves(unittest.TestCase):
+    def test_required_class_without_candidates_raises(self) -> None:
+        traced, _ = _trace_toy(_DenseToy())
+
+        with self.assertRaisesRegex(ValueError, "'moe.route_permutation' is required"):
+            select_saves(traced.gm, [ROUTE_PERMUTATION_CLASS], budget_bytes=None)
+
+    def test_always_saved_classes_must_fit_the_budget(self) -> None:
+        torch.manual_seed(0)
+        traced, _ = _trace_toy(_MoEToy())
+        routes = select_route_permutations(traced.gm)
+        route_bytes = sum(_saved_bytes(node) for node in routes)
+
+        for budget_bytes in (None, route_bytes):
+            self.assertEqual(
+                select_saves(traced.gm, [ROUTE_PERMUTATION_CLASS], budget_bytes),
+                set(routes),
+            )
+        with self.assertRaisesRegex(ValueError, "save budget"):
+            select_saves(traced.gm, [ROUTE_PERMUTATION_CLASS], route_bytes - 1)
+
+    def test_config_values_are_checked(self) -> None:
+        self.assertEqual(
+            resolve_save_regions(("moe.route_permutation",)),
+            [ROUTE_PERMUTATION_CLASS],
+        )
+        for names, message in (
+            ((), "needs graph_trainer_save_regions"),
+            (("moe.nope",), "Unknown save regions"),
+            (("moe.route_permutation",) * 2, "Duplicate"),
+        ):
+            with self.subTest(names=names):
+                with self.assertRaisesRegex(ValueError, message):
+                    resolve_save_regions(names)
+
+        self.assertIsNone(save_budget_bytes(None))
+        self.assertEqual(save_budget_bytes(0.5), 512 * 1024**2)
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            save_budget_bytes(-1.0)
+
+
+class TestTpuSelectivePolicy(unittest.TestCase):
+    def _run(
+        self,
+        model: nn.Module,
+        save_regions: tuple[str, ...],
+        budget_gb: float | None = None,
+    ) -> set[torch.fx.Node]:
+        """Apply tpu_selective, remat and the TPU remat schedule to ``model``.
+
+        Checks that the chosen values are saved rather than recomputed, that
+        every layer still gets its entry barrier, and that the transformed
+        graph computes exactly what the traced graph did. Returns the chosen
+        nodes.
+        """
+        n_layers = len(model.layers)
+        traced, x = _trace_toy(model)
+        expected = [
+            output.detach().clone()
+            for output in run_traced(traced, module=model)(x)
+        ]
+        remove_parameter_gradient_markers_pass(traced.gm, traced.example_inputs)
+        chosen = select_saves(
+            traced.gm,
+            resolve_save_regions(save_regions),
+            save_budget_bytes(budget_gb),
+        )
+
+        MEMORY_POLICY_REGISTRY["tpu_selective"](
+            traced.gm, config=_selective_config(save_regions, budget_gb)
+        )
+        for node in chosen:
+            self.assertIs(node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        selective_activation_remat_pass(traced.gm)
+        apply_tpu_remat_schedule(
+            traced.gm,
+            traced.example_inputs,
+            num_static_inputs=traced.num_static_inputs,
+        )
+
+        names = {node.name for node in traced.gm.graph.nodes}
+        self.assertTrue(any(name.endswith("_recomputed") for name in names))
+        self.assertFalse({f"{node.name}_recomputed" for node in chosen} & names)
+        barriers = [
+            node
+            for node in traced.gm.graph.nodes
+            if node.op == "call_function" and node.target is _optimization_barrier
+        ]
+        self.assertEqual(len(barriers), n_layers)
+        actual = run_traced(traced, module=model)(x)
+        for actual_output, expected_output in zip(actual, expected, strict=True):
+            torch.testing.assert_close(
+                actual_output, expected_output, rtol=0, atol=0
+            )
+        return chosen
+
+    def test_saves_route_permutations(self) -> None:
+        torch.manual_seed(0)
+        chosen = self._run(_MoEToy(), ("moe.route_permutation",))
+
+        self.assertEqual(sorted(_get_layer_id(node) for node in chosen), [0, 1])
+        for node in chosen:
             self.assertEqual(
                 node.meta["custom"][REMAT_REGION], MOE_ROUTE_PERMUTATION
             )

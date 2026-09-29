@@ -6,12 +6,15 @@
 
 """TPU-only GraphTrainer memory policies."""
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 import torch
 
-from torchtitan.experiments.graph_trainer.common_utils import _is_backward_node
+from torchtitan.experiments.graph_trainer.common_utils import (
+    _get_layer_id,
+    _is_backward_node,
+)
 from torchtitan.experiments.graph_trainer.cpu_offload import (
     tag_all_offloadable_activations,
 )
@@ -22,6 +25,7 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
+from torchtitan.tools.logging import logger
 
 # Semantic hints that model code attaches with ``torch.fx.traceback.annotate_fn``
 # so a policy can find values that op names alone cannot tell apart. There is
@@ -140,3 +144,144 @@ def full_remat_with_saves(
         policy_fn=_make_full_memory_policy(),
         force_save_nodes=force_save_nodes,
     )
+
+
+def _saved_bytes(node: torch.fx.Node) -> int:
+    """Bytes of a node's outputs, from the fake values FX recorded.
+
+    These are logical sizes (numel times element size); on-device padding or
+    tiling is not counted.
+    """
+    value = node.meta["val"]
+    values = value if isinstance(value, (tuple, list)) else (value,)
+    return sum(
+        int(v.numel()) * v.element_size()
+        for v in values
+        if isinstance(v, torch.Tensor)
+    )
+
+
+def _log_class(name: str, selected: int, candidates: int, nbytes: int) -> None:
+    logger.info(
+        f"tpu_selective: {name}: saving {selected}/{candidates} candidates, "
+        f"{nbytes / 1024**3:.3f} GiB"
+    )
+
+
+def select_saves(
+    gm: torch.fx.GraphModule,
+    classes: Sequence[SaveCandidateClass],
+    budget_bytes: int | None,
+) -> set[torch.fx.Node]:
+    """Choose which candidate nodes to save within ``budget_bytes``.
+
+    1. Always-save (non-budgeted) classes are charged first. Raise if they
+       alone exceed the budget.
+    2. Budgeted classes then share what is left, in the order given. Each one
+       fills from the last layer backward: backward reaches later layers
+       first, so their values are held for the shortest time. A value that
+       does not fit is skipped, and a smaller earlier one may still fit.
+
+    ``budget_bytes=None`` means unlimited. Raises if a required class has no
+    candidates.
+    """
+    candidates: dict[str, list[torch.fx.Node]] = {}
+    for candidate_class in classes:
+        nodes = candidate_class.select(gm)
+        if candidate_class.required and not nodes:
+            raise ValueError(
+                f"Save region {candidate_class.name!r} is required but matched no "
+                "forward nodes; the model or its tracing no longer exposes it."
+            )
+        candidates[candidate_class.name] = nodes
+
+    selected: set[torch.fx.Node] = set()
+    used_bytes = 0
+    for candidate_class in classes:
+        if candidate_class.budgeted:
+            continue
+        nodes = [n for n in candidates[candidate_class.name] if n not in selected]
+        class_bytes = sum(_saved_bytes(node) for node in nodes)
+        selected.update(nodes)
+        used_bytes += class_bytes
+        _log_class(candidate_class.name, len(nodes), len(nodes), class_bytes)
+    if budget_bytes is not None and used_bytes > budget_bytes:
+        raise ValueError(
+            f"Always-saved classes need {used_bytes} bytes, more than the "
+            f"{budget_bytes}-byte save budget."
+        )
+
+    position = {node: index for index, node in enumerate(gm.graph.nodes)}
+    for candidate_class in classes:
+        if not candidate_class.budgeted:
+            continue
+        nodes = candidates[candidate_class.name]
+        count = class_bytes = 0
+        for node in sorted(
+            nodes, key=lambda n: (_get_layer_id(n), position[n]), reverse=True
+        ):
+            node_bytes = _saved_bytes(node)
+            if node in selected or (
+                budget_bytes is not None and used_bytes + node_bytes > budget_bytes
+            ):
+                continue
+            selected.add(node)
+            used_bytes += node_bytes
+            class_bytes += node_bytes
+            count += 1
+        _log_class(candidate_class.name, count, len(nodes), class_bytes)
+
+    budget = (
+        "unlimited"
+        if budget_bytes is None
+        else f"{budget_bytes / 1024**3:.3f} GiB"
+    )
+    logger.info(
+        f"tpu_selective: saving {used_bytes / 1024**3:.3f} GiB in total "
+        f"(budget {budget})"
+    )
+    return selected
+
+
+def resolve_save_regions(names: Sequence[str]) -> list[SaveCandidateClass]:
+    """Map ``graph_trainer_save_regions`` to classes, rejecting bad names."""
+    known = ", ".join(sorted(SAVE_REGIONS))
+    if not names:
+        raise ValueError(
+            "graph_trainer_memory_policy='tpu_selective' needs "
+            f"graph_trainer_save_regions; known regions: {known}."
+        )
+    unknown = [name for name in names if name not in SAVE_REGIONS]
+    if unknown:
+        raise ValueError(f"Unknown save regions {unknown}; known regions: {known}.")
+    if len(set(names)) != len(names):
+        raise ValueError(f"Duplicate entries in graph_trainer_save_regions: {names}.")
+    return [SAVE_REGIONS[name] for name in names]
+
+
+def save_budget_bytes(budget_gb: float | None) -> int | None:
+    """Convert the GiB save budget to bytes; ``None`` means unlimited."""
+    if budget_gb is None:
+        return None
+    if budget_gb < 0:
+        raise ValueError(
+            "graph_trainer_memory_policy_save_budget_gb must be nonnegative "
+            "(None means unlimited)."
+        )
+    return int(budget_gb * 1024**3)
+
+
+@register_memory_policy("tpu_selective")
+def _tpu_selective_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """Full recompute, except the configured save regions within the budget."""
+    tpu_config = config.tpu_config
+    classes = resolve_save_regions(tpu_config.graph_trainer_save_regions)
+    budget_bytes = save_budget_bytes(
+        tpu_config.graph_trainer_memory_policy_save_budget_gb
+    )
+    full_remat_with_saves(gm, config, select_saves(gm, classes, budget_bytes))
+    return gm
