@@ -340,9 +340,12 @@ class CosSinRoPE(RoPE):
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
+        # Same values as cat((-x2, x1)), but a reverse and a sign multiply fuse
+        # into the consumer, where slice + concat make XLA materialize both
+        # halves.
+        half = x.shape[-1] // 2
+        sign = x.new_tensor([-1.0, 1.0]).view(2, 1)
+        return (x.unflatten(-1, (2, half)).flip(-2) * sign).flatten(-2)
 
 
 @spmd.local_map(out_types={"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R})
