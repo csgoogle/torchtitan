@@ -298,7 +298,7 @@ def make_aux_loss_config(
     coeff: float,
     top_k: int,
 ) -> MoELoadBalanceAuxLoss.Config:
-    """Build a MoELoadBalanceAuxLoss.Config."""
+    """Build a MoELoadBalanceAuxLoss.Config for ``router.aux_loss``."""
     return MoELoadBalanceAuxLoss.Config(type=type, coeff=coeff, top_k=top_k)
 
 
@@ -458,6 +458,23 @@ def make_routed_experts_config(
     )
 
 
+def moe_load_balance_aux_loss_configs(
+    layers: list,
+) -> list[MoELoadBalanceAuxLoss.Config]:
+    """The ``MoELoadBalanceAuxLoss`` router configs among ``layers``.
+
+    Upstream aux losses (e.g. MicrobatchWiseLoadBalanceLoss) self-normalize and
+    are not included.
+    """
+    configs = []
+    for layer_cfg in layers:
+        moe_cfg = getattr(layer_cfg, "moe", None)
+        aux_loss = getattr(getattr(moe_cfg, "router", None), "aux_loss", None)
+        if isinstance(aux_loss, MoELoadBalanceAuxLoss.Config):
+            configs.append(aux_loss)
+    return configs
+
+
 def update_moe_aux_loss_configs(
     layers: list,
     *,
@@ -472,16 +489,7 @@ def update_moe_aux_loss_configs(
     gradient accumulation steps, and DP ranks (FSDP sum). Also validates
     that batch-wise aux loss is not used with PP or gradient accumulation.
     """
-    for layer_cfg in layers:
-        moe_cfg = getattr(layer_cfg, "moe", None)
-        if moe_cfg is None:
-            continue
-        aux_loss = getattr(moe_cfg, "aux_loss", None)
-        if aux_loss is None and hasattr(moe_cfg, "router"):
-            aux_loss = getattr(moe_cfg.router, "aux_loss", None)
-        # Upstream aux losses (e.g. MicrobatchWiseLoadBalanceLoss) self-normalize.
-        if not isinstance(aux_loss, MoELoadBalanceAuxLoss.Config):
-            continue
+    for aux_loss in moe_load_balance_aux_loss_configs(layers):
         if aux_loss.type == "batch_wise" and pp_enabled:
             raise ValueError(
                 "batch_wise MoE aux loss is incompatible with pipeline "

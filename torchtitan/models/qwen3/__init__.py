@@ -21,6 +21,7 @@ from torchtitan.models.common import (
 )
 from torchtitan.models.common.config_utils import (
     get_attention_config,
+    make_aux_loss_config,
     make_ffn_config,
     make_gqa_config,
     make_moe_config,
@@ -147,7 +148,7 @@ def _build_qwen3_moe_layers(
     non_blocking_capacity_factor: float | None = None,
     rope: RoPE.Config,
     load_balance_coeff: float | None = 1e-3,
-    aux_loss_coeff: float | None = None,
+    global_aux_loss_coeff: float | None = None,
 ) -> list[TransformerBlock.Config]:
     """Build per-layer configs for MoE Qwen3 models."""
     inner_attention = get_attention_config(attn_backend)
@@ -174,7 +175,6 @@ def _build_qwen3_moe_layers(
                 moe=make_moe_config(
                     num_experts=num_experts,
                     load_balance_coeff=load_balance_coeff,
-                    aux_loss_coeff=aux_loss_coeff,
                     router=make_router_config(
                         dim=dim,
                         num_experts=num_experts,
@@ -195,6 +195,13 @@ def _build_qwen3_moe_layers(
                 ),
             )
         )
+    if global_aux_loss_coeff is not None:
+        # Qwen's global-batch load-balance loss (MoELoadBalanceAuxLoss
+        # batch_wise), not make_moe_config's microbatch-wise loss.
+        for layer in layers:
+            layer.moe.router.aux_loss = make_aux_loss_config(
+                type="batch_wise", coeff=global_aux_loss_coeff, top_k=top_k
+            )
     return layers
 
 
@@ -525,7 +532,7 @@ def _30b_a3b(
     *,
     seq_len: int,
     load_balance_coeff: float | None = 1e-3,
-    aux_loss_coeff: float | None = None,
+    global_aux_loss_coeff: float | None = None,
 ) -> Qwen3Model.Config:
     dim = 2048
     head_dim = 128
@@ -561,7 +568,7 @@ def _30b_a3b(
             ),
             moe_comm_backend=moe_comm_backend,
             load_balance_coeff=load_balance_coeff,
-            aux_loss_coeff=aux_loss_coeff,
+            global_aux_loss_coeff=global_aux_loss_coeff,
         ),
     )
 
@@ -577,7 +584,7 @@ def _30b_a3b_global_aux(
         moe_comm_backend,
         seq_len=seq_len,
         load_balance_coeff=None,
-        aux_loss_coeff=1e-3,
+        global_aux_loss_coeff=1e-3,
     )
 
 

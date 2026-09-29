@@ -41,8 +41,10 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
 # below: it captures that method at import time.
 from torchtitan.experiments.tpu import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
 from torchtitan.experiments.tpu.layer_loop import tpu_model_class
+from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models import qwen3 as qwen3_models
 from torchtitan.models.common import CosSinRoPE
+from torchtitan.models.common.config_utils import make_aux_loss_config
 from torchtitan.models.llama3 import model_registry
 from torchtitan.models.qwen3 import model_registry as qwen3_registry
 
@@ -59,6 +61,10 @@ SEED = 1234
 _REAL_ROPE_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.real_rope"
     ".tpu_real_arithmetic_complex_rope"
+)
+_DISCARDED_TOKEN_COUNTER_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.discarded_token_counter"
+    ".tpu_discarded_token_counter"
 )
 
 
@@ -643,6 +649,87 @@ class TestQwen3(unittest.TestCase):
         torch.testing.assert_close(
             scanned(tokens), plain(tokens), rtol=1e-5, atol=1e-6
         )
+
+    def _moe_config_with_global_batch_aux_loss(self, coeff):
+        config = qwen3_registry("debugmodel_moe", attn_backend="sdpa").model
+        config = dataclasses.replace(config, enable_weight_tying=False)
+        for layer in config.layers:
+            layer.attention.rope = dataclasses.replace(
+                layer.attention.rope, max_context_length=TOKENS
+            )
+            layer.moe.load_balance_coeff = None
+            if coeff is not None:
+                aux_loss = make_aux_loss_config(
+                    type="batch_wise", coeff=coeff, top_k=layer.moe.router.top_k
+                )
+                aux_loss.global_batch_size = TOKENS // SEQ_LEN
+                layer.moe.router.aux_loss = aux_loss
+        # As in the 235B scan recipe: no `tokens_per_expert_E` write either.
+        apply_overrides(
+            OverrideConfig(imports=[_DISCARDED_TOKEN_COUNTER_OVERRIDE]), config
+        )
+        return config
+
+    def test_scan_gradients_match_the_loop_with_global_batch_aux_loss(self):
+        """The fork's router aux loss (the 235B recipes') runs inside a scan.
+
+        It must not write a buffer in the forward, which the scan body cannot
+        do, and its injected gradient must reach every layer's router as it
+        does unrolled. The routed experts run in bf16, so scan and loop agree
+        only to a few ulps; the check is that the aux-loss gradient, which
+        is far larger than that, is carried through the scan.
+        """
+        # Large enough that the aux loss dominates the gate gradient of the
+        # `output.sum()` loss, so a dropped injection cannot hide in the noise.
+        aux_coeff = 100.0
+        plain = _build(
+            stacked=False,
+            config=self._moe_config_with_global_batch_aux_loss(aux_coeff),
+        )
+        scanned = _build(
+            stacked=True,
+            scan=True,
+            config=self._moe_config_with_global_batch_aux_loss(aux_coeff),
+        )
+        no_aux = _build(
+            stacked=False,
+            config=self._moe_config_with_global_batch_aux_loss(None),
+        )
+        scanned.load_state_dict(copy.deepcopy(plain.state_dict()))
+        no_aux.load_state_dict(copy.deepcopy(plain.state_dict()))
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
+
+        with set_unflatten_seq_len(SEQ_LEN):
+            outputs = [model(tokens) for model in (plain, scanned, no_aux)]
+            for output in outputs:
+                output.sum().backward()
+        # Relative Frobenius norm, not elementwise: the bf16 experts leave
+        # scattered few-ulp differences (large relative error on near-zero
+        # logits; up to ~1e-3 in norm depending on the host's CPU kernels),
+        # while a broken scan is off by O(1).
+        output_error = ((outputs[1] - outputs[0]).norm() / outputs[0].norm()).item()
+        self.assertLess(output_error, 1e-2)
+
+        stacks = getattr(scanned, STACK_ATTR)._parameters
+        gate = "moe.router.gate.weight"
+        scan_error, aux_effect = [], []
+        for i, (layer, no_aux_layer) in enumerate(
+            zip(plain.layers.values(), no_aux.layers.values(), strict=True)
+        ):
+            want = dict(layer.named_parameters())[gate].grad.to_local()
+            got = stacks[gate.replace(".", "__")].grad[i].to_local()
+            reference = dict(no_aux_layer.named_parameters())[gate]
+            reference = reference.grad.to_local()
+            scan_error.append(((got - want).norm() / want.norm()).item())
+            aux_effect.append(((want - reference).norm() / want.norm()).item())
+        # Per layer, relative Frobenius norms: scan-vs-loop error, and how much
+        # the aux loss changes the gate gradient. Scan error is ~6e-4 on most
+        # hosts and up to ~2e-2 on some (host-dependent CPU kernels); the aux
+        # effect is >= 0.2, so a scan that dropped the injected gradient
+        # (scan error == aux effect) fails the first bound.
+        summary = f"scan error {scan_error}, aux effect {aux_effect}"
+        self.assertLess(max(scan_error), 5e-2, summary)
+        self.assertGreater(min(aux_effect), 3 * max(scan_error), summary)
 
 
 if __name__ == "__main__":

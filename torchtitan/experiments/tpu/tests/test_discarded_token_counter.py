@@ -58,11 +58,12 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
   if aux:
     # Upstream d771abb0 dropped `make_moe_config(aux_loss_type=...)`; its
     # `aux_loss_coeff` only builds the microbatch-wise loss. The sequence-wise
-    # variant this test exercises is a fork addition that hangs off
-    # `MoE.Config.aux_loss`.
-    config.aux_loss = make_aux_loss_config(
+    # variant this test exercises is a fork addition set as
+    # `TokenChoiceTopKRouter.Config.aux_loss`.
+    config.router.aux_loss = make_aux_loss_config(
         type="sequence_wise", coeff=1e-3, top_k=_TOP_K
     )
+    config.router.aux_loss.global_batch_size = _BATCH
   return config
 
 
