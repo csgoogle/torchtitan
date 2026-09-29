@@ -4,8 +4,8 @@ For expert ``e``, forward computes ``Y_e = X_e @ W_e``. Backward computes
 ``dX_e = dY_e @ W_e.T`` with another GMM and ``dW_e = X_e.T @ dY_e`` with
 TGMM. dInput uses MegaBlox's logical rhs transpose so kernel-native weights do
 not require a physical layout conversion. dWeight always accumulates in FP32
-across token tiles. It can either store FP32, or round once to the weight dtype
-when the caller's gradient-reduction policy requires that dtype.
+across token tiles and rounds once, at the final store, to the dtype of the
+weight (``rhs.dtype``).
 
 The module-level custom operators are stable Dynamo/AOTAutograd boundaries.
 Tiling arguments are compile-time constants, while ``group_sizes`` remains a
