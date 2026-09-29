@@ -84,8 +84,9 @@ class TpuGroupedExperts(GroupedExperts):
 
     The paired path changes only W1/W3 execution: their parameters, FSDP
     collectives, checkpoint keys, and the W2 projection remain independent.
-    W2's dWeight may tile differently from W1/W3's: its contracted axis is
-    ``F`` where theirs is ``D``, so one K tile cannot suit both.
+    W2's dWeight may tile differently from W1/W3's: a dWeight is tiled along
+    ``K``, the weight's input dimension, which is ``F`` for W2 and ``D`` for
+    W1/W3, so one K tile cannot suit both.
     The unpaired dWeight kernel retains FP32 accumulation and stores in the
     final FSDP reduction dtype selected by the parallelizer.
     """
@@ -101,7 +102,7 @@ class TpuGroupedExperts(GroupedExperts):
         pallas_grouped_mm_tgmm_tiling: tuple[int, int, int] = (128, 128, 128)
         # TGMM tiling for the W2 (down-projection) dWeight. ``None`` follows
         # ``pallas_grouped_mm_tgmm_tiling``. Set it when W1/W3 want a K tile
-        # that W2's shorter contracted axis cannot hold.
+        # that W2's shorter K axis cannot hold.
         pallas_grouped_mm_w2_tgmm_tiling: tuple[int, int, int] | None = None
         use_kernel_native_weight_layout: bool = False
 
