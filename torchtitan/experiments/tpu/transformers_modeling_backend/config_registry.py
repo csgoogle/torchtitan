@@ -29,6 +29,7 @@ from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
                                             #  flavor Configs at import time)
 from torchtitan.experiments.transformers_modeling_backend import (
+    TitanModelConfig,
     TitanMoeModelConfig,
     flavors as _shared_flavors,
     model_registry,
@@ -62,6 +63,14 @@ from .parallelize import parallelize_hf_transformers_tpu
 _TPU_FLAVORS = {
     "full_moe_auto": HFTransformerModel.Config(
         model_config=TitanMoeModelConfig(experts_implementation="native")
+    ),
+    # A two-layer model shaped for the kernels: head_dim 128 (the backend's
+    # "debugmodel" has 16-wide heads, which the splash kernel does not take)
+    # and grouped-query attention, so a parity test exercises the same code
+    # paths as the full model at a few MB of state. --hf-model still picks
+    # the family (Qwen3, Llama, ...); these override its size.
+    "debugmodel_kernels": HFTransformerModel.Config(
+        model_config=TitanModelConfig(dim=512, n_layers=2, n_heads=4, n_kv_heads=2)
     ),
 }
 
@@ -261,6 +270,29 @@ def hf_debugmodel() -> TPUTransformersBackendConfig:
   return _tpu_hf_config("debugmodel", _DEFAULT_HF_MODEL, seq_len=512)
 
 
+def hf_debugmodel_max() -> TPUTransformersBackendConfig:
+  """hf_full_max's feature set on the two-layer kernel-shaped debug model.
+
+  Splash attention, fused CE, selective AC keeping the attention output and
+  per-layer compile, at parity-test scale. The fused-CE token tile must
+  divide the token count: pass ``--loss.b_block_size`` for small batches.
+  """
+  return _tpu_hf_config("debugmodel_kernels", _DEFAULT_HF_MODEL, compile=True,
+                        attn="splash_tpu", fused_loss=True, save_attention=True)
+
+
+def hf_debugmodel_kernels_sdpa() -> TPUTransformersBackendConfig:
+  """The kernel-shaped debug model on the portable path (sdpa, plain CE,
+  per-layer compile): the control for hf_debugmodel_max in parity tests."""
+  return _tpu_hf_config("debugmodel_kernels", _DEFAULT_HF_MODEL, compile=True)
+
+
+def hf_debugmodel_kernels_splash() -> TPUTransformersBackendConfig:
+  """The kernel-shaped debug model with splash attention and plain CE."""
+  return _tpu_hf_config("debugmodel_kernels", _DEFAULT_HF_MODEL, compile=True,
+                        attn="splash_tpu")
+
+
 def hf_full() -> TPUTransformersBackendConfig:
   """The published model at its real width and depth."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL)
@@ -344,3 +376,22 @@ def hf_moe_auto_compile() -> TPUTransformersBackendConfig:
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
                         compile=True)
 
+
+def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBackendConfig:
+  """The single-device CPU counterpart of a lane config, for parity tests.
+
+  Everything the lane chooses because it runs on TPU is turned back into the
+  portable equivalent: the splash kernel becomes sdpa, the fused Pallas cross
+  entropy becomes the model's logits plus plain cross entropy, compile is
+  off. Model, data, optimizer and schedule are untouched, so a CPU run of
+  this config on the same batches is the reference the TPU run is compared
+  against (``base_distributed_device_test._run_cpu_verification``).
+  """
+  model_config = config.model_spec.model
+  if getattr(model_config, "_attn_implementation", "") == "splash_tpu":
+    _set_attn_implementation(model_config, "sdpa")
+  if getattr(model_config, "fused_loss", False):
+    model_config.fused_loss = False
+    config.loss = CrossEntropyLoss.Config()
+  config.compile.enable = False
+  return config

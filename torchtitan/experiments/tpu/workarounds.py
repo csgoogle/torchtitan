@@ -584,3 +584,23 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   # Apply RoPE TPU Optimization Patch
   use_rope_tpu_optimization_patch()
   use_real_rope_arithmetic_patch()
+
+
+def raise_dynamo_recompile_limits(model_config) -> None:
+  """Size Dynamo's recompile limits for per-layer compile under SimpleFSDP.
+
+  Parametrization / AC wrapping gives every decoder layer its own module
+  class, so Dynamo recompiles the shared checkpoint-wrapper ``forward`` once
+  per layer (a type guard miss, not a real recompile). torch's default
+  recompile_limit of 8 exactly fits the 8-layer debug models and fails hard
+  (fullgraph) at 52/80 layers. Called by both TPU trainers before the first
+  compiled forward.
+  """
+  import torch._dynamo.config as dynamo_config  # pylint: disable=g-import-not-at-top
+
+  n_layers = len(getattr(model_config, "layers", ()) or ())
+  wanted = max(64, 2 * n_layers + 16)
+  dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, wanted)
+  dynamo_config.accumulated_recompile_limit = max(
+      dynamo_config.accumulated_recompile_limit, 8 * wanted
+  )

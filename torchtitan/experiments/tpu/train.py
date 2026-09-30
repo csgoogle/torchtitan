@@ -168,18 +168,9 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     )
     train_config.optimizer.implementation = "foreach"
 
-  # Per-layer torch.compile with SimpleFSDP: parametrization/AC wrapping gives
-  # every decoder layer its own module class, so Dynamo recompiles the shared
-  # checkpoint-wrapper ``forward`` once per layer (a type guard miss, not a
-  # real recompile). torch's default recompile_limit of 8 exactly fits the
-  # 8-layer debug models and fails hard (fullgraph) at 52/80 layers.
-  import torch._dynamo.config as dynamo_config  # pylint: disable=g-import-not-at-top
-  n_layers = len(getattr(train_config.model_spec.model, "layers", ()) or ())
-  wanted = max(64, 2 * n_layers + 16)
-  dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, wanted)
-  dynamo_config.accumulated_recompile_limit = max(
-      dynamo_config.accumulated_recompile_limit, 8 * wanted
-  )
+  from torchtitan.experiments.tpu import workarounds  # pylint: disable=g-import-not-at-top
+
+  workarounds.raise_dynamo_recompile_limits(train_config.model_spec.model)
   profiler_workaround.init(train_config)
 
   trainer: Optional[torchtitan.trainer.Trainer] = None

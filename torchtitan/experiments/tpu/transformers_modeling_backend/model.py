@@ -37,7 +37,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import AttentionInterface, PreTrainedModel
 
 from torchtitan.experiments.transformers_modeling_backend.model import (
     _ATTN_IMPLEMENTATION as _FLEX_IMPLEMENTATION,
@@ -47,6 +47,12 @@ from torchtitan.experiments.transformers_modeling_backend.model import (
 from torchtitan.tools.logging import logger
 
 from . import _meta_init, _structure
+# Registers ``attn_implementation="splash_tpu"`` with HF's AttentionInterface.
+# Imported here, not only by the config registry: a worker that receives the
+# Config by pickle (the test harness, any custom entry point) imports this
+# module and nothing else from the lane, and an unregistered name would be
+# quietly built as sdpa.
+from . import attention as _attention  # noqa: F401  pylint: disable=unused-import
 
 
 class _Attrs:
@@ -169,6 +175,7 @@ class TPUHFTransformerModel(HFTransformerModel):
     # the ``layers`` property, and ``norm`` / ``lm_head`` consult these.
     object.__setattr__(self, "_added_norm", None)
     object.__setattr__(self, "_added_lm_head", None)
+    object.__setattr__(self, "_context_length", None)
     super().__init__(config)
 
     self._position_capacity = _structure.position_capacity(self.model)
@@ -222,6 +229,10 @@ class TPUHFTransformerModel(HFTransformerModel):
     # out at 2046 and the last two positions of every batch read out of range
     # -- silently on TPU, where the gather clamps.
     wanted = getattr(config, "max_seq_len", None)
+    # Remembered before the growth below: max_seq_len aliases
+    # max_position_embeddings, so after growing the table it reads the table
+    # size, not the context length forward bounds positions by.
+    self._context_length = wanted or None
     if wanted:
       try:
         with torch.device("meta"):
@@ -267,6 +278,15 @@ class TPUHFTransformerModel(HFTransformerModel):
     slower is not attention that is wrong.
     """
     wanted = getattr(config, "_attn_implementation", None)
+    if wanted == "splash_tpu" and wanted not in AttentionInterface._global_mapping:
+      # Not an architecture limit -- the adapter was never imported in this
+      # process. Falling back here would train on sdpa under a config that
+      # says splash, which is the silent no-op this lane refuses to allow.
+      raise RuntimeError(
+          f"attn_implementation={wanted!r} is not registered with HF's "
+          "AttentionInterface in this process (import "
+          "torchtitan.experiments.tpu.transformers_modeling_backend.attention)."
+      )
     attempts = [wanted] + [a for a in ("sdpa", "eager") if a != wanted]
     last = None
     for attempt in attempts:
@@ -448,8 +468,8 @@ class TPUHFTransformerModel(HFTransformerModel):
     # sample: with per-document ``positions`` (reset at every sample boundary)
     # the largest index is bounded by the context length, not the stream.
     # Without them the arange above runs the full stream.
-    if positions is not None:
-      self._check_position_capacity(min(model_args[0].shape[-1], self.max_seq_len))
+    if positions is not None and self._context_length:
+      self._check_position_capacity(min(model_args[0].shape[-1], self._context_length))
     else:
       self._check_position_capacity(model_args[0].shape[-1])
 

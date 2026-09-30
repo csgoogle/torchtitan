@@ -217,6 +217,7 @@ class TrainerMinimal:
 
     # Apply TPU-specific patches/workarounds
     workarounds.apply_patches(model, job_config)
+    workarounds.raise_dynamo_recompile_limits(model_config)
 
     if self.world_size > 1:
       self.model_spec.parallelize_fn(
