@@ -120,8 +120,13 @@ def parallelize_hf_transformers_tpu(
         parallel_dims.get_mesh([_cand])
         _shard_axis = _cand
         break
-      except Exception:
-        continue
+      except ValueError as e:
+        # get_mesh raises ValueError for an axis this ParallelDims does not
+        # activate; say which one was skipped and why, so a base that renames
+        # the axis again does not fail three lines down with no trail.
+        logger.warning(
+            "SimpleFSDP: mesh axis %r unavailable (%s); trying the next", _cand, e
+        )
     if _shard_axis is None:
       raise ValueError(
           "Neither 'fsdp' nor 'dp_shard' is an activated mesh axis; "
