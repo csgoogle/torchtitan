@@ -26,13 +26,52 @@ from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
                                             #  flavor Configs at import time)
-from torchtitan.experiments.transformers_modeling_backend import model_registry
+from torchtitan.experiments.transformers_modeling_backend import (
+    TitanMoeModelConfig,
+    flavors as _shared_flavors,
+    model_registry,
+)
+from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
 from .job_config import TPUTransformersBackendConfig
+from .model import as_tpu_model_config
 from .parallelize import parallelize_hf_transformers_tpu
+
+# Like the backend's "full_moe", but takes its architecture from the
+# checkpoint instead of pinning one. "full_moe" sets dim/n_layers/n_heads/
+# num_experts/... explicitly, and _initialize_attributes records every
+# explicitly-set field into _titan_injected_model_args, which
+# update_from_config then applies OVER the loaded HF config -- so --hf-model
+# selects the weights' name while the model is built at full_moe's fixed
+# 2048-dim / 48-layer / 128-expert shape. Leaving the HF-mapped fields at
+# their None defaults is what "full" already does: nothing is injected, so
+# AutoConfig's values stand. The MoE-ness still comes from the flavor
+# (TitanMoeModelConfig gates the MoE replacement), which genuinely cannot be
+# inferred from --hf-model since that is applied after the config is built.
+# experts_implementation="native": the HF experts kernel is irrelevant here --
+# moe_replacement swaps the whole MoE block for the Titan MoE (with the TPU
+# grouped-expert kernel, see model.py) -- and the default "grouped_mm" refuses
+# every family without a settable implementation (GraniteMoe, OLMoE, ...).
+# Defined here rather than in the shared flavors table: it is this lane's way
+# of running arbitrary MoE checkpoints.
+_TPU_FLAVORS = {
+    "full_moe_auto": HFTransformerModel.Config(
+        model_config=TitanMoeModelConfig(experts_implementation="native")
+    ),
+}
+
+
+def _model_registry(flavor: str, *, seq_len: int):
+  """The backend's model_registry, extended with this lane's own flavors."""
+  if flavor in _TPU_FLAVORS and flavor not in _shared_flavors:
+    spec = model_registry(next(iter(_shared_flavors)), seq_len=seq_len)
+    spec.flavor = flavor
+    spec.model = _TPU_FLAVORS[flavor]
+    return spec
+  return model_registry(flavor, seq_len=seq_len)
 
 # Small enough to compile and run a step on a single v6e chip.
 _DEFAULT_HF_MODEL = "Qwen/Qwen3-0.6B"
@@ -106,7 +145,12 @@ def _tpu_hf_config(
     fused_loss: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
-  model_spec = model_registry(flavor, seq_len=seq_len)
+  model_spec = _model_registry(flavor, seq_len=seq_len)
+  # The TPU subclass carries everything the lane changes about the model
+  # object (structural part resolution, attached head/norm, fused-loss
+  # return, ...); the shared backend only has the hooks. Re-classing a copy
+  # also leaves the shared flavors table untouched.
+  model_spec.model = as_tpu_model_config(model_spec.model, fused_loss=fused_loss)
   model_spec.parallelize_fn = parallelize_hf_transformers_tpu
   # flex attention has no TPU lowering. "sdpa" is the portable default;
   # "splash_tpu" routes attention through the TPU splash kernel via HF's
@@ -116,11 +160,6 @@ def _tpu_hf_config(
   # it also updates _titan_injected_model_args, which update_from_config
   # re-applies afterwards and would otherwise overwrite a bare assignment.
   _set_attn_implementation(model_spec.model, attn)
-  # Route the vocab projection through the lane's fused Pallas CE: the model
-  # hands back (hidden, lm_head.weight.T) and the kernel fuses projection,
-  # softmax and cross entropy, so the B*S*vocab logits tensor is never built.
-  model_spec.model._fused_loss = fused_loss
-
   return TPUTransformersBackendConfig(
       hf_model=hf_model,
       loss=(PallasCrossEntropyLoss.Config() if fused_loss
