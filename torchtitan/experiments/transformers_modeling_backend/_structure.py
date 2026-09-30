@@ -289,3 +289,67 @@ def accepted_kwargs(fn):
         if p.kind
         in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
     }
+
+
+def moe_attr_name(layer):
+    """The attribute holding this layer's MoE block, or None if it has none.
+
+    Models differ: most use ``mlp``, Mixtral and GraniteMoe use
+    ``block_sparse_moe``. Fall back to whichever child module looks like a MoE
+    block rather than enumerating every family -- the caller only needs the
+    attribute found; the probe that follows reads the geometry off the module.
+    """
+    if hasattr(layer, "mlp"):
+        return "mlp"
+    for name in ("block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
+        if hasattr(layer, name):
+            return name
+    for name, child in layer.named_children():
+        cls = type(child).__name__.lower()
+        if "moe" in cls or "sparse" in cls or "experts" in cls:
+            return name
+    return None
+
+
+def derive_dim(config, field, default=1):
+    """Read a structural size the top-level config does not state.
+
+    Composite configs keep it in a tower sub-config; staged encoders keep a
+    per-stage list, of which the last stage is the one the head sees.
+    """
+    for name in ("text_config", "vision_config", "audio_config"):
+        sub = getattr(config, name, None)
+        v = getattr(sub, field, None) if sub is not None else None
+        if isinstance(v, int) and v > 0:
+            return v
+    v = getattr(config, field, None)
+    if isinstance(v, (list, tuple)) and v:
+        return v[-1]
+    if isinstance(v, int) and v > 0:
+        return v
+    return default
+
+
+def derive_head_dim(config):
+    """head_dim for an architecture that does not state it at the top level.
+
+    Callers read config.head_dim directly, so leaving it unset raises
+    AttributeError rather than degrading. A composite config (CLIP, BLIP,
+    CLAP) keeps real dims in text_config / vision_config, and a staged
+    encoder (SegFormer) keeps per-stage lists. Prefer the text tower.
+    """
+    for name in ("text_config", "vision_config", "audio_config"):
+        sub = getattr(config, name, None)
+        if sub is None:
+            continue
+        h = getattr(sub, "hidden_size", None)
+        n = getattr(sub, "num_attention_heads", None)
+        if h and n:
+            return h // n
+    h = getattr(config, "hidden_sizes", None)
+    n = getattr(config, "num_attention_heads", None)
+    if isinstance(h, (list, tuple)) and h:
+        n_last = n[-1] if isinstance(n, (list, tuple)) and n else n
+        if n_last:
+            return h[-1] // n_last
+    return 64
