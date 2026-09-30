@@ -12,6 +12,7 @@ import torch.multiprocessing as mp
 from torchtitan.components import metrics
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
+from torchtitan.experiments.tpu import tpu_flags
 import torchtitan.experiments.tpu.train
 
 
@@ -52,7 +53,22 @@ def _train_args(
       "--splash_attention_kernel.use_splash_attention_kernel",
       "--tpu_config.use_graph_trainer",
       "--tpu_config.compile_mode=aot_fx_trace",
+      # libtpu 0.0.48 turns Shardy HLO sharding v3 on by default, and it breaks
+      # the graph trainer. The graph-trainer recipes turn it off themselves;
+      # the debug models used here are not among them.
+      "--extra-xla-flags=xla_enable_hlo_sharding_v3=false",
   ]
+
+
+def _start_trainer(config):
+  """Starts the trainer the way ``gmain`` does, with the config's flags applied.
+
+  ``start_trainer`` alone leaves ``xla_flags`` / ``libtpu_init_flags`` in the
+  config: only ``gmain`` renders them into ``XLA_FLAGS`` / ``LIBTPU_INIT_ARGS``,
+  and libtpu reads nothing else. Module-level so spawned workers can pickle it.
+  """
+  tpu_flags.apply_init_flags(config)
+  torchtitan.experiments.tpu.train.start_trainer(config)
 
 
 class _RecordLosses:
@@ -80,7 +96,7 @@ class _RecordLosses:
       )
 
     with mock.patch.object(metrics.MetricsProcessor, "log", log):
-      torchtitan.experiments.tpu.train.start_trainer(config)
+      _start_trainer(config)
 
     if int(os.environ.get("RANK", "0")) == 0:
       with open(self.output_path, "w") as f:
@@ -128,11 +144,6 @@ class TpuGraphTrainerDistributedTest(
           args=[
               "--tpu_config.use_simple_fsdp",
               "--tpu_config.use_scan_layers",
-              # `_on_scan_lane` turns Shardy HLO sharding v3 off for the scan
-              # recipes (libtpu 0.0.48 turned it on and it breaks the graph
-              # trainer). Setting `use_scan_layers` on the command line skips
-              # that, so this case has to ask for it itself.
-              "--extra-xla-flags=xla_enable_hlo_sharding_v3=false",
           ],
       ),
   ])
@@ -164,7 +175,7 @@ class TpuGraphTrainerDistributedTest(
         tensor_parallel_degree=tensor_parallel_degree,
         data_parallel_replicate_degree=data_parallel_replicate_degree,
         skip_devices=skip_devices,
-        start_trainer=torchtitan.experiments.tpu.train.start_trainer,  # pyrefly: ignore[bad-argument-type]
+        start_trainer=_start_trainer,  # pyrefly: ignore[bad-argument-type]
         enable_compile=enable_compile,
     )
 
