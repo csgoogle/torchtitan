@@ -559,6 +559,36 @@ class WorkaroundsTest(parameterized.TestCase):
         "the forwarded set must be a subset of the callee signature",
     )
 
+  def test_tokamax_patch_propagates_sliding_window_size_from_parent(self):
+    """Parent module sliding_window_size is forwarded to ScaledDotProductAttention."""
+    from torchtitan.models.common.attention import ScaledDotProductAttention  # pylint: disable=g-import-not-at-top
+
+    class _ParentWithSlidingWindow(torch.nn.Module):
+
+      def __init__(self, sliding_window_size):
+        super().__init__()
+        self.sliding_window_size = sliding_window_size
+        attn = ScaledDotProductAttention.__new__(ScaledDotProductAttention)
+        torch.nn.Module.__init__(attn)
+        self.inner_attention = attn
+
+    class _Model(torch.nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.local_attn = _ParentWithSlidingWindow(512)
+        self.global_attn = _ParentWithSlidingWindow(None)
+
+    _, sa = self._tokamax_patch_fixture()
+    model = _Model()
+    workarounds.use_tokamax_splash_attention_patch(model, sa)
+
+    self.assertEqual(model.local_attn.inner_attention.sliding_window_size, 512)
+    self.assertIsNone(
+        getattr(model.global_attn.inner_attention, "sliding_window_size", None)
+    )
+
 
 if __name__ == "__main__":
   absltest.main()
+

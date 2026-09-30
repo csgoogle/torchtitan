@@ -1,0 +1,265 @@
+"""Parallelization utilities for Gemma4 models on TPU."""
+
+import dataclasses
+from functools import partial
+import torch
+from torch import nn
+import torchtitan.config
+import torchtitan.distributed
+from torchtitan.distributed.compile import apply_compile
+from torchtitan.distributed.context_parallel import apply_cp_to_forward
+from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
+from torchtitan.distributed.full_dtensor import (
+    resolve_fsdp_mesh,
+    resolve_sparse_fsdp_mesh,
+    validate_config,
+)
+from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
+from torchtitan.experiments.graph_trainer.common_utils import (
+    apply_simple_fsdp,
+)
+from torchtitan.experiments.tpu.grouped_experts import (
+    TpuGroupedExperts,
+    configure_expert_dweight_output_dtype,
+)
+from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+from torchtitan.models.common.moe import (
+    GroupedExperts,
+    MoE,
+    configure_moe_aux_loss_reduction,
+)
+from torchtitan.models.common.param_init import skip_param_init
+from torchtitan.tools.logging import logger
+
+
+def _parallelize_gemma4_dtensor(
+    model: nn.Module,
+    *,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+    training: torchtitan.config.TrainingConfig,
+    parallelism: torchtitan.config.ParallelismConfig,
+    compile_config: torchtitan.config.CompileConfig,
+    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config | None",
+    dump_folder: str,
+    skip_dp: bool = False,
+) -> nn.Module:
+  """Apply DTensor/SPMD TP, EP, CP, AC, compile, and FSDP to Gemma4."""
+  model_compile_enabled = (
+      compile_config.enable and "model" in compile_config.components
+  )
+
+  if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+    validate_config(parallel_dims, model)
+    model.parallelize(parallel_dims)
+  else:
+    if parallel_dims.cp_enabled:
+      apply_cp_to_forward(
+          # pyrefly: ignore [missing-attribute]
+          [block.attention.inner_attention for block in model.layers.values()],
+          parallel_dims.get_mesh("cp"),
+      )
+    if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
+      model.parallelize(parallel_dims)
+
+  configure_moe_aux_loss_reduction(model, parallel_dims)
+
+  if parallel_dims.tp_enabled:
+    maybe_enable_async_tp(
+        parallelism, compile_config, parallel_dims.get_mesh("tp")
+    )
+
+  if ac_config is not None:
+    ac_config.build(dump_folder=dump_folder).apply(model)
+
+  if model_compile_enabled:
+    apply_compile(model, compile_config)
+
+  if skip_dp:
+    return model
+
+  if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
+  else:
+    dp_mesh_names = (
+        ["dp_replicate", "fsdp"]
+        if parallel_dims.dp_replicate_enabled
+        else ["fsdp"]
+    )
+    dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+    dp_mesh_dims = None
+    edp_mesh = None
+    edp_mesh_dims = None
+    if parallel_dims.ep_enabled:
+      edp_mesh_names = (
+          ["dp_replicate", "efsdp"]
+          if parallel_dims.dp_replicate_enabled
+          else ["efsdp"]
+      )
+      edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+
+  apply_fsdp_to_decoder(
+      model,
+      dp_mesh,
+      param_dtype=torchtitan.config.TORCH_DTYPE_MAP[
+          training.mixed_precision_param
+      ],
+      reduce_dtype=torchtitan.config.TORCH_DTYPE_MAP[
+          training.mixed_precision_reduce
+      ],
+      pp_enabled=parallel_dims.pp_enabled,
+      cpu_offload=training.enable_cpu_offload,
+      reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+      ep_degree=parallel_dims.ep,
+      edp_mesh=edp_mesh,
+      dp_mesh_dims=dp_mesh_dims,
+      edp_mesh_dims=edp_mesh_dims,
+      enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+  )
+
+  return model
+
+
+def configure_gemma4_simple_fsdp_shard_dims(
+    model: nn.Module,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+) -> None:
+  """Use divisible hidden axes for uneven Gemma4 parameters under SimpleFSDP."""
+  fsdp_degree = parallel_dims.dp_shard * parallel_dims.cp
+  if fsdp_degree <= 1:
+    return
+
+  stacks = [m for m in model.modules() if hasattr(m, "plan_shard_dims")]
+  for holder in stacks:
+    holder._fsdp_shard_dim = holder.plan_shard_dims(fsdp_degree)
+
+  hidden_axis_modules: list[str] = []
+  for module_fqn in ("tok_embeddings", "lm_head"):
+    module = getattr(model, module_fqn, None)
+    if module is None:
+      continue
+    weight = module.weight
+    if weight.shape[0] % fsdp_degree == 0:
+      continue
+    if weight.ndim != 2 or weight.shape[1] % fsdp_degree != 0:
+      raise ValueError(
+          f"Cannot FSDP-shard {module_fqn}.weight with shape "
+          f"{tuple(weight.shape)} over {fsdp_degree} ranks"
+      )
+    setattr(module, "_fsdp_shard_dim", 1)
+    hidden_axis_modules.append(module_fqn)
+
+  if not parallel_dims.ep_enabled:
+    expert_modules = [
+        (module_fqn, module)
+        for module_fqn, module in model.named_modules()
+        if isinstance(module, (TpuGroupedExperts, GroupedExperts))
+    ]
+    for module_fqn, module in expert_modules:
+      if module.num_experts % fsdp_degree == 0:
+        continue
+
+      parameters = list(module.named_parameters(recurse=False))
+      if not parameters:
+        if stacks:
+          continue
+        raise ValueError(f"{module_fqn} has no direct parameters to FSDP-shard")
+      incompatible = [
+          f"{name}{tuple(parameter.shape)}"
+          for name, parameter in parameters
+          if (
+              parameter.ndim != 3
+              or parameter.shape[0] != module.num_experts
+              or parameter.shape[1] % fsdp_degree != 0
+          )
+      ]
+      if incompatible:
+        raise ValueError(
+            f"Cannot FSDP-shard {module_fqn} on Gemma4's hidden dimension 1 "
+            f"over {fsdp_degree} ranks; incompatible expert parameters: "
+            f"{incompatible}"
+        )
+      setattr(module, "_fsdp_shard_dim", 1)
+      hidden_axis_modules.append(module_fqn)
+
+  if hidden_axis_modules:
+    logger.info(
+        "Using SimpleFSDP dimension 1 for %d uneven Gemma4 modules",
+        len(hidden_axis_modules),
+    )
+
+
+def parallelize_gemma4(
+    model: nn.Module,
+    *,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+    training: torchtitan.config.TrainingConfig,
+    parallelism: torchtitan.config.ParallelismConfig,
+    compile_config: torchtitan.config.CompileConfig,
+    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config | None",
+    dump_folder: str,
+    skip_dp: bool = False,
+    tpu_compile_mode: str = "layer",
+    **kwargs,
+) -> nn.Module:
+  """Parallelizes the Gemma4 model, optionally applying Simple FSDP."""
+  compile_mode = tpu_compile_mode
+  effective_compile_config = compile_config
+  reduce_dtype = torchtitan.config.TORCH_DTYPE_MAP[
+      training.mixed_precision_reduce
+  ]
+  configure_expert_dweight_output_dtype(model, reduce_dtype)
+  if effective_compile_config.enable and hasattr(model, "layers"):
+    for layer in model.layers.values():
+      has_moe = any(isinstance(m, MoE) for m in layer.modules())
+      if not has_moe:
+        apply_spmd_safe(layer)
+
+  if compile_mode in ("fullgraph", "aot_fx_trace") and compile_config.enable:
+    effective_compile_config = dataclasses.replace(compile_config, enable=False)
+
+  if parallelism.use_simple_fsdp:
+    # SimpleFSDP wraps tok_embeddings with a read-only `weight` property, which
+    # is incompatible with Decoder.init_states assigning tok_embeddings.weight.
+    if getattr(model, "enable_weight_tying", False):
+      model.enable_weight_tying = False
+      tok_emb = getattr(model, "tok_embeddings", None)
+      if tok_emb is not None and getattr(tok_emb, "_param_init", None) == {
+          "weight": skip_param_init
+      }:
+        tok_emb._param_init = {
+            "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
+        }
+
+    _parallelize_gemma4_dtensor(
+        model,
+        ac_config=ac_config,
+        compile_config=effective_compile_config,
+        dump_folder=dump_folder,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        skip_dp=True,
+        training=training,
+    )
+
+    configure_gemma4_simple_fsdp_shard_dims(model, parallel_dims)
+    model = apply_simple_fsdp(
+        model,
+        parallel_dims=parallel_dims,
+        training=training,
+    )
+  else:
+    _parallelize_gemma4_dtensor(
+        model,
+        ac_config=ac_config,
+        compile_config=effective_compile_config,
+        dump_folder=dump_folder,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        skip_dp=skip_dp,
+        training=training,
+    )
+  if compile_mode == "fullgraph":
+    apply_spmd_safe(model)
+    model = torch.compile(model, fullgraph=True, backend="tpu")
+  return model

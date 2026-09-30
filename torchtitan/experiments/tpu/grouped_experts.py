@@ -90,6 +90,7 @@ class TpuGroupedExperts(GroupedExperts):
 
     @dataclass(kw_only=True, slots=True)
     class Config(GroupedExperts.Config):
+        activation: str = "silu"
         use_pallas_grouped_mm: bool = False
         # Share routed-token loads between the equal-shaped W1/W3 projections.
         use_pallas_paired_grouped_mm: bool = False
@@ -100,6 +101,10 @@ class TpuGroupedExperts(GroupedExperts):
         use_kernel_native_weight_layout: bool = False
 
     def __init__(self, config: Config):
+        if config.activation not in ("silu", "gelu_tanh"):
+            raise ValueError(
+                f"Unsupported expert activation: {config.activation!r}"
+            )
         if config.use_kernel_native_weight_layout:
             if not config.use_pallas_grouped_mm:
                 raise ValueError(
@@ -120,6 +125,7 @@ class TpuGroupedExperts(GroupedExperts):
         else:
             super().__init__(config)
 
+        self.activation = config.activation
         self.use_pallas_grouped_mm = config.use_pallas_grouped_mm
         self.use_pallas_paired_grouped_mm = config.use_pallas_paired_grouped_mm
         self.pallas_grouped_mm_tile_m = config.pallas_grouped_mm_tile_m
@@ -223,6 +229,14 @@ class TpuGroupedExperts(GroupedExperts):
         # dWeight is incorrect at M=4096. See
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
         if not self.use_pallas_grouped_mm:
+            if self.activation == "gelu_tanh":
+                from torchtitan.experiments.tpu.gemma4.model import (
+                    Gemma4GroupedExperts,
+                )
+
+                return Gemma4GroupedExperts._experts_forward(
+                    self, x_RD, num_tokens_per_expert_E
+                )
             return super()._experts_forward(x_RD, num_tokens_per_expert_E)
         def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor
@@ -277,7 +291,10 @@ class TpuGroupedExperts(GroupedExperts):
                 tgmm_tiling=tgmm_tiling,
                 dweight_output_dtype=self._unpaired_dweight_output_dtype,
             )
-        hidden_RF = F.silu(gate_RF) * up_RF
+        if self.activation == "gelu_tanh":
+            hidden_RF = F.gelu(gate_RF, approximate="tanh") * up_RF
+        else:
+            hidden_RF = F.silu(gate_RF) * up_RF
         return segment_matmul_pallas_2d(
             hidden_RF,
             w2_EKN.bfloat16(),
