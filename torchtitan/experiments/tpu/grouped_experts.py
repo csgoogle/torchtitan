@@ -84,6 +84,9 @@ class TpuGroupedExperts(GroupedExperts):
 
     The paired path changes only W1/W3 execution: their parameters, FSDP
     collectives, checkpoint keys, and the W2 projection remain independent.
+    W2's dWeight may tile differently from W1/W3's: a dWeight is tiled along
+    ``K``, the weight's input dimension, which is ``F`` for W2 and ``D`` for
+    W1/W3, so one K tile cannot suit both.
     The unpaired dWeight kernel retains FP32 accumulation and stores in the
     final FSDP reduction dtype selected by the parallelizer.
     """
@@ -97,6 +100,10 @@ class TpuGroupedExperts(GroupedExperts):
         pallas_grouped_mm_tile_k: int = 0
         pallas_grouped_mm_tile_n: int = 0
         pallas_grouped_mm_tgmm_tiling: tuple[int, int, int] = (128, 128, 128)
+        # TGMM tiling for the W2 (down-projection) dWeight. ``None`` follows
+        # ``pallas_grouped_mm_tgmm_tiling``. Set it when W1/W3 want a K tile
+        # that W2's shorter K axis cannot hold.
+        pallas_grouped_mm_w2_tgmm_tiling: tuple[int, int, int] | None = None
         use_kernel_native_weight_layout: bool = False
 
     def __init__(self, config: Config):
@@ -126,6 +133,7 @@ class TpuGroupedExperts(GroupedExperts):
         self.pallas_grouped_mm_tile_k = config.pallas_grouped_mm_tile_k
         self.pallas_grouped_mm_tile_n = config.pallas_grouped_mm_tile_n
         self.pallas_grouped_mm_tgmm_tiling = config.pallas_grouped_mm_tgmm_tiling
+        self.pallas_grouped_mm_w2_tgmm_tiling = config.pallas_grouped_mm_w2_tgmm_tiling
         # Standalone modules preserve the historical FP32 result. Qwen's
         # parallelizer replaces this with the final, post-CLI FSDP reduction
         # dtype before tracing or sharding.
@@ -243,6 +251,7 @@ class TpuGroupedExperts(GroupedExperts):
         tile_k = self.pallas_grouped_mm_tile_k
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
+        w2_tgmm_tiling = self.pallas_grouped_mm_w2_tgmm_tiling or tgmm_tiling
         if self.use_pallas_paired_grouped_mm:
             # Paired W1/W3 always return BF16 dWeights: two full FP32 output
             # tiles exceed TPU scoped VMEM. FP32 FSDP reductions widen those
@@ -285,7 +294,7 @@ class TpuGroupedExperts(GroupedExperts):
             tile_m=tile_m,
             tile_k=tile_k,
             tile_n=tile_n,
-            tgmm_tiling=tgmm_tiling,
+            tgmm_tiling=w2_tgmm_tiling,
             dweight_output_dtype=self._unpaired_dweight_output_dtype,
         ).type_as(x_RD)
 

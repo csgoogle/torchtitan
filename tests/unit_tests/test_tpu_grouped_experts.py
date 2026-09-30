@@ -298,6 +298,61 @@ def test_paired_grouped_mm_forwards_tgmm_tile_k():
     assert unpaired.call_args.kwargs["tgmm_tiling"] == (128, 8, 0)
 
 
+@pytest.mark.parametrize("paired", [True, False])
+def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired):
+    """``pallas_grouped_mm_w2_tgmm_tiling`` tiles W2 and nothing else.
+
+    Its N tile is non-zero here: the full-N rule is the paired kernel's, and W2
+    is never paired.
+    """
+    shared, w2_own = (128, 8, 0), (64, 4, 4)
+    experts = TpuGroupedExperts.Config(
+        dim=16,
+        hidden_dim=24,
+        num_experts=2,
+        use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=paired,
+        pallas_grouped_mm_tgmm_tiling=shared,
+        pallas_grouped_mm_w2_tgmm_tiling=w2_own,
+        token_dispatcher=LocalTokenDispatcher.Config(num_experts=2, top_k=1),
+    ).build()
+    for param in experts.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    x = torch.randn(7, 16)
+    counts = torch.tensor([3, 4], dtype=torch.int32)
+
+    def grouped_mm(x, weight, counts, **kwargs):
+        del kwargs
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        return torch._grouped_mm(x, weight, offs=offsets)
+
+    def paired_grouped_mm(x, w1, w3, counts, **kwargs):
+        del kwargs
+        return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
+
+    with patch(
+        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
+        side_effect=grouped_mm,
+    ) as unpaired, patch(
+        "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
+        side_effect=paired_grouped_mm,
+    ) as paired_kernel:
+        experts._experts_forward(x, counts)
+
+    if paired:
+        paired_kernel.assert_called_once()
+        assert paired_kernel.call_args.kwargs["tgmm_tile_m"] == shared[0]
+        assert paired_kernel.call_args.kwargs["tgmm_tile_k"] == shared[1]
+        unpaired.assert_called_once()
+    else:
+        paired_kernel.assert_not_called()
+        gate, up, _ = unpaired.call_args_list
+        assert gate.kwargs["tgmm_tiling"] == shared
+        assert up.kwargs["tgmm_tiling"] == shared
+    # W2 is always the last unpaired call.
+    assert unpaired.call_args_list[-1].kwargs["tgmm_tiling"] == w2_own
+
+
 def test_kernel_native_layout_preserves_initialization_and_state_dict():
     param_init = {
         "w1_EFD": lambda x: torch.nn.init.normal_(x, std=0.02),

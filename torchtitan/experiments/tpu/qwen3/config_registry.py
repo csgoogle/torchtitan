@@ -730,23 +730,18 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
     experts.use_pallas_grouped_mm = True
     experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
-    # Four K slabs. The paired dWeight needs 105 MB at 4096 x 1536 against
-    # Mosaic's 64 MB, which the K tile this PR adds brings under 30 MB. The N
-    # tile must stay full; the unpaired alternative is (256, 0, 512).
+    # A dWeight is tiled along K, the weight's input dimension: D = 4096 for
+    # the paired W1/W3, F = 1536 for W2. Untiled, the paired dWeight needs
+    # 105 MB at 4096 x 1536 against Mosaic's 64 MB. Its N tile must stay full.
     #
-    # This element feeds TWO kernels, and 1024 is bounded by the SECOND of them.
-    # In isolation the paired dWeight prefers 2048 - measured 20.824 -> 18.576 ms
-    # p50 (1.121x), bit-exact - but the same value also tiles the unpaired dW2,
-    # whose corresponding axis is 1536, not 4096. A 2048 tile on a 1536 axis does
-    # not clamp: it allocates a f32[1,2048,4096] window, 33.55 MB, doubled by the
-    # two buffering levels to exactly the 64 MB budget, and the module OOMs at
-    # 103.04M before the first step. Measured end to end on 64 v7x, not inferred.
-    #
-    # So 2048 is reachable only by giving the two kernels independent K tiles.
-    # Until then this stays at 1024.
-    # perf: see wiki/experiments/qwen3_autoresearch_optimization/tpu/
-    #       2026-09-20-v016-tgmm-tile-k-2048-e2e.md
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
+    # The paired dWeight prefers a 2048 K tile, which W2 cannot take. A 2048
+    # tile on a 1536 axis does not clamp: it allocates a f32[1,2048,4096]
+    # window, 33.55 MB, doubled by the two buffering levels to the whole 64 MB
+    # budget, and the module OOMs before the first step (measured on 64 v7x).
+    # So the two kernels are tiled independently.
+    experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
+    # A K tile that does not divide F leaves a masked remainder tile.
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 768, 0)
     experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = 8192
@@ -898,7 +893,12 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
     # The splitter's expert kernels: W1/W3 paired, with its K-tiled dWeight.
     experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
+    # A dWeight is tiled along K, the weight's input dimension: D for the
+    # paired W1/W3, the smaller F for W2. The K tile that measures best for
+    # W1/W3 does not fit W2, so tile them independently.
+    experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
+    # A K tile that does not divide F leaves a masked remainder tile.
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 768, 0)
     experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = 8192
