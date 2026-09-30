@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import contextlib
 import copy
 import importlib
 import math
@@ -20,8 +19,6 @@ from torch.nn import init
 from torch.nn.attention.flex_attention import and_masks
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
-
-from . import _meta_init, _structure
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.modeling_utils import AttentionInterface, PreTrainedModel
 
@@ -156,10 +153,29 @@ _TT_SPECIFIC_ATTRIBUTES = [
 # ``transformers`` config/model pair for denylisted model types.
 _REMOTE_CONFIG_DENYLIST = frozenset({"deepseek_v2", "deepseek_v3"})
 
-
 # TorchTitan initializes an untied token embedding at unit std.
 _TITAN_EMBED_INIT_STD = 1.0
 
+
+def _get_moe_attr_name(layer: nn.Module) -> str | None:
+    """Return the attribute name holding the MoE block on a decoder layer.
+
+    Most models use ``mlp``; Mixtral and GraniteMoe use ``block_sparse_moe``.
+    Returns ``None`` if no candidate is present.
+    """
+    for name in ("mlp", "block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
+        if hasattr(layer, name):
+            return name
+    return None
+
+
+# The backend routes attention through flex. The custom impl name is registered
+# in the HF ``AttentionInterface`` (see
+# ``_configure_hf_attention``) and set on ``config._attn_implementation`` so HF
+# routes attention through ``_flex_attention_torchtitan`` -- bypassing HF's
+# per-model ``_supports_flex_attn`` gate. A causal or document/packing BlockMask
+# is applied via the titan-built mask (is_causal alone cannot express
+# cross-sample masking); see ``get_attention_masks``.
 _ATTN_IMPLEMENTATION = "flex_torchtitan"
 
 
@@ -248,11 +264,7 @@ class HFTransformerModel(BaseModel):
             with the custom __init__ here (expects model_config).
             """
             clone = self._replace()
-            # HF modules compute real buffers in __init__ (causal masks, rope
-            # tables, embedding normalizers) and a plain meta build throws all
-            # of them away. See _meta_init.py.
-            with _meta_init.params_meta_buffers_real():
-                instance = self._owner(config=clone, **kwargs)
+            instance = self._owner(config=clone, **kwargs)
             if self.param_init is not None:
                 instance._param_init = self.param_init
             return instance
@@ -407,34 +419,11 @@ class HFTransformerModel(BaseModel):
                 config_dict.get("model_type", "") not in _REMOTE_CONFIG_DENYLIST
             )
             # Load HF config (overwrites our HF attributes)
-            # is_moe was decided from the *flavor* in __init__, before
-            # --hf-model had been applied, so a MoE checkpoint selected on the
-            # command line arrived with a dense flavor and the MoE replacement
-            # never ran. hf_model_id is final here: ask the checkpoint.
             hf_model_config = AutoConfig.from_pretrained(
                 hf_model_id,
                 attn_implementation=self.attn_implementation,
                 trust_remote_code=trust_remote_code,
             )
-
-            if not getattr(self, "is_moe", False):
-                for _attr in ("num_experts", "n_routed_experts", "num_local_experts"):
-                    for _holder in (
-                        hf_model_config,
-                        getattr(hf_model_config, "text_config", None),
-                    ):
-                        _v = getattr(_holder, _attr, None) if _holder is not None else None
-                        if isinstance(_v, int) and _v > 1:
-                            logger.warning(
-                                f"{hf_model_id} declares {_v} experts but the "
-                                "selected flavor is dense, so the MoE replacement "
-                                "will not run and HF's own MoE executes unreplaced. "
-                                "Select a *_moe config for this model."
-                            )
-                            break
-                    else:
-                        continue
-                    break
 
             # For composite (VL) models, use the nested text config so we
             # build the text-only CausalLM instead of the conditional model.
@@ -489,16 +478,7 @@ class HFTransformerModel(BaseModel):
             self.attention_bias = False
             self.mlp_bias = False
             self.use_cache = False
-            # Keep the model's own initializer_range. Forcing 1.0 here also
-            # reaches HF's stock _init_weights, which uses this field as the
-            # std for every Linear/Conv1D/Embedding -- and the stock path runs
-            # whenever the Llama-like patch does not match (GPT-2, BERT, XLM-R
-            # are not named <Prefix>DecoderLayer). Those models were built at
-            # std=1.0 instead of 0.02, which lands cross entropy near 120 where
-            # ln(vocab) is 10.8, with nothing failing. TorchTitan's own init
-            # states its 1.0 directly, at the one place it means it.
-            if not hasattr(self, "initializer_range"):
-                self.initializer_range = 0.02
+            self.initializer_range = 1.0  # use as std for normal init in embedding
 
             # When dim is explicitly overridden (e.g. debugmodel), derive the
             # dependent sizes from it. Otherwise keep what AutoConfig loaded from
@@ -534,15 +514,12 @@ class HFTransformerModel(BaseModel):
                 # dim explicitly overridden: derive head_dim from it.
                 self.head_dim = self.dim // self.num_attention_heads
             elif not getattr(self, "head_dim", None):
-                # HF config did not provide head_dim; use the standard
-                # derivation. A composite config (CLIP, BLIP, SegFormer) states
-                # neither dim nor num_attention_heads at the top level, which
-                # makes that a TypeError rather than a wrong number -- read the
-                # towers' own sizes instead.
+                # HF config did not provide head_dim; use the standard derivation.
+                # A composite config (CLIP, SegFormer) states neither dim nor
+                # num_attention_heads at the top level; leave head_dim to the
+                # caller in that case rather than raising here.
                 if self.dim is not None and getattr(self, "num_attention_heads", None):
                     self.head_dim = self.dim // self.num_attention_heads
-                else:
-                    self.head_dim = _structure.derive_head_dim(self)
 
             # Ensure expert groups are consistent with (possibly overridden)
             # num_experts for models with group-level routing (DeepSeek V3).
@@ -587,7 +564,7 @@ class HFTransformerModel(BaseModel):
                 if getattr(layer, "_layer_level_moe", False):
                     moe_block = layer
                 else:
-                    moe_attr = _structure.moe_attr_name(layer)
+                    moe_attr = _get_moe_attr_name(layer)
                     if moe_attr is None:
                         logger.warning(
                             "HF MFU calculation could not identify the MoE block; "
@@ -684,60 +661,6 @@ class HFTransformerModel(BaseModel):
                 f"active parameters: {active_nparams:,}"
             )
             return nparams, num_flops_per_token
-
-    @staticmethod
-    def _set_attn_everywhere(config, attn: str) -> None:
-        """Set the attention implementation on a config and its sub-configs.
-
-        A model that builds a nested backbone from its own sub-config
-        (grounding-dino's SwinBackbone) never sees a change made only at the
-        top level.
-        """
-        config._attn_implementation = attn
-        config.attn_implementation = attn
-        for name in dir(config):
-            if not name.endswith("_config"):
-                continue
-            sub = getattr(config, name, None)
-            if sub is not None and hasattr(sub, "_attn_implementation"):
-                sub._attn_implementation = attn
-                sub.attn_implementation = attn
-
-    @staticmethod
-    def _build_with_supported_attention(model_cls, config):
-        """Build the model, backing off to an attention path it accepts.
-
-        Registering an implementation with AttentionInterface only reaches
-        architectures that dispatch through it. The BERT family indexes a
-        fixed class dict instead -- BERT_SELF_ATTENTION_CLASSES[
-        config._attn_implementation] -- so a name it does not know is a
-        KeyError in __init__, and Electra and the T5 family raise ValueError
-        for the same reason. Attention that is slower is not attention that is
-        wrong.
-        """
-        wanted = getattr(config, "_attn_implementation", None)
-        attempts = [wanted] + [a for a in ("sdpa", "eager") if a != wanted]
-        last = None
-        for attempt in attempts:
-            if attempt != wanted:
-                HFTransformerModel._set_attn_everywhere(config, attempt)
-            try:
-                model = model_cls(config=config)
-            except (ValueError, KeyError) as e:
-                text = str(e)
-                if attempt is not None and attempt not in text and (
-                    "attention implementation" not in text
-                ):
-                    raise
-                last = e
-                continue
-            if attempt != wanted:
-                logger.warning(
-                    f"{model_cls.__name__} does not accept "
-                    f"attn_implementation={wanted!r}; built with {attempt!r}."
-                )
-            return model
-        raise last
 
     def __init__(self, config: Config):
         super().__init__()
@@ -860,94 +783,22 @@ class HFTransformerModel(BaseModel):
                     "HF model's built-in experts kernel."
                 )
 
-        # Size the learned position table to hold max_seq_len before building.
-        # The config bridges max_seq_len -> max_position_embeddings, but a
-        # family that reserves slots at the front addresses fewer rows than it
-        # has: XLM-R starts position ids at padding_idx + 1, so a 2048-row
-        # table tops out at 2046 and the last two positions of every batch read
-        # out of range -- silently on TPU, where the gather clamps.
-        _wanted = getattr(config, "max_seq_len", None)
-        if _wanted:
-            try:
-                with torch.device("meta"):
-                    _probe = model_cls(config=config)
-                _cap = _structure.position_capacity(_probe)
-                if _cap is not None and _cap < _wanted:
-                    config.max_position_embeddings = (
-                        config.max_position_embeddings + (_wanted - _cap)
-                    )
-                    logger.info(
-                        f"Grew the position table by {_wanted - _cap} to address "
-                        f"{_wanted} positions ({type(_probe).__name__} reserves "
-                        "slots at the front of its table)."
-                    )
-            except Exception as e:
-                logger.warning(f"Could not size the position table: {e}")
-
-        self.model = self._build_with_supported_attention(model_cls, config)
+        self.model = self._build_hf_model(model_cls, config)
         self.max_seq_len = config.max_seq_len
         self.cp_mesh = None
-        self._position_capacity = _structure.position_capacity(self.model)
-        # T5 positions with relative bias and DistilBERT with its own
-        # embedding, so neither takes position_ids; passing it is a TypeError
-        # rather than something they ignore. Ask the signature once.
-        self._forward_kwargs = _structure.accepted_kwargs(self.model.forward)
-
-        # BERT, DistilBERT and XLM-R normalize inside every block and end
-        # without a trailing norm. Callers still expect the part to exist, so
-        # stand in an Identity, which is what "no final norm" computes.
-        self._added_norm = None
-        if _structure.find_norm(self.model)[0] is None:
-            self._added_norm = nn.Identity()
-
-        # A bare encoder has no output projection, and a classification head
-        # maps to num_labels rather than to the vocabulary -- neither can
-        # produce token logits. Attach a head tied to the token embedding, as
-        # any fine-tuning harness does to put a token objective on such a
-        # model. This adds parameters the checkpoint does not carry; it is for
-        # training and measurement, not for restoring a published head.
-        self._added_lm_head = None
-        _head, _ = _structure.find_head(self.model)
-        _head_out = _structure.head_out_features(_head)
-        _vocab = getattr(config, "vocab_size", None)
-        if _head is not None and _head_out is not None and _vocab and _head_out != _vocab:
-            logger.info(
-                f"{type(self.model).__name__}'s head maps to {_head_out} labels, "
-                f"not the {_vocab}-token vocabulary; attaching an lm_head and "
-                "training the backbone on a token objective instead."
-            )
-            _head = None
-        if _head is None:
-            _emb, _ = _structure.find_embedding(self.model)
-            if isinstance(_emb, nn.Embedding):
-                self._added_lm_head = nn.Linear(
-                    _emb.embedding_dim, _emb.num_embeddings, bias=False
-                )
-                self._added_lm_head.weight = _emb.weight
-                logger.info(
-                    f"{type(self.model).__name__} has no usable output projection; "
-                    f"attached an lm_head tied to the token embedding "
-                    f"({_emb.embedding_dim} -> {_emb.num_embeddings})."
-                )
 
         # Convert ModuleList to ModuleDict to preserve original indices
         # This ensures state dict keys match checkpoint keys
-        _blocks, _blocks_path = _structure.find_layers(self.model)
-        if _blocks is None:
-            raise AttributeError(
-                f"Could not locate the block stack on {type(self.model).__name__}"
+        if isinstance(self.layers, nn.ModuleList):
+            self.layers = SliceableModuleDict(
+                {str(i): layer for i, layer in enumerate(self.layers)}
             )
-        if isinstance(_blocks, nn.ModuleList):
-            _blocks = SliceableModuleDict(
-                {str(i): layer for i, layer in enumerate(_blocks)}
-            )
-            _structure.set_at(self.model, _blocks_path, _blocks)
 
-        for layer in _blocks.values():
+        for layer in self.layers.values():
             # Detect MoE layers by checking for gate/router and experts sub-modules.
             # Gemma4 has router/experts as siblings of the dense MLP at the
             # layer level (not inside ``mlp``).
-            moe_attr = _structure.moe_attr_name(layer)
+            moe_attr = _get_moe_attr_name(layer)
             moe_module = getattr(layer, moe_attr, None) if moe_attr else None
             if moe_module is not None:
                 has_gate = hasattr(moe_module, "gate") or hasattr(moe_module, "router")
@@ -968,6 +819,10 @@ class HFTransformerModel(BaseModel):
             from .moe_replacement import prepare_native_moe_configs
 
             prepare_native_moe_configs(self, config)
+
+    def _build_hf_model(self, model_cls, config):
+        """Construct the wrapped HF model; a subclass may prepare or retry."""
+        return model_cls(config=config)
 
     def set_cp_mesh(self, mesh):
         self.cp_mesh = mesh
@@ -1209,88 +1064,123 @@ class HFTransformerModel(BaseModel):
 
     @property
     def tok_embeddings(self):
-        """The token embedding table, wherever this architecture keeps it."""
-        found, _ = _structure.find_embedding(self.model)
-        if found is None:
+        """Returns the model's embed_tokens, handling different Hugging Face model structures."""
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "embed_tokens"
+        ):  # Llama-like
+            return self.model.model.embed_tokens
+        else:
             raise AttributeError(
-                f"Could not locate tok_embeddings on {type(self.model).__name__}"
+                "Could not find embed_tokens in the model. Please check the model structure."
             )
-        return found
 
     @tok_embeddings.setter
     def tok_embeddings(self, value):
-        _, path = _structure.find_embedding(self.model)
-        if path is None:
-            raise AttributeError("Could not locate tok_embeddings to assign")
-        _structure.set_at(self.model, path, value)
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "embed_tokens"
+        ):  # Llama-like
+            self.model.model.embed_tokens = value
+        else:
+            raise AttributeError(
+                "Could not find embed_tokens in the model. Please check the model structure."
+            )
 
     @property
     def layers(self):
-        """The decoder/encoder block stack."""
-        found, _ = _structure.find_layers(self.model)
-        if found is None:
+        """Returns the model's layers, handling different Hugging Face model structures."""
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "layers"
+        ):  # Llama-like
+            return self.model.model.layers
+        else:
+            # Add more cases here if needed for other model architectures
             raise AttributeError(
-                f"Could not locate the block stack on {type(self.model).__name__}"
+                "Could not find layers in the model. Please check the model structure."
             )
-        return found
 
     @layers.setter
     def layers(self, value):
-        _, path = _structure.find_layers(self.model)
-        if path is None:
-            raise AttributeError("Could not locate layers to assign")
-        _structure.set_at(self.model, path, value)
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "layers"
+        ):  # Llama-like
+            self.model.model.layers = value
+        else:
+            raise AttributeError(
+                "Could not find layers in the model. Please check the model structure."
+            )
 
     @property
     def norm(self):
-        """The final norm, or an Identity for an architecture without one."""
-        if getattr(self, "_added_norm", None) is not None:
-            return self._added_norm
-        found, _ = _structure.find_norm(self.model)
-        if found is None:
+        """Returns the model's norm, handling different Hugging Face model structures."""
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "norm"
+        ):  # Llama-like
+            return self.model.model.norm
+        elif hasattr(self.model, "model") and hasattr(
+            self.model.model, "final_layernorm"
+        ):  # Phi-like
+            return self.model.model.final_layernorm
+        else:
             raise AttributeError(
-                f"Could not locate norm on {type(self.model).__name__}"
+                "Could not find norm in the model. Please check the model structure."
             )
-        return found
 
     @norm.setter
     def norm(self, value):
-        _, path = _structure.find_norm(self.model)
-        if path is None:
-            raise AttributeError("Could not locate norm to assign")
-        _structure.set_at(self.model, path, value)
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "norm"
+        ):  # Llama-like
+            self.model.model.norm = value
+        elif hasattr(self.model, "model") and hasattr(
+            self.model.model, "final_layernorm"
+        ):  # Phi-like
+            self.model.model.final_layernorm = value
+        else:
+            raise AttributeError(
+                "Could not find norm in the model. Please check the model structure."
+            )
 
     @property
     def lm_head(self):
-        """The output projection, native to the architecture or attached for it."""
-        if getattr(self, "_added_lm_head", None) is not None:
-            return self._added_lm_head
-        found, _ = _structure.find_head(self.model)
-        if found is None:
+        """Returns the model's output layer, handling different Hugging Face model structures."""
+        if hasattr(self.model, "lm_head"):  # For models like LlamaForCausalLM
+            return self.model.lm_head
+        else:
             raise AttributeError(
-                f"Could not locate lm_head on {type(self.model).__name__}"
+                "Could not find lm_head in the model. Please check the model structure."
             )
-        return found
 
     @lm_head.setter
     def lm_head(self, value):
-        _, path = _structure.find_head(self.model)
-        if path is None:
-            raise AttributeError("Could not locate lm_head to assign")
-        _structure.set_at(self.model, path, value)
+        if hasattr(self.model, "lm_head"):  # For models like LlamaForCausalLM
+            self.model.lm_head = value
+        else:
+            raise AttributeError(
+                "Could not find lm_head in the model. Please check the model structure."
+            )
 
     @property
     def rotary_emb(self):
-        """Rotary embedding module, or None for a learned-position model."""
-        found, _ = _structure.find_rotary(self.model)
-        return found
+        """Returns the model's rotary_emb, handling different Hugging Face model structures."""
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "rotary_emb"
+        ):  # Llama-like
+            return self.model.model.rotary_emb
+        else:
+            raise AttributeError(
+                "Could not find rotary_emb in the model. Please check the model structure."
+            )
 
     @rotary_emb.setter
     def rotary_emb(self, value):
-        _, path = _structure.find_rotary(self.model)
-        if path is None:
-            raise AttributeError("This architecture has no rotary_emb to assign")
-        _structure.set_at(self.model, path, value)
+        if hasattr(self.model, "model") and hasattr(
+            self.model.model, "rotary_emb"
+        ):  # Llama-like
+            self.model.model.rotary_emb = value
+        else:
+            raise AttributeError(
+                "Could not find rotary_emb in the model. Please check the model structure."
+            )
 
     def preprocess_inputs(
         self,
@@ -1352,14 +1242,6 @@ class HFTransformerModel(BaseModel):
         express); "causal" is plain causal (flex with no mask would be full
         attention, so a causal BlockMask is still required).
         """
-
-        # A flex BlockMask is only consumable by the flex attention path, and
-        # flex has no TPU lowering -- building one here is what puts an
-        # untranslatable gather/concatenate into the graph. This lane runs
-        # sdpa or the splash kernel, which build their own causal masking, so
-        # only produce a BlockMask when flex is actually the implementation.
-        if getattr(self.model.config, "_attn_implementation", "") != _ATTN_IMPLEMENTATION:
-            return None
         if _uses_dsa(self.model.config):
             # DSA models cannot consume a flex BlockMask: their indexer and main
             # attention treat the mask as a dense additive tensor (see
@@ -1412,23 +1294,6 @@ class HFTransformerModel(BaseModel):
         mask.masked_fill_(~allowed, float("-inf"))
         return mask.unsqueeze(0).unsqueeze(0)
 
-    def _check_position_capacity(self, seq_len: int) -> None:
-        """Refuse a sequence the learned position table cannot address.
-
-        An out-of-range embedding gather raises on CPU but is silently clamped
-        on TPU, so overrunning the table costs no error and shows up only as
-        numerics wrong by an order of magnitude. RoPE models report no capacity
-        and are not checked.
-        """
-        cap = getattr(self, "_position_capacity", None)
-        if cap is not None and seq_len > cap:
-            raise ValueError(
-                f"{type(self.model).__name__} positions at most {cap} tokens "
-                f"but was given seq_len={seq_len}. Lower the config's seq_len "
-                f"to {cap} or less; running past the table reads out-of-range "
-                "entries, which TPU returns silently as garbage."
-            )
-
     def forward(self, *args, **kwargs):
         positions = kwargs.pop("positions", None)
         attention_masks = kwargs.pop("attention_masks", None)
@@ -1456,63 +1321,12 @@ class HFTransformerModel(BaseModel):
             # BlockMask flows straight through to the flex attention function.
             kwargs["attention_mask"] = attention_masks
 
-        self._check_position_capacity(model_args[0].shape[-1])
-
-        # An encoder-decoder (T5, BART, Marian, mBART) will not run without
-        # something to feed its decoder. Teacher-force the same sequence, which
-        # is the token objective this lane trains.
-        if getattr(self.model.config, "is_encoder_decoder", False):
-            kwargs.setdefault("decoder_input_ids", model_args[0])
-
-        # T5 positions with relative bias and DistilBERT with its own
-        # embedding, so neither accepts position_ids -- and neither ignores it.
-        if self._forward_kwargs is not None:
-            for k in [k for k in kwargs if k not in self._forward_kwargs]:
-                kwargs.pop(k)
-
-        # Resolve the backbone rather than assuming the Llama nesting: OPT
-        # keeps it at model.decoder, GPT-2 at transformer, and a bare encoder
-        # is its own backbone.
-        # Run the whole model and take hidden states from whatever it
-        # returns. Calling a resolved backbone directly only works when the
-        # backbone accepts input_ids -- BERT's is its encoder, which takes
-        # embeddings -- and the wrapper's output type varies by head
-        # (BaseModelOutput, MaskedLMOutput, ...). Asking for hidden states is
-        # the one contract every HF model honours.
-        # When the head we train through is one this backend attached, the
-        # hidden states are what we need -- and asking for them through
-        # output_hidden_states no longer works: transformers 5.x dropped that
-        # argument from the task-head forwards (checked on Roberta/Bert/GPT-2/
-        # Qwen3), so the kwarg filter correctly removes it and nothing comes
-        # back. base_model is HF's own handle on the trunk and takes input_ids
-        # on every family checked, so call that instead.
-        use_trunk = self._added_lm_head is not None
-        base = getattr(self.model, "base_model", None) if use_trunk else None
-        if base is not None and base is not self.model:
-            output = base(*model_args, **kwargs)
-        else:
-            output = self.model(*model_args, **kwargs)
-        hidden = getattr(output, "last_hidden_state", None)
-        if hidden is None:
-            states = getattr(output, "hidden_states", None)
-            hidden = states[-1] if states else None
-        if hidden is None and isinstance(output, (tuple, list)) and output:
-            first = output[0]
-            if hasattr(first, "dim") and first.dim() == 3:
-                hidden = first
-        if hidden is None:
-            logits = getattr(output, "logits", None)
-            if logits is None:
-                raise AttributeError(
-                    f"{type(self.model).__name__} returned neither hidden "
-                    "states nor logits to train on"
-                )
-            return logits.squeeze(0)
-        hidden_states = hidden.squeeze(0)
+        output = self.model.model(*model_args, **kwargs)
+        hidden_states = output.last_hidden_state.squeeze(0)
 
         if self._skip_lm_head:
             return hidden_states
-        output = self.lm_head(hidden_states)
+        output = self.model.lm_head(hidden_states)
 
         # Numerical-test hook: when HF_BACKEND_LOGIT_DUMP=<dir> is set, append
         # this rank's per-forward logits (+ CP coordinate) to a file. Used by
@@ -1581,29 +1395,6 @@ class HFTransformerModel(BaseModel):
                 )
                 module.attention_scaling = attention_scaling
 
-        # Titan MoE modules swapped in by moe_replacement initialize themselves
-        # at parallelize time (to_empty(cpu) + init_states(cpu)), but the
-        # trainer parallelizes FIRST and materializes SECOND, so the to_empty()
-        # that precedes this call hands those expert weights fresh,
-        # uninitialized storage and the CPU values are gone. The walk above
-        # cannot restore them: HF's _init_weights dispatches on module type,
-        # and a stacked [E, *, *] expert weight is not an nn.Linear. Nothing
-        # then writes them, so training sees expert weights that read back as
-        # nan -- measured on device at the first MoE forward as finite=0.0000
-        # for w1/w2/w3, while the activations and routing counts entering the
-        # same call were healthy. This is the same failure the inv_freq
-        # recompute above exists for: a tensor whose value is established
-        # outside _init_weights and destroyed by to_empty().
-        #
-        # Re-run each swapped module's own init_states(), which consults the
-        # param_init table keyed by the real parameter names (w1_EFD/w2_EDF/...
-        # discovered dynamically by _get_expert_param_info). Must run with
-        # SimpleFSDP's parametrization disabled, otherwise reads of .w1_EFD
-        # return the computed tensor and the initializer writes into a
-        # temporary instead of the parameter -- the same trap documented for
-        # tie_weights in the TPU lane's _defer_parametrization_during_init.
-        self._init_swapped_native_modules()
-
         # TODO(3outeille): For pipeline parallel, only tie weights if both input and output embeddings are on the same device
         # Maybe better way of handling this?
         if not isinstance(self.tok_embeddings, nn.Identity) and not isinstance(
@@ -1611,163 +1402,16 @@ class HFTransformerModel(BaseModel):
         ):
             self.model.tie_weights()
 
-        # to_empty() hands every parameter fresh storage, which breaks the tie
-        # made in __init__. HF's tie_weights only knows about its own head.
-        if getattr(self, "_added_lm_head", None) is not None:
-            self._added_lm_head.weight = self.tok_embeddings.weight
-
-        self._reassert_device()
-
-    def _init_swapped_native_modules(self) -> None:
-        """Re-initialize Titan modules swapped into the HF tree after to_empty().
-
-        Only modules that own a ``param_init`` table are touched -- that is
-        exactly the set built by ``moe_replacement``, whose parameters HF's
-        type-dispatched ``_init_weights`` cannot reach. ``init_states`` is
-        called on the outermost such module; it recurses to its own children,
-        so nested experts are covered once.
-        """
-        roots = [
-            m for m in self.model.modules()
-            if getattr(m, "_param_init", None) is not None
-        ]
-        if not roots:
-            return
-
-        # Deduplicate to outermost modules: a root that is a descendant of
-        # another root would otherwise be initialized twice.
-        inner = set()
-        for r in roots:
-            for child in r.modules():
-                if child is not r:
-                    inner.add(id(child))
-        roots = [r for r in roots if id(r) not in inner]
-
-        # Only take the guard if parametrization is actually active.
-        # disable_active_parametrization() is NOT reentrant -- its finally
-        # clause sets the flag back to True unconditionally rather than
-        # restoring the previous value -- so nesting it inside a caller that
-        # already disabled it (which the TPU lane does around this whole
-        # method, see parallelize.py's _defer_parametrization_during_init)
-        # re-enables parametrization on exit and the caller's subsequent
-        # tie_weights() fails with "`model.embed_tokens.weight` is neither a
-        # parameter, buffer, nor extra state."
-        ctx = contextlib.nullcontext()
-        try:
-            from torchtitan.experiments.graph_trainer import simple_fsdp as _sfsdp
-
-            if getattr(_sfsdp, "_active_parametrization", False):
-                ctx = _sfsdp.disable_active_parametrization()
-        except Exception:  # SimpleFSDP not in use on this lane
-            pass
-        with ctx:
-            for r in roots:
-                r.init_states(buffer_device=self._reinit_buffer_device())
-        logger.info(
-            "Re-initialized %d swapped native module(s) after materialization.",
-            len(roots),
-        )
-
-    def _reinit_buffer_device(self) -> torch.device | None:
-        """Device for buffers rebuilt during the post-materialization re-init."""
-        for param in self.model.parameters():
-            if param.device.type != "meta":
-                return param.device
-        return None
-
-    def to_empty(self, *, device, recurse: bool = True):
-        """Materialize parameters, but keep buffer values.
-
-        torch's to_empty() runs empty_like over buffers too, discarding the
-        causal masks / rope tables / normalizers that __init__ computed.
-        """
-        return _meta_init.to_empty_keep_buffers(self, device)
-
-    def _reassert_device(self) -> None:
-        """Pull back anything init left on the wrong device.
-
-        Some HF initializers build a tensor without a device and assign it over
-        the materialized parameter -- Pegasus and Marian do this for sinusoidal
-        positions:
-
-            out = torch.empty(n_pos, dim, dtype=self.weight.dtype)
-            self.weight = nn.Parameter(out, requires_grad=False)
-
-        torch.empty with no device= lands on CPU, so the weight to_empty() had
-        placed on the accelerator is silently replaced and the first forward
-        dies mixing devices. Upstream HF bug; guard until it is fixed.
-        """
-        device = None
-        for prm in self.model.parameters():
-            if prm.device.type != "cpu":
-                device = prm.device
-                break
-        if device is None:
-            return
-        moved = []
-        for name, mod in self.model.named_modules():
-            for attr, val in list(mod._parameters.items()):
-                if val is not None and val.device != device:
-                    mod._parameters[attr] = nn.Parameter(
-                        val.data.to(device), requires_grad=val.requires_grad
-                    )
-                    moved.append(f"{name}.{attr}")
-            for attr, val in list(mod._buffers.items()):
-                if val is not None and val.device != device:
-                    mod._buffers[attr] = val.to(device)
-                    moved.append(f"{name}.{attr}")
-        if moved:
-            logger.warning(
-                f"init left {len(moved)} tensor(s) off {device}; moved back "
-                f"(first: {moved[0]}). This is an upstream initializer that "
-                "builds a tensor without a device."
-            )
-
     def named_children(self):
-        """A flattened view of the parts torchtitan expects.
-
-        Parts an architecture does not have are skipped rather than yielded as
-        None (GPT-2 and OPT position with learned embeddings and have no
-        rotary_emb), and anything outside the five buckets is yielded too:
-        nn.Module._apply walks children(), so a module omitted here is one
-        .to_empty() never materializes -- it stays on meta and dies at the
-        first forward with "Cannot copy out of meta tensor". GPT-2 has wpe,
-        OPT has embed_positions.
         """
-        seen: set[int] = set()
-        for name in ("tok_embeddings", "layers", "norm", "lm_head", "rotary_emb"):
-            try:
-                child = getattr(self, name)
-            except AttributeError:
-                continue
-            if child is None or id(child) in seen:
-                continue
-            seen.add(id(child))
-            yield name, child
-
-        # Mark the backbone covered before walking: its children are yielded
-        # below, so yielding the backbone itself as well would hand the same
-        # subtree to the caller twice -- and Module.parallelize() refuses to
-        # visit a module more than once.
-        backbone, _ = _structure.find_backbone(self.model)
-        if backbone is not None:
-            seen.add(id(backbone))
-        for holder in (backbone, self.model):
-            if holder is None:
-                continue
-            for child_name, child in holder.named_children():
-                if child is None or id(child) in seen:
-                    continue
-                # Skip a module that *contains* something already yielded.
-                # BERT keeps its head at cls.predictions.decoder and its token
-                # table at embeddings.word_embeddings, so yielding `cls` or
-                # `embeddings` here would hand the caller a second route to a
-                # part already given -- and Module.parallelize() refuses to
-                # visit a module twice.
-                if any(id(d) in seen for d in child.modules()):
-                    continue
-                seen.add(id(child))
-                yield child_name, child
+        Provides a flattened view of the model's main components,
+        making it compatible with TorchTitan's expectations.
+        """
+        yield "tok_embeddings", self.tok_embeddings
+        yield "layers", self.layers
+        yield "norm", self.norm
+        yield "lm_head", self.lm_head
+        yield "rotary_emb", self.rotary_emb
 
     def __setattr__(self, name, value):
         # If a property with a setter exists for this name, use it.

@@ -19,13 +19,11 @@ Two-phase replacement:
 from dataclasses import replace
 from functools import partial
 
-import os
 import spmd_types as spmd
 import torch
 import torch.nn as nn
 
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.experiments.transformers_modeling_backend import _structure
 from torchtitan.experiments.transformers_modeling_backend.hf_sharding import (
     _hf_activation_placement,
     _hf_sequence_parallel_placement,
@@ -47,6 +45,11 @@ from torchtitan.models.common.moe import GroupedExperts, MoE
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.logging import logger
+
+# Optional hook for an accelerator lane to swap the experts implementation in
+# the probed MoE config before it is built (e.g. a grouped-matmul kernel). Set
+# by the lane at import; None leaves the portable GroupedExperts in place.
+expert_impl_converter = None
 
 
 class _HFBatchedMoE(MoE):
@@ -91,54 +94,6 @@ def prepare_native_moe_configs(model: nn.Module, config) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _apply_expert_impl_converters(moe_config):
-    """Let the accelerator swap in its own grouped-expert implementation.
-
-    The probe in phase 1 is architecture-agnostic -- it reads num_experts,
-    top_k, the score function and the expert dims off whatever HF module it is
-    handed, which is how one path covers qwen3_moe, mixtral, deepseek_v2/v3,
-    olmoe and glm4_moe. What it produces is a config, and
-    ``GroupedExperts.Config`` inside it names the implementation.
-
-    Registered ModelConfigConverters never see this config: they run over the
-    model spec before construction, and these are built during it. So run the
-    accelerator's converter here, where the config is read and before the
-    module is built. On TPU that substitutes ``TpuGroupedExperts``, whose
-    grouped matmul is the kernel this lane already uses for its own MoE
-    models.
-
-    Expert parallelism is deliberately not involved: this keeps the experts
-    replicated and lets SimpleFSDP shard them, which is what the qwen3 TPU
-    lane does. The all-to-all dispatcher is an EP concern and is left alone.
-    """
-    # Diagnostic escape hatch: keep the portable GroupedExperts (torch
-    # grouped_mm) instead of substituting the TPU/Pallas implementation, so a
-    # bad result can be attributed to the kernel rather than to the router or
-    # the MoE forward boundary. Off by default; this is for bisecting only.
-    if os.environ.get("TT_HF_MOE_NO_TPU_EXPERTS") == "1":
-        logger.warning(
-            "TT_HF_MOE_NO_TPU_EXPERTS=1: keeping the portable GroupedExperts "
-            "implementation (TPU grouped-expert substitution skipped)."
-        )
-        return moe_config
-
-    try:
-        import torch
-
-        if not (hasattr(torch, "tpu") and torch.tpu.is_available()):
-            return moe_config
-        from torchtitan.experiments.tpu.grouped_experts import (
-            TpuGroupedExpertsConverter,
-        )
-    except Exception:
-        return moe_config
-
-    converter = TpuGroupedExpertsConverter(TpuGroupedExpertsConverter.Config())
-    converted = converter.convert(moe_config)
-    logger.info("Substituted the TPU grouped-expert implementation for this MoE.")
-    return converted
-
-
 def build_and_swap_native_moe(
     model: nn.Module,
     parallel_dims: ParallelDims,
@@ -163,8 +118,6 @@ def build_and_swap_native_moe(
         moe_config = getattr(layer, "_native_moe_config", None)
         if moe_config is None:
             continue
-
-        moe_config = _apply_expert_impl_converters(moe_config)
 
         _, expert_layout = _get_expert_param_info()
         set_moe_sharding_config(
@@ -216,6 +169,8 @@ def build_and_swap_native_moe(
                 out_dst_shardings=gate_output_layout,
             )
 
+        if expert_impl_converter is not None:
+            moe_config = expert_impl_converter(moe_config)
         with torch.device("meta"):
             native_moe = moe_config.build()
         # Preserve the Titan MoE state-dict paths while adapting its root
@@ -268,11 +223,14 @@ def build_and_swap_native_moe(
 def _get_moe_attr_name(layer: nn.Module) -> str:
     """Return the attribute name holding the MoE block on a decoder layer.
 
-    ``_structure.moe_attr_name`` does the lookup (``mlp``, then the known
-    alternates, then any child whose class looks like a MoE block); here a
-    miss is an error because the caller is about to swap that attribute.
+    Same lookup as ``model._get_moe_attr_name`` (``mlp``, then the names
+    Mixtral / GraniteMoe use); for layer-level MoE (Gemma4) the Titan MoE
+    replaces ``mlp`` too. A miss is an error because the caller is about to
+    swap that attribute.
     """
-    name = _structure.moe_attr_name(layer)
+    from .model import _get_moe_attr_name as _lookup
+
+    name = _lookup(layer)
     if name is None:
         raise AttributeError(
             f"Layer {type(layer).__name__} has no recognisable MoE block "
