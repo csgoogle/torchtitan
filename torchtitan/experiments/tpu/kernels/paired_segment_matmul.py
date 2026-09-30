@@ -70,8 +70,14 @@ def _metadata(group_sizes, *, m, tile_m, groups, visit_empty_groups):
     )
 
 
-def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
-    """Compute the two projections from one routed-token tile load."""
+def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m, emit_swiglu=False):
+    """Compute the two projections from one routed-token tile load.
+
+    With ``emit_swiglu`` a third output holds ``silu(out1) * out3``, evaluated
+    in BF16 exactly as XLA evaluates ``F.silu(gate) * up`` (BF16 ``logistic``,
+    two BF16 multiplies). It is computed from the stored BF16 tiles, so rows a
+    tile shares with a neighbouring group see their final gate/up values.
+    """
     _validate_shapes(lhs, rhs1, rhs3, group_sizes, tile_m)
     m, k = lhs.shape
     groups, _, n = rhs1.shape
@@ -84,18 +90,12 @@ def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
     )
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    def kernel(
-        group_metadata,
-        group_offset,
-        lhs,
-        rhs1,
-        rhs3,
-        out1,
-        out3,
-        acc1,
-        acc3,
-    ):
+    def kernel(group_metadata, group_offset, lhs, rhs1, rhs3, *refs):
         del group_offset
+        if emit_swiglu:
+            out1, out3, hidden, acc1, acc3 = refs
+        else:
+            out1, out3, acc1, acc3 = refs
         grid_id = pl.program_id(1)
 
         acc1[...] = jnp.zeros_like(acc1)
@@ -124,6 +124,9 @@ def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
         out3[...] = lax.select(
             mask[...], acc3[...], out3[...].astype(jnp.float32)
         ).astype(jnp.bfloat16)
+        if emit_swiglu:
+            gate = out1[...]
+            hidden[...] = (gate * lax.logistic(gate)) * out3[...]
 
     def lhs_indices(n_i, grid_id, k_i, group_metadata, group_offset):
         del n_i, k_i, group_offset
@@ -140,16 +143,14 @@ def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
     lhs_spec = pl.BlockSpec((tile_m, k), lhs_indices)
     rhs_spec = pl.BlockSpec((None, k, n), rhs_indices)
     out_spec = pl.BlockSpec((tile_m, n), out_indices)
+    num_outputs = 3 if emit_swiglu else 2
     return pl.pallas_call(
         kernel,
-        out_shape=[
-            jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
-            jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
-        ],
+        out_shape=[jax.ShapeDtypeStruct((m, n), jnp.bfloat16)] * num_outputs,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[lhs_spec, rhs_spec, rhs_spec],
-            out_specs=[out_spec, out_spec],
+            out_specs=[out_spec] * num_outputs,
             grid=(1, num_active_tiles, 1),
             scratch_shapes=[
                 pltpu.VMEM((tile_m, n), jnp.float32),
@@ -480,6 +481,84 @@ def _backward(ctx, grad_output1, grad_output3):
 _paired_grouped_mm_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
+@pallas.jax_op("tt_experts::paired_grouped_mm_swiglu")
+def _paired_grouped_mm_swiglu_fwd(
+    lhs: jax.Array,
+    rhs1: jax.Array,
+    rhs3: jax.Array,
+    group_sizes: jax.Array,
+    tile_m: int,
+    tgmm_tile_m: int,
+    tgmm_tile_k: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    del tgmm_tile_m, tgmm_tile_k
+    return _paired_forward(
+        lhs, rhs1, rhs3, group_sizes, tile_m=tile_m, emit_swiglu=True
+    )
+
+
+def _swiglu_setup_context(ctx, inputs, output):
+    lhs, rhs1, rhs3, group_sizes, tile_m, tgmm_tile_m, tgmm_tile_k = inputs
+    gate, up, _ = output
+    ctx.save_for_backward(lhs, rhs1, rhs3, group_sizes, gate, up)
+    ctx.tile_m = tile_m
+    ctx.tgmm_tile_m = tgmm_tile_m
+    ctx.tgmm_tile_k = tgmm_tile_k
+
+
+def _swiglu_backward(ctx, grad_gate, grad_up, grad_hidden):
+    # ``paired_swiglu_segment_matmul_pallas_2d`` returns only the hidden
+    # output, so gate/up have no consumers and their gradients are zero.
+    del grad_gate, grad_up
+    lhs, rhs1, rhs3, group_sizes, gate, up = ctx.saved_tensors
+    # Differentiate the ops the unfused path runs, so the gradients match it.
+    _, vjp = torch.func.vjp(lambda g, u: torch.nn.functional.silu(g) * u, gate, up)
+    grad_gate, grad_up = vjp(grad_hidden)
+    grad_lhs, grad_rhs1, grad_rhs3 = _paired_grouped_mm_bwd(
+        grad_gate,
+        grad_up,
+        lhs,
+        rhs1,
+        rhs3,
+        group_sizes,
+        ctx.tile_m,
+        ctx.tgmm_tile_m,
+        ctx.tgmm_tile_k,
+    )
+    return grad_lhs, grad_rhs1, grad_rhs3, None, None, None, None
+
+
+_paired_grouped_mm_swiglu_fwd.register_autograd(
+    _swiglu_backward, setup_context=_swiglu_setup_context
+)
+
+
+def paired_swiglu_segment_matmul_pallas_2d(
+    lhs: torch.Tensor,
+    rhs1: torch.Tensor,
+    rhs3: torch.Tensor,
+    group_sizes: torch.Tensor,
+    *,
+    tile_m: int = 1024,
+    tgmm_tile_m: int = 128,
+    tgmm_tile_k: int = 0,
+) -> torch.Tensor:
+    """``F.silu(lhs @ rhs1) * (lhs @ rhs3)`` per expert, bit-identical to the
+    unfused ``paired_segment_matmul_pallas_2d`` + ``F.silu(gate) * up``.
+
+    The kernel still writes gate and up: the backward needs them, and under
+    rematerialization the recomputed forward is what provides them.
+    """
+    if rhs1.shape != rhs3.shape:
+        raise ValueError("Paired grouped matmul weights must have equal shapes")
+    if group_sizes.dtype != torch.int32:
+        group_sizes = group_sizes.to(torch.int32)
+    _, _, hidden = _paired_grouped_mm_swiglu_fwd(
+        lhs, rhs1, rhs3, group_sizes, tile_m, tgmm_tile_m, tgmm_tile_k
+    )
+    return hidden
+
+
 def paired_segment_matmul_pallas_2d(
     lhs: torch.Tensor,
     rhs1: torch.Tensor,
@@ -505,4 +584,7 @@ def paired_segment_matmul_pallas_2d(
     )
 
 
-__all__ = ["paired_segment_matmul_pallas_2d"]
+__all__ = [
+    "paired_segment_matmul_pallas_2d",
+    "paired_swiglu_segment_matmul_pallas_2d",
+]

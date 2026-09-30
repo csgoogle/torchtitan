@@ -833,6 +833,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
     experts.use_pallas_grouped_mm = True
     # The splitter's expert kernels: W1/W3 paired, with its K-tiled dWeight.
     experts.use_pallas_paired_grouped_mm = True
+    experts.use_pallas_paired_swiglu_epilogue = True
     experts.pallas_grouped_mm_tile_m = 256
     # The paired W1/W3 dWeight contracts over D, W2's over the smaller F, so
     # the K tile that measures best for W1/W3 does not fit W2. Tile them

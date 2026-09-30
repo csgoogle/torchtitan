@@ -11,6 +11,7 @@ from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
 )
 from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
     paired_segment_matmul_pallas_2d,
+    paired_swiglu_segment_matmul_pallas_2d,
 )
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
@@ -95,6 +96,9 @@ class TpuGroupedExperts(GroupedExperts):
         use_pallas_grouped_mm: bool = False
         # Share routed-token loads between the equal-shaped W1/W3 projections.
         use_pallas_paired_grouped_mm: bool = False
+        # Compute SwiGLU in the paired W1/W3 kernel's epilogue instead of a
+        # separate pass over its two outputs. Bit-identical; requires paired.
+        use_pallas_paired_swiglu_epilogue: bool = False
         pallas_grouped_mm_tile_m: int = 1024
         pallas_grouped_mm_tile_k: int = 0
         pallas_grouped_mm_tile_n: int = 0
@@ -128,6 +132,11 @@ class TpuGroupedExperts(GroupedExperts):
 
         self.use_pallas_grouped_mm = config.use_pallas_grouped_mm
         self.use_pallas_paired_grouped_mm = config.use_pallas_paired_grouped_mm
+        self.use_pallas_paired_swiglu_epilogue = (
+            config.use_pallas_paired_swiglu_epilogue
+        )
+        if self.use_pallas_paired_swiglu_epilogue and not self.use_pallas_paired_grouped_mm:
+            raise ValueError("The SwiGLU epilogue requires the paired grouped matmul")
         self.pallas_grouped_mm_tile_m = config.pallas_grouped_mm_tile_m
         self.pallas_grouped_mm_tile_k = config.pallas_grouped_mm_tile_k
         self.pallas_grouped_mm_tile_n = config.pallas_grouped_mm_tile_n
@@ -251,7 +260,17 @@ class TpuGroupedExperts(GroupedExperts):
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
         w2_tgmm_tiling = self.pallas_grouped_mm_w2_tgmm_tiling or tgmm_tiling
-        if self.use_pallas_paired_grouped_mm:
+        if self.use_pallas_paired_swiglu_epilogue:
+            hidden_RF = paired_swiglu_segment_matmul_pallas_2d(
+                x_bf16,
+                w1_EKN.bfloat16(),
+                w3_EKN.bfloat16(),
+                num_tokens_per_expert_E,
+                tile_m=tile_m,
+                tgmm_tile_m=tgmm_tiling[0],
+                tgmm_tile_k=tgmm_tiling[1],
+            )
+        elif self.use_pallas_paired_grouped_mm:
             # Paired W1/W3 always return BF16 dWeights: two full FP32 output
             # tiles exceed TPU scoped VMEM. FP32 FSDP reductions widen those
             # gradients after the kernel; BF16 reductions consume them as-is.
@@ -285,7 +304,8 @@ class TpuGroupedExperts(GroupedExperts):
                 tgmm_tiling=tgmm_tiling,
                 dweight_output_dtype=self._unpaired_dweight_output_dtype,
             )
-        hidden_RF = F.silu(gate_RF) * up_RF
+        if not self.use_pallas_paired_swiglu_epilogue:
+            hidden_RF = F.silu(gate_RF) * up_RF
         return segment_matmul_pallas_2d(
             hidden_RF,
             w2_EKN.bfloat16(),
