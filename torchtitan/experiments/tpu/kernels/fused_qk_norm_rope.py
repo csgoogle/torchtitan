@@ -14,10 +14,13 @@ input once and writes the BF16 result once.
 
 The arithmetic is the one XLA runs for the stock modules, in the same order:
 
-  xf  = f32(x)
-  rs  = rsqrt(sum(xf * xf) * (1 / head_dim) + eps)
-  n   = f32(bf16((xf * rs) * f32(weight)))       # RMSNorm, then .float()
+  rs  = rsqrt(mean(f32(x)^2) + eps)              # computed by XLA, not here
+  n   = f32(bf16((f32(x) * rs) * f32(weight)))   # RMSNorm, then .float()
   out = bf16(n * cos + rotate_half(n) * sin)
+
+The statistic ``rs`` stays in the XLA graph. XLA picks the summation order of
+that 128-wide reduction from the layout it assigns, which differs between
+programs, so a reduction inside the kernel is not bit-identical to the model.
 
 The forward is replaced; the backward is not. It differentiates the original
 ``F.rms_norm`` + ``CosSinRoPE.apply_rotary_emb`` ops with ``torch.func.vjp``,
@@ -41,11 +44,10 @@ from torchtitan.models.common.rope import CosSinRoPE
 _TOKENS_PER_BLOCK_BYTES = 4 * 1024 * 1024
 
 
-def _kernel(eps, x_ref, w_ref, cos_ref, sin_ref, o_ref):
+def _kernel(x_ref, rs_ref, w_ref, cos_ref, sin_ref, o_ref):
   head_dim = x_ref.shape[-1]
   x = x_ref[...].astype(jnp.float32)
-  ss = jnp.sum(x * x, axis=-1, keepdims=True)
-  rs = jax.lax.rsqrt(ss * (1.0 / head_dim) + eps)
+  rs = rs_ref[...][:, :, None]
   w = w_ref[...].astype(jnp.float32).reshape(1, 1, head_dim)
   n = ((x * rs) * w).astype(jnp.bfloat16).astype(jnp.float32)
   # rotate_half(n) = cat(-n[half:], n[:half]): a half-width lane roll, then
@@ -58,17 +60,18 @@ def _kernel(eps, x_ref, w_ref, cos_ref, sin_ref, o_ref):
   o_ref[...] = (n * cos + rot * sin).astype(o_ref.dtype)
 
 
-def _norm_rope_2d(x, w, cos, sin, eps):
-  """x [T, N, H] bf16, w [H], cos/sin [T, H] f32 -> [T, N, H] bf16."""
+def _norm_rope_2d(x, rs, w, cos, sin):
+  """x [T, N, H] bf16, rs [T, N] f32, w [H], cos/sin [T, H] f32 -> [T, N, H] bf16."""
   T, N, H = x.shape
   tokens = max(8, _TOKENS_PER_BLOCK_BYTES // (N * H * x.dtype.itemsize))
   while T % tokens:
     tokens //= 2
   return pl.pallas_call(
-      lambda *refs: _kernel(eps, *refs),
+      _kernel,
       grid=(T // tokens,),
       in_specs=[
           pl.BlockSpec((tokens, N, H), lambda i: (i, 0, 0)),
+          pl.BlockSpec((tokens, N), lambda i: (i, 0)),
           pl.BlockSpec((1, H), lambda i: (0, 0)),
           pl.BlockSpec((tokens, H), lambda i: (i, 0)),
           pl.BlockSpec((tokens, H), lambda i: (i, 0)),
@@ -80,23 +83,33 @@ def _norm_rope_2d(x, w, cos, sin, eps):
           # The FP32 temporaries of a 4 MiB block exceed the 32 MiB default.
           vmem_limit_bytes=64 * 1024 * 1024,
       ),
-  )(x, w.reshape(1, H), cos, sin)
+  )(x, rs, w.reshape(1, H), cos, sin)
 
 
 def jax_fused_qk_norm_rope(
     xq: jax.Array,
     xk: jax.Array,
+    rsq: jax.Array,
+    rsk: jax.Array,
     wq: jax.Array,
     wk: jax.Array,
     rope_cache: jax.Array,
     eps: float,
 ) -> tuple[jax.Array, jax.Array]:
-  """xq [B, L, Nq, H], xk [B, L, Nk, H], rope_cache [B, L, 2H] f32."""
+  """xq [B, L, Nq, H], xk [B, L, Nk, H], rs* [B, L, N] f32, rope_cache [B, L, 2H].
+
+  ``eps`` is already folded into ``rs*``; the backward needs it.
+  """
+  del eps
   B, L, _, H = xq.shape
   cos = rope_cache[..., :H].reshape(B * L, H)
   sin = rope_cache[..., H:].reshape(B * L, H)
-  q = _norm_rope_2d(xq.reshape(B * L, -1, H), wq, cos, sin, eps)
-  k = _norm_rope_2d(xk.reshape(B * L, -1, H), wk, cos, sin, eps)
+  q = _norm_rope_2d(
+      xq.reshape(B * L, -1, H), rsq.reshape(B * L, -1), wq, cos, sin
+  )
+  k = _norm_rope_2d(
+      xk.reshape(B * L, -1, H), rsk.reshape(B * L, -1), wk, cos, sin
+  )
   return q.reshape(xq.shape), k.reshape(xk.shape)
 
 
@@ -113,8 +126,13 @@ def reference_qk_norm_rope(xq, xk, wq, wk, rope_cache, eps):
   return CosSinRoPE.apply_rotary_emb(q, k, rope_cache.unsqueeze(2))
 
 
+def _rms_rsqrt(x: torch.Tensor, eps: float) -> torch.Tensor:
+  """The RMSNorm statistic, as the ops ``F.rms_norm`` decomposes into."""
+  return torch.rsqrt(x.float().pow(2).mean(-1) + eps)
+
+
 def _setup_context(ctx, inputs, output):
-  xq, xk, wq, wk, rope_cache, eps = inputs
+  xq, xk, _, _, wq, wk, rope_cache, eps = inputs
   ctx.save_for_backward(xq, xk, wq, wk, rope_cache)
   ctx.eps = eps
 
@@ -127,7 +145,9 @@ def _backward(ctx, grad_q, grad_k):
       xq, xk, wq, wk,
   )
   dxq, dxk, dwq, dwk = vjp((grad_q, grad_k))
-  return dxq, dxk, dwq, dwk, None, None
+  # The statistics are inputs only so XLA computes them; the vjp above
+  # already carries the full RMSNorm gradient into dxq/dxk.
+  return dxq, dxk, None, None, dwq, dwk, None, None
 
 
 fused_qk_norm_rope_op.register_autograd(_backward, setup_context=_setup_context)
@@ -153,6 +173,8 @@ def fused_qk_norm_rope(
   cache = rope_cache.reshape(rope_cache.shape[0], L, -1)
   if cache.shape[0] != B:
     cache = cache.expand(B, L, cache.shape[-1])
+  xq, xk = xq.contiguous(), xk.contiguous()
   return fused_qk_norm_rope_op(
-      xq.contiguous(), xk.contiguous(), wq, wk, cache.contiguous(), eps
+      xq, xk, _rms_rsqrt(xq, eps), _rms_rsqrt(xk, eps), wq, wk,
+      cache.contiguous(), eps,
   )
