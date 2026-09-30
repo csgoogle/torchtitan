@@ -52,6 +52,10 @@ def _train_args(
       "--splash_attention_kernel.use_splash_attention_kernel",
       "--tpu_config.use_graph_trainer",
       "--tpu_config.compile_mode=aot_fx_trace",
+      # libtpu 0.0.48 turns Shardy HLO sharding v3 on by default, and it breaks
+      # the graph trainer; the graph-trainer recipes turn it off (the debug
+      # models used here are not among them).
+      "--extra-xla-flags=xla_enable_hlo_sharding_v3=false",
   ]
 
 

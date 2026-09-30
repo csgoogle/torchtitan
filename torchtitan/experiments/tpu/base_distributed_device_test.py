@@ -19,6 +19,7 @@ import torchtitan.trainer
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import device_env
 from torchtitan.experiments.tpu import distributed_utils
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu import numerical_validation
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import train_minimal
@@ -604,6 +605,11 @@ class _DistributedInitWrapper:
   CLOUD_TPU_TASK_ID) from LOCAL_RANK / WORLD_SIZE, which only torchrun-spawned
   workers have, so the spawning process cannot do it on their behalf.
 
+  The config's xla_flags / libtpu_init_flags are rendered here too, as gmain
+  does: they reach libtpu only through XLA_FLAGS / LIBTPU_INIT_ARGS, and a test
+  that skips this runs with libtpu's defaults whatever its config says (the
+  diagnostic-coordinator default was silently off in every distributed test).
+
   A class rather than a closure because elastic_launch pickles the entry point,
   and it carries __name__ because gdist.torchrun uses it for the launch role.
   """
@@ -614,6 +620,9 @@ class _DistributedInitWrapper:
     self.__qualname__ = self.__name__
 
   def __call__(self, *args, **kwargs):
+    config = args[0] if args else kwargs.get("config")
+    if hasattr(config, "libtpu_init_flags"):
+      tpu_flags.apply_init_flags(config)
     distributed_utils.maybe_init_distributed()
     return self.fn(*args, **kwargs)
 
