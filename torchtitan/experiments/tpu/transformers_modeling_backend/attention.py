@@ -27,6 +27,9 @@ from transformers.modeling_utils import AttentionInterface
 from torchtitan.tools.logging import logger
 
 _BLOCK = 512
+# Block size for every splash stage. See the call site for the measurement.
+# TODO(alekseyv): plumb this to splash_attention config
+_SPLASH_BLOCK = 1024
 _reported: set[str] = set()
 
 
@@ -73,10 +76,6 @@ def _unsupported(query, key, attention_mask, dropout, is_causal) -> str | None:
     if query.device.type != "tpu":
         return f"tensors are on {query.device.type}, not tpu"
     return None
-
-
-# Block size for every splash stage. See the call site for the measurement.
-_SPLASH_BLOCK = 1024
 
 
 def splash_attention_forward(
