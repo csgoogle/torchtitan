@@ -128,6 +128,11 @@ class TpuGraphTrainerDistributedTest(
           args=[
               "--tpu_config.use_simple_fsdp",
               "--tpu_config.use_scan_layers",
+              # `_on_scan_lane` turns Shardy HLO sharding v3 off for the scan
+              # recipes (libtpu 0.0.48 turned it on and it breaks the graph
+              # trainer). Setting `use_scan_layers` on the command line skips
+              # that, so this case has to ask for it itself.
+              "--extra-xla-flags=xla_enable_hlo_sharding_v3=false",
           ],
       ),
   ])
