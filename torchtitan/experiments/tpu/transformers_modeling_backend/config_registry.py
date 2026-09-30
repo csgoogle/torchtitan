@@ -35,7 +35,7 @@ from torchtitan.experiments.transformers_modeling_backend import (
     model_registry,
 )
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
-from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TPUConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
@@ -228,6 +228,15 @@ def _tpu_hf_config(
       # access path, so the graph break lands before the layer body and the
       # body stays one compile region.
       tpu_config=TPUConfig(compile_mode="layer"),
+      # Kernel tuning for the splash_tpu attention implementation, pushed to
+      # the HF adapter by workarounds.apply_patches; CLI overrides via
+      # --splash_attention_kernel.sa_*. 1024 forward/dkv blocks are the
+      # measured optimum on the packed stream (v004: 512 worse, 2048 will not
+      # compile); the dq blocks are unused under the fused backward.
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          sa_block_q=1024, sa_block_kv=1024, sa_block_kv_compute=1024,
+          sa_block_q_dkv=1024, sa_block_kv_dkv=1024, sa_block_kv_dkv_compute=1024,
+      ),
       compile=CompileConfig(
           enable=compile,
           backend="tpu",

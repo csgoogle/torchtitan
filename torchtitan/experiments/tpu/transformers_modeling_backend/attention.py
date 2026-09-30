@@ -28,26 +28,28 @@ here as ``None`` and the module's ``is_causal`` is the whole mask contract.
 """
 
 import logging
+from typing import Any
 
-import os
 import torch
+from torchtitan.experiments.tpu.attention import KERNEL_KWARG_NAMES
 from torchtitan.models.common.attention import segment_ids_from_positions
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.modeling_utils import AttentionInterface
 
 from torchtitan.tools.logging import logger
 
-# Block size for every splash stage; see the ``splash_sdpa`` call site for the
-# measurement. The kernel needs both sequence lengths to be whole blocks, so
-# ``_pick_block`` steps down from this to the largest size that divides them
-# (Mosaic's floor is 128) rather than gating on one number and launching with
-# another -- the previous 512-gate / 1024-launch pair let a 512-multiple that
-# was not a 1024-multiple through the gate and into a kernel shape error.
-_SPLASH_BLOCK = int(os.environ.get("TPU_HF_SPLASH_BLOCK", "1024"))
-# Block sizes for the two backward stages, overridable independently: the dkv
-# stage sweeps the (q, kv) grid a second time and its optimum need not match
-# the forward's.
-_SPLASH_BLOCK_DKV = int(os.environ.get("TPU_HF_SPLASH_BLOCK_DKV", str(_SPLASH_BLOCK)))
+# Kernel tuning (block sizes, backward variant, layouts) comes from the job
+# config's ``splash_attention_kernel`` section -- the same ``sa_*`` fields the
+# native lane's ``SplashAttention`` modules take -- pushed in through
+# ``configure_kernel`` by ``workarounds.apply_patches``. The HF adapter is a
+# function rather than a module, so the tuning lives here at module level.
+# Empty until configured, in which case ``splash_sdpa``'s own defaults apply.
+_KERNEL_KWARGS: dict[str, Any] = {}
+# The kernel needs both sequence lengths to be whole blocks, so every
+# configured block is stepped down to the largest size that divides them
+# (Mosaic's floor is 128) instead of gating on one number and launching with
+# another -- a 512-gate / 1024-launch pair once let a 512-multiple that was
+# not a 1024-multiple through the gate and into a kernel shape error.
 _MIN_BLOCK = 128
 _reported: set[str] = set()
 
@@ -81,6 +83,20 @@ def _log_once(key: str, message: str, *args) -> None:
         logger.info(message, *args)
 
 
+def configure_kernel(**kwargs: Any) -> None:
+    """Apply recipe / CLI kernel tuning (``--splash_attention_kernel.sa_*``).
+
+    Same contract as ``SplashAttention.configure_kernel`` on the native lane:
+    keys are the ``KERNEL_KWARG_NAMES``; ``None`` leaves a key untouched.
+    """
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        if key not in KERNEL_KWARG_NAMES:
+            raise ValueError(f"Unknown splash attention kernel option: {key}")
+        _KERNEL_KWARGS[key] = value
+
+
 def _pick_block(q_len: int, kv_len: int, preferred: int) -> int | None:
     """Largest block <= ``preferred`` that tiles both lengths, or None."""
     block = preferred
@@ -89,6 +105,15 @@ def _pick_block(q_len: int, kv_len: int, preferred: int) -> int | None:
             return block
         block //= 2
     return None
+
+
+def _kernel_kwargs(q_len: int, kv_len: int) -> dict[str, Any]:
+    """The configured tuning with every block clamped to the sequence."""
+    out = dict(_KERNEL_KWARGS)
+    for key, value in out.items():
+        if key.startswith("block_") and isinstance(value, int):
+            out[key] = _pick_block(q_len, kv_len, value)
+    return out
 
 
 def _padding_mask(attention_mask) -> torch.Tensor | None:
@@ -120,7 +145,7 @@ def _unsupported(query, key, attention_mask, dropout) -> str | None:
     if dropout:
         return f"dropout={dropout}; splash has no dropout path"
     q_len, kv_len = query.shape[-2], key.shape[-2]
-    if _pick_block(q_len, kv_len, _SPLASH_BLOCK) is None:
+    if _pick_block(q_len, kv_len, _MIN_BLOCK) is None:
         return f"sequence {q_len}x{kv_len} is not a multiple of {_MIN_BLOCK}"
     if query.device.type != "tpu":
         return f"tensors are on {query.device.type}, not tpu"
@@ -216,21 +241,21 @@ def splash_attention_forward(
     # into segment ids restores per-document masking AND lets the kernel skip
     # every block whose q and kv segments do not overlap.
     segment_ids = _segment_ids(module, attention_mask, kwargs.get("position_ids"))
-    block = _pick_block(query.shape[-2], key.shape[-2], _SPLASH_BLOCK)
-    block_dkv = _pick_block(query.shape[-2], key.shape[-2], _SPLASH_BLOCK_DKV)
+    kernel_kwargs = _kernel_kwargs(query.shape[-2], key.shape[-2])
 
     if not _tracing():
         _log_once(
             "splash_tpu args",
             "splash_tpu: first call q=%s k=%s v=%s dtype=%s scaling=%s window=%s "
-            "is_causal=%s block=%d",
+            "is_causal=%s kernel=%s",
             tuple(query.shape), tuple(key.shape), tuple(value.shape),
-            query.dtype, scaling, window, is_causal, block,
+            query.dtype, scaling, window, is_causal, kernel_kwargs,
         )
 
     # splash_sdpa defaults every block to 512, which is the library's default
-    # rather than a tuned one. Measured on Llama-3.2-1B at batch 8, seq 2048,
-    # 4x v6e: 512 gives 17.08%, 1024 gives 18.12%, 2048 gives 17.78% and 256
+    # rather than a tuned one; the HF registry's ``splash_attention_kernel``
+    # section sets 1024. Measured on Llama-3.2-1B at batch 8, seq 2048, 4x
+    # v6e: 512 gives 17.08%, 1024 gives 18.12%, 2048 gives 17.78% and 256
     # gives 11.88% -- an interior optimum, +6.0% over the default, against a
     # repeat-measured run-to-run spread of 0.05pp. The forward blocks carry
     # most of it, which matches the profile: the two splash forward kernels
@@ -243,12 +268,7 @@ def splash_attention_forward(
         scale=scaling,
         is_causal=is_causal,
         local_window_size=window,
-        block_q=block,
-        block_kv=block,
-        block_kv_compute=block,
-        block_q_dkv=block_dkv,
-        block_kv_dkv=block_dkv,
-        block_kv_dkv_compute=block_dkv,
+        **kernel_kwargs,
     )
     if not _tracing():
         _log_once(

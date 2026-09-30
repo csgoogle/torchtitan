@@ -29,6 +29,12 @@ def _extract_splash_kwargs(sa_config: Any) -> dict[str, Any]:
   return kwargs
 
 
+def _hf_attn_implementation(model: nn.Module) -> str | None:
+  """The HF ``_attn_implementation`` of a wrapped transformers model, else None."""
+  hf_config = getattr(getattr(model, "model", None), "config", None)
+  return getattr(hf_config, "_attn_implementation", None)
+
+
 def _splash_attention_modules(model: nn.Module) -> list[nn.Module]:
   """The first-class ``SplashAttention`` inner attentions of ``model``."""
   from torchtitan.experiments.tpu.attention import SplashAttention  # pylint: disable=g-import-not-at-top
@@ -554,6 +560,13 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
       use_tokamax_splash_attention_patch(model, sa_config)
     elif sa_config.use_splash_attention_kernel:
       use_splash_attention_patch(model, sa_config)
+    # The HF transformers backend selects splash by attention implementation
+    # name rather than by module replacement; its adapter is a function, so
+    # the same ``sa_*`` tuning is pushed to it here.
+    if _hf_attn_implementation(model) == "splash_tpu":
+      from torchtitan.experiments.tpu.transformers_modeling_backend import attention as hf_attention  # pylint: disable=g-import-not-at-top
+
+      hf_attention.configure_kernel(**_extract_splash_kwargs(sa_config))
 
   # Pallas Loss Patch (Output Projection)
   if (
