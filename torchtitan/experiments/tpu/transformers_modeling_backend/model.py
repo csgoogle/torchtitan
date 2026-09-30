@@ -29,6 +29,7 @@ class's ``Config`` (``as_tpu_model_config``) so ``Config.build`` constructs a
 ``TPUHFTransformerModel``.
 """
 
+import ast
 import contextlib
 import copy
 from dataclasses import dataclass
@@ -57,6 +58,23 @@ class _Attrs:
   def __getattr__(self, name):
     v = self._d.get(name)
     return _Attrs(v) if isinstance(v, dict) else v
+
+
+def _parse_config_overrides(spec: str) -> dict:
+  """Parse ``"a=1,b=0.5,c=foo"`` into ``{"a": 1, "b": 0.5, "c": "foo"}``.
+
+  Values are Python literals when they parse as one, otherwise strings.
+  """
+  out = {}
+  for item in filter(None, (s.strip() for s in spec.split(","))):
+    if "=" not in item:
+      raise ValueError(f"hf_config_overrides: expected key=value, got {item!r}")
+    key, raw = (x.strip() for x in item.split("=", 1))
+    try:
+      out[key] = ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+      out[key] = raw
+  return out
 
 
 class TPUHFTransformerModel(HFTransformerModel):
@@ -102,6 +120,7 @@ class TPUHFTransformerModel(HFTransformerModel):
 
       HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
 
+
       # is_moe was decided from the *flavor* in __init__, before --hf-model
       # had been applied, so a MoE checkpoint selected on the command line
       # arrives with a dense flavor and the MoE replacement never runs. The
@@ -131,6 +150,18 @@ class TPUHFTransformerModel(HFTransformerModel):
       # the patch states its own 1.0 directly.
       self.initializer_range = raw.get("initializer_range", 0.02)
 
+      # Per-run HF config overrides from the job config (``key=value`` pairs,
+      # e.g. zeroing a checkpoint's attention dropout because the splash
+      # kernel has no dropout path), applied last so they win over both the
+      # checkpoint and the flavor. An unknown field is an error, not a no-op.
+      for key, value in _parse_config_overrides(
+          getattr(config, "hf_config_overrides", "")
+      ).items():
+        if not hasattr(self, key):
+          raise ValueError(
+              f"hf_config_overrides: {hf_model_id} config has no field {key!r}"
+          )
+        setattr(self, key, value)
       return self
 
   def __init__(self, config: Config):
@@ -412,7 +443,15 @@ class TPUHFTransformerModel(HFTransformerModel):
     if attention_masks is not None:
       kwargs["attention_mask"] = attention_masks
 
-    self._check_position_capacity(model_args[0].shape[-1])
+    # The trainer folds the batch into one token-major stream, so the stream
+    # is BS x seq_len long while the position table only has to cover one
+    # sample: with per-document ``positions`` (reset at every sample boundary)
+    # the largest index is bounded by the context length, not the stream.
+    # Without them the arange above runs the full stream.
+    if positions is not None:
+      self._check_position_capacity(min(model_args[0].shape[-1], self.max_seq_len))
+    else:
+      self._check_position_capacity(model_args[0].shape[-1])
 
     # An encoder-decoder (T5, BART, Marian, mBART) will not run without
     # something to feed its decoder. Teacher-force the same sequence, which
