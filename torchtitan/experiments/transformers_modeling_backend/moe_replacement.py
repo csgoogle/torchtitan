@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.experiments.transformers_modeling_backend import _structure
 from torchtitan.experiments.transformers_modeling_backend.hf_sharding import (
     _hf_activation_placement,
     _hf_sequence_parallel_placement,
@@ -267,27 +268,17 @@ def build_and_swap_native_moe(
 def _get_moe_attr_name(layer: nn.Module) -> str:
     """Return the attribute name holding the MoE block on a decoder layer.
 
-    Models use ``mlp``; for layer-level MoE (Gemma4) the Titan MoE
-    replaces ``mlp`` too.
+    ``_structure.moe_attr_name`` does the lookup (``mlp``, then the known
+    alternates, then any child whose class looks like a MoE block); here a
+    miss is an error because the caller is about to swap that attribute.
     """
-    if hasattr(layer, "mlp"):
-        return "mlp"
-    # Mixtral and GraniteMoe put it at block_sparse_moe; others use their own
-    # name again. Fall back to whichever child module looks like a MoE block
-    # rather than enumerating every family -- the probe that follows reads the
-    # geometry off the module itself, so the attribute name is the only thing
-    # that has to be found here.
-    for name in ("block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
-        if hasattr(layer, name):
-            return name
-    for name, child in layer.named_children():
-        cls = type(child).__name__.lower()
-        if "moe" in cls or "sparse" in cls or "experts" in cls:
-            return name
-    raise AttributeError(
-        f"Layer {type(layer).__name__} has no recognisable MoE block "
-        f"(children: {[n for n, _ in layer.named_children()]})"
-    )
+    name = _structure.moe_attr_name(layer)
+    if name is None:
+        raise AttributeError(
+            f"Layer {type(layer).__name__} has no recognisable MoE block "
+            f"(children: {[n for n, _ in layer.named_children()]})"
+        )
+    return name
 
 
 def _get_moe_block(layer: nn.Module) -> nn.Module:

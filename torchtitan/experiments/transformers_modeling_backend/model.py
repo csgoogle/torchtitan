@@ -157,65 +157,6 @@ _TT_SPECIFIC_ATTRIBUTES = [
 _REMOTE_CONFIG_DENYLIST = frozenset({"deepseek_v2", "deepseek_v3"})
 
 
-def _get_moe_attr_name(layer: nn.Module) -> str | None:
-    """The attribute holding this layer's MoE block, or None if it has none.
-
-    Models differ: most use ``mlp``, Mixtral and GraniteMoe use
-    ``block_sparse_moe``. Fall back to whichever child module looks like a MoE
-    block rather than enumerating every family -- the caller only needs the
-    attribute found; the probe that follows reads the geometry off the module.
-    """
-    if hasattr(layer, "mlp"):
-        return "mlp"
-    for name in ("block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
-        if hasattr(layer, name):
-            return name
-    for name, child in layer.named_children():
-        cls = type(child).__name__.lower()
-        if "moe" in cls or "sparse" in cls or "experts" in cls:
-            return name
-    return None
-
-def _derive_dim(config, field: str, default: int = 1) -> int:
-    """Read a structural size the top-level config does not state."""
-    for name in ("text_config", "vision_config", "audio_config"):
-        sub = getattr(config, name, None)
-        v = getattr(sub, field, None) if sub is not None else None
-        if isinstance(v, int) and v > 0:
-            return v
-    v = getattr(config, field, None)
-    if isinstance(v, (list, tuple)) and v:
-        return v[-1]
-    if isinstance(v, int) and v > 0:
-        return v
-    return default
-
-
-def _derive_head_dim(config) -> int:
-    """head_dim for an architecture that does not state it at the top level.
-
-    Callers read config.head_dim directly, so leaving it unset raises
-    AttributeError rather than degrading. A composite config (CLIP, BLIP,
-    CLAP) keeps real dims in text_config / vision_config, and a staged
-    encoder (SegFormer) keeps per-stage lists. Prefer the text tower.
-    """
-    for name in ("text_config", "vision_config", "audio_config"):
-        sub = getattr(config, name, None)
-        if sub is None:
-            continue
-        h = getattr(sub, "hidden_size", None)
-        n = getattr(sub, "num_attention_heads", None)
-        if h and n:
-            return h // n
-    h = getattr(config, "hidden_sizes", None)
-    n = getattr(config, "num_attention_heads", None)
-    if isinstance(h, (list, tuple)) and h:
-        n_last = n[-1] if isinstance(n, (list, tuple)) and n else n
-        if n_last:
-            return h[-1] // n_last
-    return 64
-
-
 # TorchTitan initializes an untied token embedding at unit std.
 _TITAN_EMBED_INIT_STD = 1.0
 
@@ -593,8 +534,15 @@ class HFTransformerModel(BaseModel):
                 # dim explicitly overridden: derive head_dim from it.
                 self.head_dim = self.dim // self.num_attention_heads
             elif not getattr(self, "head_dim", None):
-                # HF config did not provide head_dim; use the standard derivation.
-                self.head_dim = self.dim // self.num_attention_heads
+                # HF config did not provide head_dim; use the standard
+                # derivation. A composite config (CLIP, BLIP, SegFormer) states
+                # neither dim nor num_attention_heads at the top level, which
+                # makes that a TypeError rather than a wrong number -- read the
+                # towers' own sizes instead.
+                if self.dim is not None and getattr(self, "num_attention_heads", None):
+                    self.head_dim = self.dim // self.num_attention_heads
+                else:
+                    self.head_dim = _structure.derive_head_dim(self)
 
             # Ensure expert groups are consistent with (possibly overridden)
             # num_experts for models with group-level routing (DeepSeek V3).
@@ -639,7 +587,7 @@ class HFTransformerModel(BaseModel):
                 if getattr(layer, "_layer_level_moe", False):
                     moe_block = layer
                 else:
-                    moe_attr = _get_moe_attr_name(layer)
+                    moe_attr = _structure.moe_attr_name(layer)
                     if moe_attr is None:
                         logger.warning(
                             "HF MFU calculation could not identify the MoE block; "
@@ -999,7 +947,7 @@ class HFTransformerModel(BaseModel):
             # Detect MoE layers by checking for gate/router and experts sub-modules.
             # Gemma4 has router/experts as siblings of the dense MLP at the
             # layer level (not inside ``mlp``).
-            moe_attr = _get_moe_attr_name(layer)
+            moe_attr = _structure.moe_attr_name(layer)
             moe_module = getattr(layer, moe_attr, None) if moe_attr else None
             if moe_module is not None:
                 has_gate = hasattr(moe_module, "gate") or hasattr(moe_module, "router")
