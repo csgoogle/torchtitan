@@ -12,7 +12,9 @@ collectives. Full-world all-reduce plus a rank-local slice is mathematically
 equivalent to reduce-scatter, but sends roughly twice the ring traffic and
 materializes the full result. Recipes must therefore select parameter
 gradients explicitly and bound their validated payload size. A native
-multi-operand reduce-scatter remains the preferred backend fix.
+multi-operand reduce-scatter remains the preferred backend fix. The rewrite
+preserves dtype but changes collective reduction order, so BF16 recipes must
+validate the resulting numerical trajectory.
 """
 
 from __future__ import annotations
@@ -145,9 +147,13 @@ def apply_selected_reduce_scatter_allreduce_pass(
             output_value, torch.Tensor
         ):
             raise ValueError(f"{label}: reduce-scatter tensor metadata is missing")
-        if input_value.dtype != torch.float32 or output_value.dtype != torch.float32:
+        supported_dtypes = (torch.float32, torch.bfloat16)
+        if (
+            input_value.dtype not in supported_dtypes
+            or output_value.dtype != input_value.dtype
+        ):
             raise ValueError(
-                f"{label}: expected FP32 input/output, got "
+                f"{label}: expected matching FP32 or BF16 input/output, got "
                 f"{input_value.dtype}/{output_value.dtype}"
             )
         input_bytes = int(input_value.numel()) * input_value.element_size()
