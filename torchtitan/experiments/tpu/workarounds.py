@@ -664,6 +664,14 @@ def use_fused_qk_norm_rope_patch(model: nn.Module) -> None:
     ).contiguous()
     return self.wo(out_BLNH.view(B, L, -1))
 
+  def _unwrapped_type(module: nn.Module) -> type:
+    # SimpleFSDP swaps a module's class for a generated subclass that only
+    # adds parameter-gathering properties; judge numerics by the class it wraps.
+    cls = type(module)
+    if hasattr(module, "_simple_fsdp_parametrization_list"):
+      cls = cls.__mro__[1]
+    return cls
+
   patched = 0
   for module in model.modules():
     if not isinstance(module, GQAttention):
@@ -671,7 +679,7 @@ def use_fused_qk_norm_rope_patch(model: nn.Module) -> None:
     if not (
         isinstance(module.q_norm, RMSNorm)
         and isinstance(module.k_norm, RMSNorm)
-        and type(module.rope) is CosSinRoPE
+        and _unwrapped_type(module.rope) is CosSinRoPE
         and module.q_norm.eps == module.k_norm.eps
     ):
       raise ValueError(
