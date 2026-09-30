@@ -102,6 +102,9 @@ class TPUConfig:
   # cannot resume across a flip of this flag.
   # https://github.com/google-pytorch/torchtitan/issues/389
   use_scan_layers: bool = False
+  # Run Qwen3's q_norm + k_norm + cos/sin RoPE as one Pallas pass per tensor
+  # (kernels/fused_qk_norm_rope.py). Bit-identical forward; backward unchanged.
+  fused_qk_norm_rope: bool = False
   # Keep rematerialized layer workspaces local in the XLA schedule.
   enable_graph_trainer_remat_schedule: bool = False
   # TPU SimpleFSDP scheduling for GraphTrainer rematerialization. ``prefetch``

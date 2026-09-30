@@ -1,5 +1,6 @@
 import inspect
 import logging
+import types
 from typing import Any, Optional
 import torch
 from torch import nn
@@ -624,6 +625,67 @@ def use_rope_tpu_optimization_patch() -> None:
   )
 
 
+def use_fused_qk_norm_rope_patch(model: nn.Module) -> None:
+  """Replaces q_norm + k_norm + cos/sin RoPE with one Pallas pass per tensor.
+
+  Applies to every ``GQAttention`` whose QK norms are ``RMSNorm`` and whose
+  RoPE is exactly ``CosSinRoPE`` (not a subclass with different numerics).
+  The forward result is bit-identical; see ``kernels/fused_qk_norm_rope.py``.
+  """
+  from torch.distributed.tensor import DTensor  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.kernels.fused_qk_norm_rope import fused_qk_norm_rope  # pylint: disable=g-import-not-at-top
+  from torchtitan.models.common.attention import GQAttention  # pylint: disable=g-import-not-at-top
+  from torchtitan.models.common.nn_modules import RMSNorm  # pylint: disable=g-import-not-at-top
+  from torchtitan.models.common.rope import CosSinRoPE  # pylint: disable=g-import-not-at-top
+
+  def _forward(self, x_BLD, attention_masks, positions=None, segment_ids=None):
+    B, L, _ = x_BLD.shape
+    xq_BLNH, xk_BLNH, xv_BLNH = self.qkv_linear(x_BLD)
+    rope_cache = self.rope._reshape_cache(xq_BLNH, positions)
+    operands = (xq_BLNH, xk_BLNH, self.q_norm.weight, self.k_norm.weight, rope_cache)
+    if any(isinstance(t, DTensor) for t in operands):
+      raise ValueError(
+          "fused_qk_norm_rope takes plain local tensors; this model passes"
+          " DTensors to attention. Disable tpu_config.fused_qk_norm_rope."
+      )
+    xq_BLNH, xk_BLNH = fused_qk_norm_rope(
+        xq_BLNH, xk_BLNH, self.q_norm.weight, self.k_norm.weight, rope_cache,
+        self.q_norm.eps,
+    )
+    out_BLNH = self.inner_attention(
+        xq_BLNH,
+        xk_BLNH,
+        xv_BLNH,
+        attention_masks=attention_masks,
+        scale=self.scaling,
+        enable_gqa=self.enable_gqa,
+        positions=positions,
+        segment_ids=segment_ids,
+    ).contiguous()
+    return self.wo(out_BLNH.view(B, L, -1))
+
+  patched = 0
+  for module in model.modules():
+    if not isinstance(module, GQAttention):
+      continue
+    if not (
+        isinstance(module.q_norm, RMSNorm)
+        and isinstance(module.k_norm, RMSNorm)
+        and type(module.rope) is CosSinRoPE
+        and module.q_norm.eps == module.k_norm.eps
+    ):
+      raise ValueError(
+          "fused_qk_norm_rope needs RMSNorm q/k norms with one eps and an exact"
+          f" CosSinRoPE; {type(module).__name__} has {type(module.q_norm).__name__}"
+          f" / {type(module.rope).__name__}."
+      )
+    module.forward = types.MethodType(_forward, module)
+    patched += 1
+  if not patched:
+    raise ValueError("fused_qk_norm_rope found no GQAttention module to patch.")
+  logger.info("Fused QK-norm + RoPE: patched %d attention modules", patched)
+
+
 def apply_patches(model: nn.Module, job_config: Any) -> None:
   """Applies all TPU-specific patches and workarounds to the model."""
   # Enable CPU safe histc workaround.
@@ -636,6 +698,12 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
       use_tokamax_splash_attention_patch(model, sa_config)
     elif sa_config.use_splash_attention_kernel:
       use_splash_attention_patch(model, sa_config)
+
+  if (
+      hasattr(job_config, "tpu_config")
+      and job_config.tpu_config.fused_qk_norm_rope
+  ):
+    use_fused_qk_norm_rope_patch(model)
 
   # Pallas Loss Patch (Output Projection)
   if (

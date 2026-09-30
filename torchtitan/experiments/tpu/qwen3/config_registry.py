@@ -854,6 +854,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.parallelism.fsdp_reshard_after_forward = "always"
   cfg.tpu_config.use_scan_layers = True
   cfg.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  cfg.tpu_config.fused_qk_norm_rope = True
   # The 30B chain coalesces its packed-QKV and `wo` reductions (#419). This
   # model packs no QKV and scan leaves no per-layer FQN to match, so the pass
   # would find none of its targets and refuse to run.
