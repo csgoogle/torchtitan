@@ -838,8 +838,9 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
     # the K tile that measures best for W1/W3 does not fit W2. Tile them
     # independently.
     experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
-    # A K tile that does not divide F leaves a masked remainder tile.
-    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 768, 0)
+    # One K tile over all of F. It fits v7x's 64 MiB of scoped VMEM because the
+    # W2 dWeight is stored in bf16; with an f32 store it needs 78 MiB.
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 1536, 0)
     experts.use_kernel_native_weight_layout = True
   cfg.training.local_batch_size = 16
   cfg.training.global_batch_size = 8192
