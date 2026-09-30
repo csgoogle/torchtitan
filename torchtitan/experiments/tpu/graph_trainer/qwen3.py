@@ -51,12 +51,17 @@ def parallelize_qwen3(
         model, TORCH_DTYPE_MAP[training.mixed_precision_reduce]
     )
     configure_qwen_simple_fsdp_shard_dims(model, parallel_dims)
-    return graph_trainer_parallelize_qwen3(
+    model = graph_trainer_parallelize_qwen3(
         model,
         training=training,
         parallel_dims=parallel_dims,
         **kwargs,
     )
+    # Creates process groups, so every rank runs it here, right after sharding.
+    for holder in model.modules():
+        if hasattr(holder, "build_split_meshes"):
+            holder.build_split_meshes()
+    return model
 
 
 def model_registry(flavor: str) -> ModelSpec:

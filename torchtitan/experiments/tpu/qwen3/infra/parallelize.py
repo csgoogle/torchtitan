@@ -29,8 +29,12 @@ def configure_qwen_simple_fsdp_shard_dims(
 
   # Layer stacking moves the layer weights into a holder, which plans an axis
   # per stack -- dim 1 of a stack is one axis further in than dim 1 of a layer.
+  # Flatten first: it reshapes some stacks, and both `plan_shard_dims` and
+  # sharding must see the new shapes. Reshaping after sharding would need a
+  # redistribute.
   stacks = [m for m in model.modules() if hasattr(m, "plan_shard_dims")]
   for holder in stacks:
+    holder.flatten_for(fsdp_degree)
     holder._fsdp_shard_dim = holder.plan_shard_dims(fsdp_degree)
 
   hidden_axis_modules: list[str] = []
@@ -151,6 +155,10 @@ def parallelize_qwen3(
         parallel_dims=parallel_dims,
         training=training,
     )
+    # Creates process groups, so every rank runs it here, right after sharding.
+    for holder in model.modules():
+      if hasattr(holder, "build_split_meshes"):
+        holder.build_split_meshes()
   else:
     dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]

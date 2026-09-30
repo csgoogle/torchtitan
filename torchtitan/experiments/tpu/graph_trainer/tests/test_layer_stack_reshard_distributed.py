@@ -22,6 +22,7 @@ from absl.testing import absltest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.api import CheckpointException
 import torch.multiprocessing as mp
 
 from torchtitan.components.checkpoint_utils import (
@@ -35,6 +36,7 @@ from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
 )
+from torchtitan.experiments.tpu.graph_trainer.tests import test_layer_stack
 from torchtitan.experiments.tpu.layer_loop import tpu_model_class
 from torchtitan.models.llama3 import model_registry
 
@@ -146,6 +148,47 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _flattened_moe_optim_state(world_size: int) -> dict[str, torch.Tensor]:
+    """A 4-expert stacked MoE's flat AdamW state, at ``world_size`` ranks.
+
+    Above 4 ranks the expert and router stacks are stored flattened, and so
+    are their moments; at 4 ranks nothing is flattened.
+    """
+    # ParallelDims reads the accelerator type at import; there is none here.
+    import torchtitan.distributed.parallel_dims as parallel_dims_module
+
+    parallel_dims_module.device_type = "cpu"
+    model = test_layer_stack._build(  # pylint: disable=protected-access
+        stacked=True,
+        flatten=True,
+        config=test_layer_stack._moe_config(num_experts=4),  # pylint: disable=protected-access
+        world_size=world_size,
+    )
+    optim = torch.optim.AdamW(list(model.named_parameters()))
+    init_optim_state(optim)
+    return get_flat_optim_state_dict(optim)
+
+
+def _save_flattened_optim_worker(rank: int, world_size: int, port: int, path: str):
+    with _process_group(rank, world_size, port):
+        state = _flattened_moe_optim_state(world_size)
+        dcp.save(state, checkpoint_id=os.path.join(path, "optim"))
+
+
+def _load_flattened_optim_worker(rank: int, world_size: int, port: int, path: str):
+    with _process_group(rank, world_size, port):
+        state = _flattened_moe_optim_state(world_size)
+        try:
+            dcp.load(state, checkpoint_id=os.path.join(path, "optim"))
+        except CheckpointException as err:
+            assert "Size mismatch" in str(err), err
+        else:
+            raise AssertionError(
+                f"rank {rank} loaded flattened optimizer state into unflattened "
+                "stacks"
+            )
+
+
 class ReshardTest(unittest.TestCase):
     """Eight ranks out, four ranks back, across both layouts."""
 
@@ -214,6 +257,34 @@ class OptimizerStateTest(unittest.TestCase):
                 keys[stacked] = set(get_flat_optim_state_dict(optim))
 
         self.assertEqual(keys[True], keys[False])
+
+
+class FlattenedOptimizerStateTest(unittest.TestCase):
+    """Optimizer state follows the live shape, and flattening changes it.
+
+    ``flatten_for`` stores a stack whose axis 1 the mesh outgrows as
+    ``[L, E*X, ...]``, and Adam's moments take that shape. Model checkpoints
+    are unaffected -- ``state_dict`` views each layer back to ``[E, X, ...]`` --
+    but the flat optimizer state is keyed off the live parameters, so a run
+    that crosses the E-rank boundary between save and resume sees different
+    shapes under the same keys. That has to fail at load, not resume on
+    moments reshaped into the wrong rows.
+    """
+
+    def test_loading_across_the_flatten_boundary_raises(self):
+        with tempfile.TemporaryDirectory() as path:
+            # 8 ranks > 4 experts: flattened. 4 ranks: not.
+            mp.spawn(
+                _save_flattened_optim_worker,
+                args=(8, _free_port(), path),
+                nprocs=8,
+            )
+            # Every rank asserts it raised, so a rank that loaded fails here.
+            mp.spawn(
+                _load_flattened_optim_worker,
+                args=(4, _free_port(), path),
+                nprocs=4,
+            )
 
 
 if __name__ == "__main__":
