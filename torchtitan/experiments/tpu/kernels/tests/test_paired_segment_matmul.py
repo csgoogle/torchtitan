@@ -214,6 +214,68 @@ class PairedSegmentMatmulTest(base_device_test.BaseAcceleratorDeviceTest):
         torch.testing.assert_close(got_rhs3, want_rhs3, rtol=0, atol=0)
         torch.testing.assert_close(got_lhs, want_lhs, rtol=0, atol=0)
 
+    def test_dinput_tiles_shared_by_many_groups(self):
+        """dInput adds the W3 term in place, seeding each row tile once.
+
+        With tile_m=128 the first tile holds rows of four groups (5, 60, 3 and
+        the head of the 300-row group), runs of empty groups sit between them,
+        one group spans three tiles, and the last group is a single row, so the
+        kernel revisits tiles across group boundaries and must seed each one
+        exactly once.
+        """
+        self._paired_vs_unpaired(
+            torch.tensor([5, 0, 60, 3, 0, 300, 0, 0, 143, 1], dtype=torch.int32),
+            128,
+            256,
+            tile_m=128,
+            tgmm_tile_k=0,
+        )
+
+    def test_dinput_rounds_like_two_matmuls_with_random_values(self):
+        """dInput equals bf16(bf16(dH1 W1^T) + bf16(dH3 W3^T)) bit for bit.
+
+        Random bf16 inputs make both products round, so accumulating the W3
+        term in FP32 before a single rounding (instead of rounding it to bf16
+        first, as two separate matmuls and an add do) would be caught here.
+        """
+        device = self.accelerator_device
+        generator = torch.Generator().manual_seed(0)
+        group_sizes = torch.tensor([37, 0, 219, 12, 0, 244], dtype=torch.int32)
+        total_m = int(group_sizes.sum().item())
+        groups, k, n, tile_m = group_sizes.shape[0], 256, 512, 128
+
+        def randn(shape):
+            return torch.randn(shape, generator=generator).bfloat16().to(device)
+
+        lhs = randn((total_m, k)).requires_grad_()
+        rhs1 = randn((groups, k, n)).requires_grad_()
+        rhs3 = randn((groups, k, n)).requires_grad_()
+        grad1 = randn((total_m, n))
+        grad3 = randn((total_m, n))
+        group_sizes_dev = group_sizes.to(device)
+
+        ref_tiling = (tile_m, 0, 0)
+        out1 = expert_segment_matmul.segment_matmul_pallas_2d(
+            lhs, rhs1, group_sizes_dev, tile_m=tile_m, tgmm_tiling=ref_tiling
+        )
+        out3 = expert_segment_matmul.segment_matmul_pallas_2d(
+            lhs, rhs3, group_sizes_dev, tile_m=tile_m, tgmm_tiling=ref_tiling
+        )
+        (want_lhs,) = torch.autograd.grad((out1, out3), (lhs,), (grad1, grad3))
+
+        got_lhs, _, _ = paired_segment_matmul._paired_grouped_mm_bwd(
+            grad1,
+            grad3,
+            lhs.detach(),
+            rhs1.detach(),
+            rhs3.detach(),
+            group_sizes_dev,
+            tile_m,
+            tile_m,
+            0,
+        )
+        torch.testing.assert_close(got_lhs, want_lhs, rtol=0, atol=0)
+
     def test_rejects_k_tile_that_does_not_divide_k(self):
         device = self.accelerator_device
         lhs = torch.ones((128, 128), device=device, dtype=torch.bfloat16, requires_grad=True)
