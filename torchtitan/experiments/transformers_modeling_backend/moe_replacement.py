@@ -46,11 +46,6 @@ from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.logging import logger
 
-# Optional hook for an accelerator lane to swap the experts implementation in
-# the probed MoE config before it is built (e.g. a grouped-matmul kernel). Set
-# by the lane at import; None leaves the portable GroupedExperts in place.
-expert_impl_converter = None
-
 
 class _HFBatchedMoE(MoE):
     """Adapt HF's singleton batch to Titan MoE's flat token interface."""
@@ -169,8 +164,6 @@ def build_and_swap_native_moe(
                 out_dst_shardings=gate_output_layout,
             )
 
-        if expert_impl_converter is not None:
-            moe_config = expert_impl_converter(moe_config)
         with torch.device("meta"):
             native_moe = moe_config.build()
         # Preserve the Titan MoE state-dict paths while adapting its root
@@ -223,20 +216,13 @@ def build_and_swap_native_moe(
 def _get_moe_attr_name(layer: nn.Module) -> str:
     """Return the attribute name holding the MoE block on a decoder layer.
 
-    Same lookup as ``model._get_moe_attr_name`` (``mlp``, then the names
-    Mixtral / GraniteMoe use); for layer-level MoE (Gemma4) the Titan MoE
-    replaces ``mlp`` too. A miss is an error because the caller is about to
-    swap that attribute.
+    Models use ``mlp``; for layer-level MoE (Gemma4) the Titan MoE
+    replaces ``mlp`` too.
     """
-    from .model import _get_moe_attr_name as _lookup
-
-    name = _lookup(layer)
-    if name is None:
-        raise AttributeError(
-            f"Layer {type(layer).__name__} has no recognisable MoE block "
-            f"(children: {[n for n, _ in layer.named_children()]})"
-        )
-    return name
+    for name in ("mlp", "block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
+        if hasattr(layer, name):
+            return name
+    raise AttributeError(f"Layer {type(layer).__name__} has no MoE block")
 
 
 def _get_moe_block(layer: nn.Module) -> nn.Module:

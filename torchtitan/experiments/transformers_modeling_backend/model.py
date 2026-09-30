@@ -153,9 +153,6 @@ _TT_SPECIFIC_ATTRIBUTES = [
 # ``transformers`` config/model pair for denylisted model types.
 _REMOTE_CONFIG_DENYLIST = frozenset({"deepseek_v2", "deepseek_v3"})
 
-# TorchTitan initializes an untied token embedding at unit std.
-_TITAN_EMBED_INIT_STD = 1.0
-
 
 def _get_moe_attr_name(layer: nn.Module) -> str | None:
     """Return the attribute name holding the MoE block on a decoder layer.
@@ -515,11 +512,7 @@ class HFTransformerModel(BaseModel):
                 self.head_dim = self.dim // self.num_attention_heads
             elif not getattr(self, "head_dim", None):
                 # HF config did not provide head_dim; use the standard derivation.
-                # A composite config (CLIP, SegFormer) states neither dim nor
-                # num_attention_heads at the top level; leave head_dim to the
-                # caller in that case rather than raising here.
-                if self.dim is not None and getattr(self, "num_attention_heads", None):
-                    self.head_dim = self.dim // self.num_attention_heads
+                self.head_dim = self.dim // self.num_attention_heads
 
             # Ensure expert groups are consistent with (possibly overridden)
             # num_experts for models with group-level routing (DeepSeek V3).
@@ -1037,9 +1030,8 @@ class HFTransformerModel(BaseModel):
                         b=cutoff_factor * final_out_std,
                     )
                 else:
-                    # TorchTitan initializes an untied token embedding at
-                    # std=1.0, independent of the HF config's initializer_range.
-                    module.weight.data.normal_(mean=0.0, std=_TITAN_EMBED_INIT_STD)
+                    std = config.initializer_range
+                    module.weight.data.normal_(mean=0.0, std=std)
 
                 if module.padding_idx is not None:
                     module.weight.data[module.padding_idx].zero_()

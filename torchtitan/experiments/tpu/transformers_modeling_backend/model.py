@@ -21,7 +21,8 @@ subclass, and the shared backend keeps only small hooks:
   weight instead of logits (``fused_loss`` on the Config);
 - Titan modules swapped in by ``moe_replacement`` are re-initialized after
   the trainer's ``to_empty`` destroyed their CPU-initialized weights, and the
-  TPU grouped-expert kernel is substituted for the portable experts.
+  TPU grouped-expert kernel is substituted for the portable experts
+  (``substitute_tpu_experts``, called from the lane's parallelize).
 
 The lane's registry swaps a flavor's ``HFTransformerModel.Config`` for this
 class's ``Config`` (``as_tpu_model_config``) so ``Config.build`` constructs a
@@ -35,8 +36,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_utils import PreTrainedModel
 
-from torchtitan.experiments.transformers_modeling_backend import moe_replacement
 from torchtitan.experiments.transformers_modeling_backend.model import (
     _ATTN_IMPLEMENTATION as _FLEX_IMPLEMENTATION,
     HFTransformerModel,
@@ -45,6 +46,17 @@ from torchtitan.experiments.transformers_modeling_backend.model import (
 from torchtitan.tools.logging import logger
 
 from . import _meta_init, _structure
+
+
+class _Attrs:
+  """Attribute view over a (nested) config dict, for ``_structure`` helpers."""
+
+  def __init__(self, d):
+    self._d = d
+
+  def __getattr__(self, name):
+    v = self._d.get(name)
+    return _Attrs(v) if isinstance(v, dict) else v
 
 
 class TPUHFTransformerModel(HFTransformerModel):
@@ -71,9 +83,24 @@ class TPUHFTransformerModel(HFTransformerModel):
       return instance
 
     def update_from_config(self, *, config=None, **kwargs):
-      HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
       hf_model_id = getattr(config, "hf_model", "")
       raw, _ = PretrainedConfig.get_config_dict(hf_model_id)
+
+      # The base derives head_dim as dim // num_attention_heads when the HF
+      # config has none. A composite config (SegFormer's per-stage lists; a
+      # vision tower) states neither at the top level, which makes that a
+      # TypeError. Such a config carries no head_dim of its own, so a value
+      # set here survives the base's attribute copy and short-circuits the
+      # derivation. Text-bearing composites (CLIP) are unaffected: the base
+      # swaps in their text_config, which has both sizes.
+      if (
+          "head_dim" not in raw
+          and "text_config" not in raw
+          and not (raw.get("hidden_size") and raw.get("num_attention_heads"))
+      ):
+        self.head_dim = _structure.derive_head_dim(_Attrs(raw))
+
+      HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
 
       # is_moe was decided from the *flavor* in __init__, before --hf-model
       # had been applied, so a MoE checkpoint selected on the command line
@@ -104,11 +131,6 @@ class TPUHFTransformerModel(HFTransformerModel):
       # the patch states its own 1.0 directly.
       self.initializer_range = raw.get("initializer_range", 0.02)
 
-      # A composite config (CLIP, BLIP, SegFormer) states neither dim nor
-      # num_attention_heads at the top level, so the base left head_dim
-      # unset; read the towers' own sizes.
-      if not getattr(self, "head_dim", None):
-        self.head_dim = _structure.derive_head_dim(self)
       return self
 
   def __init__(self, config: Config):
@@ -293,9 +315,9 @@ class TPUHFTransformerModel(HFTransformerModel):
 
   @property
   def rotary_emb(self):
-    """Rotary embedding module, or None for a learned-position model."""
-    found, _ = _structure.find_rotary(self.model)
-    return found
+    """The rotary embedding module; AttributeError for a learned-position model
+    (GPT-2, OPT, BERT), which is what ``hasattr`` callers expect."""
+    return self._part(_structure.find_rotary, "rotary_emb")
 
   @rotary_emb.setter
   def rotary_emb(self, value):
@@ -462,7 +484,20 @@ class TPUHFTransformerModel(HFTransformerModel):
     return _meta_init.to_empty_keep_buffers(self, device)
 
   def init_states(self, *, buffer_device: torch.device | None = None) -> None:
-    super().init_states(buffer_device=buffer_device)
+    # The base's Llama-like patched _init_weights reads the token-embedding
+    # std from config.initializer_range, which the base forces to 1.0
+    # (TorchTitan's init). This lane keeps the checkpoint's value instead
+    # (update_from_config) so HF's *stock* init -- what runs when the patch
+    # does not match: GPT-2, BERT, XLM-R -- uses 0.02 rather than 1.0. When
+    # the patch is what runs, restore TorchTitan's 1.0 for its duration.
+    patched = getattr(PreTrainedModel._init_weights, "__name__", "") == "_init_weights_patched"
+    saved = self.model.config.initializer_range
+    if patched:
+      self.model.config.initializer_range = 1.0
+    try:
+      super().init_states(buffer_device=buffer_device)
+    finally:
+      self.model.config.initializer_range = saved
 
     # Titan MoE modules swapped in by moe_replacement initialize themselves at
     # parallelize time (to_empty(cpu) + init_states(cpu)), but the trainer
@@ -567,24 +602,29 @@ def as_tpu_model_config(
   return cfg
 
 
-def _tpu_expert_impl_converter(moe_config):
-  """Substitute the TPU grouped-expert implementation in a probed MoE config.
+def substitute_tpu_experts(model: nn.Module) -> None:
+  """Swap the TPU grouped-expert implementation into each probed MoE config.
 
-  The phase-1 probe in ``moe_replacement`` is architecture-agnostic and
-  produces a config whose ``GroupedExperts.Config`` names the implementation.
-  Registered ModelConfigConverters never see it (they run over the model spec
-  before construction), so the lane installs this hook instead. Expert
-  parallelism is deliberately not involved: experts stay replicated and
-  SimpleFSDP shards them, as the qwen3 TPU lane does.
+  ``moe_replacement`` works in two phases: at construction it probes every HF
+  MoE block into a Titan MoE config stored on the layer as
+  ``_native_moe_config``; at parallelize time it builds and swaps the module.
+  Registered ModelConfigConverters never see those configs (they run over the
+  model spec before construction), so this rewrites the stored configs in
+  between -- the lane's parallelize calls it before handing the model to the
+  shared parallelize. Expert parallelism is deliberately not involved:
+  experts stay replicated and SimpleFSDP shards them, as the qwen3 TPU lane
+  does.
   """
   if not (hasattr(torch, "tpu") and torch.tpu.is_available()):
-    return moe_config
+    return
   from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
 
   converter = TpuGroupedExpertsConverter(TpuGroupedExpertsConverter.Config())
-  converted = converter.convert(moe_config)
-  logger.info("Substituted the TPU grouped-expert implementation for this MoE.")
-  return converted
-
-
-moe_replacement.expert_impl_converter = _tpu_expert_impl_converter
+  n = 0
+  for layer in model.layers.values():
+    cfg = getattr(layer, "_native_moe_config", None)
+    if cfg is not None:
+      layer._native_moe_config = converter.convert(cfg)
+      n += 1
+  if n:
+    logger.info("Substituted the TPU grouped-expert implementation in %d MoE layer(s).", n)

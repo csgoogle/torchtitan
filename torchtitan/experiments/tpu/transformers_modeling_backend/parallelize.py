@@ -37,6 +37,8 @@ from torchtitan.experiments.transformers_modeling_backend.parallelize import (
 )
 from torchtitan.tools.logging import logger
 
+from .model import substitute_tpu_experts
+
 
 
 def _defer_parametrization_during_init(model: nn.Module) -> None:
@@ -98,6 +100,11 @@ def parallelize_hf_transformers_tpu(
   if effective_compile_config.enable:
     for layer in model.layers.values():
       apply_spmd_safe(layer)
+
+  # The shared parallelize builds and swaps the Titan MoE (phase 2) from the
+  # configs probed at construction; rewrite those first so it builds the TPU
+  # grouped-expert implementation.
+  substitute_tpu_experts(model)
 
   parallelize_hf_transformers(
       model,
