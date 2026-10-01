@@ -328,6 +328,16 @@ def hf_full_fused_compile() -> TPUTransformersBackendConfig:
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True, fused_loss=True)
 
 
+def hf_full_kernels() -> TPUTransformersBackendConfig:
+  """Splash attention + fused CE in eager mode (hf_full_max without compile).
+
+  The eager counterpart of the frontier config: the splash adapter's fallback
+  report fires only outside Dynamo tracing, so this is the config for asking
+  "does this model run on the kernels, and did they actually fire".
+  """
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, attn="splash_tpu", fused_loss=True)
+
+
 def hf_full_max() -> TPUTransformersBackendConfig:
   """Everything on: splash attention, fused CE, per-layer compile."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
