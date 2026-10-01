@@ -24,8 +24,10 @@ import torch.multiprocessing as mp
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
 
-_MODULE = "torchtitan.experiments.tpu.transformers_modeling_backend"
-_CPU_REFERENCE = f"{_MODULE}.config_registry:as_cpu_reference"
+from torchtitan.experiments.tpu.transformers_modeling_backend.tests.lane_args import (
+    CPU_REFERENCE,
+    lane_config_args,
+)
 
 
 class HFBackendDistributedTest(
@@ -149,19 +151,9 @@ class HFBackendDistributedTest(
     if self.accelerator_device_type == device_type.AcceleratorDeviceType.CPU:
       args = (args or []) + (cpu_args or [])
     self._run_trainer_distributed_parity_test(
-        config_args=[
-            f"--module={_MODULE}",
-            f"--config={config}",
-            f"--hf_model={hf_model}",
-            "--optimizer.implementation=foreach",
-            "--hf_assets_path=tests/assets/tokenizer",
-            "--training.max_context_length=128",
-            "--training.steps=3",
-            "--training.mixed_precision_param=float32",
-            "--training.mixed_precision_reduce=float32",
-            "--training.num_tokens_per_microbatch_per_dp_rank=256",  # 2 x 128
-            "--parallelism.use_simple_fsdp",
-        ] + (args or []),
+        config_args=lane_config_args(
+            config, hf_model, steps=3, extra=["--parallelism.use_simple_fsdp"] + (args or [])
+        ),
         tensor_parallel_degree=1,
         data_parallel_shard_degree=-1,
         skip_devices=skip_devices,
@@ -171,7 +163,7 @@ class HFBackendDistributedTest(
         grad_rtol=grad_rtol,
         param_atol=param_atol,
         param_rtol=param_rtol,
-        cpu_config_fn=_CPU_REFERENCE,
+        cpu_config_fn=CPU_REFERENCE,
     )
 
 
