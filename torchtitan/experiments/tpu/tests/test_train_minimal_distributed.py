@@ -124,10 +124,6 @@ class TrainMinimalDistributedTest(
           config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
-          skip_devices=[
-             # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
-              device_type.AcceleratorDeviceType.TPU,
-          ],
           loss_atol=1e-3,
           loss_rtol=1e-3,
           grad_atol=2e-3,
@@ -142,10 +138,6 @@ class TrainMinimalDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           args=["--parallelism.use_simple_fsdp"],
-          skip_devices=[
-              # TODO(jeremiahhsu): Investigate numerical divergence b/540005818
-              device_type.AcceleratorDeviceType.TPU,
-          ],
           loss_atol=1e-3,
           loss_rtol=1e-3,
           grad_atol=2e-3,
