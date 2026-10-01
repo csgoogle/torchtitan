@@ -1,5 +1,6 @@
 """Base class and helper functions for single-device accelerator tests."""
 
+import contextlib
 import copy
 from typing import Any, Callable, Dict, Tuple, Type
 
@@ -264,7 +265,25 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
       grad_rtol: float = 1e-3,
       param_atol: float = 5e-3,
       param_rtol: float = 5e-3,
+      validate_job_config=None,
+      validate_device: torch.device | None = None,
+      validate_context: contextlib.AbstractContextManager | None = None,
   ):
+    """Trains `job_config` on the accelerator, then checks a second run against it.
+
+    By default the second run is the same config on CPU. Passing
+    `validate_job_config` and `validate_device` instead compares two configs
+    on one device -- e.g. a kernel against the stock op it replaces -- from the
+    same initial weights and batches. `validate_context` wraps the second run,
+    e.g. to count the ops it dispatches.
+
+    Returns:
+      The second run's trainer, so callers can inspect the model it built.
+    """
+    if validate_job_config is None:
+      validate_job_config = job_config
+    if validate_device is None:
+      validate_device = torch.device("cpu")
 
     # Setup recorder callback
     recorder = numerical_validation.StateRecorderCallback(
@@ -300,16 +319,19 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     )
 
     with validator:
-      trainer_cpu = torchtitan.experiments.tpu.train_minimal.TrainerMinimal(
-          torch.device("cpu"),
+      trainer_validate = torchtitan.experiments.tpu.train_minimal.TrainerMinimal(
+          validate_device,
           rank=0,
           world_size=1,
-          job_config=job_config,
+          job_config=validate_job_config,
           step_callback=validator.on_step,
       )
 
       # Load initial weights
-      trainer_cpu.model.load_state_dict(initial_state_dict)
+      trainer_validate.model.load_state_dict(initial_state_dict)
 
-      # Phase 2: Train the CPU model and validate against the recorded history.
-      trainer_cpu.train()
+      # Phase 2: Train the second model and validate against the recorded
+      # history.
+      with validate_context or contextlib.nullcontext():
+        trainer_validate.train()
+    return trainer_validate
