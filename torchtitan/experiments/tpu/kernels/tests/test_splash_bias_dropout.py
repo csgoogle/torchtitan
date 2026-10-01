@@ -13,6 +13,7 @@ import functools
 import unittest
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import torch
 from torch.nn import attention
 import torch.nn.functional as F
@@ -228,7 +229,14 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
 
   # -------- layouts --------
 
-  def test_heads_first_layout_matches_torch_standard(self):
+  @parameterized.named_parameters(
+      ("mha", 4), ("gqa", 2),
+      # MQA takes the kernel's rank-reduced entry, whose dk/dv come back
+      # without a head axis -- the one place the two layouts need different
+      # reshapes rather than a transpose.
+      ("mqa", 1),
+  )
+  def test_heads_first_layout_matches_torch_standard(self, h_kv):
     """`heads_first=True` is the same computation on the same bits.
 
     It is the layout HF hands attention and the kernel's own, so it skips the
@@ -236,7 +244,7 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
     backward, or the saving is a bug.
     """
     device = self.accelerator_device
-    b, s, h, h_kv, d = 2, 512, 4, 2, 64
+    b, s, h, d = 2, 512, 4, 64
     q, k, v = self._qkv(b, s, h, h_kv, d, device, seed=53)
     segment_ids = torch.zeros(b, s, dtype=torch.int32)
     segment_ids[:, 256:] = 1
