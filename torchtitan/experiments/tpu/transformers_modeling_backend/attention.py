@@ -9,17 +9,27 @@ finds nothing and raises.
 That interface is the generic hook. Registering a kernel here reaches every HF
 architecture that uses the standard attention path, without naming any of them.
 
-The shape contract already matches: HF hands attention (B, H, S, D), which is
-what `splash_sdpa` takes, and expects (B, S, H, D) back, which is one transpose.
+Two kernels serve the call, chosen per call by whether HF asks for dropout:
 
-Splash takes boolean structure -- causal / bidirectional / sliding window,
-plus per-token segment ids -- and nothing else. This adapter translates what
-HF hands it into that vocabulary: ``is_causal`` is passed through (encoders
-run bidirectional), document boundaries and a 2D padding mask both become
-segment ids. What it cannot express (an additive float bias, dropout, a
-sequence that is not a whole number of blocks) falls back to SDPA and *says
-so*, once per distinct reason. A silent fallback is how a kernel that never
-fired gets reported as a speedup.
+- ``splash_sdpa`` (the JAX-experimental splash) when ``dropout == 0``: it
+  skips every (q, kv) block whose documents do not overlap, which on the
+  lane's packed stream (8 x 2048 tokens folded into one 16k sequence, block
+  1024) visits ~24 of 136 causal blocks per layer. Measured 2026-10-01 on
+  Llama-3.2-1B, 4x v6e: the exact-but-unskipped alternative below costs 29 %
+  of step throughput there (14,307 vs ~20,000 tok/s/device, +2.4 GiB).
+- ``sbd_splash_attention`` (a tokamax splash fork) when ``dropout > 0``: the
+  only kernel with an in-kernel dropout path, so these calls no longer fall
+  back to SDPA. It masks packed documents exactly at token granularity but
+  does not skip blocks on them (tokamax's MaskInfo is a static compacted
+  block list); at the encoder op-point (512-token documents) that is a wash
+  with the skipping kernel, so dropout models pay only the dropout itself.
+
+Both take the same translation of HF's contract: ``is_causal`` passed through
+(encoders run bidirectional), document boundaries and a 2D padding mask as
+segment ids, grouped-KV / MQA heads, a sliding window. What neither can
+express (an additive float mask, a sequence that is not a whole number of
+blocks) falls back to SDPA and *says so*, once per distinct reason. A silent
+fallback is how a kernel that never fired gets reported as a speedup.
 
 Note that HF only builds a mask for implementations registered with its
 ``AttentionMaskInterface``; ``splash_tpu`` is not, so for every model on the
@@ -43,8 +53,16 @@ from torchtitan.tools.logging import logger
 # native lane's ``SplashAttention`` modules take -- pushed in through
 # ``configure_kernel`` by ``workarounds.apply_patches``. The HF adapter is a
 # function rather than a module, so the tuning lives here at module level.
-# Empty until configured, in which case ``splash_sdpa``'s own defaults apply.
+# Empty until configured, in which case ``SbdConfig``'s own defaults apply.
 _KERNEL_KWARGS: dict[str, Any] = {}
+# The sbd kernel takes the six block sizes; the stock kernel's other knobs
+# (dkv/dq blocks, fused/vmap backward, document-aware skipping, layouts) have
+# no counterpart there and are reported once as ignored on the dropout path.
+_SBD_BLOCK_KEYS = ("block_q", "block_kv", "block_kv_compute",
+                   "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute")
+# Keys in ``_reported`` that are informational (the kernel ran); everything
+# else in that set is a fallback reason. Tests read this.
+INFO_REPORTS = frozenset({"splash_tpu fired", "splash_tpu fired (sbd)", "splash_tpu args", "splash_tpu ignored"})
 # The kernel needs both sequence lengths to be whole blocks, so every
 # configured block is stepped down to the largest size that divides them
 # (Mosaic's floor is 128) instead of gating on one number and launching with
@@ -142,8 +160,6 @@ def _unsupported(query, key, attention_mask, dropout) -> str | None:
             f"{attention_mask.dtype} is not a 2D padding mask; splash takes "
             "boolean structure only (causal / window / segment ids)"
         )
-    if dropout:
-        return f"dropout={dropout}; splash has no dropout path"
     q_len, kv_len = query.shape[-2], key.shape[-2]
     if _pick_block(q_len, kv_len, _MIN_BLOCK) is None:
         return f"sequence {q_len}x{kv_len} is not a multiple of {_MIN_BLOCK}"
@@ -213,16 +229,6 @@ def splash_attention_forward(
             dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs,
         )
 
-    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
-
-    # splash_sdpa keeps enable_gqa only for signature compatibility, so the
-    # kv heads have to be expanded here when the model is grouped-query.
-    heads, kv_heads = query.shape[1], key.shape[1]
-    if kv_heads != heads:
-        repeat = heads // kv_heads
-        key = key.repeat_interleave(repeat, dim=1)
-        value = value.repeat_interleave(repeat, dim=1)
-
     # Only forward a genuine int window. Reading whatever `sliding_window`
     # happens to be off a wrapped module and handing it to the kernel is how
     # you get a bogus mask extent and a segfault rather than an exception.
@@ -238,8 +244,8 @@ def splash_attention_forward(
     # quadratically -- measured 2026-09-19 on Llama-3.2-1B, 4x v6e: splash
     # went from 151 ms to 618 ms per step and the step from 0.59 s to 1.15 s.
     # ``position_ids`` restart at 0 at every document boundary; turning them
-    # into segment ids restores per-document masking AND lets the kernel skip
-    # every block whose q and kv segments do not overlap.
+    # into segment ids restores per-document masking AND (stock kernel) lets
+    # it skip every block whose q and kv segments do not overlap.
     segment_ids = _segment_ids(module, attention_mask, kwargs.get("position_ids"))
     kernel_kwargs = _kernel_kwargs(query.shape[-2], key.shape[-2])
 
@@ -247,19 +253,43 @@ def splash_attention_forward(
         _log_once(
             "splash_tpu args",
             "splash_tpu: first call q=%s k=%s v=%s dtype=%s scaling=%s window=%s "
-            "is_causal=%s kernel=%s",
+            "is_causal=%s dropout=%s kernel=%s",
             tuple(query.shape), tuple(key.shape), tuple(value.shape),
-            query.dtype, scaling, window, is_causal, kernel_kwargs,
+            query.dtype, scaling, window, is_causal, dropout, kernel_kwargs,
         )
+    seg_desc = (
+        "none" if segment_ids is None
+        else "document+padding" if attention_mask is not None
+        else "document"
+    )
 
+    if dropout:
+        out = _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
+                           dropout, kernel_kwargs, seg_desc)
+    else:
+        out = _splash_forward(query, key, value, segment_ids, is_causal, scaling, window,
+                              kernel_kwargs, seg_desc)
+    return out, None
+
+
+def _splash_forward(query, key, value, segment_ids, is_causal, scaling, window,
+                    kernel_kwargs, seg_desc):
+    """The stock splash kernel: document-aware block skipping, no dropout."""
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
+
+    # splash_sdpa keeps enable_gqa only for signature compatibility, so the
+    # kv heads have to be expanded here when the model is grouped-query.
+    heads, kv_heads = query.shape[1], key.shape[1]
+    if kv_heads != heads:
+        repeat = heads // kv_heads
+        key = key.repeat_interleave(repeat, dim=1)
+        value = value.repeat_interleave(repeat, dim=1)
     # splash_sdpa defaults every block to 512, which is the library's default
     # rather than a tuned one; the HF registry's ``splash_attention_kernel``
     # section sets 1024. Measured on Llama-3.2-1B at batch 8, seq 2048, 4x
     # v6e: 512 gives 17.08%, 1024 gives 18.12%, 2048 gives 17.78% and 256
     # gives 11.88% -- an interior optimum, +6.0% over the default, against a
-    # repeat-measured run-to-run spread of 0.05pp. The forward blocks carry
-    # most of it, which matches the profile: the two splash forward kernels
-    # are 20.8% of device time against 12.5% for the backward dkv.
+    # repeat-measured run-to-run spread of 0.05pp.
     out = splash_sdpa(
         query.contiguous(),
         key.contiguous(),
@@ -273,14 +303,56 @@ def splash_attention_forward(
     if not _tracing():
         _log_once(
             "splash_tpu fired",
-            "splash_tpu: kernel active (heads=%d kv_heads=%d seq=%d head_dim=%d "
+            "splash_tpu: kernel active (splash; heads=%d kv_heads=%d seq=%d head_dim=%d "
             "causal=%s segment_ids=%s)",
-            heads, kv_heads, query.shape[-2], query.shape[-1], is_causal,
-            "none" if segment_ids is None
-            else "document+padding" if attention_mask is not None
-            else "document",
+            heads, kv_heads, query.shape[-2], query.shape[-1], is_causal, seg_desc,
         )
-    return out.transpose(1, 2).contiguous(), None
+    return out.transpose(1, 2).contiguous()
+
+
+def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
+                 dropout, kernel_kwargs, seg_desc):
+    """The sbd kernel: in-kernel PRNG dropout, exact segment masking."""
+    from torchtitan.experiments.tpu.kernels.splash_bias_dropout import (
+        SbdConfig,
+        sbd_splash_attention,
+    )
+
+    ignored = sorted(k for k in kernel_kwargs if k not in _SBD_BLOCK_KEYS)
+    if ignored and not _tracing():
+        _log_once("splash_tpu ignored", "splash_tpu: sbd kernel has no %s; ignored", ignored)
+    blocks = {k: v for k, v in kernel_kwargs.items() if k in _SBD_BLOCK_KEYS}
+    # The seed is a (B, 2) int32 tensor drawn from torch's RNG on the device:
+    # fresh per call and per layer, reproducible under torch.manual_seed, and
+    # a tensor operand so a new seed never retraces the op. Every SbdConfig
+    # value is a static op argument hashed into the trace cache key, so
+    # setting them per call is what the kernel expects.
+    dropout_seed = torch.randint(
+        -(2**31), 2**31 - 1, (query.shape[0], 2), dtype=torch.int32, device=query.device
+    )
+    SbdConfig.update(dropout_rate=float(dropout), **blocks)
+    # HF hands (B, H, S, D); the kernel takes and returns torch-standard
+    # (B, S, H, D), which is what HF expects back. Grouped-KV and MQA go to
+    # the kernel as-is (no K/V expansion).
+    out = sbd_splash_attention(
+        query.transpose(1, 2).contiguous(),
+        key.transpose(1, 2).contiguous(),
+        value.transpose(1, 2).contiguous(),
+        dropout_seed=dropout_seed,
+        segment_ids=segment_ids,
+        is_causal=is_causal,
+        scale=scaling,
+        local_window_size=window,
+    )
+    if not _tracing():
+        _log_once(
+            "splash_tpu fired (sbd)",
+            "splash_tpu: kernel active (sbd; heads=%d kv_heads=%d seq=%d head_dim=%d "
+            "causal=%s dropout=%s segment_ids=%s)",
+            query.shape[1], key.shape[1], query.shape[-2], query.shape[-1], is_causal,
+            dropout, seg_desc,
+        )
+    return out
 
 
 def register() -> None:

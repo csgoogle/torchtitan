@@ -118,6 +118,114 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
           got.cpu(), want.cpu(), rtol=8e-2, atol=8e-2, msg=name
       )
 
+  # -------- packed-document segment ids --------
+
+  def _segment_ids_case(self, h_kv, causal, use_window=False):
+    """Kernel with segment_ids vs SDPA over the dense document(+causal) mask,
+    forward and backward; also checks the ids actually changed the output
+    (a vacuous pass -- ids silently dropped -- would still match the
+    unmasked reference otherwise)."""
+    device = self.accelerator_device
+    b, s, h, d = 2, 512, 4, 64
+    q, k, v = self._qkv(b, s, h, h_kv, d, device, seed=41)
+    segment_ids = torch.zeros(b, s, dtype=torch.int32)
+    segment_ids[0, 128:] = 1  # one boundary on a block edge
+    segment_ids[1, 40:100] = 1  # three boundaries inside blocks
+    segment_ids[1, 100:200] = 2
+    segment_ids[1, 200:] = 3
+    allowed = segment_ids[:, :, None] == segment_ids[:, None, :]  # (B, Sq, Skv)
+    if causal:
+      allowed &= torch.tril(torch.ones(s, s, dtype=torch.bool))[None]
+    window = 64 if use_window else None
+    if use_window:
+      i = torch.arange(s)
+      allowed &= ((i[:, None] - i[None, :]) <= window) & (i[:, None] >= i[None, :])
+    mask = torch.zeros(b, 1, s, s, dtype=torch.float32)
+    mask.masked_fill_(~allowed[:, None], float("-inf"))
+
+    def reference(q_, k_, v_):
+      k_e, v_e = self._expand_kv(k_, v_, h)
+      return _sdpa_ref(q_, k_e, v_e, attn_mask=mask)
+
+    q_ref = q.cpu().clone().requires_grad_(True)
+    k_ref = k.cpu().clone().requires_grad_(True)
+    v_ref = v.cpu().clone().requires_grad_(True)
+    out_ref = reference(q_ref, k_ref, v_ref)
+    out_ref.sum().backward()
+
+    q_t = q.clone().requires_grad_(True)
+    k_t = k.clone().requires_grad_(True)
+    v_t = v.clone().requires_grad_(True)
+    out = splash_bias_dropout.sbd_splash_attention(
+        q_t, k_t, v_t, segment_ids=segment_ids.to(device), is_causal=causal,
+        local_window_size=window,
+    )
+    out.sum().backward()
+    torch.testing.assert_close(out.cpu(), out_ref.cpu(), rtol=5e-2, atol=5e-2)
+    for name, got, want in (
+        ("dq", q_t.grad, q_ref.grad), ("dk", k_t.grad, k_ref.grad), ("dv", v_t.grad, v_ref.grad),
+    ):
+      self.assertIsNotNone(got, f"{name} is None")
+      torch.testing.assert_close(got.cpu(), want.cpu(), rtol=8e-2, atol=8e-2, msg=name)
+
+    # Guard against a vacuous pass: the same call without ids must differ.
+    out_no_ids = splash_bias_dropout.sbd_splash_attention(
+        q, k, v, is_causal=causal, local_window_size=window
+    )
+    self.assertGreater(
+        float((out_no_ids.cpu() - out.cpu()).abs().max()), 1e-2,
+        "segment_ids had no effect on the output",
+    )
+
+  def test_segment_ids_mha_causal(self):
+    self._segment_ids_case(h_kv=4, causal=True)
+
+  def test_segment_ids_mha_bidirectional(self):
+    self._segment_ids_case(h_kv=4, causal=False)
+
+  def test_segment_ids_gqa_causal(self):
+    self._segment_ids_case(h_kv=2, causal=True)
+
+  def test_segment_ids_mqa_causal(self):
+    # The kernel tiles kv segment ids differently on its rank-reduced entry.
+    self._segment_ids_case(h_kv=1, causal=True)
+
+  def test_segment_ids_window(self):
+    self._segment_ids_case(h_kv=4, causal=True, use_window=True)
+
+  def test_segment_ids_with_dropout(self):
+    """Dropout on top of segment ids must not disturb the document mask.
+
+    Deterministic form (a mean-over-seeds check is a coin flip at 262k
+    elements): the second document's values carry a +1000 offset, so any
+    cross-document leakage would show up as a large first-document output;
+    with dropout active that output must stay within the undropped,
+    unoffset output's range, while within-document outputs do change with
+    the seed.
+    """
+    device = self.accelerator_device
+    b, s, h, d = 2, 512, 4, 64
+    q, k, v = self._qkv(b, s, h, h, d, device, seed=43)
+    segment_ids = torch.zeros(b, s, dtype=torch.int32)
+    segment_ids[:, 256:] = 1
+    seg = segment_ids.to(device)
+    v_offset = v.clone()
+    v_offset[:, 256:] += 1000.0  # document 2 only
+    base = splash_bias_dropout.sbd_splash_attention(q, k, v, segment_ids=seg)
+    splash_bias_dropout.SbdConfig.update(dropout_rate=0.1)
+    try:
+      out0 = splash_bias_dropout.sbd_splash_attention(q, k, v_offset, segment_ids=seg, dropout_seed=0)
+      out1 = splash_bias_dropout.sbd_splash_attention(q, k, v_offset, segment_ids=seg, dropout_seed=1)
+    finally:
+      splash_bias_dropout.SbdConfig.update(dropout_rate=0.0)
+    # Document 1's queries never see document 2's +1000: bounded by the
+    # undropped output scaled by the worst-case dropout rescale (1 / 0.9).
+    doc1_bound = float(base[:, :256].abs().max()) / 0.9 + 1e-3
+    self.assertLess(float(out0[:, :256].abs().max()), doc1_bound, "cross-document leakage under dropout")
+    self.assertLess(float(out1[:, :256].abs().max()), doc1_bound, "cross-document leakage under dropout")
+    # Dropout is active: a different seed gives a different output.
+    self.assertGreater(float((out0 - out1).abs().max()), 1e-3, "seeds gave identical masks")
+
   def test_noncausal_parity(self):
     device = self.accelerator_device
     q, k, v = self._qkv(2, 512, 4, 4, 64, device, seed=31)

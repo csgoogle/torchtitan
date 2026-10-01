@@ -25,9 +25,11 @@ Capabilities over stock tokamax splash (which has neither feature):
     so changing seeds never retraces.
 
 Coverage matches the stock splash wrapper otherwise: causal, full
-(non-causal), or sliding-window masks, an explicit softmax scale, and
-MHA / grouped-KV / MQA head layouts (MQA routes through the kernel's
-dedicated rank-reduced k/v entry).
+(non-causal), or sliding-window masks, packed-document `segment_ids`
+(exact token-level masking; no document-aware block skipping, see
+`_segment_ids`), an explicit softmax scale, and MHA / grouped-KV / MQA
+head layouts (MQA routes through the kernel's dedicated rank-reduced k/v
+entry).
 
 Features off, the kernel is bit-exact with unmodified tokamax splash (the
 family's standing no-regression contract). Dropout costs ~+12-13% and the
@@ -204,6 +206,7 @@ def sbd_attention_fwd(
     v: jax.Array,
     bias: jax.Array | None,
     dropout_seed: jax.Array | None,
+    segment_ids: jax.Array | None,
     causal: bool,
     scale: float,
     local_window_size: int,
@@ -227,9 +230,11 @@ def sbd_attention_fwd(
   with `H_kv == H` (MHA), `H % H_kv == 0` (grouped KV), or `H_kv == 1`
   (MQA, rank-reduced kernel entry); `bias` is `(H, S, S)` full-rank or
   `(H, PER_KEY_ROWS, S)` per-key, shared across batch, or None;
-  `dropout_seed` is `(B, 2)` int32 seed words, or None when dropout is off.
-  The remaining args are trace-time statics; the dkv-only ones ride along
-  for `setup_context` to hand to the backward op."""
+  `dropout_seed` is `(B, 2)` int32 seed words, or None when dropout is off;
+  `segment_ids` is `(B, S)` int32 packed-document ids (a token attends only
+  within its own id, on top of the causal / window mask), or None. The
+  remaining args are trace-time statics; the dkv-only ones ride along for
+  `setup_context` to hand to the backward op."""
   seq_len = q.shape[1]
   use_bias = bias is not None
   use_dropout = dropout_seed is not None
@@ -268,7 +273,7 @@ def sbd_attention_fwd(
     k_tr = k_tr[:, 0]
     v_tr = v_tr[:, 0]
 
-  def _fwd_b(q_b, k_b, v_b, seed_b):
+  def _fwd_b(q_b, k_b, v_b, seed_b, seg_b):
     # pylint: disable=protected-access
     out_b, stats_b = sbd_kernel._splash_attention_forward(
         fwd_mi,
@@ -278,7 +283,7 @@ def sbd_attention_fwd(
         bias,
         None,  # dropout_mask (explicit-mask path unused here)
         seed_b,
-        None,  # segment_ids
+        _segment_ids(seg_b),
         None,  # sinks
         mask_value,
         is_mqa,
@@ -291,9 +296,11 @@ def sbd_attention_fwd(
     # pylint: enable=protected-access
     return out_b, stats_b["logsumexp"]
 
-  out_tr, lse = jax.vmap(_fwd_b, in_axes=(0, 0, 0, 0 if use_dropout else None))(
-      q_tr, k_tr, v_tr, dropout_seed
-  )
+  # in_axes=None broadcasts an absent seed / segment_ids to every batch element.
+  out_tr, lse = jax.vmap(
+      _fwd_b,
+      in_axes=(0, 0, 0, 0 if use_dropout else None, 0 if segment_ids is not None else None),
+  )(q_tr, k_tr, v_tr, dropout_seed, segment_ids)
   return jnp.transpose(out_tr, (0, 2, 1, 3)), lse
 
 
@@ -303,6 +310,7 @@ def sbd_attention_bwd(
     v: jax.Array,
     bias: jax.Array | None,
     dropout_seed: jax.Array | None,
+    segment_ids: jax.Array | None,
     out: jax.Array,
     logsumexp: jax.Array,
     grad_out: jax.Array,
@@ -367,7 +375,7 @@ def sbd_attention_bwd(
   out_tr = jnp.transpose(out, (0, 2, 1, 3))
   g_tr = jnp.transpose(grad_out, (0, 2, 1, 3))
 
-  def _bwd_b(q_b, k_b, v_b, out_b, lse_b, g_b, seed_b):
+  def _bwd_b(q_b, k_b, v_b, out_b, lse_b, g_b, seed_b, seg_b):
     res = (
         q_b,
         k_b,
@@ -375,7 +383,7 @@ def sbd_attention_bwd(
         bias,
         None,  # dropout_mask
         seed_b,
-        None,  # segment_ids
+        _segment_ids(seg_b),
         None,  # sinks
         out_b,
         lse_b,
@@ -401,8 +409,10 @@ def sbd_attention_bwd(
     return dq_b, dk_b, dv_b, dbias_b
 
   dq_tr, dk_tr, dv_tr, dbias_b = jax.vmap(
-      _bwd_b, in_axes=(0, 0, 0, 0, 0, 0, 0 if use_dropout else None)
-  )(q_tr, k_tr, v_tr, out_tr, logsumexp, g_tr, dropout_seed)
+      _bwd_b,
+      in_axes=(0, 0, 0, 0, 0, 0, 0 if use_dropout else None,
+               0 if segment_ids is not None else None),
+  )(q_tr, k_tr, v_tr, out_tr, logsumexp, g_tr, dropout_seed, segment_ids)
 
   dq = jnp.transpose(dq_tr, (0, 2, 1, 3)) * scale_arr  # chain rule for q * scale
   if is_mqa:
@@ -419,6 +429,20 @@ def sbd_attention_bwd(
   return dq, dk, dv, dbias
 
 
+def _segment_ids(seg_b):
+  """One batch element's `(S,)` ids as the kernel's `SegmentIds`, or None.
+
+  The same ids serve q and kv (self-attention over one packed stream). The
+  kernel masks at token granularity over its static causal / window block
+  metadata, so a block straddling a document boundary is still visited and
+  masked inside -- exact, with no document-aware block skipping (tokamax's
+  MaskInfo is a compacted active-block list, not a rewritable grid).
+  """
+  if seg_b is None:
+    return None
+  return sbd_kernel.SegmentIds(q=seg_b, kv=seg_b)
+
+
 _sbd_fwd = pallas.jax_op("pallas::sbd_splash_attn_fwd", sbd_attention_fwd)
 _sbd_bwd = pallas.jax_op("pallas::sbd_splash_attn_bwd", sbd_attention_bwd)
 
@@ -426,20 +450,20 @@ _NUM_STATIC_ARGS = 18  # causal, scale, window + the 15 SbdConfig values
 
 
 def _setup_context(ctx, inputs, output):
-  q, k, v, bias, dropout_seed = inputs[: len(inputs) - _NUM_STATIC_ARGS]
+  q, k, v, bias, dropout_seed, segment_ids = inputs[: len(inputs) - _NUM_STATIC_ARGS]
   out, logsumexp = output
-  ctx.save_for_backward(q, k, v, bias, dropout_seed, out, logsumexp)
+  ctx.save_for_backward(q, k, v, bias, dropout_seed, segment_ids, out, logsumexp)
   ctx.static_args = tuple(inputs[len(inputs) - _NUM_STATIC_ARGS :])
 
 
 def _backward(ctx, grad_out, grad_lse):
   del grad_lse
-  q, k, v, bias, dropout_seed, out, logsumexp = ctx.saved_tensors
+  q, k, v, bias, dropout_seed, segment_ids, out, logsumexp = ctx.saved_tensors
   dq, dk, dv, dbias = _sbd_bwd(
-      q, k, v, bias, dropout_seed, out, logsumexp, grad_out, *ctx.static_args
+      q, k, v, bias, dropout_seed, segment_ids, out, logsumexp, grad_out, *ctx.static_args
   )
   dbias_ret = dbias if bias is not None else None
-  return (dq, dk, dv, dbias_ret, None) + (None,) * _NUM_STATIC_ARGS
+  return (dq, dk, dv, dbias_ret, None, None) + (None,) * _NUM_STATIC_ARGS
 
 
 _sbd_fwd.register_autograd(_backward, setup_context=_setup_context)
@@ -471,6 +495,7 @@ def sbd_splash_attention(
     bias: Optional[torch.Tensor] = None,
     *,
     dropout_seed: int | torch.Tensor = 0,
+    segment_ids: Optional[torch.Tensor] = None,
     is_causal: bool = True,
     scale: Optional[float] = None,
     local_window_size: Optional[int] = None,
@@ -493,6 +518,11 @@ def sbd_splash_attention(
       ranks passing the same value apply identical masks at the same local
       positions. Neither form retraces on seed change (the seed reaches
       the op as a tensor input).
+    segment_ids: optional `(B, S)` integer packed-document ids. A token
+      attends only to keys with its own id, on top of the causal / window
+      mask -- exact token-level masking; blocks are not skipped on it.
+      Made contiguous and int32 here: the jax_op bridge reads an operand as
+      dense regardless of its strides.
     is_causal: causal (default) or full attention. Like every `SbdConfig`
       knob, a trace-time static: each value compiles its own kernel, so
       mixing configurations across calls at the same shapes is safe.
@@ -518,6 +548,13 @@ def sbd_splash_attention(
       seed_t = _seed_words(int(dropout_seed), q.shape[0], q.device)
   else:
     seed_t = None
+  if segment_ids is not None:
+    if segment_ids.shape != (q.shape[0], q.shape[1]):
+      raise ValueError(
+          f"segment_ids must be (B, S) = {(q.shape[0], q.shape[1])}, got"
+          f" {tuple(segment_ids.shape)}"
+      )
+    segment_ids = segment_ids.to(device=q.device, dtype=torch.int32).contiguous()
   scale_val = 1.0 / math.sqrt(q.shape[-1]) if scale is None else float(scale)
   window_val = -1 if local_window_size is None else int(local_window_size)
   out, _ = _sbd_fwd(
@@ -526,6 +563,7 @@ def sbd_splash_attention(
       v,
       bias,
       seed_t,
+      segment_ids,
       is_causal,
       scale_val,
       window_val,

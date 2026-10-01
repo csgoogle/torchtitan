@@ -132,8 +132,9 @@ def one_step_vs_reference(config_args: list[str], device: torch.device) -> dict:
   return {
       "model_class": type(hf).__name__,
       "attn_impl": getattr(hf.config, "_attn_implementation", None),
-      "splash_fired": "splash_tpu fired" in reports,
-      "fallbacks": sorted(r for r in reports if r not in ("splash_tpu fired", "splash_tpu args")),
+      "splash_fired": bool(reports & {"splash_tpu fired", "splash_tpu fired (sbd)"}),
+      "kernel": "sbd" if "splash_tpu fired (sbd)" in reports else "splash",
+      "fallbacks": sorted(r for r in reports if r not in splash_adapter.INFO_REPORTS),
       "fused_loss": wrapper._fused_loss,
       "fused_operands": isinstance(pred, tuple),  # (hidden, head weight) for the fused CE
       "n_valid": int(valid.cpu()),
@@ -195,10 +196,20 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
       dict(testcase_name="tiny_mixtral_moe", config="hf_moe_auto",
            hf_model="hf-internal-testing/tiny-random-MixtralForCausalLM",
            grad_atol=2e-2, grad_rtol=1e-1),
+      # BERT with its shipped attention dropout KEPT: the sbd kernel path
+      # (in-kernel PRNG dropout), where the adapter used to fall back to sdpa.
+      # The reference runs undropped, so this case checks the path -- sbd
+      # fired, no fallback, loss finite and near the undropped value -- not
+      # the numbers; dropout's own parity is the kernel test
+      # (test_splash_bias_dropout.test_segment_ids_with_dropout).
+      dict(testcase_name="bert_base_with_dropout", config="hf_full_splash",
+           hf_model="google-bert/bert-base-uncased",
+           args=["--hf_config_overrides=hidden_dropout_prob=0"],
+           expect_kernel="sbd", loss_atol=0.5, loss_rtol=0.05, check_grads=False),
   ])
   def test_one_step_matches_hf(
       self, config, hf_model, args=None, loss_atol=1e-2, loss_rtol=1e-3,
-      grad_atol=5e-3, grad_rtol=5e-3,
+      grad_atol=5e-3, grad_rtol=5e-3, expect_kernel="splash", check_grads=True,
   ):
     # Eager: the adapter's fallback report fires outside Dynamo tracing, so a
     # kernel that did not run is visible rather than silently measured as sdpa.
@@ -210,6 +221,7 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(result["attn_impl"], "splash_tpu", "the device run did not select splash")
     self.assertEqual(result["fallbacks"], [], "the splash adapter fell back to sdpa")
     self.assertTrue(result["splash_fired"], "the splash kernel never ran")
+    self.assertEqual(result["kernel"], expect_kernel, "unexpected kernel for this call")
     self.assertEqual(result["fused_operands"], result["fused_loss"],
                      "fused-loss config and the model's output disagree")
     logging.info(
@@ -222,6 +234,8 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
         result["device_loss"], result["ref_loss"], atol=loss_atol, rtol=loss_rtol,
         check_name="Loss", **labels,
     )
+    if not check_grads:
+      return
     device_grads, ref_grads = result["device_grads"], result["ref_grads"]
     self.assertEqual(set(device_grads), set(ref_grads), "gradient sets differ")
     worst = max((float((device_grads[n] - ref_grads[n]).abs().max()), n) for n in ref_grads)
