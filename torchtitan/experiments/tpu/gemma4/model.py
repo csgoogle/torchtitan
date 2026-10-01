@@ -152,6 +152,11 @@ class Gemma4Attention(GQAttention):
         self.use_k_eq_v = config.use_k_eq_v
         # Gemma4 normalizes Q, K, and V with RMSNorm and uses a softmax scale of 1.0.
         self.scaling = 1.0
+        if self.is_sliding and self.sliding_window_size is not None:
+            # HF's sliding_window includes the current token (0 <= q - kv < W),
+            # while the TPU splash kernels read inner_attention.sliding_window_size
+            # as the number of *previous* keys (LocalMask(window_size=(left, 0))).
+            self.inner_attention.sliding_window_size = self.sliding_window_size - 1
 
     def forward(
         self,

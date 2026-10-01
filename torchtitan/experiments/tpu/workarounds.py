@@ -361,16 +361,6 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     )
     return out
 
-  # Propagate sliding_window_size from parent attention modules
-  # (e.g. Gemma4Attention) to their inner ScaledDotProductAttention children.
-  for parent_module in model.modules():
-    for _, child_module in parent_module.named_children():
-      if "ScaledDotProductAttention" in type(child_module).__name__:
-        if getattr(child_module, "sliding_window_size", None) is None:
-          parent_window = getattr(parent_module, "sliding_window_size", None)
-          if parent_window is not None:
-            child_module.sliding_window_size = parent_window
-
   _patched = 0
   _windowed = 0
   _causal = 0
