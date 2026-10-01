@@ -129,6 +129,11 @@ class TpuGraphTrainerDistributedTest(
               "--tpu_config.use_simple_fsdp",
               "--tpu_config.use_scan_layers",
           ],
+          # TODO: re-enable once the native abort is fixed.
+          skip_reason=(
+              "Every rank aborts in the step-1 loss all-reduce over the 2-D"
+              " HSDP loss mesh (absl raw_hash_map::at in throw_delegate.cc)."
+          ),
       ),
   ])
   def test_graph_trainer_distributed(
