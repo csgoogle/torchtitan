@@ -11,6 +11,7 @@ import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import sdpa_kernel
 
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.attention import (
@@ -21,6 +22,7 @@ from torchtitan.models.common.attention import (
     get_sliding_window_mask_mod,
     GQAttention,
     QKVLinear,
+    ScaledDotProductAttention,
     VarlenAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
@@ -134,6 +136,69 @@ class QKVLinearKeqV(QKVLinear):
         return xq, xk, xk
 
 
+class SlidingWindowScaledDotProductAttention(ScaledDotProductAttention):
+    """``ScaledDotProductAttention`` that honors ``sliding_window_size``.
+
+    Upstream SDPA only supports plain causal attention. When
+    ``sliding_window_size`` is set, each query attends to itself and the
+    ``sliding_window_size`` previous keys, via an explicit band mask. This is
+    the same attribute and convention the TPU splash patches read, and the
+    class name keeps matching their ``"ScaledDotProductAttention"`` lookup, so
+    enabling a splash kernel still replaces this module.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(ScaledDotProductAttention.Config):
+        pass
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.sliding_window_size: int | None = None
+
+    def forward(
+        self,
+        q_BLNH: torch.Tensor,
+        k_BLNH: torch.Tensor,
+        v_BLNH: torch.Tensor,
+        *,
+        attention_masks: AttentionMasksType | None = None,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+        is_causal: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self.sliding_window_size is None:
+            return super().forward(
+                q_BLNH,
+                k_BLNH,
+                v_BLNH,
+                attention_masks=attention_masks,
+                scale=scale,
+                enable_gqa=enable_gqa,
+                is_causal=is_causal,
+                **kwargs,
+            )
+        if attention_masks is not None:
+            raise ValueError(
+                "SlidingWindowScaledDotProductAttention does not support "
+                "attention_masks."
+            )
+        seq_len = q_BLNH.shape[1]
+        pos = torch.arange(seq_len, device=q_BLNH.device)
+        dist = pos[:, None] - pos[None, :]
+        mask_LL = (dist >= 0) & (dist <= self.sliding_window_size)
+        with sdpa_kernel(self.sdpa_backends, set_priority=True):
+            out_BNLH = F.scaled_dot_product_attention(
+                q_BLNH.transpose(1, 2),
+                k_BLNH.transpose(1, 2),
+                v_BLNH.transpose(1, 2),
+                attn_mask=mask_LL,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+        return out_BNLH.transpose(1, 2)
+
+
 class Gemma4Attention(GQAttention):
     """Gemma4 attention supporting hybrid sliding/global layers, K=V, and Q/K/V norms."""
 
@@ -145,6 +210,16 @@ class Gemma4Attention(GQAttention):
         use_k_eq_v: bool = False
 
     def __init__(self, config: Config) -> None:
+        if (
+            config.is_sliding
+            and config.sliding_window_size is not None
+            and type(config.inner_attention) is ScaledDotProductAttention.Config
+        ):
+            # Plain SDPA is causal-only and would silently drop the window.
+            config = dataclasses.replace(
+                config,
+                inner_attention=SlidingWindowScaledDotProductAttention.Config(),
+            )
         super().__init__(config)
         self.v_norm = config.v_norm.build()
         self.is_sliding = config.is_sliding
@@ -154,8 +229,9 @@ class Gemma4Attention(GQAttention):
         self.scaling = 1.0
         if self.is_sliding and self.sliding_window_size is not None:
             # HF's sliding_window includes the current token (0 <= q - kv < W),
-            # while the TPU splash kernels read inner_attention.sliding_window_size
-            # as the number of *previous* keys (LocalMask(window_size=(left, 0))).
+            # while SlidingWindowScaledDotProductAttention and the TPU splash
+            # kernels read inner_attention.sliding_window_size as the number of
+            # *previous* keys (splash: LocalMask(window_size=(left, 0))).
             self.inner_attention.sliding_window_size = self.sliding_window_size - 1
 
     def forward(

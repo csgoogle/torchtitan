@@ -34,6 +34,7 @@ from torchtitan.experiments.tpu.gemma4.model import (
     Gemma4Router,
     Gemma4TransformerBlock,
     QKVLinearKeqV,
+    SlidingWindowScaledDotProductAttention,
 )
 from torchtitan.experiments.tpu.gemma4.state_dict_adapter import (
     Gemma4StateDictAdapter,
@@ -210,6 +211,117 @@ class TestGemma4StateDictAdapter(absltest.TestCase):
     self.assertEqual(set(roundtrip_sd.keys()), set(tt_sd.keys()))
     for k in tt_sd:
       torch.testing.assert_close(roundtrip_sd[k], tt_sd[k])
+
+
+class TestGemma4SdpaSlidingWindow(absltest.TestCase):
+  """Sliding layers must apply the HF window on the plain SDPA backend."""
+
+  _WINDOW = 4
+  _SEQ_LEN = 12  # Longer than the window, so the window actually masks keys.
+  _DIM = 32
+
+  def _attention_with_mask(self, attn, mask_LL):
+    """Copy of ``attn`` whose inner attention uses an explicit boolean mask."""
+    ref = copy.deepcopy(attn)
+
+    def masked_sdpa(
+        q, k, v, *, scale=None, enable_gqa=False, **unused_kwargs
+    ):
+      return F.scaled_dot_product_attention(
+          q.transpose(1, 2),
+          k.transpose(1, 2),
+          v.transpose(1, 2),
+          attn_mask=mask_LL,
+          scale=scale,
+          enable_gqa=enable_gqa,
+      ).transpose(1, 2)
+
+    ref.inner_attention.forward = masked_sdpa
+    return ref
+
+  def test_sliding_window_applied_beyond_window(self):
+    head_dim = 8
+    cfg = Gemma4Attention.Config(
+        dim=self._DIM,
+        n_heads=4,
+        n_kv_heads=2,
+        head_dim=head_dim,
+        is_sliding=True,
+        sliding_window_size=self._WINDOW,
+        use_k_eq_v=False,
+        qk_norm=RMSNorm.Config(
+            normalized_shape=head_dim, eps=1e-6, param_init=_NORM_INIT
+        ),
+        v_norm=RMSNorm.Config(
+            normalized_shape=head_dim, eps=1e-6, elementwise_affine=False
+        ),
+        qkv_linear=QKVLinear.Config(
+            head_dim=head_dim,
+            wq=Linear.Config(
+                in_features=self._DIM, out_features=32, param_init=_LINEAR_INIT
+            ),
+            wkv=Linear.Config(
+                in_features=self._DIM, out_features=16, param_init=_LINEAR_INIT
+            ),
+        ),
+        wo=Linear.Config(
+            in_features=32, out_features=self._DIM, param_init=_LINEAR_INIT
+        ),
+        inner_attention=ScaledDotProductAttention.Config(),
+        rope=Gemma4RoPE.Config(
+            dim=head_dim, max_seq_len=self._SEQ_LEN, theta=10000.0
+        ),
+    )
+    torch.manual_seed(0)
+    attn = cfg.build()
+    attn.init_states()
+
+    # HF Gemma 4: query q attends to key kv iff 0 <= q - kv < sliding_window.
+    dist = (
+        torch.arange(self._SEQ_LEN)[:, None]
+        - torch.arange(self._SEQ_LEN)[None, :]
+    )
+    hf_mask = (dist >= 0) & (dist < self._WINDOW)
+    causal_mask = dist >= 0
+
+    x = torch.randn(2, self._SEQ_LEN, self._DIM)
+    with torch.no_grad():
+      actual = attn(x, attention_masks=None)
+      expected = self._attention_with_mask(attn, hf_mask)(
+          x, attention_masks=None
+      )
+      full_causal = self._attention_with_mask(attn, causal_mask)(
+          x, attention_masks=None
+      )
+
+    torch.testing.assert_close(actual, expected)
+    # Rows that see fewer than W tokens are unaffected by the window; every
+    # later row must differ from full causal attention.
+    w = self._WINDOW
+    torch.testing.assert_close(actual[:, :w], full_causal[:, :w])
+    row_diff = (actual - full_causal).abs().amax(dim=(0, 2))
+    self.assertTrue(
+        bool((row_diff[w:] > 1e-4).all()),
+        f"Rows >= window match full causal attention: {row_diff[w:]}",
+    )
+    self.assertIsInstance(
+        attn.inner_attention, SlidingWindowScaledDotProductAttention
+    )
+
+  def test_flavor_sliding_layers_use_windowed_sdpa(self):
+    config = _build_flavor_config("testmodel", attn_backend="sdpa")
+    with torch.device("meta"):
+      model = config.build()
+    for layer in model.layers.values():
+      inner = layer.attention.inner_attention
+      if layer.attention.is_sliding:
+        self.assertIsInstance(inner, SlidingWindowScaledDotProductAttention)
+        self.assertEqual(
+            inner.sliding_window_size,
+            layer.attention.sliding_window_size - 1,
+        )
+      else:
+        self.assertIs(type(inner), ScaledDotProductAttention)
 
 
 class TestGemma4Components(BaseDeviceTest):
