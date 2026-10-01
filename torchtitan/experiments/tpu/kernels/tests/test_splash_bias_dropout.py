@@ -280,6 +280,53 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
         block_q_dkv=blk, block_kv_dkv=blk, block_kv_dkv_compute=blk,
     )
 
+  def test_segment_ids_padding_layout_parity(self):
+    """Right-padded ids (the encoder shape) with blocks smaller than the
+    sequence.
+
+    The skipping test is a non-decreasing packed stream; a padding mask is
+    non-INcreasing (real tokens 1, padding 0), and a block that straddles the
+    boundary spans [0, 1], which makes the interval test conservative rather
+    than exact. Conservative is safe -- it only declines to skip -- but the
+    claim needs a measurement, not an argument.
+    """
+    device = self.accelerator_device
+    b, s, h, d, blk = 2, 512, 4, 64, 128
+    q, k, v = self._qkv(b, s, h, h, d, device, seed=61)
+    segment_ids = torch.ones(b, s, dtype=torch.int32)
+    segment_ids[0, 300:] = 0  # boundary inside a block
+    segment_ids[1, 256:] = 0  # boundary on a block edge
+    allowed = segment_ids[:, :, None] == segment_ids[:, None, :]
+    allowed &= torch.tril(torch.ones(s, s, dtype=torch.bool))[None]
+    mask = torch.zeros(b, 1, s, s, dtype=torch.float32)
+    mask.masked_fill_(~allowed[:, None], float("-inf"))
+
+    q_ref = q.cpu().clone().requires_grad_(True)
+    k_ref = k.cpu().clone().requires_grad_(True)
+    v_ref = v.cpu().clone().requires_grad_(True)
+    out_ref = _sdpa_ref(q_ref, k_ref, v_ref, attn_mask=mask)
+    out_ref.sum().backward()
+
+    splash_bias_dropout.SbdConfig.update(**self._blocks(blk))
+    try:
+      q_t = q.clone().requires_grad_(True)
+      k_t = k.clone().requires_grad_(True)
+      v_t = v.clone().requires_grad_(True)
+      out = splash_bias_dropout.sbd_splash_attention(
+          q_t, k_t, v_t, segment_ids=segment_ids.to(device)
+      )
+      out.sum().backward()
+    finally:
+      splash_bias_dropout.SbdConfig.update(**self._blocks(512))
+    torch.testing.assert_close(out.cpu(), out_ref.cpu(), rtol=5e-2, atol=5e-2)
+    for name, got, want in (
+        ("dq", q_t.grad, q_ref.grad), ("dk", k_t.grad, k_ref.grad),
+        ("dv", v_t.grad, v_ref.grad),
+    ):
+      torch.testing.assert_close(
+          got.cpu(), want.cpu(), rtol=8e-2, atol=8e-2, msg=name
+      )
+
   def test_document_aware_mask_info_compacts_grid(self):
     """The grid metadata itself, with no kernel in the way.
 
