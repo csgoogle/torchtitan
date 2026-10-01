@@ -1,6 +1,5 @@
 """Base class and helper functions for single-device accelerator tests."""
 
-import contextlib
 import copy
 from typing import Any, Callable, Dict, Tuple, Type
 
@@ -265,24 +264,11 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
       grad_rtol: float = 1e-3,
       param_atol: float = 5e-3,
       param_rtol: float = 5e-3,
-      cpu_job_config=None,
-      device_capture_fn: numerical_validation.CaptureFn | None = None,
-      device_context: contextlib.AbstractContextManager | None = None,
   ):
-    """Trains `job_config` on the accelerator, then replays it on CPU and compares.
 
-    Args:
-      cpu_job_config: The CPU reference's config, when it differs from the
-        device's -- e.g. stock ops in place of device kernels. Defaults to
-        `job_config`.
-      device_capture_fn: Captures the device model's state per step, e.g. to
-        map device-specific parameter layouts back to the CPU model's.
-      device_context: Wraps the device run, e.g. to count the ops it
-        dispatches.
-    """
     # Setup recorder callback
     recorder = numerical_validation.StateRecorderCallback(
-        capture_fn=device_capture_fn or numerical_validation.capture_local_state
+        capture_fn=numerical_validation.capture_local_state
     )
 
     trainer_device = torchtitan.experiments.tpu.train_minimal.TrainerMinimal(
@@ -300,8 +286,7 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     }
 
     # Phase 1: Run Device Training and record the state at each step
-    with device_context or contextlib.nullcontext():
-      trainer_device.train()
+    trainer_device.train()
     # Get the recorded history
     recorded_history = recorder.get_history()
 
@@ -319,7 +304,7 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
           torch.device("cpu"),
           rank=0,
           world_size=1,
-          job_config=cpu_job_config or job_config,
+          job_config=job_config,
           step_callback=validator.on_step,
       )
 
