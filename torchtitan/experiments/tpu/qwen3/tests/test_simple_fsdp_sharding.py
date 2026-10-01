@@ -136,17 +136,11 @@ class SimpleFSDPShardingTest(absltest.TestCase):
         SimpleNamespace(mixed_precision_reduce="bfloat16"),
     )
 
-    with (
-        mock.patch.object(
-            graph_trainer_qwen3,
-            "configure_expert_dweight_output_dtype",
-        ),
-        mock.patch.object(
-            graph_trainer_qwen3,
-            "graph_trainer_parallelize_qwen3",
-            return_value=model,
-        ) as upstream_parallelize,
-    ):
+    with mock.patch.object(
+        graph_trainer_qwen3,
+        "graph_trainer_parallelize_qwen3",
+        return_value=model,
+    ) as upstream_parallelize:
       result = graph_trainer_qwen3.parallelize_qwen3(
           cast(GraphTrainerQwen3Model, model),
           training=training,
