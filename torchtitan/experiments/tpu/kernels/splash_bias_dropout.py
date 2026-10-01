@@ -163,6 +163,21 @@ def _build_kernel(
       block_kv_dkv_compute=min(block_kv_dkv_compute, seq_len),
       use_experimental_scheduler=use_experimental_scheduler,
       use_base2_exp=True,
+      # Left at the fork's default (None = one dq partial per kv step). The
+      # alternative, `dq_reduction_steps=3`, is tempting twice over -- it
+      # shrinks the fused backward's unreduced dq from
+      # `(kv_steps, heads, seq, head_dim)` fp32 (2 GiB unpadded at the HF
+      # lane's 16k x 32-head op-point, 4 GiB after head_dim 64 pads to 128)
+      # to three partials in q's dtype, AND it is the only mode that asks
+      # `_process_mask` for a dynamic dkv grid, which would let the backward
+      # drop skipped steps outright instead of only their arithmetic. It is
+      # unusable here as of 2026-10-01: on the dynamic grid the GQA/MQA path
+      # initializes its aliased dk/dv with `lax.empty` and the dynamic branch
+      # never applies the `q_heads_per_kv_head` group-AND that the static one
+      # does, so dk comes back wrong for every grouped-KV shape (5 of 23
+      # kernel tests fail on dk; MHA is unaffected). Fixing that accumulation
+      # in the fork is what unlocks both wins.
+      dq_reduction_steps=None,
       attn_logits_soft_cap=attn_logits_soft_cap,
       dropout_rate=dropout_rate if use_dropout else 0.0,
       dropout_fold_rescale=dropout_fold_rescale,
