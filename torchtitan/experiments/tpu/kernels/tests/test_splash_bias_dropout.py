@@ -280,6 +280,54 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
         block_q_dkv=blk, block_kv_dkv=blk, block_kv_dkv_compute=blk,
     )
 
+  def test_block_skipping_with_dropout_is_bit_identical(self):
+    """Skipping must not disturb the dropout mask.
+
+    The forward's grid is compacted while the backward's dkv grid stays dense
+    and merely zeroes tiles, and the PRNG mask is keyed on the ABSOLUTE
+    (q-block, kv-block) indices -- so compaction has to carry those indices
+    through unchanged or the two passes would drop different entries. With the
+    same seed, skipping on and off must agree bit for bit, forward and
+    backward; a shifted key would show up here and nowhere else (the
+    dropout-free cases pass either way).
+    """
+    device = self.accelerator_device
+    # Blocks must be a multiple of the kernel's 256-token dropout quantum, so
+    # this case runs 1024 tokens in 256-blocks: a 4x4 block grid, 4 documents.
+    b, s, h, d, blk = 2, 1024, 4, 64, 256
+    q, k, v = self._qkv(b, s, h, h, d, device, seed=67)
+    docs = torch.arange(s) // blk
+    seg = docs[None, :].repeat(b, 1).to(torch.int32).to(device)
+
+    def run(skipping):
+      splash_bias_dropout.SbdConfig.update(
+          dropout_rate=0.1, document_aware_skipping=skipping, **self._blocks(blk)
+      )
+      try:
+        q_t = q.clone().requires_grad_(True)
+        k_t = k.clone().requires_grad_(True)
+        v_t = v.clone().requires_grad_(True)
+        out = splash_bias_dropout.sbd_splash_attention(
+            q_t, k_t, v_t, segment_ids=seg, dropout_seed=4242
+        )
+        out.sum().backward()
+      finally:
+        splash_bias_dropout.SbdConfig.update(
+            dropout_rate=0.0, document_aware_skipping=True, **self._blocks(512)
+        )
+      return out.cpu(), [t.grad.cpu() for t in (q_t, k_t, v_t)]
+
+    out_on, grads_on = run(True)
+    out_off, grads_off = run(False)
+    # Dropout really is on: the undropped output differs.
+    out_plain = splash_bias_dropout.sbd_splash_attention(q, k, v, segment_ids=seg)
+    self.assertGreater(
+        float((out_on - out_plain.cpu()).abs().max()), 1e-3, "dropout did not fire"
+    )
+    torch.testing.assert_close(out_on, out_off, rtol=0, atol=0)
+    for name, a, b_ in zip(("dq", "dk", "dv"), grads_on, grads_off):
+      torch.testing.assert_close(a, b_, rtol=0, atol=0, msg=name)
+
   def test_segment_ids_padding_layout_parity(self):
     """Right-padded ids (the encoder shape) with blocks smaller than the
     sequence.

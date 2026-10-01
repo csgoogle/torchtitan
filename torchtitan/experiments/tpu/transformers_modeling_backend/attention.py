@@ -76,6 +76,9 @@ INFO_REPORTS = frozenset({"splash_tpu fired", "splash_tpu args", "splash_tpu ign
 # another -- a 512-gate / 1024-launch pair once let a 512-multiple that was
 # not a 1024-multiple through the gate and into a kernel shape error.
 _MIN_BLOCK = 128
+# `sbd_splash.splash_attention_kernel.DROPOUT_QUANTUM`: the PRNG emits its mask
+# in tiles of this many tokens and asserts on a block that is not a multiple.
+_DROPOUT_QUANTUM = 256
 _reported: set[str] = set()
 # Resolved on first dropout call; see `_seed_salt`.
 _SEED_SALT: int | None = None
@@ -192,6 +195,20 @@ def _unsupported(query, key, attention_mask, dropout) -> str | None:
         return f"sequence {q_len}x{kv_len} is not a multiple of {_MIN_BLOCK}"
     if query.device.type != "tpu":
         return f"tensors are on {query.device.type}, not tpu"
+    if dropout:
+        # The in-kernel PRNG generates its mask a fixed quantum at a time, and
+        # asserts on a block that is not a multiple of it -- a trace-time
+        # AssertionError from inside the kernel, where this gate owes the
+        # caller a named fallback instead. Short encoder sequences reach it
+        # (seq 128 gives a 128 block), and only with dropout: the quantum is
+        # not consulted otherwise.
+        block = _pick_block(q_len, kv_len, _DROPOUT_QUANTUM)
+        if block is None or block % _DROPOUT_QUANTUM:
+            return (
+                f"sequence {q_len}x{kv_len} does not tile the kernel's "
+                f"{_DROPOUT_QUANTUM}-token dropout quantum; zero the model's "
+                "attention dropout to use the kernel at this length"
+            )
     return None
 
 
