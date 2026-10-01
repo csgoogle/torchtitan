@@ -9,11 +9,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torchtitan.components.loss import cross_entropy_loss
+from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest as BaseDeviceTest
 from torchtitan.experiments.tpu.gemma4 import (
     _build_flavor_config,
     gemma4_configs,
 )
+from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.experiments.tpu.gemma4.config_registry import (
     gemma4_26b_a4b,
     gemma4_31b,
@@ -540,6 +542,126 @@ class TestGemma4Components(BaseDeviceTest):
       self.assertTrue(
           torch.isfinite(param.grad).all(), f"Non-finite gradient for {name}"
       )
+
+
+  @parameterized.named_parameters(
+      ("dense_testmodel", "testmodel", False),
+      ("moe_testmodel", "testmodel_moe", True),
+  )
+  def test_gemma4_transformer_block_cpu_device_parity(self, flavor, is_moe):
+    """Tests CPU vs. DEVICE forward and backward parity of Gemma4TransformerBlock."""
+    use_cpu_safe_histc_patch()
+    config = _build_flavor_config(flavor)
+    batch, seq_len = 2, 8
+    for layer_id, block_config in enumerate(config.layers):
+      with self.subTest(layer_id=layer_id):
+        block_cpu, block_device = self._setup_module_cpu_device(
+            Gemma4TransformerBlock,
+            lambda m: m.init_states(buffer_device=torch.device("cpu")),
+            config=block_config,
+        )
+        x_cpu, x_device = self._create_input_tensor_cpu_device(
+            (batch, seq_len, config.dim), requires_grad=True
+        )
+        positions_cpu = (
+            torch.arange(seq_len, dtype=torch.long, device="cpu")
+            .unsqueeze(0)
+            .expand(batch, seq_len)
+        )
+        positions_device = positions_cpu.to(self.accelerator_device)
+
+        out_cpu = block_cpu(x_cpu, None, positions_cpu)
+        out_device = block_device(x_device, None, positions_device)
+        test_utils.check_equivalence(
+            out_device.cpu(),
+            out_cpu,
+            atol=5e-3,
+            rtol=5e-3,
+            check_name=f"TransformerBlock Layer {layer_id} Forward",
+        )
+
+        out_cpu.sum().backward()
+        out_device.sum().backward()
+        test_utils.check_equivalence(
+            x_device.grad.cpu(),
+            x_cpu.grad,
+            atol=1e-1 if is_moe else 5e-3,
+            rtol=1e-1 if is_moe else 5e-3,
+            check_name=f"TransformerBlock Layer {layer_id} Input Grad",
+        )
+        for (name, p_cpu), p_device in zip(
+            block_cpu.named_parameters(),
+            block_device.parameters(),
+        ):
+          param_atol = 5e-3
+          param_rtol = 5e-3
+          if "attention" in name:
+            param_atol = 5e-2
+            param_rtol = 5e-2
+          elif "moe" in name:
+            param_atol = 1.0
+            param_rtol = 1e-1
+          test_utils.check_equivalence(
+              p_device.grad.cpu(),
+              p_cpu.grad,
+              atol=param_atol,
+              rtol=param_rtol,
+              check_name=f"TransformerBlock Layer {layer_id} Param Grad: {name}",
+          )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="dense_testmodel",
+          flavor="testmodel",
+          loss_atol=1e-1,
+          loss_rtol=1e-2,
+          grad_atol=2.5,
+          grad_rtol=1e-2,
+          param_atol=8e-2,
+          param_rtol=1e-2,
+      ),
+      dict(
+          testcase_name="moe_testmodel",
+          flavor="testmodel_moe",
+          loss_atol=1e-1,
+          loss_rtol=1e-2,
+          grad_atol=2.5,
+          grad_rtol=1e-2,
+          param_atol=8e-2,
+          param_rtol=1e-2,
+      ),
+  )
+  def test_gemma4_full_model_training_steps_cpu_device_parity(
+      self,
+      flavor,
+      loss_atol,
+      loss_rtol,
+      grad_atol,
+      grad_rtol,
+      param_atol,
+      param_rtol,
+  ):
+    """Tests CPU vs. DEVICE parity of full Gemma4 model after 3 training steps."""
+    use_cpu_safe_histc_patch()
+    config = _build_flavor_config(flavor)
+    batch, seq_len = 2, 8
+
+    model_cpu = Gemma4Model(config)
+    model_cpu.init_weights(buffer_device=torch.device("cpu"))
+    model_cpu = model_cpu.cpu()
+
+    self._run_full_model_training_steps_parity_test(
+        model_cpu=model_cpu,
+        loss_atol=loss_atol,
+        loss_rtol=loss_rtol,
+        grad_atol=grad_atol,
+        grad_rtol=grad_rtol,
+        param_atol=param_atol,
+        param_rtol=param_rtol,
+        vocab_size=config.vocab_size,
+        batch=batch,
+        seq_len=seq_len,
+    )
 
 
 class TestGemma4EndToEndLossConvergence(BaseDeviceTest):

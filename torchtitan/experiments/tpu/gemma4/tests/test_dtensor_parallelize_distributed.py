@@ -1,5 +1,7 @@
 """Distributed tests for Gemma 4 DTensor/SPMD parallelization."""
 
+import copy
+from functools import partial
 import os
 
 from absl import logging
@@ -7,16 +9,40 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 import torch.multiprocessing as mp
+from torch import nn
 import torchtitan.config
+from torchtitan.config.configs import (
+    CompileConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.tpu import base_distributed_device_test
-import torchtitan.experiments.tpu.gemma4  # trigger model registration
+from torchtitan.experiments.tpu import distributed
+from torchtitan.experiments.tpu.base_distributed_device_test import (
+    InputDistribution,
+)
+import torchtitan.experiments.tpu.gemma4 as gemma4_tpu
+from torchtitan.experiments.tpu.gemma4.infra import (
+    parallelize as gemma4_parallelize,
+)
 from torchtitan.experiments.tpu.gemma4.model import Gemma4Model
+from torchtitan.experiments.tpu.gemma4.sharding import (
+    set_gemma4_sharding_config,
+)
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 import torchtitan.experiments.tpu.tpu_job_config
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.tools import utils
+
+
+TEST_BATCH_SIZE = 8
+TEST_SEQ_LEN = 32
+TEST_TRAINING_STEPS = 3
 
 
 def _setup_logger():
@@ -24,6 +50,289 @@ def _setup_logger():
     logging.set_verbosity(logging.INFO)
   else:
     logging.set_verbosity(logging.ERROR)
+
+
+def _get_gemma4_model_config(
+    flavor: str = "testmodel",
+    *,
+    enable_sp: bool = False,
+    enable_ep: bool = False,
+    disable_weight_tying: bool = False,
+) -> Gemma4Model.Config:
+  config = copy.deepcopy(gemma4_tpu.gemma4_configs[flavor])
+  if disable_weight_tying:
+    config.enable_weight_tying = False
+    config.tok_embeddings.param_init = {
+        "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
+    }
+  set_gemma4_sharding_config(config, enable_sp=enable_sp, enable_ep=enable_ep)
+  return config
+
+
+class _Gemma4DistributedRunner(
+    base_distributed_device_test.DistributedUnitTestRunner
+):
+  """DistributedUnitTestRunner that unshards DTensor outputs before MSELoss."""
+
+  def _create_parallel_model(self, func):
+    torch.manual_seed(42)
+    super()._create_parallel_model(func)
+    with torch.no_grad():
+      for param in self.parallel_model.parameters():
+        if isinstance(param, DTensor) and all(
+            p.is_replicate() for p in param.placements
+        ):
+          torch.distributed.broadcast(param._local_tensor, src=0)
+
+  def _run_step(
+      self,
+      model: nn.Module,
+      inputs: torch.Tensor,
+      targets: torch.Tensor = None,
+      backward: bool = False,
+  ):
+    if backward:
+      model.zero_grad()
+
+    output = model(inputs)
+    loss = None
+
+    if backward and targets is not None:
+      output_for_loss = (
+          output.full_tensor() if isinstance(output, DTensor) else output
+      )
+      if targets.dtype != output_for_loss.dtype:
+        targets = targets.to(output_for_loss.dtype)
+      loss = nn.MSELoss()(output_for_loss, targets)
+      loss.backward()
+
+    return output, loss
+
+
+def _verify_dtensor_gemma4_tp_forward_worker(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    flavor: str = "testmodel",
+):
+  """Verifies numerical equivalence of forward pass of Gemma4 model with DTensor TP."""
+  use_cpu_safe_histc_patch()
+  config = _get_gemma4_model_config(flavor, enable_sp=False, enable_ep=False)
+
+  def apply_tp_wrapper(model):
+    parallel_dims = ParallelDims(
+        dp_shard=1,
+        dp_replicate=1,
+        cp=1,
+        tp=world_size,
+        pp=1,
+        ep=1,
+        world_size=world_size,
+    )
+    return gemma4_parallelize.parallelize_gemma4(
+        model,
+        ac_config=SelectiveAC.Config(),
+        compile_config=CompileConfig(),
+        dump_folder="",
+        parallel_dims=parallel_dims,
+        parallelism=ParallelismConfig(
+            tensor_parallel_degree=world_size,
+            enable_sequence_parallel=False,
+        ),
+        training=TrainingConfig(),
+    )
+
+  runner = _Gemma4DistributedRunner(
+      device=device,
+      rank=rank,
+      world_size=world_size,
+      model_class=Gemma4Model,
+      model_args=config,
+      parallelism_func=apply_tp_wrapper,
+      input_distribution=InputDistribution.REPLICATE,
+      use_meta_init=True,
+  )
+  runner.run_forward_parity(
+      TEST_BATCH_SIZE, TEST_SEQ_LEN, atol=1e-1, rtol=1e-1
+  )
+
+
+def _verify_dtensor_gemma4_tp_backward_worker(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    flavor: str = "testmodel",
+):
+  """Verifies numerical equivalence of forward + backward pass of Gemma4 with DTensor TP."""
+  use_cpu_safe_histc_patch()
+  config = _get_gemma4_model_config(flavor, enable_sp=False, enable_ep=False)
+
+  def apply_tp_wrapper(model):
+    parallel_dims = ParallelDims(
+        dp_shard=1,
+        dp_replicate=1,
+        cp=1,
+        tp=world_size,
+        pp=1,
+        ep=1,
+        world_size=world_size,
+    )
+    return gemma4_parallelize.parallelize_gemma4(
+        model,
+        ac_config=SelectiveAC.Config(),
+        compile_config=CompileConfig(),
+        dump_folder="",
+        parallel_dims=parallel_dims,
+        parallelism=ParallelismConfig(
+            tensor_parallel_degree=world_size,
+            enable_sequence_parallel=False,
+        ),
+        training=TrainingConfig(),
+    )
+
+  runner = _Gemma4DistributedRunner(
+      device=device,
+      rank=rank,
+      world_size=world_size,
+      model_class=Gemma4Model,
+      model_args=config,
+      parallelism_func=apply_tp_wrapper,
+      input_distribution=InputDistribution.REPLICATE,
+      use_meta_init=True,
+  )
+  runner.run_backward_parity(
+      num_steps=1,
+      batch_size=TEST_BATCH_SIZE,
+      seq_len=TEST_SEQ_LEN,
+      atol_loss=5e-2,
+      rtol_loss=5e-2,
+      atol_grad=1e-1,
+      rtol_grad=1e-1,
+  )
+
+
+def _verify_dtensor_gemma4_fsdp_training_loop_worker(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    flavor: str = "testmodel",
+    use_simple_fsdp: bool = False,
+):
+  """Verifies numerical equivalence of FSDP / SimpleFSDP multi-step loop on Gemma4."""
+  use_cpu_safe_histc_patch()
+  config = _get_gemma4_model_config(
+      flavor,
+      enable_sp=False,
+      enable_ep=False,
+      disable_weight_tying=use_simple_fsdp,
+  )
+
+  def apply_fsdp_wrapper(model):
+    parallel_dims = ParallelDims(
+        dp_shard=world_size,
+        dp_replicate=1,
+        cp=1,
+        tp=1,
+        pp=1,
+        ep=1,
+        world_size=world_size,
+    )
+    return gemma4_parallelize.parallelize_gemma4(
+        model,
+        ac_config=SelectiveAC.Config(),
+        compile_config=CompileConfig(),
+        dump_folder="",
+        parallel_dims=parallel_dims,
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=world_size,
+            use_simple_fsdp=use_simple_fsdp,
+        ),
+        training=TrainingConfig(
+            mixed_precision_param="float32",
+            mixed_precision_reduce="float32",
+        ),
+    )
+
+  runner = _Gemma4DistributedRunner(
+      device=device,
+      rank=rank,
+      world_size=world_size,
+      model_class=Gemma4Model,
+      model_args=config,
+      parallelism_func=apply_fsdp_wrapper,
+      input_distribution=InputDistribution.SPLIT_BATCH,
+      use_meta_init=not use_simple_fsdp,
+  )
+  runner.run_backward_parity(
+      num_steps=TEST_TRAINING_STEPS,
+      batch_size=TEST_BATCH_SIZE,
+      seq_len=TEST_SEQ_LEN,
+      atol_loss=3,
+      rtol_loss=3,
+      atol_grad=9e-1,
+      rtol_grad=9e-1,
+  )
+
+
+def _verify_dtensor_gemma4_ep_fsdp_moe_worker(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+):
+  """Verifies numerical equivalence of Expert Parallelism (EP) + FSDP on Gemma4 MoE."""
+  use_cpu_safe_histc_patch()
+  config = _get_gemma4_model_config(
+      "testmodel_moe",
+      enable_sp=False,
+      enable_ep=True,
+  )
+
+  def apply_ep_fsdp_wrapper(model):
+    parallel_dims = ParallelDims(
+        dp_shard=world_size,
+        dp_replicate=1,
+        cp=1,
+        tp=1,
+        pp=1,
+        ep=world_size,
+        world_size=world_size,
+    )
+    return gemma4_parallelize.parallelize_gemma4(
+        model,
+        ac_config=SelectiveAC.Config(),
+        compile_config=CompileConfig(),
+        dump_folder="",
+        parallel_dims=parallel_dims,
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=world_size,
+            expert_parallel_degree=world_size,
+            enable_sequence_parallel=False,
+        ),
+        training=TrainingConfig(
+            mixed_precision_param="float32",
+            mixed_precision_reduce="float32",
+        ),
+    )
+
+  runner = _Gemma4DistributedRunner(
+      device=device,
+      rank=rank,
+      world_size=world_size,
+      model_class=Gemma4Model,
+      model_args=config,
+      parallelism_func=apply_ep_fsdp_wrapper,
+      input_distribution=InputDistribution.SPLIT_BATCH,
+      use_meta_init=True,
+  )
+  runner.run_backward_parity(
+      num_steps=1,
+      batch_size=TEST_BATCH_SIZE,
+      seq_len=TEST_SEQ_LEN,
+      atol_loss=3,
+      rtol_loss=3,
+      atol_grad=9e-1,
+      rtol_grad=9e-1,
+  )
 
 
 def _run_gemma4_distributed(
@@ -114,7 +423,55 @@ def _run_gemma4_distributed(
 class TestDTensorParallelizeGemma4(
     base_distributed_device_test.BaseDistributedDeviceTest
 ):
-  """Tests parallelize_gemma4 with DTensor TP + FSDP on CPU and TPU."""
+  """Tests parallelize_gemma4 with DTensor TP, FSDP, SimpleFSDP, and EP on CPU/TPU."""
+
+  @parameterized.named_parameters(
+      ("dense", "testmodel"),
+      ("moe", "testmodel_moe"),
+  )
+  def test_apply_tp_forward_equivalence_distributed(self, flavor):
+    distributed.run_distributed(
+        num_devices=self.num_devices,
+        accelerator_device_type=self.accelerator_device_type,
+        func=partial(_verify_dtensor_gemma4_tp_forward_worker, flavor=flavor),
+    )
+
+  @parameterized.named_parameters(
+      ("dense", "testmodel"),
+      ("moe", "testmodel_moe"),
+  )
+  def test_apply_tp_backward_equivalence_distributed(self, flavor):
+    distributed.run_distributed(
+        num_devices=self.num_devices,
+        accelerator_device_type=self.accelerator_device_type,
+        func=partial(_verify_dtensor_gemma4_tp_backward_worker, flavor=flavor),
+    )
+
+  @parameterized.named_parameters(
+      ("dense_fsdp", "testmodel", False),
+      ("moe_fsdp", "testmodel_moe", False),
+      ("dense_simple_fsdp", "testmodel", True),
+      ("moe_simple_fsdp", "testmodel_moe", True),
+  )
+  def test_apply_fsdp_full_training_loop_equivalence_distributed(
+      self, flavor, use_simple_fsdp
+  ):
+    distributed.run_distributed(
+        num_devices=self.num_devices,
+        accelerator_device_type=self.accelerator_device_type,
+        func=partial(
+            _verify_dtensor_gemma4_fsdp_training_loop_worker,
+            flavor=flavor,
+            use_simple_fsdp=use_simple_fsdp,
+        ),
+    )
+
+  def test_apply_ep_fsdp_moe_backward_equivalence_distributed(self):
+    distributed.run_distributed(
+        num_devices=self.num_devices,
+        accelerator_device_type=self.accelerator_device_type,
+        func=_verify_dtensor_gemma4_ep_fsdp_moe_worker,
+    )
 
   @parameterized.named_parameters([
       dict(
@@ -140,8 +497,8 @@ class TestDTensorParallelizeGemma4(
         "--module=torchtitan.experiments.tpu.gemma4",
         f"--config={config}",
         "--optimizer.implementation=foreach",
-        "--hf_assets_path=third_party/py/torchtitan/tests/assets/tokenizer",
-        "--dataloader.dataset_path=third_party/py/torchtitan/tests/assets/c4_test",
+        "--hf_assets_path=tests/assets/tokenizer",
+        "--dataloader.dataset_path=tests/assets/c4_test",
         "--dataloader.dataset=c4_test",
         "--training.seq_len=32",
         "--training.steps=2",

@@ -381,6 +381,44 @@ class TrainDistributedTest(
       #           device_type.AcceleratorDeviceType.CUDA,
       #       ],
       #   ),
+      # gemma4
+      dict(
+          testcase_name="gemma4_tp",
+          module="torchtitan.experiments.tpu.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=-1,
+      ),
+      dict(
+          testcase_name="gemma4_fsdp",
+          module="torchtitan.experiments.tpu.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+      ),
+      dict(
+          testcase_name="gemma4_simplefsdp",
+          module="torchtitan.experiments.tpu.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.use_simple_fsdp"],
+      ),
+      dict(
+          testcase_name="gemma4_moe_fsdp",
+          module="torchtitan.experiments.tpu.gemma4",
+          config="gemma4_moe_testmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+      ),
+      dict(
+          testcase_name="gemma4_fsdp_checkpoint",
+          module="torchtitan.experiments.tpu.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          checkpoint_enabled=True,
+      ),
   ])
   def test_train_distributed(
       self,

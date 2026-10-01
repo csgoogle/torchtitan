@@ -583,9 +583,10 @@ def _build_flavor_config(
                 non_blocking_capacity_factor
             )
         config = factory(layers=layers_partial(**extra_kw))
-        set_gemma4_sharding_config(
-            config, enable_sp=enable_sp, enable_ep=enable_ep
-        )
+
+    set_gemma4_sharding_config(
+        config, enable_sp=enable_sp, enable_ep=enable_ep
+    )
 
     if converters is not None:
         validate_converter_order(converters)

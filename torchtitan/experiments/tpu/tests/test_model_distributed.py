@@ -12,6 +12,7 @@ import torchtitan.config
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
+import torchtitan.experiments.tpu.gemma4  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
@@ -227,6 +228,21 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
+          enable_compile=True,
+      ),
+      dict(
+          testcase_name="gemma4_tp_dtensor",
+          module="torchtitan.experiments.tpu.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=-1,
+      ),
+      dict(
+          testcase_name="gemma4_tp_dtensor_compile",
+          module="torchtitan.experiments.tpu.gemma4",
+          config="gemma4_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=-1,
           enable_compile=True,
       ),
   ])
