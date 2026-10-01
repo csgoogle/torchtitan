@@ -226,6 +226,168 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
     # Dropout is active: a different seed gives a different output.
     self.assertGreater(float((out0 - out1).abs().max()), 1e-3, "seeds gave identical masks")
 
+  # -------- layouts --------
+
+  def test_heads_first_layout_matches_torch_standard(self):
+    """`heads_first=True` is the same computation on the same bits.
+
+    It is the layout HF hands attention and the kernel's own, so it skips the
+    wrapper's transposes -- the result has to be identical, forward and
+    backward, or the saving is a bug.
+    """
+    device = self.accelerator_device
+    b, s, h, h_kv, d = 2, 512, 4, 2, 64
+    q, k, v = self._qkv(b, s, h, h_kv, d, device, seed=53)
+    segment_ids = torch.zeros(b, s, dtype=torch.int32)
+    segment_ids[:, 256:] = 1
+    seg = segment_ids.to(device)
+
+    def run(heads_first):
+      made = [
+          (t.transpose(1, 2).contiguous() if heads_first else t.clone())
+          for t in (q, k, v)
+      ]
+      qq, kk, vv = [t.requires_grad_(True) for t in made]
+      out = splash_bias_dropout.sbd_splash_attention(
+          qq, kk, vv, segment_ids=seg, heads_first=heads_first
+      )
+      out.sum().backward()
+      grads = [t.grad for t in (qq, kk, vv)]
+      if heads_first:
+        out = out.transpose(1, 2)
+        grads = [g.transpose(1, 2) for g in grads]
+      return out.cpu(), [g.cpu() for g in grads]
+
+    out_bshd, grads_bshd = run(False)
+    out_bhsd, grads_bhsd = run(True)
+    torch.testing.assert_close(out_bhsd, out_bshd, rtol=0, atol=0)
+    for name, a, b_ in zip(("dq", "dk", "dv"), grads_bhsd, grads_bshd):
+      torch.testing.assert_close(a, b_, rtol=0, atol=0, msg=name)
+
+  # -------- document-aware block skipping --------
+
+  def _blocks(self, blk):
+    return dict(
+        block_q=blk, block_kv=blk, block_kv_compute=blk,
+        block_q_dkv=blk, block_kv_dkv=blk, block_kv_dkv_compute=blk,
+    )
+
+  def test_document_aware_mask_info_compacts_grid(self):
+    """The grid metadata itself, with no kernel in the way.
+
+    An end-to-end parity test cannot tell skipping from masking -- both are
+    exact -- so the thing that has to be measured is the step count: this is
+    the firing audit for `_document_aware_mask_info`.
+    """
+    import jax.numpy as jnp  # local: the rest of this suite is torch-only
+    import numpy as np
+
+    def build(seq, blk):
+      return splash_bias_dropout._build_kernel(
+          seq, True, 1.0, -1, False, False, blk, blk, blk, blk, blk, blk,
+          False, None, 0.0, True, 4, True, 0, False, True,
+      )[1]
+
+    def steps(mi, seg, blk, is_dkv):
+      out = splash_bias_dropout._document_aware_mask_info(
+          mi, seg, blk, blk, is_dkv=is_dkv
+      )
+      if is_dkv:  # dense grid: tiles are zeroed, the grid is not compacted
+        return int((np.asarray(out.block_mask) > 0).sum())
+      return int(out.num_active_blocks[0])
+
+    # The lane's op-point: 8 x 2048-token documents in one 16k stream, block
+    # 1024. 136 causal tiles, 24 of which can hold a same-document pair.
+    kernel = build(16384, 1024)
+    seg = jnp.repeat(jnp.arange(8, dtype=jnp.int32), 2048)
+    self.assertEqual(int(kernel.fwd_mask_info.num_active_blocks[0]), 136)
+    self.assertEqual(steps(kernel.fwd_mask_info, seg, 1024, False), 24)
+    self.assertEqual(int((np.asarray(kernel.dkv_mask_info.block_mask) > 0).sum()), 136)
+    self.assertEqual(steps(kernel.dkv_mask_info, seg, 1024, True), 24)
+
+    # One document is the no-op case: every causal tile stays.
+    seg_one = jnp.zeros(16384, jnp.int32)
+    self.assertEqual(steps(kernel.fwd_mask_info, seg_one, 1024, False), 136)
+    self.assertEqual(steps(kernel.dkv_mask_info, seg_one, 1024, True), 136)
+
+    # Row order survives compaction (find_bounds reads neighbours), and the
+    # dead tail reads as a row end.
+    out = splash_bias_dropout._document_aware_mask_info(
+        kernel.fwd_mask_info, seg, 1024, 1024, is_dkv=False
+    )
+    n = int(out.num_active_blocks[0])
+    rows = np.asarray(out.active_rows)
+    self.assertTrue((np.diff(rows[:n]) >= 0).all(), rows[:n])
+    self.assertEqual(int(rows[n]), -1)
+
+  def test_segment_ids_block_skipping_parity(self):
+    """Skipping is exact: the kernel agrees with the dense mask, and with
+    itself when the skipping is turned off.
+
+    Needs blocks SMALLER than the sequence -- at the suite's default 512
+    blocks a 512-token case is one tile and nothing can be skipped.
+    """
+    device = self.accelerator_device
+    b, s, h, d, blk = 2, 512, 4, 64, 128
+    q, k, v = self._qkv(b, s, h, h, d, device, seed=47)
+    docs = torch.arange(s) // blk  # 4 documents, one per block row
+    segment_ids = docs[None, :].repeat(b, 1).to(torch.int32)
+    allowed = (segment_ids[:, :, None] == segment_ids[:, None, :]) & torch.tril(
+        torch.ones(s, s, dtype=torch.bool)
+    )[None]
+    mask = torch.zeros(b, 1, s, s, dtype=torch.float32)
+    mask.masked_fill_(~allowed[:, None], float("-inf"))
+
+    q_ref = q.cpu().clone().requires_grad_(True)
+    k_ref = k.cpu().clone().requires_grad_(True)
+    v_ref = v.cpu().clone().requires_grad_(True)
+    out_ref = _sdpa_ref(q_ref, k_ref, v_ref, attn_mask=mask)
+    out_ref.sum().backward()
+
+    seg = segment_ids.to(device)
+    grads = {}
+    outs = {}
+    for skipping in (True, False):
+      splash_bias_dropout.SbdConfig.update(
+          document_aware_skipping=skipping, **self._blocks(blk)
+      )
+      try:
+        q_t = q.clone().requires_grad_(True)
+        k_t = k.clone().requires_grad_(True)
+        v_t = v.clone().requires_grad_(True)
+        out = splash_bias_dropout.sbd_splash_attention(
+            q_t, k_t, v_t, segment_ids=seg
+        )
+        out.sum().backward()
+      finally:
+        splash_bias_dropout.SbdConfig.update(
+            document_aware_skipping=True, **self._blocks(512)
+        )
+      outs[skipping] = out.cpu()
+      grads[skipping] = [t.grad.cpu() for t in (q_t, k_t, v_t)]
+      torch.testing.assert_close(
+          outs[skipping], out_ref.cpu(), rtol=5e-2, atol=5e-2,
+          msg=f"forward, skipping={skipping}",
+      )
+      for name, got, want in zip(
+          ("dq", "dk", "dv"), grads[skipping],
+          (q_ref.grad, k_ref.grad, v_ref.grad),
+      ):
+        torch.testing.assert_close(
+            got, want.cpu(), rtol=8e-2, atol=8e-2,
+            msg=f"{name}, skipping={skipping}",
+        )
+
+    # A skipped tile contributes exactly zero, so dropping it must not move
+    # a single bit of the result.
+    torch.testing.assert_close(
+        outs[True], outs[False], rtol=0, atol=0, msg="skipping changed the output"
+    )
+    for name, a, b_ in zip(("dq", "dk", "dv"), grads[True], grads[False]):
+      torch.testing.assert_close(
+          a, b_, rtol=0, atol=0, msg=f"skipping changed {name}"
+      )
+
   def test_noncausal_parity(self):
     device = self.accelerator_device
     q, k, v = self._qkv(2, 512, 4, 4, 64, device, seed=31)

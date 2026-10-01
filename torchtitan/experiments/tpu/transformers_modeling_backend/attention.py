@@ -9,27 +9,26 @@ finds nothing and raises.
 That interface is the generic hook. Registering a kernel here reaches every HF
 architecture that uses the standard attention path, without naming any of them.
 
-Two kernels serve the call, chosen per call by whether HF asks for dropout:
+One kernel serves every call: ``sbd_splash_attention``, a tokamax splash
+fork that adds an in-kernel PRNG dropout path and, since 2026-10-01,
+document-aware block skipping on its compacted grid -- so dropout models no
+longer fall back to SDPA, and dropout-free ones give nothing up for it.
+Measured that day on Llama-3.2-1B, 4x v6e (8 x 2048 tokens folded into one
+16k stream, block 1024: 24 of 136 causal blocks per layer can hold a
+same-document pair): 20,063 tok/s/device against 20,102 for the stock
+JAX-experimental splash it replaced, and 14,307 for the same kernel before
+the skipping. The stock kernel is gone from this path; its dropout-free
+block skipping was the only thing it did better, and it cannot do dropout at
+all.
 
-- ``splash_sdpa`` (the JAX-experimental splash) when ``dropout == 0``: it
-  skips every (q, kv) block whose documents do not overlap, which on the
-  lane's packed stream (8 x 2048 tokens folded into one 16k sequence, block
-  1024) visits ~24 of 136 causal blocks per layer. Measured 2026-10-01 on
-  Llama-3.2-1B, 4x v6e: the exact-but-unskipped alternative below costs 29 %
-  of step throughput there (14,307 vs ~20,000 tok/s/device, +2.4 GiB).
-- ``sbd_splash_attention`` (a tokamax splash fork) when ``dropout > 0``: the
-  only kernel with an in-kernel dropout path, so these calls no longer fall
-  back to SDPA. It masks packed documents exactly at token granularity but
-  does not skip blocks on them (tokamax's MaskInfo is a static compacted
-  block list); at the encoder op-point (512-token documents) that is a wash
-  with the skipping kernel, so dropout models pay only the dropout itself.
-
-Both take the same translation of HF's contract: ``is_causal`` passed through
-(encoders run bidirectional), document boundaries and a 2D padding mask as
-segment ids, grouped-KV / MQA heads, a sliding window. What neither can
-express (an additive float mask, a sequence that is not a whole number of
-blocks) falls back to SDPA and *says so*, once per distinct reason. A silent
-fallback is how a kernel that never fired gets reported as a speedup.
+The translation of HF's contract: ``is_causal`` passed through (encoders run
+bidirectional), document boundaries and a 2D padding mask as segment ids,
+grouped-KV / MQA heads straight through (no K/V expansion), a sliding
+window, and heads-first operands handed over without a transpose. What the
+kernel cannot express (an additive float mask, a sequence that is not a
+whole number of blocks) falls back to SDPA and *says so*, once per distinct
+reason. A silent fallback is how a kernel that never fired gets reported as
+a speedup.
 
 Note that HF only builds a mask for implementations registered with its
 ``AttentionMaskInterface``; ``splash_tpu`` is not, so for every model on the
@@ -55,14 +54,22 @@ from torchtitan.tools.logging import logger
 # function rather than a module, so the tuning lives here at module level.
 # Empty until configured, in which case ``SbdConfig``'s own defaults apply.
 _KERNEL_KWARGS: dict[str, Any] = {}
-# The sbd kernel takes the six block sizes; the stock kernel's other knobs
-# (dkv/dq blocks, fused/vmap backward, document-aware skipping, layouts) have
-# no counterpart there and are reported once as ignored on the dropout path.
-_SBD_BLOCK_KEYS = ("block_q", "block_kv", "block_kv_compute",
-                   "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute")
+# Which of those ``sa_*`` fields the kernel has, and what it calls them. The
+# rest of ``KERNEL_KWARG_NAMES`` -- the dq-kernel blocks, the backward-variant
+# switches, the operand layouts -- has no counterpart here and is reported
+# once as ignored.
+_SBD_KERNEL_KWARGS = {
+    "block_q": "block_q",
+    "block_kv": "block_kv",
+    "block_kv_compute": "block_kv_compute",
+    "block_q_dkv": "block_q_dkv",
+    "block_kv_dkv": "block_kv_dkv",
+    "block_kv_dkv_compute": "block_kv_dkv_compute",
+    "use_document_aware_block_skipping": "document_aware_skipping",
+}
 # Keys in ``_reported`` that are informational (the kernel ran); everything
 # else in that set is a fallback reason. Tests read this.
-INFO_REPORTS = frozenset({"splash_tpu fired", "splash_tpu fired (sbd)", "splash_tpu args", "splash_tpu ignored"})
+INFO_REPORTS = frozenset({"splash_tpu fired", "splash_tpu args", "splash_tpu ignored"})
 # The kernel needs both sequence lengths to be whole blocks, so every
 # configured block is stepped down to the largest size that divides them
 # (Mosaic's floor is 128) instead of gating on one number and launching with
@@ -70,6 +77,8 @@ INFO_REPORTS = frozenset({"splash_tpu fired", "splash_tpu fired (sbd)", "splash_
 # not a 1024-multiple through the gate and into a kernel shape error.
 _MIN_BLOCK = 128
 _reported: set[str] = set()
+# Resolved on first dropout call; see `_seed_salt`.
+_SEED_SALT: int | None = None
 
 
 def _tracing() -> bool:
@@ -99,6 +108,24 @@ def _log_once(key: str, message: str, *args) -> None:
     if key not in _reported:
         _reported.add(key)
         logger.info(message, *args)
+
+
+def _seed_salt() -> int:
+    """A per-rank constant to fold into the dropout seed (0 off a mesh).
+
+    Resolved once: the rank cannot change within a process, and a python int
+    folds into a captured graph as a constant.
+    """
+    global _SEED_SALT
+    if _SEED_SALT is None:
+        try:
+            import torch.distributed as dist
+
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        except Exception:  # pragma: no cover - no mesh is the common local case
+            rank = 0
+        _SEED_SALT = (rank * 0x9E3779B1) & 0x7FFFFFFF
+    return _SEED_SALT
 
 
 def configure_kernel(**kwargs: Any) -> None:
@@ -244,8 +271,8 @@ def splash_attention_forward(
     # quadratically -- measured 2026-09-19 on Llama-3.2-1B, 4x v6e: splash
     # went from 151 ms to 618 ms per step and the step from 0.59 s to 1.15 s.
     # ``position_ids`` restart at 0 at every document boundary; turning them
-    # into segment ids restores per-document masking AND (stock kernel) lets
-    # it skip every block whose q and kv segments do not overlap.
+    # into segment ids restores per-document masking AND lets the kernel skip
+    # every block whose q and kv segments cannot overlap.
     segment_ids = _segment_ids(module, attention_mask, kwargs.get("position_ids"))
     kernel_kwargs = _kernel_kwargs(query.shape[-2], key.shape[-2])
 
@@ -263,96 +290,76 @@ def splash_attention_forward(
         else "document"
     )
 
-    if dropout:
-        out = _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
-                           dropout, kernel_kwargs, seg_desc)
-    else:
-        out = _splash_forward(query, key, value, segment_ids, is_causal, scaling, window,
-                              kernel_kwargs, seg_desc)
+    out = _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
+                       dropout, kernel_kwargs, seg_desc)
     return out, None
-
-
-def _splash_forward(query, key, value, segment_ids, is_causal, scaling, window,
-                    kernel_kwargs, seg_desc):
-    """The stock splash kernel: document-aware block skipping, no dropout."""
-    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
-
-    # splash_sdpa keeps enable_gqa only for signature compatibility, so the
-    # kv heads have to be expanded here when the model is grouped-query.
-    heads, kv_heads = query.shape[1], key.shape[1]
-    if kv_heads != heads:
-        repeat = heads // kv_heads
-        key = key.repeat_interleave(repeat, dim=1)
-        value = value.repeat_interleave(repeat, dim=1)
-    # splash_sdpa defaults every block to 512, which is the library's default
-    # rather than a tuned one; the HF registry's ``splash_attention_kernel``
-    # section sets 1024. Measured on Llama-3.2-1B at batch 8, seq 2048, 4x
-    # v6e: 512 gives 17.08%, 1024 gives 18.12%, 2048 gives 17.78% and 256
-    # gives 11.88% -- an interior optimum, +6.0% over the default, against a
-    # repeat-measured run-to-run spread of 0.05pp.
-    out = splash_sdpa(
-        query.contiguous(),
-        key.contiguous(),
-        value.contiguous(),
-        segment_ids=segment_ids,
-        scale=scaling,
-        is_causal=is_causal,
-        local_window_size=window,
-        **kernel_kwargs,
-    )
-    if not _tracing():
-        _log_once(
-            "splash_tpu fired",
-            "splash_tpu: kernel active (splash; heads=%d kv_heads=%d seq=%d head_dim=%d "
-            "causal=%s segment_ids=%s)",
-            heads, kv_heads, query.shape[-2], query.shape[-1], is_causal, seg_desc,
-        )
-    return out.transpose(1, 2).contiguous()
 
 
 def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
                  dropout, kernel_kwargs, seg_desc):
-    """The sbd kernel: in-kernel PRNG dropout, exact segment masking."""
+    """The kernel call: document-aware skipping, exact segment masking at
+    token granularity, in-kernel PRNG dropout."""
     from torchtitan.experiments.tpu.kernels.splash_bias_dropout import (
         SbdConfig,
         sbd_splash_attention,
     )
 
-    ignored = sorted(k for k in kernel_kwargs if k not in _SBD_BLOCK_KEYS)
+    ignored = sorted(k for k in kernel_kwargs if k not in _SBD_KERNEL_KWARGS)
     if ignored and not _tracing():
-        _log_once("splash_tpu ignored", "splash_tpu: sbd kernel has no %s; ignored", ignored)
-    blocks = {k: v for k, v in kernel_kwargs.items() if k in _SBD_BLOCK_KEYS}
+        _log_once("splash_tpu ignored", "splash_tpu: the kernel has no %s; ignored", ignored)
+    blocks = {
+        _SBD_KERNEL_KWARGS[k]: v
+        for k, v in kernel_kwargs.items()
+        if k in _SBD_KERNEL_KWARGS
+    }
     # The seed is a (B, 2) int32 tensor drawn from torch's RNG on the device:
     # fresh per call and per layer, reproducible under torch.manual_seed, and
-    # a tensor operand so a new seed never retraces the op. Every SbdConfig
-    # value is a static op argument hashed into the trace cache key, so
-    # setting them per call is what the kernel expects.
+    # a tensor operand so a new seed never retraces the op. Verified
+    # 2026-10-01 on v6e that the draw survives graph capture -- three
+    # successive calls on identical inputs differ under eager AND under
+    # `torch.compile(backend="tpu", fullgraph=True)`, while two calls after
+    # the same `manual_seed` agree bit-for-bit. A frozen draw would be
+    # invisible otherwise: dropout would still *look* applied, with one mask
+    # reused for the whole run.
     dropout_seed = torch.randint(
         -(2**31), 2**31 - 1, (query.shape[0], 2), dtype=torch.int32, device=query.device
     )
+    # torchtitan seeds every rank identically (weights and data order depend
+    # on it), so without a rank-dependent salt every data-parallel rank would
+    # drop the same (position, head) entries -- the kernel's docstring asks
+    # the caller to fold the rank in for exactly this reason. The salt is a
+    # rank constant, so it costs nothing in a captured graph.
+    salt = _seed_salt()
+    if salt:
+        dropout_seed = dropout_seed ^ salt
     SbdConfig.update(dropout_rate=float(dropout), **blocks)
-    # HF hands (B, H, S, D); the kernel takes and returns torch-standard
-    # (B, S, H, D), which is what HF expects back. Grouped-KV and MQA go to
-    # the kernel as-is (no K/V expansion).
+    # HF hands (B, H, S, D) and wants it back; `heads_first` is the kernel's
+    # own layout, so nothing is transposed on either side (the torch-standard
+    # entry would cost three full-size copies per call, saved until the
+    # backward). Grouped-KV and MQA go in as-is, no K/V expansion.
     out = sbd_splash_attention(
-        query.transpose(1, 2).contiguous(),
-        key.transpose(1, 2).contiguous(),
-        value.transpose(1, 2).contiguous(),
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
         dropout_seed=dropout_seed,
         segment_ids=segment_ids,
         is_causal=is_causal,
         scale=scaling,
         local_window_size=window,
+        heads_first=True,
     )
     if not _tracing():
         _log_once(
-            "splash_tpu fired (sbd)",
-            "splash_tpu: kernel active (sbd; heads=%d kv_heads=%d seq=%d head_dim=%d "
+            "splash_tpu fired",
+            "splash_tpu: kernel active (heads=%d kv_heads=%d seq=%d head_dim=%d "
             "causal=%s dropout=%s segment_ids=%s)",
             query.shape[1], key.shape[1], query.shape[-2], query.shape[-1], is_causal,
             dropout, seg_desc,
         )
-    return out
+    # HF's contract is (B, S, H, D) out (its own sdpa path transposes too),
+    # while heads-first hands back (B, H, S, D) -- the same single transpose
+    # the splash path above does, with three input copies saved.
+    return out.transpose(1, 2).contiguous()
 
 
 def register() -> None:
