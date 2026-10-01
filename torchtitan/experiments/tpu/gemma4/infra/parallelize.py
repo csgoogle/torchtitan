@@ -6,7 +6,7 @@ import torch
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
-from torchtitan.distributed.compile import apply_compile
+from torchtitan.distributed.compile import _maybe_regional_inductor_backend
 from torchtitan.distributed.context_parallel import apply_cp_to_forward
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 from torchtitan.distributed.full_dtensor import (
@@ -30,6 +30,30 @@ from torchtitan.models.common.moe import (
 )
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.tools.logging import logger
+
+
+def _apply_compile_gemma4(
+    model: nn.Module, compile_config: torchtitan.config.CompileConfig
+) -> None:
+  """Apply torch.compile to each Gemma4TransformerBlock with dynamic=False.
+
+  Gemma4 mixes sliding-window layers (smaller head_dim) and global attention
+  layers (larger head_dim) using the same Gemma4TransformerBlock class. Leaving
+  `dynamic` at None causes TorchDynamo's automatic dynamic shapes to mark the
+  differing head_dim / rope_cache dimensions as SymInt on the first global
+  layer, which is unsupported by the TPU backend.
+  """
+  torch._dynamo.config.capture_scalar_outputs = True
+  torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = (
+      True  # pyrefly: ignore [bad-assignment]
+  )
+  backend = _maybe_regional_inductor_backend(model, compile_config.backend)
+  # pyrefly: ignore [missing-attribute]
+  for _, transformer_block in model.layers.named_children():
+    transformer_block.compile(backend=backend, fullgraph=True, dynamic=False)
+  logger.info(
+      "Compiling each Gemma4TransformerBlock with torch.compile (dynamic=False)"
+  )
 
 
 def _parallelize_gemma4_dtensor(
@@ -72,7 +96,7 @@ def _parallelize_gemma4_dtensor(
     ac_config.build(dump_folder=dump_folder).apply(model)
 
   if model_compile_enabled:
-    apply_compile(model, compile_config)
+    _apply_compile_gemma4(model, compile_config)
 
   if skip_dp:
     return model
