@@ -265,29 +265,24 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
       grad_rtol: float = 1e-3,
       param_atol: float = 5e-3,
       param_rtol: float = 5e-3,
-      validate_job_config=None,
-      validate_device: torch.device | None = None,
-      validate_context: contextlib.AbstractContextManager | None = None,
+      cpu_job_config=None,
+      device_capture_fn: numerical_validation.CaptureFn | None = None,
+      device_context: contextlib.AbstractContextManager | None = None,
   ):
-    """Trains `job_config` on the accelerator, then checks a second run against it.
+    """Trains `job_config` on the accelerator, then replays it on CPU and compares.
 
-    By default the second run is the same config on CPU. Passing
-    `validate_job_config` and `validate_device` instead compares two configs
-    on one device -- e.g. a kernel against the stock op it replaces -- from the
-    same initial weights and batches. `validate_context` wraps the second run,
-    e.g. to count the ops it dispatches.
-
-    Returns:
-      The second run's trainer, so callers can inspect the model it built.
+    Args:
+      cpu_job_config: The CPU reference's config, when it differs from the
+        device's -- e.g. stock ops in place of device kernels. Defaults to
+        `job_config`.
+      device_capture_fn: Captures the device model's state per step, e.g. to
+        map device-specific parameter layouts back to the CPU model's.
+      device_context: Wraps the device run, e.g. to count the ops it
+        dispatches.
     """
-    if validate_job_config is None:
-      validate_job_config = job_config
-    if validate_device is None:
-      validate_device = torch.device("cpu")
-
     # Setup recorder callback
     recorder = numerical_validation.StateRecorderCallback(
-        capture_fn=numerical_validation.capture_local_state
+        capture_fn=device_capture_fn or numerical_validation.capture_local_state
     )
 
     trainer_device = torchtitan.experiments.tpu.train_minimal.TrainerMinimal(
@@ -305,7 +300,8 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     }
 
     # Phase 1: Run Device Training and record the state at each step
-    trainer_device.train()
+    with device_context or contextlib.nullcontext():
+      trainer_device.train()
     # Get the recorded history
     recorded_history = recorder.get_history()
 
@@ -319,19 +315,16 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     )
 
     with validator:
-      trainer_validate = torchtitan.experiments.tpu.train_minimal.TrainerMinimal(
-          validate_device,
+      trainer_cpu = torchtitan.experiments.tpu.train_minimal.TrainerMinimal(
+          torch.device("cpu"),
           rank=0,
           world_size=1,
-          job_config=validate_job_config,
+          job_config=cpu_job_config or job_config,
           step_callback=validator.on_step,
       )
 
       # Load initial weights
-      trainer_validate.model.load_state_dict(initial_state_dict)
+      trainer_cpu.model.load_state_dict(initial_state_dict)
 
-      # Phase 2: Train the second model and validate against the recorded
-      # history.
-      with validate_context or contextlib.nullcontext():
-        trainer_validate.train()
-    return trainer_validate
+      # Phase 2: Train the CPU model and validate against the recorded history.
+      trainer_cpu.train()
