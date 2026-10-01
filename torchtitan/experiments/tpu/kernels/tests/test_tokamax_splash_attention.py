@@ -353,11 +353,7 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     """Packed-document forward and gradients match a block-causal SDPA reference."""
     device = self.accelerator_device
     torch.manual_seed(7)
-    # The jax_op bridge caches compiled kernels by input shapes, not by the
-    # process-global TokamaxConfig.use_vmap_bwd, so scan and vmap cases need
-    # distinct shapes or the second would reuse the first's backward.
-    seq_len = 384 if use_vmap_bwd else 256
-    b, n_heads, head_dim = 2, 8, 64
+    b, n_heads, seq_len, head_dim = 2, 8, 256, 64
     n_rep = n_heads // n_kv_heads
 
     prev_use_vmap_bwd = tokamax_splash_attention.TokamaxConfig.use_vmap_bwd
@@ -442,6 +438,43 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
             atol=5e-2,
         )
     )
+
+
+  def test_config_change_retraces_kernel(self):
+    """A TokamaxConfig change must not reuse a kernel compiled for the old one.
+
+    jax_op caches compiled kernels by argument values, so the config has to be
+    passed as op arguments; read inside the op, two calls with equal shapes
+    would share one compiled kernel whatever the config said.
+    """
+    from unittest import mock  # pylint: disable=g-import-not-at-top
+
+    device = self.accelerator_device
+    cfg = tokamax_splash_attention.TokamaxConfig
+    saved = cfg.use_vmap_bwd
+    self.addCleanup(setattr, cfg, "use_vmap_bwd", saved)
+
+    # A shape no other test uses, so the first call below must trace too.
+    q, k, v = (
+        torch.randn(1, 1024, 2, 64, device=device).requires_grad_(True)
+        for _ in range(3)
+    )
+    real = tokamax_splash_attention._make_splash_attention_fn
+    seen = []
+
+    def record(*args, **kwargs):
+      seen.append(kwargs["use_vmap_bwd"])
+      return real(*args, **kwargs)
+
+    with mock.patch.object(
+        tokamax_splash_attention, "_make_splash_attention_fn", record
+    ):
+      for use_vmap_bwd in (False, True):
+        cfg.use_vmap_bwd = use_vmap_bwd
+        tokamax_splash_attention.splash_sdpa(q, k, v).sum().backward()
+
+    # fwd + bwd each traced once per config value.
+    self.assertEqual(sorted(seen), [False, False, True, True])
 
 
 if __name__ == "__main__":

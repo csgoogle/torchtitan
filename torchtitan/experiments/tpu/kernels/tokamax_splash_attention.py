@@ -282,11 +282,26 @@ def jax_attention_fwd(
     is_causal: bool,
     local_window_size: int,  # Sentinel int: -1 means None
     scale: float,
+    block_q: int,
+    block_kv: int,
+    block_kv_compute: int,
+    block_q_dkv: int,
+    block_kv_dkv: int,
+    block_kv_dkv_compute: int,
+    block_q_dq: int | None,
+    block_kv_dq: int | None,
+    use_fused_bwd_kernel: bool,
+    use_vmap_bwd: bool,
+    q_layout: str,
+    k_layout: str,
+    v_layout: str,
 ) -> tuple[jax.Array, jax.Array]:
   """Forward attention in JAX using Pallas.
 
   Accepts raw PyTorch layouts: (batch, seq_len, heads, head_dim), and
   optional int32 ``segment_ids`` of shape (batch, seq_len) for packed documents.
+  The tiling/layout fields arrive as arguments (see _kernel_config_args) so
+  they are part of the jax_op compile-cache key.
   """
   seq_len = q.shape[1]
   n_heads = q.shape[2]
@@ -310,19 +325,19 @@ def jax_attention_fwd(
       n_kv_heads=n_kv_heads,
       is_causal=is_causal,
       local_window_size=local_window_size_opt,
-      block_q=TokamaxConfig.block_q,
-      block_kv=TokamaxConfig.block_kv,
-      block_kv_compute=TokamaxConfig.block_kv_compute,
-      block_q_dkv=TokamaxConfig.block_q_dkv,
-      block_kv_dkv=TokamaxConfig.block_kv_dkv,
-      block_kv_dkv_compute=TokamaxConfig.block_kv_dkv_compute,
-      block_q_dq=TokamaxConfig.block_q_dq,
-      block_kv_dq=TokamaxConfig.block_kv_dq,
-      use_fused_bwd_kernel=TokamaxConfig.use_fused_bwd_kernel,
-      use_vmap_bwd=TokamaxConfig.use_vmap_bwd,
-      q_layout=TokamaxConfig.q_layout,
-      k_layout=TokamaxConfig.k_layout,
-      v_layout=TokamaxConfig.v_layout,
+      block_q=block_q,
+      block_kv=block_kv,
+      block_kv_compute=block_kv_compute,
+      block_q_dkv=block_q_dkv,
+      block_kv_dkv=block_kv_dkv,
+      block_kv_dkv_compute=block_kv_dkv_compute,
+      block_q_dq=block_q_dq,
+      block_kv_dq=block_kv_dq,
+      use_fused_bwd_kernel=use_fused_bwd_kernel,
+      use_vmap_bwd=use_vmap_bwd,
+      q_layout=q_layout,
+      k_layout=k_layout,
+      v_layout=v_layout,
   )
 
   # Apply scaling inside the compiled JAX pipeline
@@ -348,6 +363,19 @@ def jax_attention_bwd(
     is_causal: bool,
     local_window_size: int,  # Sentinel int: -1 means None
     scale: float,
+    block_q: int,
+    block_kv: int,
+    block_kv_compute: int,
+    block_q_dkv: int,
+    block_kv_dkv: int,
+    block_kv_dkv_compute: int,
+    block_q_dq: int | None,
+    block_kv_dq: int | None,
+    use_fused_bwd_kernel: bool,
+    use_vmap_bwd: bool,
+    q_layout: str,
+    k_layout: str,
+    v_layout: str,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Backward attention in JAX calling direct Pallas kernel backward."""
   seq_len = q.shape[1]
@@ -374,19 +402,19 @@ def jax_attention_bwd(
       n_kv_heads=n_kv_heads,
       is_causal=is_causal,
       local_window_size=local_window_size_opt,
-      block_q=TokamaxConfig.block_q,
-      block_kv=TokamaxConfig.block_kv,
-      block_kv_compute=TokamaxConfig.block_kv_compute,
-      block_q_dkv=TokamaxConfig.block_q_dkv,
-      block_kv_dkv=TokamaxConfig.block_kv_dkv,
-      block_kv_dkv_compute=TokamaxConfig.block_kv_dkv_compute,
-      block_q_dq=TokamaxConfig.block_q_dq,
-      block_kv_dq=TokamaxConfig.block_kv_dq,
-      use_fused_bwd_kernel=TokamaxConfig.use_fused_bwd_kernel,
-      use_vmap_bwd=TokamaxConfig.use_vmap_bwd,
-      q_layout=TokamaxConfig.q_layout,
-      k_layout=TokamaxConfig.k_layout,
-      v_layout=TokamaxConfig.v_layout,
+      block_q=block_q,
+      block_kv=block_kv,
+      block_kv_compute=block_kv_compute,
+      block_q_dkv=block_q_dkv,
+      block_kv_dkv=block_kv_dkv,
+      block_kv_dkv_compute=block_kv_dkv_compute,
+      block_q_dq=block_q_dq,
+      block_kv_dq=block_kv_dq,
+      use_fused_bwd_kernel=use_fused_bwd_kernel,
+      use_vmap_bwd=use_vmap_bwd,
+      q_layout=q_layout,
+      k_layout=k_layout,
+      v_layout=v_layout,
   )
 
   default_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -426,17 +454,45 @@ splash_op_backward: torch._library.custom_ops.CustomOpDef = pallas.jax_op(
 )
 
 
+_KERNEL_CONFIG_FIELDS = (
+    "block_q",
+    "block_kv",
+    "block_kv_compute",
+    "block_q_dkv",
+    "block_kv_dkv",
+    "block_kv_dkv_compute",
+    "block_q_dq",
+    "block_kv_dq",
+    "use_fused_bwd_kernel",
+    "use_vmap_bwd",
+    "q_layout",
+    "k_layout",
+    "v_layout",
+)
+
+
+def _kernel_config_args() -> tuple:
+  """TokamaxConfig values, in jax_attention_fwd/bwd argument order.
+
+  Passed as op arguments rather than read inside the JAX functions: jax_op
+  caches compiled kernels by argument values, so a config read inside would be
+  invisible to the cache and a changed config could reuse a stale kernel.
+  """
+  return tuple(getattr(TokamaxConfig, name) for name in _KERNEL_CONFIG_FIELDS)
+
+
 def setup_context(ctx, inputs, output, **kwargs):
   del kwargs
-  # inputs contains exactly the 7 positional dynamic custom op parameters:
-  # q, k, v, segment_ids, is_causal, local_window_size, scale
-  q, k, v, segment_ids, is_causal, local_window_size, scale = inputs
+  # inputs: q, k, v, segment_ids, is_causal, local_window_size, scale, then
+  # the _KERNEL_CONFIG_FIELDS values.
+  q, k, v, segment_ids, is_causal, local_window_size, scale = inputs[:7]
   out, logsumexp = output
   ctx.save_for_backward(q, k, v, out, logsumexp, segment_ids)
 
   ctx.is_causal = is_causal
   ctx.local_window_size = local_window_size
   ctx.scale = scale
+  ctx.kernel_config = inputs[7:]
 
 
 def backward(ctx, grad_out, grad_lse):
@@ -455,9 +511,10 @@ def backward(ctx, grad_out, grad_lse):
       ctx.is_causal,
       ctx.local_window_size,
       ctx.scale,
+      *ctx.kernel_config,
   )
   # One gradient per forward input; segment_ids and the scalars get None.
-  return dq, dk, dv, None, None, None, None
+  return (dq, dk, dv) + (None,) * (4 + len(ctx.kernel_config))
 
 
 # Register the autograd!
@@ -496,8 +553,9 @@ def splash_sdpa(
   document, on top of the causal/local mask.
   """
   # These are accepted for signature compatibility with the JAX splash wrapper
-  # but are NOT the channel that reaches the kernel: splash_op reads the
-  # process-global TokamaxConfig, which the patch populates once at setup.
+  # but are NOT the channel that reaches the kernel: the kernel is configured
+  # from the process-global TokamaxConfig, which the patch populates once at
+  # setup.
   # Passing a value here that disagrees with TokamaxConfig would silently do
   # nothing, so refuse it rather than discard it -- a caller who tiles through
   # this path is wrong about how the kernel is configured.
@@ -536,15 +594,11 @@ def splash_sdpa(
     )
 
   head_dim = q.shape[-1]
-
-
-
   if scale is None:
     scale = 1.0 / math.sqrt(head_dim)
 
   local_window_size_val = local_window_size if local_window_size is not None else -1
 
-  # Call global custom operator passing exactly the 7 positional parameters!
   out, _ = splash_op(
       q,
       k,
@@ -553,5 +607,6 @@ def splash_sdpa(
       is_causal,
       local_window_size_val,
       scale,
+      *_kernel_config_args(),
   )
   return out
