@@ -7,10 +7,18 @@ several configurations, comparing what the model produces: the logits
 - `test_stock_matches_cpu`: the stock model on TPU against the stock model on
   CPU in float32, anchoring the TPU model to a ground truth. Its tolerance is
   TPU's default float32 matmul precision (bfloat16 inputs).
+- `test_batch_packing_matters`: guards the rest -- the batch's document
+  boundaries must change the outputs well beyond the attention tolerance.
 - `test_feature_matches_stock`: each feature the Qwen3 MoE recipes use, alone
   and all together as the 235B recipe runs them, against the stock model on
   TPU: same device and precision, so a numerics problem shows up against the
   feature that caused it.
+
+The batch packs several documents per row, as the text dataloaders do, and is
+passed with its `positions`, so the decoder computes segment IDs and every
+attention must keep tokens within their own document. The stock SDPA module is
+causal only and ignores segment IDs, so the reference model replaces it with
+SDPA under an explicit block-causal mask.
 
 Outputs are compared as wholes -- the loss, and the relative error norm of the
 logits and of all gradients together -- not element by element. In an MoE a
@@ -23,7 +31,8 @@ Resolution, measured by scaling a kernel's output: expert kernels are
 bit-identical to the stock grouped matmul in the forward pass, so their cases
 catch an error of 0.001%; attention kernels legitimately differ from TPU's
 stock SDPA by about as much as TPU differs from CPU, so their cases catch a 1%
-error but not 0.1%.
+error but not 0.1%, and attention that ignores document boundaries is off by
+52% of the logits.
 
 Every configuration also checks that its kernel ran -- a silent fallback to
 the stock op would otherwise match the reference trivially -- and that every
@@ -34,6 +43,8 @@ load-balancing loss, which reaches the router's gradients.
 import collections
 import contextlib
 import copy
+import types
+import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -49,6 +60,7 @@ from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
 from torchtitan.experiments.tpu.qwen3 import config_registry
 from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
+from torchtitan.models.common.attention import ScaledDotProductAttention
 
 
 _TRAIN_ARGS = [
@@ -68,6 +80,61 @@ _NATIVE_TO_CANONICAL_WEIGHT = {
     native: canonical
     for canonical, native in _CANONICAL_TO_NATIVE_WEIGHT.items()
 }
+
+# Each row packs several documents, as the text dataloaders do, with boundaries
+# inside the attention kernels' blocks. `positions` restarts at 0 per document.
+_DOCUMENT_LENGTHS = ((40, 50, 38), (64, 30, 34))
+
+
+def _packed_positions():
+  return torch.stack([
+      torch.cat([torch.arange(length) for length in row])
+      for row in _DOCUMENT_LENGTHS
+  ])
+
+
+def _document_masked_sdpa(
+    self, q_BLNH, k_BLNH, v_BLNH, *, scale=None, enable_gqa=False,
+    segment_ids=None, **kwargs
+):
+  """SDPA with an explicit block-causal mask: each document attends to itself.
+
+  The stock `ScaledDotProductAttention` is causal only and ignores
+  `segment_ids`, so it cannot be the reference for kernels that mask packed
+  documents. This computes the same attention with the documents masked.
+  """
+  del self, kwargs
+  seq_len = q_BLNH.shape[1]
+  mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=q_BLNH.device)
+  mask = mask.tril()[None, None]
+  if segment_ids is not None:
+    same_document = segment_ids[:, :, None] == segment_ids[:, None, :]
+    mask = mask & same_document[:, None]
+  out_BNLH = F.scaled_dot_product_attention(
+      q_BLNH.transpose(1, 2),
+      k_BLNH.transpose(1, 2),
+      v_BLNH.transpose(1, 2),
+      attn_mask=mask,
+      scale=scale,
+      enable_gqa=enable_gqa,
+  )
+  return out_BNLH.transpose(1, 2)
+
+
+def _mask_documents(model) -> int:
+  """Makes the model's stock SDPA modules mask packed documents.
+
+  Leaves alone any attention a kernel patch replaced, or whose `forward` a
+  patch rebound (the tokamax patch does that on the SDPA modules themselves).
+  """
+  count = 0
+  for module in model.modules():
+    if type(module) is ScaledDotProductAttention and "forward" not in vars(
+        module
+    ):
+      module.forward = types.MethodType(_document_masked_sdpa, module)
+      count += 1
+  return count
 
 
 def _config():
@@ -125,11 +192,13 @@ _EXACT = dict(loss_atol=0.0, logits_rtol=0.0, grads_rtol=0.0)
 # gradients 1.0e-3. Scaling the expert output by 1.00001 moves the logits by
 # 1.3e-3.
 _EXPERTS = dict(loss_atol=1e-6, logits_rtol=1e-6, grads_rtol=3e-3)
-# Attention kernels against TPU's stock SDPA: loss 1.2e-4, logits 9.2e-3,
-# gradients 6.7e-3 (splash; tokamax is closer). Scaling the tokamax output by
-# 1.01 moves the loss by 5.0e-4 and the gradients by 1.45e-2.
-_ATTENTION = dict(loss_atol=2.5e-4, logits_rtol=1.5e-2, grads_rtol=1.2e-2)
-# Stock TPU against CPU float32: loss 1.6e-4, logits 1.1e-2, gradients 8.9e-3.
+# Attention kernels against the document-masked reference on the packed batch:
+# loss <= 1.7e-4, logits <= 9.8e-3, gradients <= 9.5e-3 (splash, and tokamax
+# with segment IDs). Scaling the tokamax output by 1.01 moves the loss by
+# 5.0e-4; attention that ignores the documents moves it by 1.9e-2 and the
+# logits by 52%.
+_ATTENTION = dict(loss_atol=4e-4, logits_rtol=2e-2, grads_rtol=2e-2)
+# Stock TPU against CPU float32: loss 7.7e-5, logits 1.2e-2, gradients 1.0e-2.
 _CPU = dict(loss_atol=4e-4, logits_rtol=2e-2, grads_rtol=2e-2)
 
 
@@ -155,10 +224,10 @@ class _OpCounter(_python_dispatch.TorchDispatchMode):
     return any(name.startswith(prefix) for name in self.counts)
 
 
-def _forward_backward(model, tokens, labels):
+def _forward_backward(model, tokens, positions, labels):
   """Logits, loss, and canonical-layout parameter gradients for one batch."""
   model.zero_grad(set_to_none=True)
-  logits = model(tokens)
+  logits = model(tokens, positions=positions)
   loss = F.cross_entropy(logits.flatten(0, 1).float(), labels.flatten())
   loss.backward()
   grads = {}
@@ -185,17 +254,23 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
     self.cpu_model = trainer.model
     batch, self.labels = next(iter(trainer.dataloader))
     self.tokens = batch["input"]
+    self.positions = _packed_positions()
 
-  def _outputs(self, config, device, counter=None):
+  def _outputs(self, config, device, counter=None, mask_documents=True):
     """Logits, loss and gradients of `config` on `device`, shared weights."""
     model = train_minimal.TrainerMinimal(
         device, rank=0, world_size=1, job_config=config
     ).model
     # Canonical names and layout in; kernel-native layouts convert on load.
     model.load_state_dict(self.cpu_model.state_dict())
+    if mask_documents:
+      _mask_documents(model)
     with counter or contextlib.nullcontext():
       return _forward_backward(
-          model, self.tokens.to(device), self.labels.to(device)
+          model,
+          self.tokens.to(device),
+          self.positions.to(device),
+          self.labels.to(device),
       )
 
   def _check(self, actual, expected, *, loss_atol, logits_rtol, grads_rtol):
@@ -218,6 +293,20 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
     self.assertLessEqual(
         _relative_error(grads, expected_grads), grads_rtol, "gradients"
     )
+
+  def test_batch_packing_matters(self):
+    """The comparisons below are only meaningful if masking changes outputs.
+
+    Attention that ignored the document boundaries in this batch -- or a batch
+    with none -- would leave the outputs within the attention tolerance, and
+    every kernel would pass whether or not it masks.
+    """
+    masked = self._outputs(_config(), self.accelerator_device)
+    unmasked = self._outputs(
+        _config(), self.accelerator_device, mask_documents=False
+    )
+    with self.assertRaises(AssertionError):
+      self._check(unmasked, masked, **_ATTENTION)
 
   def test_stock_matches_cpu(self):
     self._check(
@@ -251,6 +340,14 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
           ops=("pallas.splash_attn_fwd",),
           tolerances=_ATTENTION,
       ),
+  )
+  def test_feature_matches_stock(self, enable, ops, tolerances):
+    self._check_feature(enable, ops, tolerances)
+
+  # TODO(#492): tokamax splash drops `segment_ids`, so these attend across
+  # documents (loss off by 1.9e-2, logits by 52%). Remove the decorator once
+  # #492 lands; until then these report an unexpected success when fixed.
+  @parameterized.named_parameters(
       dict(
           testcase_name="tokamax_splash",
           enable=_tokamax_splash,
@@ -267,7 +364,11 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
           tolerances=_ATTENTION,
       ),
   )
-  def test_feature_matches_stock(self, enable, ops, tolerances):
+  @unittest.expectedFailure
+  def test_tokamax_feature_matches_stock(self, enable, ops, tolerances):
+    self._check_feature(enable, ops, tolerances)
+
+  def _check_feature(self, enable, ops, tolerances):
     config = _config()
     enable(config)
     counter = _OpCounter()
