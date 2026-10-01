@@ -29,6 +29,27 @@ custom_jax_kernel = pallas.custom_jax_kernel
 _DEFAULT_MASK_VALUE = splash_attention_kernel.DEFAULT_MASK_VALUE
 
 
+def document_block_overlap(segment_ids_b, block_q, block_kv):
+  """Returns which (q block, kv block) tiles contain a same-document pair.
+
+  `segment_ids` is non-decreasing, so a block's documents are the interval
+  [min, max] over it and a tile has a same-document pair iff two intervals
+  overlap: exact, and O(num_blocks). Returns a bool [num_q_blocks,
+  num_kv_blocks] array, or None if `block_q`/`block_kv` do not divide the
+  sequence.
+  """
+  seq_len = segment_ids_b.shape[-1]
+  num_q_blocks, q_rem = divmod(seq_len, block_q)
+  num_kv_blocks, kv_rem = divmod(seq_len, block_kv)
+  if q_rem or kv_rem:
+    return None
+  q_seg = segment_ids_b.reshape(num_q_blocks, block_q)
+  kv_seg = segment_ids_b.reshape(num_kv_blocks, block_kv)
+  q_lo, q_hi = jnp.min(q_seg, axis=-1), jnp.max(q_seg, axis=-1)
+  kv_lo, kv_hi = jnp.min(kv_seg, axis=-1), jnp.max(kv_seg, axis=-1)
+  return (q_lo[:, None] <= kv_hi[None, :]) & (kv_lo[None, :] <= q_hi[:, None])
+
+
 def _document_aware_mask_info(mask_info, segment_ids_b, block_q, block_kv, is_dkv):
   """Extend block sparsity to skip tiles that are entirely cross-document.
 
@@ -37,30 +58,21 @@ def _document_aware_mask_info(mask_info, segment_ids_b, block_q, block_kv, is_dk
   and blind to documents -- so packed sequences still multiply fully-masked
   tiles and discard them.
 
-  `segment_ids` is non-decreasing, so a block's documents are the interval
-  [min, max] over it and a tile has a same-document pair iff two intervals
-  overlap: exact, and O(num_blocks). Only `block_mask` and `data_next` change,
-  the latter mirroring JAX's `_process_dynamic_mask`.
+  The tile test is `document_block_overlap`. Only `block_mask` and `data_next`
+  change, the latter mirroring JAX's `_process_dynamic_mask`.
   """
   base_block_mask = mask_info.block_mask
   base_data_next = mask_info.data_next
   if base_block_mask is None or base_data_next is None:
     return mask_info
 
-  seq_len = segment_ids_b.shape[-1]
-  num_q_blocks, q_rem = divmod(seq_len, block_q)
-  num_kv_blocks, kv_rem = divmod(seq_len, block_kv)
-  if q_rem or kv_rem:
+  overlaps = document_block_overlap(segment_ids_b, block_q, block_kv)
+  if overlaps is None:
     return mask_info
+  num_q_blocks, num_kv_blocks = overlaps.shape
   if base_block_mask.shape[-2:] != (num_q_blocks, num_kv_blocks):
     # Sharded or otherwise unexpected layout: leave the static metadata alone.
     return mask_info
-
-  q_seg = segment_ids_b.reshape(num_q_blocks, block_q)
-  kv_seg = segment_ids_b.reshape(num_kv_blocks, block_kv)
-  q_lo, q_hi = jnp.min(q_seg, axis=-1), jnp.max(q_seg, axis=-1)
-  kv_lo, kv_hi = jnp.min(kv_seg, axis=-1), jnp.max(kv_seg, axis=-1)
-  overlaps = (q_lo[:, None] <= kv_hi[None, :]) & (kv_lo[None, :] <= q_hi[:, None])
 
   block_mask = jnp.where(overlaps[None], base_block_mask, 0).astype(
       base_block_mask.dtype

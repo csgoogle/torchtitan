@@ -341,41 +341,26 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     )
     logging.info("MQA/GQA backward test passed.")
 
-  @parameterized.named_parameters(
-      ("mha_scan_bwd", 8, False),
-      ("mha_vmap_bwd", 8, True),
-      ("gqa_scan_bwd", 2, False),
-      ("gqa_vmap_bwd", 2, True),
-      ("mqa_scan_bwd", 1, False),
-      ("mqa_vmap_bwd", 1, True),
-  )
-  def test_segment_ids_parity(self, n_kv_heads, use_vmap_bwd):
-    """Packed-document forward and gradients match a block-causal SDPA reference."""
+  def _set_tokamax_config(self, **overrides):
+    """Set process-global TokamaxConfig fields, restored after the test."""
+    cfg = tokamax_splash_attention.TokamaxConfig
+    saved = {k: getattr(cfg, k) for k in overrides}
+    self.addCleanup(lambda: [setattr(cfg, k, v) for k, v in saved.items()])
+    for k, v in overrides.items():
+      setattr(cfg, k, v)
+
+  def _check_packed_parity(self, n_kv_heads, segment_ids):
+    """Forward and dq/dk/dv match a block-causal SDPA reference."""
     device = self.accelerator_device
     torch.manual_seed(7)
-    b, n_heads, seq_len, head_dim = 2, 8, 256, 64
+    b, seq_len = segment_ids.shape
+    n_heads, head_dim = 8, 64
     n_rep = n_heads // n_kv_heads
 
-    prev_use_vmap_bwd = tokamax_splash_attention.TokamaxConfig.use_vmap_bwd
-    tokamax_splash_attention.TokamaxConfig.use_vmap_bwd = use_vmap_bwd
-    self.addCleanup(
-        setattr,
-        tokamax_splash_attention.TokamaxConfig,
-        "use_vmap_bwd",
-        prev_use_vmap_bwd,
-    )
-
-    # (B, S, H, D). Row 0 packs two documents, row 1 packs four with a
-    # boundary inside a 128-token block, so a kernel that only honored the
-    # static causal mask would visibly disagree with the reference.
+    # (B, S, H, D).
     q = torch.randn(b, seq_len, n_heads, head_dim, dtype=torch.float32)
     k = torch.randn(b, seq_len, n_kv_heads, head_dim, dtype=torch.float32)
     v = torch.randn(b, seq_len, n_kv_heads, head_dim, dtype=torch.float32)
-    segment_ids = torch.zeros(b, seq_len, dtype=torch.int32)
-    segment_ids[0, 128:] = 1
-    segment_ids[1, 40:100] = 1
-    segment_ids[1, 100:200] = 2
-    segment_ids[1, 200:] = 3
 
     # (B, 1, S, S): same document AND causal.
     document_mask = segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)
@@ -439,6 +424,118 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
         )
     )
 
+  @parameterized.named_parameters(
+      ("mha_scan_bwd", 8, False),
+      ("mha_vmap_bwd", 8, True),
+      ("gqa_scan_bwd", 2, False),
+      ("gqa_vmap_bwd", 2, True),
+      ("mqa_scan_bwd", 1, False),
+      ("mqa_vmap_bwd", 1, True),
+  )
+  def test_segment_ids_parity(self, n_kv_heads, use_vmap_bwd):
+    """Batch-native masking: packed documents via segment IDs, no skipping."""
+    seq_len = 256
+    self._set_tokamax_config(
+        use_vmap_bwd=use_vmap_bwd, use_document_aware_block_skipping=False
+    )
+    # Row 0 packs two documents, row 1 packs four with a boundary inside a
+    # 128-token block, so a kernel that only honored the static causal mask
+    # would visibly disagree with the reference.
+    segment_ids = torch.zeros(2, seq_len, dtype=torch.int32)
+    segment_ids[0, 128:] = 1
+    segment_ids[1, 40:100] = 1
+    segment_ids[1, 100:200] = 2
+    segment_ids[1, 200:] = 3
+    self._check_packed_parity(n_kv_heads, segment_ids)
+
+  @parameterized.named_parameters(
+      ("mha_scan_bwd", 8, False),
+      ("mha_vmap_bwd", 8, True),
+      ("gqa_scan_bwd", 2, False),
+      ("gqa_vmap_bwd", 2, True),
+      ("mqa_scan_bwd", 1, False),
+      ("mqa_vmap_bwd", 1, True),
+  )
+  def test_document_aware_block_skipping_parity(self, n_kv_heads, use_vmap_bwd):
+    """Skipping cross-document tiles leaves the result exact."""
+    # 128-token tiles over 512 tokens give several skippable tiles per row.
+    seq_len = 512
+    self._set_tokamax_config(
+        use_vmap_bwd=use_vmap_bwd,
+        use_document_aware_block_skipping=True,
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        block_q_dkv=128,
+        block_kv_dkv=128,
+        block_kv_dkv_compute=128,
+    )
+    segment_ids = torch.zeros(2, seq_len, dtype=torch.int32)
+    segment_ids[0, 128:] = 1
+    segment_ids[0, 300:] = 2
+    segment_ids[1, 40:] = 1
+    segment_ids[1, 100:] = 2
+    segment_ids[1, 200:] = 3
+    segment_ids[1, 420:] = 4
+    self._check_packed_parity(n_kv_heads, segment_ids)
+
+  def test_document_aware_mask_info_drops_cross_document_tiles(self):
+    """The expected tiles are dropped from both tokamax MaskInfo forms."""
+    import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+
+    kernel_lib = tokamax_splash_attention.splash_attention_kernel
+    seq_len, block = 512, 128
+    kernel = kernel_lib.make_splash_mha_single_device(
+        mask=tokamax_splash_attention.splash_attention_mask.CausalMask(
+            (seq_len, seq_len)
+        ),
+        config=kernel_lib.SplashConfig(
+            block_q=block,
+            block_kv=block,
+            block_kv_compute=block,
+            block_q_dkv=block,
+            block_kv_dkv=block,
+            block_kv_dkv_compute=block,
+            use_fused_bwd_kernel=True,
+        ),
+    )
+    # Blocks hold documents {0}, {1}, {1, 2}, {2}, so of the 10 causal
+    # (q, kv) tiles, (1,0), (2,0), (3,0), (3,1) are entirely cross-document.
+    segment_ids = jnp.concatenate([
+        jnp.zeros(128, jnp.int32),
+        jnp.ones(172, jnp.int32),
+        jnp.full(212, 2, jnp.int32),
+    ])
+    expected = [(0, 0), (1, 1), (2, 1), (2, 2), (3, 2), (3, 3)]
+
+    def active_tiles(mask_info, is_dkv):
+      if mask_info.active_rows is not None:
+        n = int(mask_info.num_active_blocks[0])
+        rows = [int(r) for r in mask_info.active_rows]
+        cols = [int(c) for c in mask_info.active_cols]
+        self.assertTrue(all(r == -1 for r in rows[n:]), rows)
+        pairs = list(zip(rows[:n], cols[:n]))
+        # dkv lists are kv-major: (kv, q).
+        return sorted((c, r) for r, c in pairs) if is_dkv else pairs
+      grid = jnp.asarray(mask_info.block_mask).reshape(4, 4)
+      if is_dkv:
+        grid = grid.T
+      return [(i, j) for i in range(4) for j in range(4) if int(grid[i, j])]
+
+    for name, mask_info, is_dkv in (
+        ("fwd", kernel.fwd_mask_info, False),
+        ("dkv", kernel.dkv_mask_info, True),
+    ):
+      got = active_tiles(
+          tokamax_splash_attention._document_aware_mask_info(
+              mask_info, segment_ids, block, block, is_dkv
+          ),
+          is_dkv,
+      )
+      self.assertEqual(sorted(got), expected, name)
+      # Kept tiles stay in the kernel's original order.
+      if not is_dkv and mask_info.active_rows is not None:
+        self.assertEqual(got, expected, name)
 
   def test_config_change_retraces_kernel(self):
     """A TokamaxConfig change must not reuse a kernel compiled for the old one.

@@ -38,6 +38,7 @@ from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_
 jaxtyping.jaxtyped = _real_jaxtyped
 
 import torch  # noqa: E402  pylint: disable=g-import-not-at-top,g-bad-import-order
+from torchtitan.experiments.tpu.kernels.splash_attention import document_block_overlap  # noqa: E402  pylint: disable=g-import-not-at-top
 # torch_tpu Pallas bridge
 from torch_tpu._internal import pallas
 
@@ -46,6 +47,73 @@ from torch_tpu._internal import pallas
 _DEFAULT_MASK_VALUE = -0.7 * float(
     np.finfo(np.dtype("float32")).max
 )
+
+
+def _document_aware_mask_info(mask_info, segment_ids_b, block_q, block_kv, is_dkv):
+  """Drop tiles that are entirely cross-document from tokamax's MaskInfo.
+
+  Same tile test as splash_attention._document_aware_mask_info, but tokamax
+  stores MaskInfo in one of two forms:
+
+  - Compacted list (`active_rows` set; the forward at the recipe tiles): the
+    grid walks entries [0, num_active_blocks) and has no "skip" state, so
+    dropped tiles are moved behind the kept ones (stable, preserving row order)
+    and `num_active_blocks` shrinks. Dropped rows become -1 so `find_bounds`,
+    which compares neighbouring rows, still marks each kept row's last tile.
+    Every q row keeps its diagonal tile, so no output row goes unwritten.
+  - Dense grid (`active_rows` None; the dkv backward): `block_mask` is the
+    flattened [kv_steps, q_steps] grid where 0 already means skip, so
+    cross-document cells are zeroed. Skipped cells are still DMA'd: tokamax's
+    dense index maps have no `data_next` to hold the previous block.
+
+  Per-example metadata makes JAX batch the kernel as a loop over the batch
+  (batched dynamic grid bounds / scalar prefetch), as with the JAX kernel.
+  """
+  if mask_info.block_mask is None:
+    return mask_info
+  overlaps = document_block_overlap(segment_ids_b, block_q, block_kv)
+  if overlaps is None:
+    return mask_info
+  num_q_blocks, num_kv_blocks = overlaps.shape
+
+  if mask_info.active_rows is not None:
+    rows = jnp.asarray(mask_info.active_rows).astype(jnp.int32)
+    cols = jnp.asarray(mask_info.active_cols).astype(jnp.int32)
+    # dkv lists are kv-major: rows index kv blocks, cols index q blocks.
+    q_idx, kv_idx = (cols, rows) if is_dkv else (rows, cols)
+    num_active = jnp.asarray(mask_info.num_active_blocks)
+    valid = jnp.arange(rows.shape[0]) < num_active[0]
+    keep = valid & overlaps[
+        jnp.clip(q_idx, 0, num_q_blocks - 1), jnp.clip(kv_idx, 0, num_kv_blocks - 1)
+    ]
+    order = jnp.argsort(jnp.logical_not(keep), stable=True)
+    keep_sorted = keep[order]
+
+    def compact(x, fill):
+      if x is None:
+        return None
+      x = jnp.asarray(x)
+      return jnp.where(keep_sorted, x[order], fill).astype(x.dtype)
+
+    return mask_info._replace(
+        active_rows=compact(mask_info.active_rows, -1),
+        active_cols=compact(mask_info.active_cols, -1),
+        block_mask=compact(mask_info.block_mask, 0),
+        mask_next=compact(mask_info.mask_next, 0),
+        num_active_blocks=keep.sum(keepdims=True).astype(num_active.dtype),
+    )
+
+  # Dense grids only have a skip state in the dkv kernel (`block_mask == 0`);
+  # the forward kernel would compute a 0 cell as an unmasked full tile.
+  if not is_dkv:
+    return mask_info
+  block_mask = jnp.asarray(mask_info.block_mask)
+  if block_mask.size != num_q_blocks * num_kv_blocks:
+    return mask_info
+  keep = overlaps.T.reshape(-1)
+  return mask_info._replace(
+      block_mask=jnp.where(keep, block_mask, 0).astype(block_mask.dtype)
+  )
 
 
 class TokamaxConfig:
@@ -60,6 +128,7 @@ class TokamaxConfig:
   block_kv_dq: Optional[int] = None
   use_fused_bwd_kernel: bool = True
   use_vmap_bwd: bool = False
+  use_document_aware_block_skipping: bool = True
   q_layout: str = "HEAD_DIM_MINOR"
   k_layout: str = "HEAD_DIM_MINOR"
   v_layout: str = "HEAD_DIM_MINOR"
@@ -90,6 +159,7 @@ def _make_splash_attention_fn(
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
     use_vmap_bwd: bool = False,
+    use_document_aware_block_skipping: bool = True,
 ):
   """Create JAX splash attention forward and backward functions using Tokamax.
 
@@ -155,13 +225,10 @@ def _make_splash_attention_fn(
         config=config,
     )
 
-  # Static mask infos and kernel kwargs from creation time.
-  # Packed documents are masked only by the runtime segment IDs below, over the
-  # static causal/local block metadata (the batch-native masking mode of
-  # splash_attention.py). TODO: document-aware block skipping. Tokamax's
-  # MaskInfo is a compacted active-block list (active_rows/active_cols), not
-  # the block_mask grid that splash_attention._document_aware_mask_info
-  # rewrites, so skipping cross-document blocks needs a per-example recompaction.
+  # Static mask infos and kernel kwargs from creation time. With segment IDs,
+  # use_document_aware_block_skipping specializes them per example (see
+  # _document_aware_mask_info); otherwise every example shares them and only
+  # the runtime segment IDs mask packed documents (batch-native masking).
   fwd_mask_info = splash_kernel.fwd_mask_info
   dkv_mask_info = splash_kernel.dkv_mask_info
   _mask_value = splash_kernel.kwargs.get("mask_value", _DEFAULT_MASK_VALUE)
@@ -174,12 +241,23 @@ def _make_splash_attention_fn(
       return None
     return splash_attention_kernel.SegmentIds(q=segment_ids_b, kv=segment_ids_b)
 
+  def _maybe_document_aware(mask_info, segment_ids_b, block_q, block_kv, is_dkv):
+    if segment_ids_b is None or not use_document_aware_block_skipping:
+      return mask_info
+    return _document_aware_mask_info(
+        mask_info, segment_ids_b, block_q, block_kv, is_dkv
+    )
+
   def _single_fwd_with_lse(q_b, k_b, v_b, segment_ids_b):
     """Forward for one batch element; returns (out_b, logsumexp_b)."""
     # q_b is already scaled (q * 1/sqrt(head_dim)) from the caller.
+    fwd_mask_info_b = _maybe_document_aware(
+        fwd_mask_info, segment_ids_b, config.block_q, config.block_kv,
+        is_dkv=False,
+    )
     # pylint: disable=protected-access
     out_b, stats_b = splash_attention_kernel._splash_attention_forward(
-        fwd_mask_info,
+        fwd_mask_info_b,
         q_b,
         k_b,
         v_b,
@@ -222,7 +300,10 @@ def _make_splash_attention_fn(
         None,  # sinks
         out_b,
         logsumexp_b,
-        dkv_mask_info,
+        _maybe_document_aware(
+            dkv_mask_info, segment_ids_b, config.block_q_dkv,
+            config.block_kv_dkv, is_dkv=True,
+        ),
         None,  # prng_key (added in upstream tokamax)
     )
     # pylint: disable=protected-access
@@ -292,6 +373,7 @@ def jax_attention_fwd(
     block_kv_dq: int | None,
     use_fused_bwd_kernel: bool,
     use_vmap_bwd: bool,
+    use_document_aware_block_skipping: bool,
     q_layout: str,
     k_layout: str,
     v_layout: str,
@@ -335,6 +417,7 @@ def jax_attention_fwd(
       block_kv_dq=block_kv_dq,
       use_fused_bwd_kernel=use_fused_bwd_kernel,
       use_vmap_bwd=use_vmap_bwd,
+      use_document_aware_block_skipping=use_document_aware_block_skipping,
       q_layout=q_layout,
       k_layout=k_layout,
       v_layout=v_layout,
@@ -373,6 +456,7 @@ def jax_attention_bwd(
     block_kv_dq: int | None,
     use_fused_bwd_kernel: bool,
     use_vmap_bwd: bool,
+    use_document_aware_block_skipping: bool,
     q_layout: str,
     k_layout: str,
     v_layout: str,
@@ -412,6 +496,7 @@ def jax_attention_bwd(
       block_kv_dq=block_kv_dq,
       use_fused_bwd_kernel=use_fused_bwd_kernel,
       use_vmap_bwd=use_vmap_bwd,
+      use_document_aware_block_skipping=use_document_aware_block_skipping,
       q_layout=q_layout,
       k_layout=k_layout,
       v_layout=v_layout,
@@ -465,6 +550,7 @@ _KERNEL_CONFIG_FIELDS = (
     "block_kv_dq",
     "use_fused_bwd_kernel",
     "use_vmap_bwd",
+    "use_document_aware_block_skipping",
     "q_layout",
     "k_layout",
     "v_layout",
@@ -542,6 +628,7 @@ def splash_sdpa(
     block_kv_dq: Optional[int] = None,
     use_fused_bwd_kernel: Optional[bool] = None,
     use_vmap_bwd: Optional[bool] = None,
+    use_document_aware_block_skipping: Optional[bool] = None,
     q_layout: Optional[str] = None,
     k_layout: Optional[str] = None,
     v_layout: Optional[str] = None,
@@ -565,6 +652,7 @@ def splash_sdpa(
       "block_kv_dkv": block_kv_dkv, "block_kv_dkv_compute": block_kv_dkv_compute,
       "block_q_dq": block_q_dq, "block_kv_dq": block_kv_dq,
       "use_fused_bwd_kernel": use_fused_bwd_kernel, "use_vmap_bwd": use_vmap_bwd,
+      "use_document_aware_block_skipping": use_document_aware_block_skipping,
       "q_layout": q_layout, "k_layout": k_layout, "v_layout": v_layout,
   }
   _conflicts = {

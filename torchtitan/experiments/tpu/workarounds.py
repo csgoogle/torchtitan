@@ -245,6 +245,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
       block_kv_dq=_sa("block_kv_dq"),
       use_fused_bwd_kernel=_sa("use_fused_bwd_kernel"),
       use_vmap_bwd=_sa("use_vmap_bwd"),
+      use_document_aware_block_skipping=_sa("use_document_aware_block_skipping"),
       q_layout=_sa("q_layout"),
       k_layout=_sa("k_layout"),
       v_layout=_sa("v_layout"),
@@ -278,10 +279,10 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     return {k: v for k, v in kwargs.items() if v is not None}
 
   # _SPLASH_KEYS is the union over splash implementations; tokamax's splash_sdpa
-  # accepts a strict subset of it (e.g. it has no use_document_aware_block_skipping),
-  # so filtering against the static set passes kwargs the callee rejects with
-  # "Unexpected keyword arguments". Derive the filter from the callee's actual
-  # signature instead, so it tracks the kernel rather than drifting from it.
+  # may accept only a subset of it, and filtering against the static set would
+  # pass kwargs the callee rejects with "Unexpected keyword arguments". Derive
+  # the filter from the callee's actual signature instead, so it tracks the
+  # kernel rather than drifting from it.
   _tokamax_sdpa_params = frozenset(
       inspect.signature(tokamax_splash_sdpa).parameters
   )
@@ -378,7 +379,6 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     return out
 
   _patched = 0
-  _patched_non_redacted = 0
   _windowed = 0
   _causal = 0
   for _, module in model.named_modules():
@@ -388,7 +388,6 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
       else:
         module.forward = types.MethodType(_splash_forward, module)
-        _patched_non_redacted += 1
       _patched += 1
       if getattr(module, "sliding_window_size", None) is not None:
         _windowed += 1
@@ -406,17 +405,6 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         "Tokamax splash attention ENABLED: patched %d attention modules "
         "(causal=%d, sliding-window=%d)",
         _patched, _causal, _windowed,
-    )
-
-  # Only non-[redacted] modules receive segment_ids, so only they are affected. [redacted]
-  # (e.g. redacted) runs with the field at its default and must not warn.
-  if _patched_non_redacted and sa_kwargs.get("use_document_aware_block_skipping"):
-    logger.warning(
-        "Tokamax splash: use_document_aware_block_skipping=True is not"
-        " supported; packed documents are still masked exactly via segment_ids,"
-        " but cross-document blocks are computed and discarded. Set"
-        " sa_use_document_aware_block_skipping=False to acknowledge, or use the"
-        " stock splash kernel for block skipping."
     )
 
 

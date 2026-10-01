@@ -544,7 +544,7 @@ class WorkaroundsTest(parameterized.TestCase):
   def test_tokamax_patch_drops_kwargs_the_kernel_does_not_accept(self):
     """_SPLASH_KEYS is the union over splash implementations.
 
-    tokamax's splash_sdpa accepts a strict subset - it has no
+    tokamax's splash_sdpa once accepted a strict subset - it had no
     use_document_aware_block_skipping - so forwarding the whole set made every run
     die at first compile with "Unexpected keyword arguments".
     """
@@ -552,7 +552,7 @@ class WorkaroundsTest(parameterized.TestCase):
     from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import splash_sdpa  # pylint: disable=g-import-not-at-top
 
     accepted = set(inspect.signature(splash_sdpa).parameters)
-    self.assertNotIn("use_document_aware_block_skipping", accepted)
+    self.assertIn("use_document_aware_block_skipping", accepted)
     self.assertIn("segment_ids", accepted)
     # every key the patch may forward must be one the callee accepts
     self.assertContainsSubset(
@@ -613,8 +613,8 @@ class WorkaroundsTest(parameterized.TestCase):
     torch.testing.assert_close(captured[1], expected)
     self.assertIsNone(captured[2])
 
-  def test_tokamax_patch_warns_on_unsupported_block_skipping(self):
-    """Requesting document-aware block skipping must not be silently dropped."""
+  def test_tokamax_patch_forwards_block_skipping(self):
+    """use_document_aware_block_skipping must reach TokamaxConfig, both ways."""
     from torchtitan.experiments.tpu.kernels import tokamax_splash_attention  # pylint: disable=g-import-not-at-top
 
     config_cls = tokamax_splash_attention.TokamaxConfig
@@ -622,17 +622,14 @@ class WorkaroundsTest(parameterized.TestCase):
     self.addCleanup(lambda: [setattr(config_cls, k, v) for k, v in saved.items()])
 
     model, sa = self._tokamax_patch_fixture()
-    self.assertTrue(sa.sa_use_document_aware_block_skipping, "precondition")
-    with self.assertLogs(workarounds.logger, level="WARNING") as logs:
-      workarounds.use_tokamax_splash_attention_patch(model, sa)
-    self.assertTrue(
-        any("use_document_aware_block_skipping" in m for m in logs.output)
-    )
+    sa.sa_use_document_aware_block_skipping = False
+    workarounds.use_tokamax_splash_attention_patch(model, sa)
+    self.assertFalse(config_cls.use_document_aware_block_skipping)
 
     model, sa = self._tokamax_patch_fixture()
-    sa.sa_use_document_aware_block_skipping = False
-    with self.assertNoLogs(workarounds.logger, level="WARNING"):
-      workarounds.use_tokamax_splash_attention_patch(model, sa)
+    sa.sa_use_document_aware_block_skipping = True
+    workarounds.use_tokamax_splash_attention_patch(model, sa)
+    self.assertTrue(config_cls.use_document_aware_block_skipping)
 
 
 if __name__ == "__main__":
