@@ -991,17 +991,12 @@ def substitute_tpu_experts(model: nn.Module) -> None:
 def _enable_pallas_experts(moe_config) -> None:
   """Turn on the qwen3 TPU lane's expert kernels in a converted MoE config.
 
-  Without these the experts run upstream's torch._grouped_mm (XLA ragged dot).
-  The settings follow the qwen3 recipe: Pallas segment matmul, paired W1/W3
-  (one kernel for gate and up), tile_m 256, and the kernel-native weight
-  layout (no per-step transposes; checkpoints still save the canonical
-  layout). One thing is sized per model instead of copied: the paired
-  dWeight kernel keeps full-K fp32 accumulators unless K is tiled, which
-  exceeds v6e's scoped VMEM even at moderate expert sizes. The qwen3 235B
-  recipe solves the same thing with K slabs of 1024; here the K tile is the largest
-  of 1024 / 512 / 256 / 128 that divides the model's hidden size, capped at
-  half of it so there are always at least two slabs. N stays untiled, which
-  the paired kernel requires.
+  Otherwise the experts run torch._grouped_mm (XLA ragged dot). Settings
+  follow the qwen3 recipe (paired W1/W3, tile_m 256, kernel-native weight
+  layout), except K: the paired dWeight kernel's full-K accumulators exceed
+  v6e's scoped VMEM, so K is tiled to the largest of 1024/512/256/128 that
+  divides the hidden size (at least two slabs). N stays untiled, as the paired
+  kernel requires.
   """
   from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
