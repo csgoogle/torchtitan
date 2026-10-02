@@ -341,6 +341,141 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     )
     logging.info("MQA/GQA backward test passed.")
 
+  @parameterized.named_parameters(
+      ("mha_scan_bwd", 8, False),
+      ("mha_vmap_bwd", 8, True),
+      ("gqa_scan_bwd", 2, False),
+      ("gqa_vmap_bwd", 2, True),
+      ("mqa_scan_bwd", 1, False),
+      ("mqa_vmap_bwd", 1, True),
+  )
+  def test_segment_ids_parity(self, n_kv_heads, use_vmap_bwd):
+    """Packed-document forward and gradients match a block-causal SDPA reference."""
+    device = self.accelerator_device
+    torch.manual_seed(7)
+    b, n_heads, seq_len, head_dim = 2, 8, 256, 64
+    n_rep = n_heads // n_kv_heads
+
+    prev_use_vmap_bwd = tokamax_splash_attention.TokamaxConfig.use_vmap_bwd
+    tokamax_splash_attention.TokamaxConfig.use_vmap_bwd = use_vmap_bwd
+    self.addCleanup(
+        setattr,
+        tokamax_splash_attention.TokamaxConfig,
+        "use_vmap_bwd",
+        prev_use_vmap_bwd,
+    )
+
+    # (B, S, H, D). Row 0 packs two documents, row 1 packs four with a
+    # boundary inside a 128-token block, so a kernel that only honored the
+    # static causal mask would visibly disagree with the reference.
+    q = torch.randn(b, seq_len, n_heads, head_dim, dtype=torch.float32)
+    k = torch.randn(b, seq_len, n_kv_heads, head_dim, dtype=torch.float32)
+    v = torch.randn(b, seq_len, n_kv_heads, head_dim, dtype=torch.float32)
+    segment_ids = torch.zeros(b, seq_len, dtype=torch.int32)
+    segment_ids[0, 128:] = 1
+    segment_ids[1, 40:100] = 1
+    segment_ids[1, 100:200] = 2
+    segment_ids[1, 200:] = 3
+
+    # (B, 1, S, S): same document AND causal.
+    document_mask = segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+    attn_mask = (document_mask & causal_mask).unsqueeze(1)
+
+    q_ref = q.transpose(1, 2).clone().requires_grad_(True)
+    k_ref = k.transpose(1, 2).clone().requires_grad_(True)
+    v_ref = v.transpose(1, 2).clone().requires_grad_(True)
+    with attention.sdpa_kernel([attention.SDPBackend.MATH]):
+      out_ref = F.scaled_dot_product_attention(
+          q_ref,
+          k_ref.repeat_interleave(n_rep, dim=1),
+          v_ref.repeat_interleave(n_rep, dim=1),
+          attn_mask=attn_mask,
+          is_causal=False,
+      )
+    out_ref.sum().backward()
+
+    q_t = q.to(device).requires_grad_(True)
+    k_t = k.to(device).requires_grad_(True)
+    v_t = v.to(device).requires_grad_(True)
+    out = tokamax_splash_attention.splash_sdpa(
+        q_t,
+        k_t,
+        v_t,
+        segment_ids=segment_ids.to(device),
+        is_causal=True,
+        enable_gqa=n_kv_heads != n_heads,
+    )
+    out.sum().backward()
+
+    torch.testing.assert_close(
+        out.detach().cpu(), out_ref.detach().transpose(1, 2), rtol=5e-2, atol=5e-2
+    )
+    for name, got, want in (
+        ("dq", q_t.grad, q_ref.grad),
+        ("dk", k_t.grad, k_ref.grad),
+        ("dv", v_t.grad, v_ref.grad),
+    ):
+      self.assertIsNotNone(got, f"{name} is None")
+      torch.testing.assert_close(
+          got.cpu(), want.transpose(1, 2), rtol=5e-2, atol=5e-2, msg=name
+      )
+
+    # Guard against a vacuous pass: without segment_ids the kernel must differ
+    # from the packed reference.
+    out_unpacked = tokamax_splash_attention.splash_sdpa(
+        q_t.detach(),
+        k_t.detach(),
+        v_t.detach(),
+        is_causal=True,
+        enable_gqa=n_kv_heads != n_heads,
+    )
+    self.assertFalse(
+        torch.allclose(
+            out_unpacked.cpu(),
+            out_ref.detach().transpose(1, 2),
+            rtol=5e-2,
+            atol=5e-2,
+        )
+    )
+
+
+  def test_config_change_retraces_kernel(self):
+    """A TokamaxConfig change must not reuse a kernel compiled for the old one.
+
+    jax_op caches compiled kernels by argument values, so the config has to be
+    passed as op arguments; read inside the op, two calls with equal shapes
+    would share one compiled kernel whatever the config said.
+    """
+    from unittest import mock  # pylint: disable=g-import-not-at-top
+
+    device = self.accelerator_device
+    cfg = tokamax_splash_attention.TokamaxConfig
+    saved = cfg.use_vmap_bwd
+    self.addCleanup(setattr, cfg, "use_vmap_bwd", saved)
+
+    # A shape no other test uses, so the first call below must trace too.
+    q, k, v = (
+        torch.randn(1, 1024, 2, 64, device=device).requires_grad_(True)
+        for _ in range(3)
+    )
+    real = tokamax_splash_attention._make_splash_attention_fn
+    seen = []
+
+    def record(*args, **kwargs):
+      seen.append(kwargs["use_vmap_bwd"])
+      return real(*args, **kwargs)
+
+    with mock.patch.object(
+        tokamax_splash_attention, "_make_splash_attention_fn", record
+    ):
+      for use_vmap_bwd in (False, True):
+        cfg.use_vmap_bwd = use_vmap_bwd
+        tokamax_splash_attention.splash_sdpa(q, k, v).sum().backward()
+
+    # fwd + bwd each traced once per config value.
+    self.assertEqual(sorted(seen), [False, False, True, True])
+
 
 if __name__ == "__main__":
   absltest.main()

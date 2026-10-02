@@ -221,6 +221,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
   """Patches zero-overhead Tokamax layout-fused splash attention into the model."""
   from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import TokamaxConfig  # pylint: disable=g-import-not-at-top
   from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import splash_sdpa as tokamax_splash_sdpa  # pylint: disable=g-import-not-at-top
+  from torchtitan.models.common.attention import segment_ids_from_positions  # pylint: disable=g-import-not-at-top
   import types
 
   # Update core JAX trace compilation configs internally from config registry
@@ -320,10 +321,25 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
 
     local_window_size = getattr(self, "sliding_window_size", None)
 
+    # Same fallback as SplashAttention.forward: Decoder normally computes
+    # segment_ids once per step, but a caller passing only `positions` must
+    # still get packed-document masking rather than silently losing it.
+    if (
+        extra_args.get("segment_ids") is None
+        and extra_args.get("positions") is not None
+    ):
+      extra_args["segment_ids"] = segment_ids_from_positions(
+          extra_args["positions"]
+      )
+
     # Tokamax JAX-side transpositions path (Direct pass-through of contiguous layouts)
+    # The jax_op bridge reads operands by shape alone, so every tensor operand,
+    # segment_ids included, must be dense.
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
+    if extra_args.get("segment_ids") is not None:
+      extra_args["segment_ids"] = extra_args["segment_ids"].contiguous()
     combined_args = {**extra_args, **sa_kwargs}
     forward_kwargs = _filter_splash_kwargs(combined_args)
     out = tokamax_splash_sdpa(
@@ -362,6 +378,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     return out
 
   _patched = 0
+  _patched_non_redacted = 0
   _windowed = 0
   _causal = 0
   for _, module in model.named_modules():
@@ -371,6 +388,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
       else:
         module.forward = types.MethodType(_splash_forward, module)
+        _patched_non_redacted += 1
       _patched += 1
       if getattr(module, "sliding_window_size", None) is not None:
         _windowed += 1
@@ -388,6 +406,17 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         "Tokamax splash attention ENABLED: patched %d attention modules "
         "(causal=%d, sliding-window=%d)",
         _patched, _causal, _windowed,
+    )
+
+  # Only non-[redacted] modules receive segment_ids, so only they are affected. [redacted]
+  # (e.g. redacted) runs with the field at its default and must not warn.
+  if _patched_non_redacted and sa_kwargs.get("use_document_aware_block_skipping"):
+    logger.warning(
+        "Tokamax splash: use_document_aware_block_skipping=True is not"
+        " supported; packed documents are still masked exactly via segment_ids,"
+        " but cross-document blocks are computed and discarded. Set"
+        " sa_use_document_aware_block_skipping=False to acknowledge, or use the"
+        " stock splash kernel for block skipping."
     )
 
 

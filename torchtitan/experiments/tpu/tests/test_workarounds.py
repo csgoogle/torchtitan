@@ -553,11 +553,86 @@ class WorkaroundsTest(parameterized.TestCase):
 
     accepted = set(inspect.signature(splash_sdpa).parameters)
     self.assertNotIn("use_document_aware_block_skipping", accepted)
+    self.assertIn("segment_ids", accepted)
     # every key the patch may forward must be one the callee accepts
     self.assertContainsSubset(
         workarounds._SPLASH_KEYS & accepted, accepted,
         "the forwarded set must be a subset of the callee signature",
     )
+
+  def test_tokamax_patch_forwards_segment_ids(self):
+    """Packed-document segment IDs must reach the tokamax kernel.
+
+    Regression test. The patch filters forward kwargs against tokamax
+    splash_sdpa's signature, which used to lack segment_ids, so the IDs that
+    GQAttention passes were silently dropped and packed documents attended
+    across their boundaries. Also covers the positions-only fallback.
+    """
+    import functools  # pylint: disable=g-import-not-at-top
+    import unittest.mock  # pylint: disable=g-import-not-at-top
+    from torchtitan.experiments.tpu.kernels import tokamax_splash_attention  # pylint: disable=g-import-not-at-top
+
+    captured = []
+    real_splash_sdpa = tokamax_splash_attention.splash_sdpa
+
+    # functools.wraps keeps the real signature visible to the patch's filter.
+    @functools.wraps(real_splash_sdpa)
+    def capture(q, k, v, *, segment_ids=None, **kwargs):
+      del k, v, kwargs
+      captured.append(segment_ids)
+      return torch.zeros_like(q)
+
+    # The patch writes the process-global TokamaxConfig; restore it so tests
+    # that assert its class defaults are order-independent.
+    config_cls = tokamax_splash_attention.TokamaxConfig
+    saved = {k: v for k, v in vars(config_cls).items() if not k.startswith("_")}
+    self.addCleanup(lambda: [setattr(config_cls, k, v) for k, v in saved.items()])
+
+    model, sa = self._tokamax_patch_fixture()
+    with unittest.mock.patch.object(
+        tokamax_splash_attention, "splash_sdpa", capture
+    ):
+      workarounds.use_tokamax_splash_attention_patch(model, sa)
+
+    q = k = v = torch.zeros(2, 128, 2, 8)
+    positions = torch.cat([torch.arange(64), torch.arange(64)]).expand(2, -1)
+    expected = torch.cat(
+        [torch.zeros(64, dtype=torch.int32), torch.ones(64, dtype=torch.int32)]
+    ).expand(2, -1)
+    # A transposed copy: same values, non-contiguous strides.
+    non_contiguous = expected.t().contiguous().t()
+    self.assertFalse(non_contiguous.is_contiguous())
+
+    model.attn(q, k, v, segment_ids=non_contiguous, positions=positions)
+    model.attn(q, k, v, positions=positions)
+    model.attn(q, k, v)
+
+    self.assertLen(captured, 3)
+    torch.testing.assert_close(captured[0], expected)
+    self.assertTrue(captured[0].is_contiguous())
+    torch.testing.assert_close(captured[1], expected)
+    self.assertIsNone(captured[2])
+
+  def test_tokamax_patch_warns_on_unsupported_block_skipping(self):
+    """Requesting document-aware block skipping must not be silently dropped."""
+    from torchtitan.experiments.tpu.kernels import tokamax_splash_attention  # pylint: disable=g-import-not-at-top
+
+    config_cls = tokamax_splash_attention.TokamaxConfig
+    saved = {k: v for k, v in vars(config_cls).items() if not k.startswith("_")}
+    self.addCleanup(lambda: [setattr(config_cls, k, v) for k, v in saved.items()])
+
+    model, sa = self._tokamax_patch_fixture()
+    self.assertTrue(sa.sa_use_document_aware_block_skipping, "precondition")
+    with self.assertLogs(workarounds.logger, level="WARNING") as logs:
+      workarounds.use_tokamax_splash_attention_patch(model, sa)
+    self.assertTrue(
+        any("use_document_aware_block_skipping" in m for m in logs.output)
+    )
+
+    model, sa = self._tokamax_patch_fixture()
+    sa.sa_use_document_aware_block_skipping = False
+    with self.assertNoLogs(workarounds.logger, level="WARNING"):
+      workarounds.use_tokamax_splash_attention_patch(model, sa)
 
 
 if __name__ == "__main__":
