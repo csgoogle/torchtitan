@@ -38,7 +38,6 @@ from .model import (
     Gemma4RoPE,
     Gemma4Router,
     Gemma4TransformerBlock,
-    MaxTextGemma4Config,
     QKVLinearKeqV,
 )
 from .sharding import set_gemma4_sharding_config
@@ -54,7 +53,6 @@ __all__ = [
     "Gemma4Router",
     "Gemma4StateDictAdapter",
     "Gemma4TransformerBlock",
-    "MaxTextGemma4Config",
     "QKVLinearKeqV",
     "parallelize_gemma4",
     "gemma4_configs",
@@ -314,14 +312,14 @@ def _build_gemma4_layers(
     return layers
 
 
-def _testmodel(attn_backend: str = "sdpa") -> MaxTextGemma4Config:
+def _testmodel(attn_backend: str = "sdpa") -> Gemma4Model.Config:
     dim = 128
     head_dim = 16
     global_head_dim = 32
     n_layers = 2
     vocab_size = 2048
     sliding_window_size = 64
-    config = MaxTextGemma4Config(
+    config = Gemma4Model.Config(
         vocab_size=vocab_size,
         dim=dim,
         sliding_window_size=sliding_window_size,
@@ -363,14 +361,14 @@ def _testmodel(attn_backend: str = "sdpa") -> MaxTextGemma4Config:
 def _testmodel_moe(
     attn_backend: str = "sdpa",
     moe_comm_backend: str = "standard",
-) -> MaxTextGemma4Config:
+) -> Gemma4Model.Config:
     dim = 128
     head_dim = 16
     global_head_dim = 32
     n_layers = 2
     vocab_size = 2048
     sliding_window_size = 64
-    config = MaxTextGemma4Config(
+    config = Gemma4Model.Config(
         vocab_size=vocab_size,
         dim=dim,
         sliding_window_size=sliding_window_size,
@@ -416,7 +414,7 @@ def _testmodel_moe(
 
 _gemma4_factories = {
     "debugmodel": partial(
-        MaxTextGemma4Config,
+        Gemma4Model.Config,
         vocab_size=2048,
         dim=256,
         sliding_window_size=128,
@@ -448,7 +446,7 @@ _gemma4_factories = {
         enable_weight_tying=True,
     ),
     "debugmodel_moe": partial(
-        MaxTextGemma4Config,
+        Gemma4Model.Config,
         vocab_size=2048,
         dim=256,
         sliding_window_size=128,
@@ -484,7 +482,7 @@ _gemma4_factories = {
         enable_weight_tying=True,
     ),
     "31B": partial(
-        MaxTextGemma4Config,
+        Gemma4Model.Config,
         vocab_size=262144,
         dim=5376,
         sliding_window_size=1024,
@@ -516,7 +514,7 @@ _gemma4_factories = {
         enable_weight_tying=True,
     ),
     "26B-A4B": partial(
-        MaxTextGemma4Config,
+        Gemma4Model.Config,
         vocab_size=262144,
         dim=2816,
         sliding_window_size=1024,
@@ -563,7 +561,7 @@ def _build_flavor_config(
     enable_sp: bool = True,
     enable_ep: bool = False,
     converters: list[ModelConfigConverter.Config] | None = None,
-) -> MaxTextGemma4Config:
+) -> Gemma4Model.Config:
     if flavor == "testmodel":
         config = _testmodel(attn_backend=attn_backend)
     elif flavor == "testmodel_moe":
@@ -605,11 +603,11 @@ gemma4_configs = {
 }
 
 
-def gemma4_debugmodel() -> MaxTextGemma4Config:
+def gemma4_debugmodel() -> Gemma4Model.Config:
     return gemma4_configs["debugmodel"]
 
 
-def gemma4_debugmodel_moe() -> MaxTextGemma4Config:
+def gemma4_debugmodel_moe() -> Gemma4Model.Config:
     return gemma4_configs["debugmodel_moe"]
 
 

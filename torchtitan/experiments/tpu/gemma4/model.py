@@ -34,10 +34,6 @@ from torchtitan.models.common.moe import (
 )
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import CosSinRoPE
-from torchtitan.models.utils import (
-    get_dense_model_nparams_and_flops,
-    get_moe_model_nparams_and_flops,
-)
 from torchtitan.tools.logging import logger
 
 
@@ -622,29 +618,60 @@ class Gemma4Model(Decoder):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            has_moe = any(
-                isinstance(layer, Gemma4TransformerBlock.Config)
-                and layer.moe is not None
-                for layer in self.layers
-            )
-            assert isinstance(self.first_attention, GQAttention.Config)
-            assert self.first_attention.head_dim is not None
-            if has_moe:
-                return get_moe_model_nparams_and_flops(
-                    self,
-                    model,
-                    n_heads=self.first_attention.n_heads,
-                    head_dims=2 * self.first_attention.head_dim,
-                    seq_len=seq_len,
+            """Parameter count and MaxText-style training FLOPs per token."""
+            if seq_len <= 0:
+                raise ValueError("Sequence length must be positive")
+            if not self.layers:
+                raise ValueError("Model must have at least one decoder layer")
+
+            nparams = sum(parameter.numel() for parameter in model.parameters())
+
+            dim = self.dim
+            # MaxText counts the LM-head projection but not the embedding lookup.
+            forward_weight_flops = 2 * dim * self.vocab_size
+            forward_attention_flops = 0
+
+            for layer in self.layers:
+                if not isinstance(layer, Gemma4TransformerBlock.Config):
+                    raise ValueError("Expected Gemma4TransformerBlock.Config")
+                attention = layer.attention
+                if not isinstance(attention, Gemma4Attention.Config):
+                    raise ValueError("Expected Gemma4Attention.Config")
+
+                n_heads = attention.n_heads
+                n_kv_heads = attention.n_kv_heads or n_heads
+                head_dim = attention.head_dim or dim // n_heads
+
+                if attention.use_k_eq_v:
+                    # Global K=V layers have only Q, K, and O projections (no V projection).
+                    qkv_out = (n_heads + n_kv_heads) * head_dim
+                else:
+                    qkv_out = (n_heads + 2 * n_kv_heads) * head_dim
+                forward_weight_flops += 2 * dim * (qkv_out + n_heads * head_dim)
+
+                eff_seq_len = (
+                    min(seq_len, attention.sliding_window_size)
+                    if attention.is_sliding and attention.sliding_window_size
+                    else seq_len
                 )
-            return get_dense_model_nparams_and_flops(
-                model,
-                n_layers=len(self.layers),
-                n_heads=self.first_attention.n_heads,
-                head_dims=2 * self.first_attention.head_dim,
-                seq_len=seq_len,
-                enable_weight_tying=self.enable_weight_tying,
-            )
+                forward_attention_flops += 2 * eff_seq_len * n_heads * head_dim
+
+                feed_forward = layer.feed_forward
+                if feed_forward is not None:
+                    if not isinstance(feed_forward, FeedForward.Config):
+                        raise ValueError("Expected FeedForward.Config")
+                    forward_weight_flops += 6 * dim * feed_forward.w1.out_features
+
+                moe = layer.moe
+                if moe is not None:
+                    if not isinstance(moe, MoE.Config):
+                        raise ValueError("Expected MoE.Config")
+                    forward_weight_flops += (
+                        2 * dim * moe.num_experts
+                        + 6 * dim * moe.experts.hidden_dim * moe.router.top_k
+                    )
+
+            return nparams, 3 * (forward_weight_flops + forward_attention_flops)
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -703,80 +730,6 @@ class Gemma4Model(Decoder):
         return output
 
 
-@dataclass(kw_only=True, slots=True)
-class MaxTextGemma4Config(Gemma4Model.Config):
-    """Gemma4 config that builds Gemma4Model and uses MaxText-style FLOPs."""
-
-    @classmethod
-    def from_gemma4(cls, config: Gemma4Model.Config) -> "MaxTextGemma4Config":
-        if isinstance(config, cls):
-            return config
-        return cls(
-            **{
-                field.name: getattr(config, field.name)
-                for field in dataclasses.fields(Gemma4Model.Config)
-                if field.init
-            }
-        )
-
-    def get_nparams_and_flops(
-        self, model: nn.Module, seq_len: int
-    ) -> tuple[int, int]:
-        if seq_len <= 0:
-            raise ValueError("Sequence length must be positive")
-        if not self.layers:
-            raise ValueError("Model must have at least one decoder layer")
-
-        nparams = sum(parameter.numel() for parameter in model.parameters())
-
-        dim = self.dim
-        # MaxText counts the LM-head projection but not the embedding lookup.
-        forward_weight_flops = 2 * dim * self.vocab_size
-        forward_attention_flops = 0
-
-        for layer in self.layers:
-            if not isinstance(layer, Gemma4TransformerBlock.Config):
-                raise ValueError("Expected Gemma4TransformerBlock.Config")
-            attention = layer.attention
-            if not isinstance(attention, Gemma4Attention.Config):
-                raise ValueError("Expected Gemma4Attention.Config")
-
-            n_heads = attention.n_heads
-            n_kv_heads = attention.n_kv_heads or n_heads
-            head_dim = attention.head_dim or dim // n_heads
-
-            if attention.use_k_eq_v:
-                # Global K=V layers have only Q, K, and O projections (no V projection).
-                qkv_out = (n_heads + n_kv_heads) * head_dim
-            else:
-                qkv_out = (n_heads + 2 * n_kv_heads) * head_dim
-            forward_weight_flops += 2 * dim * (qkv_out + n_heads * head_dim)
-
-            eff_seq_len = (
-                min(seq_len, attention.sliding_window_size)
-                if attention.is_sliding and attention.sliding_window_size
-                else seq_len
-            )
-            forward_attention_flops += 2 * eff_seq_len * n_heads * head_dim
-
-            feed_forward = layer.feed_forward
-            if feed_forward is not None:
-                if not isinstance(feed_forward, FeedForward.Config):
-                    raise ValueError("Expected FeedForward.Config")
-                forward_weight_flops += 6 * dim * feed_forward.w1.out_features
-
-            moe = layer.moe
-            if moe is not None:
-                if not isinstance(moe, MoE.Config):
-                    raise ValueError("Expected MoE.Config")
-                forward_weight_flops += (
-                    2 * dim * moe.num_experts
-                    + 6 * dim * moe.experts.hidden_dim * moe.router.top_k
-                )
-
-        return nparams, 3 * (forward_weight_flops + forward_attention_flops)
-
-
 __all__ = [
     "Gemma4Attention",
     "Gemma4Embedding",
@@ -786,6 +739,5 @@ __all__ = [
     "Gemma4RoPE",
     "Gemma4Router",
     "Gemma4TransformerBlock",
-    "MaxTextGemma4Config",
     "QKVLinearKeqV",
 ]
