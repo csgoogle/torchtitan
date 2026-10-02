@@ -615,6 +615,27 @@ def qwen3_moe_30b_fsdp_only_full_ac_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_30b_v6e32_scan() -> TPUTrainerConfig:
+  """Q30 benchmark with its 48 layers scanned and the layer input offloaded.
+
+  For slices whose HBM cannot hold Zero-2's gathered weights (v6e-32): Zero-3
+  inside the scan body, with the per-layer input on host, as
+  `qwen3_moe_235b_scan` does.
+  """
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  # A scan body cannot write to a tensor it closed over.
+  cfg.override.imports.append(_DISCARDED_TOKEN_COUNTER_OVERRIDE)
+  cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.tpu_config.use_scan_layers = True
+  cfg.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  # Scan leaves no per-layer FQN for the packed-QKV / wo all-reduce pass.
+  cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
+  # The routing metrics stash tensors on the module, which a scan body cannot
+  # do (https://github.com/google-pytorch/torchtitan/issues/399).
+  cfg.metrics.enable_moe_routing = False
+  return cfg
+
+
 def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   """Q30 benchmark adding MaxText's BF16 RoPE numerical policy.
 
