@@ -23,6 +23,7 @@ from torch.distributed.tensor import (
     Replicate,
     Shard,
 )
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
@@ -140,6 +141,54 @@ class TestShardDimPicker(unittest.TestCase):
             out = scan_fsdp._gather_on(shard, 2, "group")
         self.assertTrue(torch.equal(out, torch.cat([shard] * ranks, dim=2)))
 
+    def test_fold_survives_strides_that_change_between_trace_and_replay(self):
+        # TorchTPU traces against fake strides and replays with its own. The
+        # fused loss's `lm_head` gradient is contiguous in the first and
+        # transposed in the second (128 or 256 ranks put it on Shard(0) with
+        # 1002 or 501 rows/rank, so it folds), and a `.contiguous()` traced as
+        # a no-op left `view` to fail at replay. Trace contiguous, replay
+        # transposed.
+        ranks = 4
+        rows, cols = 26, 1024  # per rank; 26 rows -> k = 4
+        with _fake_pg(ranks):
+            mesh = init_device_mesh("cpu", (ranks,), mesh_dim_names=("fsdp",))
+            group_name = mesh.get_group(0).group_name
+
+            def fake_all_gather(x, gather_dim, group, tag=""):
+                return torch.cat([x] * ranks, dim=0)
+
+            def fake_reduce_scatter(x, reduceOp, scatter_dim, group, tag=""):
+                return x.chunk(ranks, dim=0)[0] * ranks
+
+            cases = (
+                (
+                    lambda x: scan_fsdp._movedim_all_gather_tensor(x, 0, group_name),
+                    (rows, cols),
+                    lambda x: torch.cat([x] * ranks, dim=0),
+                ),
+                (
+                    lambda x: scan_fsdp._movedim_reduce_scatter_tensor(
+                        x, "sum", 0, group_name
+                    ),
+                    (rows * ranks, cols),
+                    lambda x: x.chunk(ranks, dim=0)[0] * ranks,
+                ),
+            )
+            with (
+                unittest.mock.patch.object(
+                    scan_fsdp, "_orig_all_gather_single", fake_all_gather
+                ),
+                unittest.mock.patch.object(
+                    scan_fsdp, "_orig_reduce_scatter_single", fake_reduce_scatter
+                ),
+            ):
+                for collective, shape, expected in cases:
+                    traced = make_fx(collective)(torch.zeros(shape))
+                    transposed = torch.randn(shape[::-1]).t()
+                    self.assertFalse(transposed.is_contiguous())
+                    out = torch.fx.Interpreter(traced).run(transposed)
+                    self.assertTrue(torch.equal(out, expected(transposed)))
+
     def test_the_layer_axis_is_never_chosen(self):
         for name, shape in Q235_STACKS.items():
             for degree in (128, 1024, 2048, 4096):
@@ -147,6 +196,79 @@ class TestShardDimPicker(unittest.TestCase):
         # And a stack with no other axis is refused, not sharded on dim 0.
         with self.assertRaises(ValueError):
             _pick((N_LAYERS,), 128)
+
+    def test_subtile_two_d_gather_and_scatter_fold_minor_axis_to_align_tiles(
+        self,
+    ):
+        # For 2-D weight shards `[rows, cols]`, when `rows % 8 != 0` (e.g.
+        # Llama 405B w1/w3 at 26 rows/rank, Qwen3 wqkv at 9 rows/rank, or
+        # Llama 70B wk/wv at 4 cols/rank on gather_dim=1), `_movedim_*` folds
+        # `k = 8 // gcd(rows, 8)` from `cols` into `rows` so XLA sees an
+        # 8-row-aligned collective.
+        ranks = 4
+        with _fake_pg(ranks):
+            mesh = init_device_mesh("cpu", (ranks,), mesh_dim_names=("fsdp",))
+            group_name = mesh.get_group(0).group_name
+            for shape, gather_dim, expected_folded in (
+                ((26, 1024), 0, (104, 256)),
+                ((9, 1024), 0, (72, 128)),
+                ((1024, 4), 1, (8, 512)),
+            ):
+                shard = (
+                    torch.arange(shape[0] * shape[1], dtype=torch.float32)
+                    .reshape(shape)
+                    .requires_grad_(True)
+                )
+                seen_gather_shapes = []
+                seen_scatter_shapes = []
+
+                def fake_all_gather(x, gather_dim, group, tag=""):
+                    self.assertEqual(gather_dim, 0)
+                    seen_gather_shapes.append(tuple(x.shape))
+                    return torch.cat([x] * ranks, dim=0)
+
+                def fake_reduce_scatter(
+                    x, reduceOp, scatter_dim, group, tag=""
+                ):
+                    self.assertEqual(scatter_dim, 0)
+                    seen_scatter_shapes.append(tuple(x.shape))
+                    return x.chunk(ranks, dim=0)[0] * ranks
+
+                spec = scan_fsdp.ScanFSDPSpec(
+                    group_name=group_name,
+                    param_dtype=None,
+                    reduce_dtype=None,
+                    sharded=True,
+                    gather_dim=gather_dim,
+                )
+                with (
+                    unittest.mock.patch.object(
+                        scan_fsdp, "_orig_all_gather_single", fake_all_gather
+                    ),
+                    unittest.mock.patch.object(
+                        scan_fsdp,
+                        "_orig_reduce_scatter_single",
+                        fake_reduce_scatter,
+                    ),
+                ):
+                    whole = scan_fsdp.gather_slice(shard, spec)
+                    expected_whole = torch.cat([shard] * ranks, dim=gather_dim)
+                    self.assertEqual(
+                        tuple(whole.shape), tuple(expected_whole.shape)
+                    )
+                    self.assertTrue(torch.equal(whole, expected_whole))
+                    grad_out = torch.randn_like(whole)
+                    whole.backward(grad_out)
+
+                self.assertEqual(seen_gather_shapes, [expected_folded])
+                self.assertEqual(
+                    seen_scatter_shapes,
+                    [(expected_folded[0] * ranks, expected_folded[1])],
+                )
+                expected_grad = (
+                    grad_out.chunk(ranks, dim=gather_dim)[0] * ranks
+                )
+                self.assertTrue(torch.equal(shard.grad, expected_grad))
 
 
 class TestQ235Placements(unittest.TestCase):

@@ -19,6 +19,7 @@ graph.
 """
 
 import dataclasses
+import math
 from typing import Any
 
 import torch
@@ -65,27 +66,61 @@ _orig_all_gather_single = funcol.all_gather_single
 _orig_reduce_scatter_single = funcol.reduce_scatter_single
 
 
+def _fold_rows(t: torch.Tensor, k: int) -> torch.Tensor:
+    """Views 2-D `t` as `[rows * k, cols // k]`.
+
+    `.contiguous()` can't be used here: it is a no-op at trace time when the
+    fake tensor looks row-major, but TorchTPU may replay the graph with a
+    transposed input (e.g. the fused loss's `lm_head` gradient), and `view`
+    would then read it in the wrong order.
+    `clone(memory_format=torch.contiguous_format)` always records the copy.
+    """
+    return t.clone(memory_format=torch.contiguous_format).view(
+        t.shape[0] * k, t.shape[1] // k
+    )
+
+
 def _movedim_all_gather_tensor(
     self: torch.Tensor,
     gather_dim: int,
     group: Any,
     tag: str = "",
 ) -> torch.Tensor:
-    """All-gather `self` along `gather_dim`, always collecting on dim 0.
+    """TPU-friendly drop-in replacement for `funcol.all_gather_single` / `all_gather_tensor`.
 
-    Off dim 0, `funcol` falls back to `cat(chunk(t, world_size))` unless every
-    axis before `gather_dim` has size 1. Patching `funcol` ensures unstacked
-    `SimpleFSDP` parameters on `Shard(1)` (such as `tok_embeddings` and
-    `lm_head` at 2,048 ranks) also transpose onto dim 0 instead of emitting
-    `world_size` slices and a concat.
+    Addresses two TPU performance issues in PyTorch's default all-gather:
+
+    1. Gathering on `gather_dim > 0`:
+       - Problem: PyTorch's default `funcol` implementation splits the output
+         into `world_size` chunks and concatenates them along `gather_dim`,
+         creating thousands of slice/concat ops at large scale.
+       - Solution: Transpose `gather_dim` to dim 0, run a single contiguous
+         dim-0 all-gather, and transpose back.
+
+    2. Unaligned 2-D weight shards (`rows % 8 != 0`):
+       - Problem: TPU stores 2-D tensors in `(8, 128)` tiles. At high FSDP
+         degrees, a rank's 2-D shard can have a row count not divisible by 8
+         (e.g. 18 or 36 rows for fused `wqkv` at 512 ranks), forcing XLA to pad
+         or relayout the collective.
+       - Solution: Reshape `[rows, cols]` into `[rows * k, cols // k]` before
+         the all-gather so the row count is a multiple of 8, then reshape back
+         to `[-1, cols]` afterward.
     """
     if gather_dim < 0:
         gather_dim += self.ndim
-    if gather_dim != 0:
-        t = self.movedim(gather_dim, 0).contiguous()
-        out = _orig_all_gather_single(t, gather_dim=0, group=group, tag=tag)
-        return out.movedim(0, gather_dim)
-    return _orig_all_gather_single(self, gather_dim=0, group=group, tag=tag)
+    t = self.movedim(gather_dim, 0).contiguous() if gather_dim != 0 else self
+    # Only 2-D shards fold: 1-D norms use 1-D tiles, and 3-D expert slices
+    # `[E, D, F]` already tile on `(D, F)`.
+    orig_cols = None
+    if t.ndim == 2 and t.shape[0] % 8 != 0:
+        k = 8 // math.gcd(t.shape[0], 8)
+        if t.shape[1] % (k * 128) == 0:
+            orig_cols = t.shape[1]
+            t = _fold_rows(t, k)
+    out = _orig_all_gather_single(t, gather_dim=0, group=group, tag=tag)
+    if orig_cols is not None:
+        out = out.reshape(-1, orig_cols)
+    return out.movedim(0, gather_dim) if gather_dim != 0 else out
 
 
 def _movedim_reduce_scatter_tensor(
@@ -95,18 +130,42 @@ def _movedim_reduce_scatter_tensor(
     group: Any,
     tag: str = "",
 ) -> torch.Tensor:
-    """Reduce-scatter `self` along `scatter_dim`, always scattering on dim 0."""
+    """TPU-friendly drop-in replacement for `funcol.reduce_scatter_single` / `reduce_scatter_tensor`.
+
+    The backward counterpart of `_movedim_all_gather_tensor`, applying the same
+    two fixes:
+    1. Transposes `scatter_dim` to dim 0 before reduce-scattering and back after.
+    2. If a 2-D tensor's per-rank scattered output would have `shard_rows % 8 != 0`,
+       folds `cols` into `rows` by `k = 8 // gcd(shard_rows, 8)` before the
+       reduce-scatter and reshapes back after.
+    """
     if scatter_dim < 0:
         scatter_dim += self.ndim
-    if scatter_dim != 0:
-        t = self.movedim(scatter_dim, 0).contiguous()
-        out = _orig_reduce_scatter_single(
-            t, reduceOp=reduceOp, scatter_dim=0, group=group, tag=tag
-        )
-        return out.movedim(0, scatter_dim)
-    return _orig_reduce_scatter_single(
-        self, reduceOp=reduceOp, scatter_dim=0, group=group, tag=tag
+    t = self.movedim(scatter_dim, 0).contiguous() if scatter_dim != 0 else self
+    orig_cols = None
+    if t.ndim == 2:
+        try:
+            group_size = funcol.c10d._get_group_size_by_name(
+                funcol._resolve_group(group, tag)
+            )
+        except Exception:  # pylint: disable=broad-except
+            group_size = 0
+        shard_rows = t.shape[0] // group_size if group_size > 0 else 0
+        if (
+            shard_rows > 0
+            and t.shape[0] % group_size == 0
+            and shard_rows % 8 != 0
+        ):
+            k = 8 // math.gcd(shard_rows, 8)
+            if t.shape[1] % (k * 128) == 0:
+                orig_cols = t.shape[1]
+                t = _fold_rows(t, k)
+    out = _orig_reduce_scatter_single(
+        t, reduceOp=reduceOp, scatter_dim=0, group=group, tag=tag
     )
+    if orig_cols is not None:
+        out = out.reshape(-1, orig_cols)
+    return out.movedim(0, scatter_dim) if scatter_dim != 0 else out
 
 
 funcol.all_gather_single = _movedim_all_gather_tensor
