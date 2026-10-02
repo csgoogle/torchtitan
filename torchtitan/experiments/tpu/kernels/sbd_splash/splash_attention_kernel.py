@@ -2555,16 +2555,29 @@ def _flash_attention_dkv_kernel(
   else:
     q_head = pl.program_id(0)
     first_q_head_in_kv_group = lax.rem(q_head, q_heads_per_kv_head) == 0
+    # sbd fork: `bounds_end == 2` marks a write whose dk/dv block was already
+    # resident from the previous grid step (the previous q head of this kv
+    # group wrote it, and the block index did not change in between). Pallas
+    # neither writes back nor re-fetches a block whose index is unchanged, so
+    # `dk_alias` still holds the pre-kernel `lax.empty` contents there; the
+    # running sum lives in `dk_ref`. See `_splash_attention_bwd_dkv`.
+    carried = bounds_end_ref[grid_idx].astype(jnp.int32) == 2
+    accumulate = jnp.logical_and(should_write, _not(first_q_head_in_kv_group))
 
     @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
     def _():
       dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
       dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
 
-    @pl.when(jnp.logical_and(should_write, _not(first_q_head_in_kv_group)))
+    @pl.when(jnp.logical_and(accumulate, _not(carried)))
     def _():
       dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
       dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
+
+    @pl.when(jnp.logical_and(accumulate, carried))
+    def _():
+      dk_ref[...] = dk_ref[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
+      dv_ref[...] = dv_ref[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
 
 
 def _splash_attention_bwd_dkv(
@@ -2840,6 +2853,20 @@ def _splash_attention_bwd_dkv(
   if dynamic_grid and q_heads_per_kv_head != 1:
     # in/out aliasing to accumulate within kv groups.
     in_specs += [dk_spec, dv_spec]
+    # sbd fork: the aliased read-back only works when consecutive q heads of
+    # a group reach a dk/dv block on NON-consecutive grid steps (the block is
+    # written back, then re-fetched). The dkv list visits every kv row once
+    # per head in contiguous runs, so the last step of head h and the first
+    # step of head h + 1 share a block exactly when the list is a single row
+    # (one kv block, e.g. seq_len == block_kv_dkv): that block never leaves
+    # VMEM, `dk_alias` stays at its `lax.empty` contents, and dk/dv come back
+    # wrong. Flag that write with `bounds_end == 2` so the kernel accumulates
+    # from the resident output block instead.
+    _rows = mask_info.active_rows.astype(jnp.int32)  # pyrefly: ignore[missing-attribute]
+    _last = mask_info.num_active_blocks.reshape(-1)[0].astype(jnp.int32) - 1  # pyrefly: ignore[missing-attribute]
+    bounds_end = bounds_end.at[_last].set(  # pyrefly: ignore[missing-attribute]
+        jnp.where(_rows[0] == _rows[_last], 2, bounds_end[_last])  # pyrefly: ignore[unsupported-operation]
+    )
     dk = lax.empty(k.shape, dtype=jnp.float32)
     dv = lax.empty(v.shape, dtype=jnp.float32)
     # Keep gradients in fp32 when accumulating over head groups.
