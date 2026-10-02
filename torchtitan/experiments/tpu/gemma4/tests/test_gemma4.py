@@ -27,7 +27,6 @@ from torchtitan.experiments.tpu.gemma4.model import (
     Gemma4Attention,
     Gemma4Embedding,
     Gemma4FeedForward,
-    Gemma4GroupedExperts,
     Gemma4MoE,
     Gemma4Model,
     Gemma4RoPE,
@@ -577,12 +576,14 @@ class TestGemma4Components(BaseDeviceTest):
     )
     torch.testing.assert_close(selected_experts_indices, ref_indices)
 
-  def test_gemma4_grouped_experts_gelu_tanh(self):
+  def test_gemma4_grouped_experts_gelu_tanh_with_empty_experts(self):
     dim, hidden_dim, num_experts = 16, 32, 4
-    cfg = Gemma4GroupedExperts.Config(
+    cfg = TpuGroupedExperts.Config(
         dim=dim,
         hidden_dim=hidden_dim,
         num_experts=num_experts,
+        activation="gelu_tanh",
+        use_pallas_grouped_mm=False,
         token_dispatcher=make_token_dispatcher_config(
             num_experts=num_experts,
             top_k=2,
@@ -592,19 +593,20 @@ class TestGemma4Components(BaseDeviceTest):
         ),
         param_init=_EXPERTS_INIT,
     )
-    self.assertEqual(cfg.activation, "gelu_tanh")
     experts = cfg.build().to(self.accelerator_device)
     experts.init_states()
 
-    x = torch.randn(8, dim, device=self.accelerator_device)
+    # Experts 0 and 2 receive no tokens.
+    counts = [0, 5, 0, 3]
+    x = torch.randn(sum(counts), dim, device=self.accelerator_device)
     num_tokens_per_expert = torch.tensor(
-        [2, 3, 1, 2], device=self.accelerator_device, dtype=torch.int32
+        counts, device=self.accelerator_device, dtype=torch.int32
     )
     out = experts._experts_forward(x, num_tokens_per_expert)
-    self.assertEqual(out.shape, (8, dim))
+    self.assertEqual(out.shape, (sum(counts), dim))
 
     expected_chunks = []
-    for i, chunk in enumerate(x.split([2, 3, 1, 2], dim=0)):
+    for i, chunk in enumerate(x.split(counts, dim=0)):
       c_bf16 = chunk.bfloat16()
       w1 = experts.w1_EFD[i].bfloat16().t()
       w2 = experts.w2_EDF[i].bfloat16().t()

@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.models.common.attention import (
     FusedQKVLinear,
     QKVLinear,
@@ -32,7 +33,6 @@ from .model import (
     Gemma4Attention,
     Gemma4Embedding,
     Gemma4FeedForward,
-    Gemma4GroupedExperts,
     Gemma4MoE,
     Gemma4Model,
     Gemma4RoPE,
@@ -48,7 +48,6 @@ __all__ = [
     "Gemma4Attention",
     "Gemma4Embedding",
     "Gemma4FeedForward",
-    "Gemma4GroupedExperts",
     "Gemma4MoE",
     "Gemma4Model",
     "Gemma4RoPE",
@@ -140,7 +139,8 @@ def _make_moe_config(
             ),
             param_init=param_init["router"],
         ),
-        experts=Gemma4GroupedExperts.Config(
+        experts=TpuGroupedExperts.Config(
+            activation="gelu_tanh",
             dim=dim,
             hidden_dim=hidden_dim,
             num_experts=num_experts,

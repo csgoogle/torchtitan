@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from torchtitan.config import derive
+from torchtitan.distributed.spmd_types import spmd_mesh_size
+from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.kernels.expert_segment_matmul import (
     segment_matmul_pallas_2d,
 )
@@ -220,6 +222,48 @@ class TpuGroupedExperts(GroupedExperts):
                     canonical_key
                 ).transpose(-2, -1).contiguous()
 
+    def _native_experts_forward(
+        self,
+        x_RD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+    ) -> torch.Tensor:
+        """``GroupedExperts._experts_forward`` with a configurable activation.
+
+        Mirrors the upstream method (keep in sync); upstream hard-codes silu.
+        """
+        if isinstance(self.w1_EFD, DTensor):
+            w1_EFD = self.w1_EFD.to_local()
+            w2_EDF = self.w2_EDF.to_local()
+            w3_EFD = self.w3_EFD.to_local()
+        else:
+            w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
+
+        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
+        if (
+            get_spmd_backend() == "spmd_types"
+            and spmd.is_type_checking()
+            and spmd_mesh_size("ep") == 1
+        ):
+            for axis in ("dp", "cp"):
+                spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
+
+        gate_RF = torch._grouped_mm(
+            x_RD.bfloat16(), w1_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
+        )
+        up_RF = torch._grouped_mm(
+            x_RD.bfloat16(), w3_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
+        )
+        return torch._grouped_mm(
+            self._activation_fn(gate_RF) * up_RF,
+            w2_EDF.bfloat16().transpose(-2, -1),
+            offs=offsets_E,
+        ).type_as(x_RD)
+
+    def _activation_fn(self, gate_RF: torch.Tensor) -> torch.Tensor:
+        if self.activation == "gelu_tanh":
+            return F.gelu(gate_RF, approximate="tanh")
+        return F.silu(gate_RF)
+
     def _experts_forward(
         self,
         x_RD: torch.Tensor,
@@ -229,15 +273,7 @@ class TpuGroupedExperts(GroupedExperts):
         # dWeight is incorrect at M=4096. See
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
         if not self.use_pallas_grouped_mm:
-            if self.activation == "gelu_tanh":
-                from torchtitan.experiments.tpu.gemma4.model import (
-                    Gemma4GroupedExperts,
-                )
-
-                return Gemma4GroupedExperts._experts_forward(
-                    self, x_RD, num_tokens_per_expert_E
-                )
-            return super()._experts_forward(x_RD, num_tokens_per_expert_E)
+            return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
         def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
@@ -291,10 +327,7 @@ class TpuGroupedExperts(GroupedExperts):
                 tgmm_tiling=tgmm_tiling,
                 dweight_output_dtype=self._unpaired_dweight_output_dtype,
             )
-        if self.activation == "gelu_tanh":
-            hidden_RF = F.gelu(gate_RF, approximate="tanh") * up_RF
-        else:
-            hidden_RF = F.silu(gate_RF) * up_RF
+        hidden_RF = self._activation_fn(gate_RF) * up_RF
         return segment_matmul_pallas_2d(
             hidden_RF,
             w2_EKN.bfloat16(),

@@ -29,7 +29,6 @@ from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe import (
-    GroupedExperts,
     MoE,
     TokenChoiceTopKRouter,
 )
@@ -218,7 +217,10 @@ class Gemma4Attention(GQAttention):
             # Plain SDPA is causal-only and would silently drop the window.
             config = dataclasses.replace(
                 config,
-                inner_attention=SlidingWindowScaledDotProductAttention.Config(),
+                inner_attention=SlidingWindowScaledDotProductAttention.Config(
+                    param_init=config.inner_attention.param_init,
+                    sharding_config=config.inner_attention.sharding_config,
+                ),
             )
         super().__init__(config)
         self.v_norm = config.v_norm.build()
@@ -285,86 +287,6 @@ class Gemma4FeedForward(FeedForward):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.gelu(self.w1(x), approximate="tanh") * self.w3(x))
-
-
-class Gemma4GroupedExperts(GroupedExperts):
-    """Grouped routed experts using GeGLU activation (`gelu(approximate='tanh')`)."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(GroupedExperts.Config):
-        activation: str = "gelu_tanh"
-
-    def _experts_forward(
-        self,
-        x_RD: torch.Tensor,
-        num_tokens_per_expert_E: torch.Tensor,
-    ) -> torch.Tensor:
-        from torch.distributed.tensor import DTensor
-        from torchtitan.distributed.spmd_types import spmd_mesh_size
-
-        if isinstance(self.w1_EFD, DTensor):
-            w1_EFD = self.w1_EFD.to_local()
-            assert isinstance(self.w2_EDF, DTensor)
-            w2_EDF = self.w2_EDF.to_local()
-            assert isinstance(self.w3_EFD, DTensor)
-            w3_EFD = self.w3_EFD.to_local()
-        else:
-            w1_EFD = self.w1_EFD
-            w2_EDF = self.w2_EDF
-            w3_EFD = self.w3_EFD
-
-        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
-            if spmd_mesh_size("ep") == 1:
-                for axis in ("dp", "cp"):
-                    spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
-            h_RF = F.gelu(
-                torch._grouped_mm(
-                    x_RD.bfloat16(),
-                    w1_EFD.bfloat16().transpose(-2, -1),
-                    offs=offsets_E,
-                ),
-                approximate="tanh",
-            )
-            h_RF = h_RF * torch._grouped_mm(
-                x_RD.bfloat16(),
-                w3_EFD.bfloat16().transpose(-2, -1),
-                offs=offsets_E,
-            )
-            return torch._grouped_mm(
-                h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
-            ).type_as(x_RD)
-
-        # Pad 1 dummy zero token at the end of each expert's segment so every
-        # expert has >= 1 token (K_e >= 1).
-        R, D = x_RD.shape
-        E = offsets_E.size(0)
-        r_idx = torch.arange(R, device=x_RD.device, dtype=offsets_E.dtype)
-        padded_idx = (
-            r_idx + torch.searchsorted(offsets_E, r_idx, right=True)
-        ).long()
-        padded_offsets_E = offsets_E + torch.arange(
-            1, E + 1, device=offsets_E.device, dtype=offsets_E.dtype
-        )
-        x_padded_RD = x_RD.new_zeros((R + E, D)).index_copy(0, padded_idx, x_RD)
-
-        h_RF = F.gelu(
-            torch._grouped_mm(
-                x_padded_RD.bfloat16(),
-                w1_EFD.bfloat16().transpose(-2, -1),
-                offs=padded_offsets_E,
-            ),
-            approximate="tanh",
-        )
-        h_RF = h_RF * torch._grouped_mm(
-            x_padded_RD.bfloat16(),
-            w3_EFD.bfloat16().transpose(-2, -1),
-            offs=padded_offsets_E,
-        )
-        out_padded_RD = torch._grouped_mm(
-            h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=padded_offsets_E
-        ).type_as(x_RD)
-        return out_padded_RD.index_select(0, padded_idx)
 
 
 class Gemma4Router(TokenChoiceTopKRouter):
@@ -859,7 +781,6 @@ __all__ = [
     "Gemma4Attention",
     "Gemma4Embedding",
     "Gemma4FeedForward",
-    "Gemma4GroupedExperts",
     "Gemma4MoE",
     "Gemma4Model",
     "Gemma4RoPE",
