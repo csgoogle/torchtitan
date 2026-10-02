@@ -791,7 +791,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         proxy.training.global_batch_size, 32 * proxy.training.local_batch_size
     )
 
-  def test_235b_maxtext_twin_changes_only_the_three_numerics_knobs(self) -> None:
+  def test_235b_maxtext_twin_changes_only_the_two_numerics_knobs(self) -> None:
     base = qwen3_moe_235b_scan()
     maxtext = qwen3_moe_235b_scan_maxtext()
 
@@ -802,14 +802,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         {"torchtitan.experiments.tpu.overrides.bf16_rope"},
     )
     assert base.model_spec is not None and maxtext.model_spec is not None
-    for config, expected in ((base, False), (maxtext, True)):
+    # The FP32 route-score fusion is not a numerics knob: every Q235 recipe
+    # uses it.
+    splitter = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
+    assert splitter.model_spec is not None
+    for config in (base, maxtext, splitter):
       dispatchers = list(
           config.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
       )
       self.assertLen(dispatchers, 94)
-      self.assertTrue(
-          all(d.fuse_route_score_backward is expected for _, d, _, _ in dispatchers)
-      )
+      self.assertTrue(all(d.fuse_route_score_backward for _, d, _, _ in dispatchers))
     # Everything the base recipe works around is inherited, not re-derived.
     self.assertEqual(maxtext.model_spec.flavor, base.model_spec.flavor)
     self.assertEqual(maxtext.training.local_batch_size, 16)

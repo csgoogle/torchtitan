@@ -704,6 +704,23 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+def _fuse_route_score_backward(cfg: TPUTrainerConfig) -> None:
+  """Compute dScore in one fusion instead of saving an FP32 expert output.
+
+  The multiply and hidden-dimension reduction stay FP32, as in native
+  autograd; only the reduction order changes. On Q235 at 512 ranks this
+  removes a per-layer ``f32[524288, 4096]`` copy and reduction (1.12 s/step).
+  """
+  assert cfg.model_spec is not None
+  dispatchers = list(
+      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+  )
+  if not dispatchers:
+    raise ValueError("Qwen3 MoE route-score fusion needs a TPU token dispatcher")
+  for _, dispatcher, _, _ in dispatchers:
+    dispatcher.fuse_route_score_backward = True
+
+
 def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   """Build the common Qwen3 235B-A22B FSDP configuration."""
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
@@ -725,6 +742,7 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   # 30B base recipe, so apply the intended Q235 routing policy afterwards.
   _use_global_batch_aux_loss(cfg)
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
+  _fuse_route_score_backward(cfg)
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
@@ -790,14 +808,6 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
   cfg.training.mixed_precision_reduce = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  assert cfg.model_spec is not None
-  dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-  )
-  if not dispatchers:
-    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
-  for _, dispatcher, _, _ in dispatchers:
-    dispatcher.fuse_route_score_backward = True
   return cfg
 
 
@@ -884,6 +894,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   _use_global_batch_aux_loss(cfg)
+  _fuse_route_score_backward(cfg)
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.
@@ -955,22 +966,14 @@ def qwen3_moe_235b_scan_proxy() -> TPUTrainerConfig:
 def qwen3_moe_235b_scan_maxtext() -> TPUTrainerConfig:
   """`qwen3_moe_235b_scan` with MaxText's numerics instead of torchtitan's.
 
-  Three changes, all of them bf16 where torchtitan keeps f32: the gradient
-  reduce, the rotary arithmetic, and the route-score backward. None is
-  bit-preserving, so the base recipe stays the accuracy reference and this one
-  is the speed comparison against MaxText's published Ironwood number.
+  Two changes, both bf16 where torchtitan keeps f32: the gradient reduce and
+  the rotary arithmetic. Neither is bit-preserving, so the base recipe stays the
+  accuracy reference and this one is the speed comparison against MaxText's
+  published Ironwood number.
   """
   cfg = qwen3_moe_235b_scan()
   cfg.training.mixed_precision_reduce = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  assert cfg.model_spec is not None
-  dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-  )
-  if not dispatchers:
-    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
-  for _, dispatcher, _, _ in dispatchers:
-    dispatcher.fuse_route_score_backward = True
   return cfg
 
 
