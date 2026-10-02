@@ -753,6 +753,43 @@ class TestIsValidationSwitch:
         assert "validation/reward/_mean: 1.0" in msg
         assert "loss/mean" not in msg
 
+    def test_default_validation_allow_list_shows_the_reward(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # compute_rollout_metrics(prefix="validation") emits the validation reward
+        # as SummaryStats under "validation_reward"; the default validation console
+        # keys must select its reduced keys.
+        logger_inst = self._logger()
+        records = [m.Metric("validation_reward", m.SummaryStats.from_list([0.0, 1.0]))]
+        with caplog.at_level(logging.INFO):
+            logger_inst.log(0, records, is_validation=True)
+        msg = next(r.getMessage() for r in caplog.records if "Step:" in r.getMessage())
+        assert "validation_reward/_mean: " in msg
+        assert "validation_reward/_max: " in msg
+
+    def test_validation_reward_metric_name_matches_compute_rollout_metrics(
+        self,
+    ) -> None:
+        # Pins the metric name the test above relies on to the emitter.
+        # rollout.types imports renderers, an optional dependency.
+        pytest.importorskip("renderers")
+        from torchtitan.experiments.rl.controller_metrics import compute_rollout_metrics
+        from torchtitan.experiments.rl.rollout import Rollout, RolloutStatus
+
+        rollouts = [
+            Rollout(
+                group_id=0,
+                rollout_id=i,
+                status=RolloutStatus.COMPLETED,
+                reward=reward,
+            )
+            for i, reward in enumerate([0.0, 1.0])
+        ]
+        metrics = compute_rollout_metrics(prefix="validation", rollouts=rollouts)
+        reward_metrics = [r for r in metrics if r.key == "validation_reward"]
+        assert len(reward_metrics) == 1
+        assert isinstance(reward_metrics[0].value, m.SummaryStats)
+
     def test_empty_train_list_silences_console(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
