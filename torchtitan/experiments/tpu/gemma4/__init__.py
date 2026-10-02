@@ -56,8 +56,6 @@ __all__ = [
     "QKVLinearKeqV",
     "parallelize_gemma4",
     "gemma4_configs",
-    "gemma4_debugmodel",
-    "gemma4_debugmodel_moe",
     "model_registry",
 ]
 
@@ -603,14 +601,6 @@ gemma4_configs = {
 }
 
 
-def gemma4_debugmodel() -> Gemma4Model.Config:
-    return gemma4_configs["debugmodel"]
-
-
-def gemma4_debugmodel_moe() -> Gemma4Model.Config:
-    return gemma4_configs["debugmodel_moe"]
-
-
 def model_registry(
     flavor: str,
     attn_backend: str = "sdpa",
@@ -640,6 +630,3 @@ def model_registry(
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=Gemma4StateDictAdapter,
     )
-
-
-from .config_registry import *  # noqa: E402, F401, F403
