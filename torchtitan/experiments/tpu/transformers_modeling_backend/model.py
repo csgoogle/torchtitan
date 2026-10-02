@@ -996,10 +996,9 @@ def _enable_pallas_experts(moe_config) -> None:
   (one kernel for gate and up), tile_m 256, and the kernel-native weight
   layout (no per-step transposes; checkpoints still save the canonical
   layout). One thing is sized per model instead of copied: the paired
-  dWeight kernel keeps full-K fp32 accumulators unless K is tiled, which at
-  OLMoE's 2048 x 1024 experts already exceeds v6e's scoped VMEM
-  (CompileTimeScopedVmemOom, measured 2026-10-02). The qwen3 235B recipe
-  solves the same thing with K slabs of 1024; here the K tile is the largest
+  dWeight kernel keeps full-K fp32 accumulators unless K is tiled, which
+  exceeds v6e's scoped VMEM even at moderate expert sizes. The qwen3 235B
+  recipe solves the same thing with K slabs of 1024; here the K tile is the largest
   of 1024 / 512 / 256 / 128 that divides the model's hidden size, capped at
   half of it so there are always at least two slabs. N stays untiled, which
   the paired kernel requires.
