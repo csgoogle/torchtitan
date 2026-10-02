@@ -329,6 +329,52 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
     for name, a, b_ in zip(("dq", "dk", "dv"), grads_on, grads_off):
       torch.testing.assert_close(a, b_, rtol=0, atol=0, msg=name)
 
+  @parameterized.named_parameters(("mha", 4), ("gqa", 2), ("mqa", 1))
+  def test_dq_reduction_steps_3_matches_default(self, h_kv):
+    """`dq_reduction_steps=3` (in-kernel dq reduction + dynamic dkv list).
+
+    With grouped KV the dkv pass accumulates dk/dv across a group's q heads
+    through aliased outputs. At one kv block (the 512-block case) consecutive
+    q heads hit the same dk/dv block on consecutive grid steps, which Pallas
+    neither writes back nor re-fetches -- the read-back used to return the
+    uninitialized buffer, so dk/dv were off by O(10) for every GQA/MQA shape
+    there. Against the default: MHA at one kv block is bit-identical; grouped
+    KV, and four kv blocks (the 128-block case, which also compacts the dkv
+    list by document), differ only in fp32 summation order (~1e-6 on v6e).
+    """
+    device = self.accelerator_device
+    b, s, h, d = 2, 512, 4, 64
+    q, k, v = self._qkv(b, s, h, h_kv, d, device, seed=71)
+    segment_ids = torch.zeros(b, s, dtype=torch.int32)
+    segment_ids[0, 128:] = 1
+    segment_ids[1, 40:300] = 1
+    seg = segment_ids.to(device)
+
+    prev_steps = splash_bias_dropout.SbdConfig.dq_reduction_steps
+
+    def run(steps, blk):
+      splash_bias_dropout.SbdConfig.update(
+          dq_reduction_steps=steps, **self._blocks(blk)
+      )
+      try:
+        q_t, k_t, v_t = [t.clone().requires_grad_(True) for t in (q, k, v)]
+        out = splash_bias_dropout.sbd_splash_attention(
+            q_t, k_t, v_t, segment_ids=seg
+        )
+        out.sum().backward()
+      finally:
+        splash_bias_dropout.SbdConfig.update(
+            dq_reduction_steps=prev_steps, **self._blocks(512)
+        )
+      return [t.grad.cpu() for t in (q_t, k_t, v_t)]
+
+    for blk in (512, 128):
+      tol = 0.0 if (blk == 512 and h_kv == h) else 1e-5
+      for name, a, b_ in zip(("dq", "dk", "dv"), run(3, blk), run(0, blk)):
+        torch.testing.assert_close(
+            a, b_, rtol=tol, atol=tol, msg=f"{name} (block {blk})"
+        )
+
   def test_segment_ids_padding_layout_parity(self):
     """Right-padded ids (the encoder shape) with blocks smaller than the
     sequence.
