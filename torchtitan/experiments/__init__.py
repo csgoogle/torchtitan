@@ -19,6 +19,7 @@ _supported_experiments = frozenset(
         # listed here so `--module <module path>` resolves (see ConfigManager).
         "alphabet_sort",
         "dapo_math",
+        "gsm8k",
         "search_r1",
         "verifiers.dapo_math",
     ]
