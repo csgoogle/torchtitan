@@ -456,6 +456,15 @@ class TPUHFTransformerModel(HFTransformerModel):
             f"{type(self.model).__name__} returned neither hidden states nor "
             "logits to train on"
         )
+      if self._fused_loss:
+        # The fused CE needs the pre-projection hidden states; an encoder-
+        # decoder with its own head (T5, mT5) returns logits only, and T5
+        # rescales before its head, so the pair cannot be recovered here.
+        raise ValueError(
+            f"fused_loss is not supported for {type(self.model).__name__}: it "
+            "returns logits rather than hidden states. Use a config with the "
+            "plain cross entropy (hf_full_splash, hf_full_splash_compile)."
+        )
       return logits.squeeze(0)
     hidden_states = hidden.squeeze(0)
 
