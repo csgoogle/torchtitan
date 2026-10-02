@@ -86,6 +86,7 @@ _DOCUMENT_LENGTHS = ((40, 50, 38), (64, 30, 34))
 
 
 def _packed_positions():
+  """`positions` for `_DOCUMENT_LENGTHS`: per row, 0..n-1 for each document."""
   return torch.stack([
       torch.cat([torch.arange(length) for length in row])
       for row in _DOCUMENT_LENGTHS
@@ -137,6 +138,7 @@ def _mask_documents(model) -> int:
 
 
 def _config():
+  """The small Qwen3 MoE with the recipe's aux loss and every feature off."""
   config = torchtitan.config.ConfigManager().parse_args(list(_TRAIN_ARGS))
   # `qwen3_moe_testmodel` hands out a module-level model config; copy it so
   # one case's converters cannot leak into the next.
@@ -146,6 +148,7 @@ def _config():
 
 
 def _token_dispatcher(config):
+  """TPU token dispatcher: reorder/combine with TPU-specific VJPs."""
   converter = TpuTokenDispatcherConverter.Config().build()
   config.model_spec.model = converter.convert(config.model_spec.model)
 
@@ -170,10 +173,12 @@ def _pallas_experts(config, *, paired=False):
 
 
 def _splash(config):
+  """Splash attention (`kernels/splash_attention.py`) in place of SDPA."""
   config.splash_attention_kernel.use_splash_attention_kernel = True
 
 
 def _tokamax_splash(config):
+  """tokamax's splash attention in place of SDPA."""
   config.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
 
 
@@ -220,6 +225,7 @@ class _OpCounter(_python_dispatch.TorchDispatchMode):
     return func(*args, **(kwargs or {}))
 
   def ran(self, prefix: str) -> bool:
+    """Whether any dispatched op's name starts with `prefix`."""
     return any(name.startswith(prefix) for name in self.counts)
 
 
@@ -244,6 +250,7 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
   """The Qwen3 MoE's outputs and gradients with each TPU feature enabled."""
 
   def setUp(self):
+    """Builds the CPU model whose weights every run loads, and the batch."""
     super().setUp()
     if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
       self.skipTest("The configurations under test are TPU kernels.")
@@ -273,6 +280,15 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
       )
 
   def _check(self, actual, expected, *, loss_atol, logits_rtol, grads_rtol):
+    """Asserts two `_outputs` results agree, as wholes.
+
+    Args:
+      actual: (logits, loss, gradients) of the configuration under test.
+      expected: the same from the reference.
+      loss_atol: max absolute loss difference.
+      logits_rtol: max ||actual - expected|| / ||expected|| over the logits.
+      grads_rtol: the same over all gradients, concatenated.
+    """
     logits, loss, grads = actual
     expected_logits, expected_loss, expected_grads = expected
     self.assertEqual(grads.keys(), expected_grads.keys())
@@ -308,6 +324,7 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
       self._check(unmasked, masked, **_ATTENTION)
 
   def test_stock_matches_cpu(self):
+    """The stock model on TPU against the stock model on CPU in float32."""
     self._check(
         self._outputs(_config(), self.accelerator_device),
         self._outputs(_config(), torch.device("cpu")),
@@ -318,59 +335,65 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
       dict(
           testcase_name="token_dispatcher",
           enable=_token_dispatcher,
-          ops=(),
+          expected_kernels=(),
           tolerances=_EXACT,
       ),
       dict(
           testcase_name="pallas_grouped_mm",
           enable=_pallas_experts,
-          ops=("tt_experts.grouped_mm",),
+          expected_kernels=("tt_experts.grouped_mm",),
           tolerances=_EXPERTS,
       ),
       dict(
           testcase_name="paired_grouped_mm_native_layout",
           enable=lambda config: _pallas_experts(config, paired=True),
-          ops=("tt_experts.paired_grouped_mm",),
+          expected_kernels=("tt_experts.paired_grouped_mm",),
           tolerances=_EXPERTS,
       ),
       dict(
           testcase_name="splash",
           enable=_splash,
-          ops=("pallas.splash_attn_fwd",),
+          expected_kernels=("pallas.splash_attn_fwd",),
           tolerances=_ATTENTION,
       ),
       dict(
           testcase_name="tokamax_splash",
           enable=_tokamax_splash,
-          ops=("pallas.tokamax_splash_attn_fwd",),
+          expected_kernels=("pallas.tokamax_splash_attn_fwd",),
           tolerances=_ATTENTION,
       ),
       dict(
           testcase_name="recipe",
           enable=_recipe,
-          ops=(
+          expected_kernels=(
               "tt_experts.paired_grouped_mm",
               "pallas.tokamax_splash_attn_fwd",
           ),
           tolerances=_ATTENTION,
       ),
   )
-  def test_feature_matches_stock(self, enable, ops, tolerances):
-    self._check_feature(enable, ops, tolerances)
+  def test_feature_matches_stock(self, enable, expected_kernels, tolerances):
+    """One feature (or the whole recipe) on TPU against the stock model on TPU.
 
-  def _check_feature(self, enable, ops, tolerances):
+    Args:
+      enable: turns the feature on in a config built by `_config()`.
+      expected_kernels: op-name prefixes the feature's run must dispatch, e.g.
+        "pallas.tokamax_splash_attn_fwd". A feature that silently fell back to
+        the stock op would otherwise match the reference trivially. Empty for
+        features with no kernel of their own (the token dispatcher).
+      tolerances: `_check` keyword arguments for this feature's class.
+    """
     config = _config()
     enable(config)
     counter = _OpCounter()
     actual = self._outputs(config, self.accelerator_device, counter)
-    for op in ops:
-      self.assertTrue(counter.ran(op), f"{op} never ran")
+    for kernel in expected_kernels:
+      self.assertTrue(counter.ran(kernel), f"{kernel} never ran")
     self._check(
         actual,
         self._outputs(_config(), self.accelerator_device),
         **tolerances,
     )
-
 
 if __name__ == "__main__":
   absltest.main()
