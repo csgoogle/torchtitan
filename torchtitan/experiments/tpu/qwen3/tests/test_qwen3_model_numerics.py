@@ -44,7 +44,6 @@ import collections
 import contextlib
 import copy
 import types
-import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -193,8 +192,8 @@ _EXACT = dict(loss_atol=0.0, logits_rtol=0.0, grads_rtol=0.0)
 # 1.3e-3.
 _EXPERTS = dict(loss_atol=1e-6, logits_rtol=1e-6, grads_rtol=3e-3)
 # Attention kernels against the document-masked reference on the packed batch:
-# loss <= 1.7e-4, logits <= 9.8e-3, gradients <= 9.5e-3 (splash, and tokamax
-# with segment IDs). Scaling the tokamax output by 1.01 moves the loss by
+# loss <= 1.7e-4, logits <= 9.8e-3, gradients <= 9.5e-3 (splash and
+# tokamax). Scaling the tokamax output by 1.01 moves the loss by
 # 5.0e-4; attention that ignores the documents moves it by 1.9e-2 and the
 # logits by 52%.
 _ATTENTION = dict(loss_atol=4e-4, logits_rtol=2e-2, grads_rtol=2e-2)
@@ -340,14 +339,6 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
           ops=("pallas.splash_attn_fwd",),
           tolerances=_ATTENTION,
       ),
-  )
-  def test_feature_matches_stock(self, enable, ops, tolerances):
-    self._check_feature(enable, ops, tolerances)
-
-  # TODO(#492): tokamax splash drops `segment_ids`, so these attend across
-  # documents (loss off by 1.9e-2, logits by 52%). Remove the decorator once
-  # #492 lands; until then these report an unexpected success when fixed.
-  @parameterized.named_parameters(
       dict(
           testcase_name="tokamax_splash",
           enable=_tokamax_splash,
@@ -364,8 +355,7 @@ class Qwen3ModelNumericsTest(base_device_test.BaseAcceleratorDeviceTest):
           tolerances=_ATTENTION,
       ),
   )
-  @unittest.expectedFailure
-  def test_tokamax_feature_matches_stock(self, enable, ops, tolerances):
+  def test_feature_matches_stock(self, enable, ops, tolerances):
     self._check_feature(enable, ops, tolerances)
 
   def _check_feature(self, enable, ops, tolerances):
