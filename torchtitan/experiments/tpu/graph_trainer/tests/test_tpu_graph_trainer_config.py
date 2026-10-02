@@ -73,6 +73,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
     qwen3_moe_235b_fsdp_activation_offload_4x4x4,
+    qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4,
     qwen3_moe_235b_scan,
     qwen3_moe_235b_scan_maxtext,
     qwen3_moe_235b_scan_proxy,
@@ -737,6 +738,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       self.assertEqual(moe.aux_loss.type, "batch_wise")
       self.assertEqual(moe.aux_loss.coeff, 1e-3)
       self.assertEqual(moe.aux_loss.top_k, moe.router.top_k)
+
+  def test_235b_splitter_uses_tokamax_splash_attention(self) -> None:
+    for config in (
+        qwen3_moe_235b_fsdp_activation_offload_4x4x4(),
+        qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4(),
+    ):
+      with self.subTest(reduce_dtype=config.training.mixed_precision_reduce):
+        splash = config.splash_attention_kernel
+        self.assertTrue(splash.use_tokamax_splash_attention_kernel)
+        self.assertFalse(splash.sa_use_document_aware_block_skipping)
 
   def test_235b_4x4x4_uses_hierarchical_reduce_scatter(self) -> None:
     config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()

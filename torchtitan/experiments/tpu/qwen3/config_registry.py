@@ -724,6 +724,7 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   # Replacing model_spec also replaces nested MoE policy inherited from the
   # 30B base recipe, so apply the intended Q235 routing policy afterwards.
   _use_global_batch_aux_loss(cfg)
+  cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
