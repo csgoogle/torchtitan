@@ -5,6 +5,7 @@ import torch
 from torch import nn
 import torchtitan.config
 import torchtitan.distributed
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.compile import _maybe_regional_inductor_backend
 from torchtitan.distributed.context_parallel import apply_cp_to_forward
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
@@ -28,6 +29,27 @@ from torchtitan.models.common.moe import (
     configure_moe_aux_loss_reduction,
 )
 from torchtitan.tools.logging import logger
+
+
+class _Gemma4SelectiveAC(SelectiveAC):
+  """SelectiveAC that avoids saving un-waited AsyncCollectiveTensors across forward/backward."""
+
+  def get_save_ops(self) -> set:
+    return super().get_save_ops() - {
+        torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        torch.ops._c10d_functional.all_to_all_single.default,
+    }
+
+
+def _apply_ac_gemma4(
+    model: nn.Module,
+    ac_config: "torchtitan.distributed.activation_checkpoint.ActivationCheckpointing.Config",
+    dump_folder: str,
+) -> None:
+  if isinstance(ac_config, SelectiveAC.Config):
+    _Gemma4SelectiveAC(ac_config, dump_folder=dump_folder).apply(model)
+  else:
+    ac_config.build(dump_folder=dump_folder).apply(model)
 
 
 def _apply_compile_gemma4(
@@ -91,7 +113,7 @@ def _parallelize_gemma4_dtensor(
     )
 
   if ac_config is not None:
-    ac_config.build(dump_folder=dump_folder).apply(model)
+    _apply_ac_gemma4(model, ac_config, dump_folder=dump_folder)
 
   if model_compile_enabled:
     _apply_compile_gemma4(model, compile_config)
@@ -251,8 +273,10 @@ def parallelize_gemma4(
 
     _parallelize_gemma4_dtensor(
         model,
-        ac_config=ac_config,
-        compile_config=effective_compile_config,
+        ac_config=None,
+        compile_config=dataclasses.replace(
+            effective_compile_config, enable=False
+        ),
         dump_folder=dump_folder,
         parallel_dims=parallel_dims,
         parallelism=parallelism,
@@ -266,6 +290,13 @@ def parallelize_gemma4(
         parallel_dims=parallel_dims,
         training=training,
     )
+    if ac_config is not None:
+      _apply_ac_gemma4(model, ac_config, dump_folder=dump_folder)
+    if (
+        effective_compile_config.enable
+        and "model" in effective_compile_config.components
+    ):
+      _apply_compile_gemma4(model, effective_compile_config)
   else:
     _parallelize_gemma4_dtensor(
         model,

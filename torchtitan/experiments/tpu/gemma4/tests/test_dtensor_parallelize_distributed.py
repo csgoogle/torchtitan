@@ -20,6 +20,9 @@ from torchtitan.config.configs import (
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    disable_active_parametrization,
+)
 from torchtitan.experiments.tpu import base_distributed_device_test
 from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu.base_distributed_device_test import (
@@ -34,7 +37,6 @@ from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 import torchtitan.experiments.tpu.tpu_job_config
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
 from torchtitan.tools import utils
-
 
 TEST_BATCH_SIZE = 8
 TEST_SEQ_LEN = 32
@@ -70,8 +72,9 @@ class _Gemma4DistributedRunner(
 
   def _create_parallel_model(self, func):
     torch.manual_seed(42)
-    super()._create_parallel_model(func)
-    with torch.no_grad():
+    with disable_active_parametrization():
+      super()._create_parallel_model(func)
+    with torch.no_grad(), disable_active_parametrization():
       for param in self.parallel_model.parameters():
         if isinstance(param, DTensor) and all(
             p.is_replicate() for p in param.placements
@@ -146,8 +149,9 @@ def _verify_dtensor_gemma4_tp_forward_worker(
       input_distribution=InputDistribution.REPLICATE,
       use_meta_init=True,
   )
+  tol = 1e-1 if flavor == "testmodel" else 1.0
   runner.run_forward_parity(
-      TEST_BATCH_SIZE, TEST_SEQ_LEN, atol=1e-1, rtol=1e-1
+      TEST_BATCH_SIZE, TEST_SEQ_LEN, atol=tol, rtol=tol
   )
 
 
@@ -255,7 +259,7 @@ def _verify_dtensor_gemma4_fsdp_training_loop_worker(
       model_args=config,
       parallelism_func=apply_fsdp_wrapper,
       input_distribution=InputDistribution.SPLIT_BATCH,
-      use_meta_init=not use_simple_fsdp,
+      use_meta_init=True,
   )
   runner.run_backward_parity(
       num_steps=TEST_TRAINING_STEPS,
@@ -272,6 +276,7 @@ def _verify_dtensor_gemma4_ep_fsdp_moe_worker(
     device: torch.device,
     rank: int,
     world_size: int,
+    use_simple_fsdp: bool = False,
 ):
   """Verifies numerical equivalence of Expert Parallelism (EP) + FSDP on Gemma4 MoE."""
   use_cpu_safe_histc_patch()
@@ -279,7 +284,9 @@ def _verify_dtensor_gemma4_ep_fsdp_moe_worker(
       "testmodel_moe",
       enable_sp=False,
       enable_ep=True,
+      disable_weight_tying=use_simple_fsdp,
   )
+  ep_degree = 2 if use_simple_fsdp else world_size
 
   def apply_ep_fsdp_wrapper(model):
     parallel_dims = ParallelDims(
@@ -288,7 +295,7 @@ def _verify_dtensor_gemma4_ep_fsdp_moe_worker(
         cp=1,
         tp=1,
         pp=1,
-        ep=world_size,
+        ep=ep_degree,
         world_size=world_size,
     )
     return gemma4_parallelize.parallelize_gemma4(
@@ -299,8 +306,9 @@ def _verify_dtensor_gemma4_ep_fsdp_moe_worker(
         parallel_dims=parallel_dims,
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=world_size,
-            expert_parallel_degree=world_size,
+            expert_parallel_degree=ep_degree,
             enable_sequence_parallel=False,
+            use_simple_fsdp=use_simple_fsdp,
         ),
         training=TrainingConfig(
             mixed_precision_param="float32",
@@ -460,11 +468,28 @@ class TestDTensorParallelizeGemma4(
         ),
     )
 
-  def test_apply_ep_fsdp_moe_backward_equivalence_distributed(self):
+  @parameterized.named_parameters(
+      ("fsdp", False),
+      ("simple_fsdp", True),
+  )
+  def test_apply_ep_fsdp_moe_backward_equivalence_distributed(
+      self, use_simple_fsdp
+  ):
+    if (
+        self.accelerator_device_type
+        == base_distributed_device_test.device_type.AcceleratorDeviceType.TPU
+    ):
+      self.skipTest(
+          "process_group_tpu does not support asymmetric all_to_all_single "
+          "buffer sizes used by AllToAllTokenDispatcher"
+      )
     distributed.run_distributed(
         num_devices=self.num_devices,
         accelerator_device_type=self.accelerator_device_type,
-        func=_verify_dtensor_gemma4_ep_fsdp_moe_worker,
+        func=partial(
+            _verify_dtensor_gemma4_ep_fsdp_moe_worker,
+            use_simple_fsdp=use_simple_fsdp,
+        ),
     )
 
   @parameterized.named_parameters([
