@@ -30,10 +30,10 @@ whole number of blocks) falls back to SDPA and *says so*, once per distinct
 reason. A silent fallback is how a kernel that never fired gets reported as
 a speedup.
 
-Note that HF only builds a mask for implementations registered with its
-``AttentionMaskInterface``; ``splash_tpu`` is not, so for every model on the
-``masking_utils`` path (BERT, RoBERTa, Llama, ...) ``attention_mask`` arrives
-here as ``None`` and the module's ``is_causal`` is the whole mask contract.
+HF builds a mask only for implementations registered with its
+``AttentionMaskInterface``; ``splash_tpu`` registers FA2's mask function, so
+a 2D padding mask arrives here as-is (or as None when nothing is padded) and
+the module's ``is_causal`` plus the packed ``position_ids`` carry the rest.
 """
 
 import logging
@@ -43,6 +43,7 @@ import torch
 from torchtitan.experiments.tpu.attention import KERNEL_KWARG_NAMES
 from torchtitan.models.common.attention import segment_ids_from_positions
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.masking_utils import AttentionMaskInterface, flash_attention_mask
 from transformers.modeling_utils import AttentionInterface
 
 from torchtitan.tools.logging import logger
@@ -234,6 +235,44 @@ def _segment_ids(module, attention_mask, position_ids) -> torch.Tensor | None:
     return seg
 
 
+def _fallback_mask(module, query, key, attention_mask, position_ids, is_causal):
+    """The dense equivalent of the kernel's mask, for the SDPA fallback.
+
+    Returns ``(mask, is_causal)`` for ``sdpa_attention_forward``. Documents and
+    padding come from the same ``_segment_ids`` the kernel uses; causality and
+    the sliding window are folded in, so the fallback computes what the kernel
+    would have. An incoming 4D mask (the reason for falling back, e.g. an
+    additive float mask) is kept and narrowed, never replaced. With no
+    document, padding or window structure the call is passed through
+    unchanged. Cost: one (B, S, S) boolean per call -- 256 MiB at a folded
+    16k stream -- acceptable on a path that is already the slow one.
+    """
+    q_len, kv_len = query.shape[-2], key.shape[-2]
+    two_d = attention_mask if (isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2) else None
+    seg = _segment_ids(module, two_d, position_ids) if q_len == kv_len else None
+    window = getattr(module, "sliding_window", None)
+    if not isinstance(window, int) or window <= 0:
+        window = None
+    if seg is None and window is None:
+        return (None if two_d is not None else attention_mask), is_causal
+    q_pos = torch.arange(q_len, device=query.device)[:, None] + (kv_len - q_len)
+    k_pos = torch.arange(kv_len, device=query.device)[None, :]
+    allowed = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device)
+    if is_causal:
+        allowed = allowed & (k_pos <= q_pos)
+    if window is not None:
+        allowed = allowed & (q_pos - k_pos <= window)
+    allowed = allowed[None]
+    if seg is not None:
+        allowed = allowed & (seg[:, :, None] == seg[:, None, :])
+    allowed = allowed[:, None]  # (B, 1, S, S): broadcast over heads
+    if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4:
+        if attention_mask.dtype == torch.bool:
+            return attention_mask & allowed, False
+        return attention_mask.masked_fill(~allowed, torch.finfo(attention_mask.dtype).min), False
+    return allowed, False
+
+
 def _document_masked(module) -> bool:
     """True when the flavor asked for document-causal attention.
 
@@ -268,9 +307,16 @@ def splash_attention_forward(
     if reason is not None:
         if not _tracing():
             _report(reason)
+        # Fall back to the SAME attention, not just the same kernel interface:
+        # HF hands this adapter no document mask (packing lives in
+        # position_ids), so a bare SDPA call would let packed documents attend
+        # across boundaries and ignore the sliding window.
+        fb_mask, fb_causal = _fallback_mask(
+            module, query, key, attention_mask, kwargs.get("position_ids"), is_causal
+        )
         return sdpa_attention_forward(
-            module, query, key, value, attention_mask,
-            dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs,
+            module, query, key, value, fb_mask,
+            dropout=dropout, scaling=scaling, is_causal=fb_causal, **kwargs,
         )
 
     # Only forward a genuine int window. Reading whatever `sliding_window`
@@ -382,6 +428,13 @@ def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
 def register() -> None:
     """Make `attn_implementation="splash_tpu"` selectable on any HF model."""
     AttentionInterface._global_mapping["splash_tpu"] = splash_attention_forward
+    # HF's masking code early-exits -- and drops the caller's mask -- for any
+    # implementation missing from its mask interface. FA2's mask function is
+    # the right contract here: it returns the 2D (B, S) padding mask as given,
+    # or None when nothing is padded, which is exactly what ``_padding_mask``
+    # turns into segment ids. Causal / window / document structure stays this
+    # adapter's job (from ``is_causal``, ``sliding_window`` and positions).
+    AttentionMaskInterface._global_mapping["splash_tpu"] = flash_attention_mask
 
 
 register()
