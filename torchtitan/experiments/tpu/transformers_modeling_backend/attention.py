@@ -203,12 +203,35 @@ def _unsupported(query, key, attention_mask, dropout) -> str | None:
         # caller a named fallback instead. Short encoder sequences reach it
         # (seq 128 gives a 128 block), and only with dropout: the quantum is
         # not consulted otherwise.
-        block = _pick_block(q_len, kv_len, _DROPOUT_QUANTUM)
+        problem = _dropout_block_problem(q_len, kv_len)
+        if problem is not None:
+            return problem
+    return None
+
+
+def _dropout_block_problem(q_len: int, kv_len: int) -> str | None:
+    """Why the blocks this call would actually use cannot run dropout, or None.
+
+    Checks the EFFECTIVE blocks -- the configured ``sa_*`` values clamped to
+    the sequence exactly as ``_kernel_kwargs`` will hand them over (or the
+    kernel's own default, clamped the same way the wrapper does) -- not just
+    whether the sequence tiles the quantum: a configured block of 128 at
+    sequence 256 tiles fine and still trips the kernel's assert. The PRNG
+    quantum applies to the q block and the kv compute block of both the
+    forward and the dkv pass (the memory kv blocks are multiples of those).
+    """
+    from torchtitan.experiments.tpu.kernels.splash_bias_dropout import SbdConfig
+
+    effective = _kernel_kwargs(q_len, kv_len)
+    for key in ("block_q", "block_kv_compute", "block_q_dkv", "block_kv_dkv_compute"):
+        block = effective.get(key)
+        if key not in effective:
+            block = min(getattr(SbdConfig, key), q_len)
         if block is None or block % _DROPOUT_QUANTUM:
             return (
-                f"sequence {q_len}x{kv_len} does not tile the kernel's "
-                f"{_DROPOUT_QUANTUM}-token dropout quantum; zero the model's "
-                "attention dropout to use the kernel at this length"
+                f"{key}={block} at sequence {q_len}x{kv_len} is not a multiple of "
+                f"the kernel's {_DROPOUT_QUANTUM}-token dropout quantum; zero the "
+                "model's attention dropout or configure blocks that are"
             )
     return None
 
