@@ -227,6 +227,42 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
     # Dropout is active: a different seed gives a different output.
     self.assertGreater(float((out0 - out1).abs().max()), 1e-3, "seeds gave identical masks")
 
+  # -------- attention-logit soft-cap (Gemma-2) --------
+
+  @parameterized.named_parameters(("cap50", 50.0), ("cap2", 2.0), ("cap0p5", 0.5))
+  def test_attn_logits_soft_cap(self, cap):
+    """cap * tanh(scaled logits / cap), forward and backward, vs a math reference.
+
+    The adapter hands HF's `softcap` kwarg to the kernel through
+    SbdConfig.attn_logits_soft_cap. A cap of 0.5 on N(0, 1)-ish logits is far
+    from the identity, so a cap that is silently skipped fails this test.
+    """
+    device = self.accelerator_device
+    b, s, h, d = 1, 512, 4, 64
+    q, k, v = self._qkv(b, s, h, h, d, device, seed=79)
+    scale = d ** -0.5
+    q_ref, k_ref, v_ref = (t.cpu().clone().requires_grad_(True) for t in (q, k, v))
+    scores = torch.einsum("bqhd,bkhd->bhqk", q_ref, k_ref) * scale
+    scores = cap * torch.tanh(scores / cap)
+    scores = scores.masked_fill(~torch.ones(s, s, dtype=torch.bool).tril(), float("-inf"))
+    out_ref = torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, -1), v_ref)
+    out_ref.sum().backward()
+    splash_bias_dropout.SbdConfig.attn_logits_soft_cap = cap
+    try:
+      q_t, k_t, v_t = (t.clone().requires_grad_(True) for t in (q, k, v))
+      out = splash_bias_dropout.sbd_splash_attention(q_t, k_t, v_t, is_causal=True, scale=scale)
+      out.sum().backward()
+    finally:
+      splash_bias_dropout.SbdConfig.attn_logits_soft_cap = None
+    torch.testing.assert_close(out.cpu(), out_ref, rtol=5e-2, atol=5e-2)
+    for name, got, want in (("dq", q_t.grad, q_ref.grad), ("dk", k_t.grad, k_ref.grad),
+                            ("dv", v_t.grad, v_ref.grad)):
+      torch.testing.assert_close(got.cpu(), want, rtol=8e-2, atol=8e-2, msg=name)
+    # Guard against a vacuous pass: the uncapped output must differ.
+    uncapped = splash_bias_dropout.sbd_splash_attention(q, k, v, is_causal=True, scale=scale)
+    if cap <= 2.0:
+      self.assertGreater(float((uncapped.cpu() - out.cpu()).abs().max()), 1e-2, "cap had no effect")
+
   # -------- Gemma-4 attention shapes --------
 
   @parameterized.named_parameters(
