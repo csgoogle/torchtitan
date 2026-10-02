@@ -19,6 +19,7 @@ from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     create_attention_mask,
+    create_sdpa_document_mask,
     create_varlen_metadata_for_document,
     FlexInnerAttention,
     get_causal_mask_mod,
@@ -395,9 +396,12 @@ class Decoder(BaseModel):
                 max_context_length=max_context_length,
             )
         elif isinstance(inner_attn, ScaledDotProductInnerAttention.Config):
-            return None
+            # Without a mask SDPA only applies is_causal, which lets packed
+            # documents attend across their boundaries.
+            return create_sdpa_document_mask(positions)
         else:
             raise TypeError(
-                f"Only VarlenInnerAttention and FlexInnerAttention support attention masks, "
+                "Only VarlenInnerAttention, FlexInnerAttention and "
+                "ScaledDotProductInnerAttention support attention masks, "
                 f"got {type(inner_attn).__name__}"
             )

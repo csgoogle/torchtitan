@@ -62,6 +62,7 @@ __all__ = [
     "VarlenInnerAttention",
     "VarlenMetadata",
     "create_attention_mask",
+    "create_sdpa_document_mask",
     "create_varlen_metadata_for_document",
     "get_causal_mask_mod",
     "get_document_mask_mod",
@@ -87,8 +88,12 @@ class VarlenMetadata(NamedTuple):
 
 # Mapping (not dict) lets covariant value types accept both BlockMask-only
 # dictionaries and mixed dictionaries. A None value marks an unused mask.
+# torch.Tensor is the dense boolean mask of ScaledDotProductInnerAttention.
 AttentionMasksType = (
-    Mapping[str, BlockMask | VarlenMetadata | None] | BlockMask | VarlenMetadata
+    Mapping[str, BlockMask | VarlenMetadata | None]
+    | BlockMask
+    | VarlenMetadata
+    | torch.Tensor
 )
 
 
@@ -444,11 +449,17 @@ class ScaledDotProductInnerAttention(InnerAttention):
         is_causal: bool = True,
         **kwargs,
     ) -> torch.Tensor:
+        attn_mask = None
         if attention_masks is not None:
-            raise ValueError(
-                "ScaledDotProductInnerAttention does not support attention_masks; it "
-                "only supports causal/non-causal attention via is_causal."
-            )
+            if not isinstance(attention_masks, torch.Tensor):
+                raise ValueError(
+                    "ScaledDotProductInnerAttention only supports a dense boolean "
+                    "attention mask (see create_sdpa_document_mask), got "
+                    f"{type(attention_masks).__name__}."
+                )
+            # The mask already encodes causality, so is_causal must be off:
+            # SDPA rejects an explicit mask combined with is_causal=True.
+            attn_mask, is_causal = attention_masks, False
         # TT-UNFLATTEN-SHIM: GQAttention passes 3-D [T, H, K] tensors after the
         # upstream [T] folding migration, while SDPA expects 4-D [B, L, H, K].
         was_3d = q_BLHK.ndim == 3
@@ -482,6 +493,7 @@ class ScaledDotProductInnerAttention(InnerAttention):
                 q_BHLK,
                 k_BHLK,
                 v_BHLV,
+                attn_mask=attn_mask,
                 scale=scale,
                 is_causal=is_causal,
                 enable_gqa=enable_gqa,
@@ -994,6 +1006,30 @@ def segment_ids_from_positions(positions: torch.Tensor) -> torch.Tensor:
     the fork's legacy `[B, S]` layout.
     """
     return (torch.cumsum((positions == 0).int(), dim=-1) - 1).int()
+
+
+def create_sdpa_document_mask(positions: torch.Tensor) -> torch.Tensor:
+    """Dense causal + packed-document mask for ``ScaledDotProductInnerAttention``.
+
+    SDPA has no varlen or block-mask path, so packed documents (``positions``
+    restarting at 0 at each document, see ``segment_ids_from_positions``) need
+    an explicit mask to keep tokens from attending across documents.
+
+    ``positions`` is the folded ``[T]`` token stream, which SDPA sees as one
+    sequence, or a legacy ``[B, L]`` batch. Returns a ``[1, 1, T, T]`` (or
+    ``[B, 1, L, L]``) bool tensor that is True where query ``i`` may attend to
+    key ``j``: same document and ``j <= i``. Memory is O(T^2) (or O(B * L^2)),
+    so prefer FlexAttention or VarlenAttention where the backend supports them.
+    """
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0)
+    segment_ids = segment_ids_from_positions(positions)
+    same_document = segment_ids.unsqueeze(-1) == segment_ids.unsqueeze(-2)
+    seq_len = positions.shape[-1]
+    causal = torch.ones(
+        seq_len, seq_len, dtype=torch.bool, device=positions.device
+    ).tril()
+    return (same_document & causal).unsqueeze(1)
 
 
 class GQAttention(BaseAttention):
