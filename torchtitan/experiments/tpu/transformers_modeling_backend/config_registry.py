@@ -192,6 +192,7 @@ def _tpu_hf_config(
     fused_loss: bool = False,
     attn_mask_type: str = "block_causal",
     save_attention: bool = False,
+    moe_kernels: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
   model_spec = _model_registry(flavor, seq_len=seq_len)
@@ -200,6 +201,9 @@ def _tpu_hf_config(
   # return, ...); the shared backend only has the hooks. Re-classing a copy
   # also leaves the shared flavors table untouched.
   model_spec.model = as_tpu_model_config(model_spec.model, fused_loss=fused_loss)
+  # Run swapped MoE experts on the Pallas grouped-matmul kernels instead of
+  # upstream's torch._grouped_mm (see model._enable_pallas_experts).
+  model_spec.model.tpu_moe_pallas = moe_kernels
   model_spec.parallelize_fn = parallelize_hf_transformers_tpu
   _set_attn_mask_type(model_spec.model, attn_mask_type)
   # flex attention has no TPU lowering. "sdpa" is the portable default;
@@ -323,9 +327,25 @@ def hf_moe_auto() -> TPUTransformersBackendConfig:
   HF-mapped fields at None so AutoConfig supplies them (the backend's
   "full_moe" flavor sets them explicitly and would build the same synthetic
   model for every checkpoint). No expert parallelism: experts stay replicated
-  and SimpleFSDP shards them. Eager by default; ``--compile.enable`` compiles.
+  and SimpleFSDP shards them.
+
+  Runs efficiently by default: per-layer compile (4.2x over eager on OLMoE,
+  measured 2026-10-02) and the experts on the Pallas grouped-matmul kernels.
+  hf_moe_auto_compile drops the kernels, hf_moe_auto_eager drops both.
   """
+  return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
+                        compile=True, moe_kernels=True)
+
+
+def hf_moe_auto_eager() -> TPUTransformersBackendConfig:
+  """hf_moe_auto without compile or the Pallas experts (debugging baseline)."""
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu")
+
+
+def hf_moe_auto_compile() -> TPUTransformersBackendConfig:
+  """hf_moe_auto without the Pallas experts (compile only; A/B reference)."""
+  return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
+                        compile=True)
 
 
 def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBackendConfig:
