@@ -8,3 +8,4 @@ numpy
 gcsfs
 frozendict
 triton
+transformers==5.10.1
