@@ -47,7 +47,7 @@ def _optimization_barrier(*values: torch.Tensor) -> tuple[torch.Tensor, ...]:
             "TPU optimization barriers require all-CPU test inputs or all-TPU "
             f"runtime inputs, got device types {sorted(device_types)}"
         )
-    return tuple(torch.ops.tpu.optimization_barrier.default(list(values)))
+    return tuple(torch.tpu.ops.optimization_barrier(list(values)))
 
 
 def _is_tensor_node(node: torch.fx.Node) -> bool:
