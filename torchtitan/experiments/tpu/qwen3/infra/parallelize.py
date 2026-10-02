@@ -11,6 +11,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
@@ -24,31 +25,8 @@ def configure_qwen_simple_fsdp_shard_dims(
   if fsdp_degree <= 1:
     return
 
-  # Layer stacking moves the layer weights into a holder, which plans an axis
-  # per stack -- dim 1 of a stack is one axis further in than dim 1 of a layer.
-  # Flatten first: it reshapes some stacks, and both `plan_shard_dims` and
-  # sharding must see the new shapes. Reshaping after sharding would need a
-  # redistribute.
-  stacks = [m for m in model.modules() if hasattr(m, "plan_shard_dims")]
-  for holder in stacks:
-    holder.flatten_for(fsdp_degree)
-    holder._fsdp_shard_dim = holder.plan_shard_dims(fsdp_degree)
-
-  hidden_axis_modules: list[str] = []
-  for module_fqn in ("tok_embeddings", "lm_head"):
-    module = getattr(model, module_fqn)
-    weight = module.weight
-    if weight.shape[0] % fsdp_degree == 0:
-      continue
-    if weight.ndim != 2 or weight.shape[1] % fsdp_degree != 0:
-      raise ValueError(
-          f"Cannot FSDP-shard {module_fqn}.weight with shape "
-          f"{tuple(weight.shape)} over {fsdp_degree} ranks"
-      )
-    # This is apply_simple_fsdp's documented per-submodule shard-axis hook,
-    # also used by LayerStackHolder for stacked layer weights.
-    setattr(module, "_fsdp_shard_dim", 1)
-    hidden_axis_modules.append(module_fqn)
+  hidden_axis_modules = configure_simple_fsdp_shard_dims(model, parallel_dims)
+  stacks = any(hasattr(m, "plan_shard_dims") for m in model.modules())
 
   # With EP, apply_simple_fsdp separately wraps each expert bank on the EDP
   # mesh and owns its shard-axis selection.

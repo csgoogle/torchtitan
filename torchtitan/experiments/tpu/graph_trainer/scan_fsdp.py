@@ -30,7 +30,12 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torchtitan.tools.logging import logger
 
 
-__all__ = ["ScanFSDPSpec", "gather_slice", "plan_stacked_gathers"]
+__all__ = [
+    "ScanFSDPSpec",
+    "configure_simple_fsdp_shard_dims",
+    "gather_slice",
+    "plan_stacked_gathers",
+]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -407,3 +412,72 @@ def plan_stacked_gathers(holder: nn.Module) -> dict[str, ScanFSDPSpec]:
         len(plan),
     )
     return plan
+
+
+def configure_simple_fsdp_shard_dims(
+    model: nn.Module,
+    parallel_dims: Any,
+) -> list[str]:
+    """Picks SimpleFSDP shard axes that divide evenly, for any decoder model.
+
+    Plans an axis per layer stack (calling ``flatten_for`` first if present) and
+    moves ``tok_embeddings`` / ``lm_head`` to their hidden axis (dim 1) when the
+    vocabulary does not divide the FSDP degree (e.g. Llama 3's 128,256 over 512+ ranks).
+
+    Args:
+        model: The model to configure, before ``apply_simple_fsdp``.
+        parallel_dims: Parallel dimensions; FSDP degree is ``dp_shard * cp``.
+
+    Returns:
+        FQNs of the modules moved to dim 1.
+    """
+    if parallel_dims is None:
+        return []
+    fsdp_degree = getattr(parallel_dims, "dp_shard", 1) * getattr(
+        parallel_dims, "cp", 1
+    )
+    if fsdp_degree <= 1:
+        return []
+
+    # Layer stacking moves the layer weights into a holder, which plans an axis
+    # per stack -- dim 1 of a stack is one axis further in than dim 1 of a layer.
+    for holder in model.modules():
+        if hasattr(holder, "plan_shard_dims"):
+            if hasattr(holder, "flatten_for"):
+                holder.flatten_for(fsdp_degree)
+            holder._fsdp_shard_dim = holder.plan_shard_dims(fsdp_degree)
+
+    hidden_axis_modules: list[str] = []
+    for module_fqn in ("tok_embeddings", "lm_head"):
+        module = getattr(model, module_fqn, None)
+        if module is None or not hasattr(module, "weight"):
+            continue
+        weight = module.weight
+        if weight.shape[0] % fsdp_degree == 0:
+            continue
+        if weight.ndim != 2 or (
+            weight.shape[1] % fsdp_degree != 0 and weight.shape[1] >= fsdp_degree
+        ):
+            raise ValueError(
+                f"Cannot FSDP-shard {module_fqn}.weight with shape "
+                f"{tuple(weight.shape)} over {fsdp_degree} ranks"
+            )
+        # This is apply_simple_fsdp's documented per-submodule shard-axis hook,
+        # also used by LayerStackHolder for stacked layer weights. When
+        # `weight.shape[1] < fsdp_degree` (e.g. Llama 3 8B at 8192 ranks),
+        # `data_parallel` downgrades `Shard(1)` to `Replicate()`.
+        if weight.shape[1] < fsdp_degree:
+            replicated_mib = weight.numel() * weight.element_size() / (1024**2)
+            logger.warning(
+                "%s.weight with shape %s has hidden dim %d < fsdp_degree %d; "
+                "SimpleFSDP will replicate it (%.1f MiB parameter) instead of "
+                "sharding.",
+                module_fqn,
+                tuple(weight.shape),
+                weight.shape[1],
+                fsdp_degree,
+                replicated_mib,
+            )
+        setattr(module, "_fsdp_shard_dim", 1)
+        hidden_axis_modules.append(module_fqn)
+    return hidden_axis_modules

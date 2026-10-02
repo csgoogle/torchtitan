@@ -197,6 +197,47 @@ class TestShardDimPicker(unittest.TestCase):
         with self.assertRaises(ValueError):
             _pick((N_LAYERS,), 128)
 
+    def test_configure_simple_fsdp_shard_dims_allows_narrow_hidden_axis_for_replication(
+        self,
+    ):
+        # Llama 3 8B at 8192 ranks: `[128256, 4096]` has `128256 % 8192 != 0`
+        # and `4096 < 8192`. Setting `_fsdp_shard_dim = 1` lets `data_parallel`
+        # downgrade `Shard(1)` to `Replicate()`.
+        model = nn.Module()
+        model.tok_embeddings = nn.Embedding(128256, 4096, device="meta")
+        model.lm_head = nn.Linear(4096, 128256, bias=False, device="meta")
+        pdims = unittest.mock.MagicMock(dp_shard=8192, cp=1)
+        with self.assertLogs(scan_fsdp.logger, level="WARNING") as cm:
+            moved = scan_fsdp.configure_simple_fsdp_shard_dims(model, pdims)
+        self.assertTrue(
+            any(
+                "tok_embeddings.weight" in msg and "replicate" in msg
+                for msg in cm.output
+            )
+        )
+        self.assertEqual(moved, ["tok_embeddings", "lm_head"])
+        self.assertEqual(model.tok_embeddings._fsdp_shard_dim, 1)
+        self.assertEqual(model.lm_head._fsdp_shard_dim, 1)
+        with _fake_pg(8192):
+            mesh = init_device_mesh("cpu", (8192,), mesh_dim_names=("fsdp",))
+            data_parallel(
+                model.tok_embeddings,
+                mesh,
+                "fully_shard",
+                shard_dim=model.tok_embeddings._fsdp_shard_dim,
+            )
+            self.assertEqual(
+                model.tok_embeddings._parameters["weight"].placements,
+                (Replicate(),),
+            )
+        # Still refuses when `shape[1] >= fsdp_degree` and neither axis divides.
+        bad = nn.Module()
+        bad.tok_embeddings = nn.Embedding(128256, 6144, device="meta")
+        with self.assertRaises(ValueError):
+            scan_fsdp.configure_simple_fsdp_shard_dims(
+                bad, unittest.mock.MagicMock(dp_shard=4096, cp=1)
+            )
+
     def test_subtile_two_d_gather_and_scatter_fold_minor_axis_to_align_tiles(
         self,
     ):

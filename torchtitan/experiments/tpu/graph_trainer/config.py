@@ -8,11 +8,15 @@
 
 import dataclasses
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
+from torch import nn
 from torchtitan.experiments.graph_trainer.configs import to_graph_trainer_config
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
+)
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
+    configure_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
@@ -112,11 +116,24 @@ def to_tpu_graph_trainer_config(
     # The rewrite happens here rather than in the recipe because the
     # GraphTrainer model spec built above comes from a fixed class in the
     # graph-trainer registry, which discards whatever the recipe had set.
+    orig_parallelize_fn = graph_config.model_spec.parallelize_fn
+
+    def parallelize_fn_with_shard_dims(
+        model: nn.Module, **kwargs: Any
+    ) -> nn.Module:
+      configure_simple_fsdp_shard_dims(model, kwargs.get("parallel_dims"))
+      model = orig_parallelize_fn(model, **kwargs)
+      for holder in model.modules():
+        if hasattr(holder, "build_split_meshes"):
+          holder.build_split_meshes()
+      return model
+
     graph_config.model_spec = dataclasses.replace(
         graph_config.model_spec,
         model=with_tpu_stacked_layers(
             graph_config.model_spec.model, use_scan=True
         ),
+        parallelize_fn=parallelize_fn_with_shard_dims,
     )
     # The rewrite is only a config edit, so anything added after it that
     # rebuilds `model_spec` from a fixed class drops it again -- and an
