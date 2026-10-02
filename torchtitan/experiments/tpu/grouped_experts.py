@@ -229,7 +229,9 @@ class TpuGroupedExperts(GroupedExperts):
     ) -> torch.Tensor:
         """``GroupedExperts._experts_forward`` with a configurable activation.
 
-        Mirrors the upstream method (keep in sync); upstream hard-codes silu.
+        Mirrors ``GroupedExperts._experts_forward`` in
+        ``torchtitan/models/common/moe.py`` (keep in sync); upstream hard-codes
+        silu.
         """
         if isinstance(self.w1_EFD, DTensor):
             w1_EFD = self.w1_EFD.to_local()
