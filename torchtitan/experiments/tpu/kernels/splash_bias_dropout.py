@@ -100,6 +100,16 @@ class SbdConfig:
   # batch into one packed stream), and the price of skipping above it.
   # Off is exact too, just denser.
   document_aware_skipping: bool = True
+  # The fork's `SplashConfig.dq_reduction_steps`: 0 keeps its default (one
+  # unreduced dq partial per kv step, fp32 once kv_steps > 4, summed outside
+  # the kernel -- `(kv_steps, H, S, D)`, the largest backward temporary at
+  # long sequence); 3 accumulates dq in-kernel into three partials of q's
+  # dtype AND gives the dkv pass a dynamic block list, which
+  # `_document_aware_mask_info` then compacts like the forward's. Not
+  # bit-identical to 0: the dq (and grouped-KV dk/dv) fp32 summation order
+  # changes (~1e-6 at fp32 inputs on v6e), and the dq partials round to q's
+  # dtype, so it is opt-in pending a loss-gated lane experiment.
+  dq_reduction_steps: int = 0
 
   @classmethod
   def update(cls, **kwargs):
@@ -127,6 +137,7 @@ class SbdConfig:
         cls.bias_per_key_dbias,
         cls.bias_per_key_dbias_mxu_reduce,
         cls.document_aware_skipping,
+        cls.dq_reduction_steps,
     )
 
 
@@ -152,6 +163,7 @@ def _build_kernel(
     bias_per_key_rows: int,
     bias_per_key_dbias: bool,
     bias_per_key_dbias_mxu_reduce: bool,
+    dq_reduction_steps: int = 0,
 ):
   """Constructs the fork kernel + static mask infos for one configuration."""
   cfg = sbd_kernel.SplashConfig(
@@ -163,21 +175,10 @@ def _build_kernel(
       block_kv_dkv_compute=min(block_kv_dkv_compute, seq_len),
       use_experimental_scheduler=use_experimental_scheduler,
       use_base2_exp=True,
-      # Left at the fork's default (None = one dq partial per kv step). The
-      # alternative, `dq_reduction_steps=3`, is tempting twice over -- it
-      # shrinks the fused backward's unreduced dq from
-      # `(kv_steps, heads, seq, head_dim)` fp32 (2 GiB unpadded at the HF
-      # lane's 16k x 32-head op-point, 4 GiB after head_dim 64 pads to 128)
-      # to three partials in q's dtype, AND it is the only mode that asks
-      # `_process_mask` for a dynamic dkv grid, which would let the backward
-      # drop skipped steps outright instead of only their arithmetic. It is
-      # unusable here as of 2026-10-01: on the dynamic grid the GQA/MQA path
-      # initializes its aliased dk/dv with `lax.empty` and the dynamic branch
-      # never applies the `q_heads_per_kv_head` group-AND that the static one
-      # does, so dk comes back wrong for every grouped-KV shape (5 of 23
-      # kernel tests fail on dk; MHA is unaffected). Fixing that accumulation
-      # in the fork is what unlocks both wins.
-      dq_reduction_steps=None,
+      # See `SbdConfig.dq_reduction_steps`. 3 used to return wrong dk/dv for
+      # every grouped-KV / MQA shape with a single kv block; fixed in the fork
+      # (`_splash_attention_bwd_dkv`, `bounds_end == 2`).
+      dq_reduction_steps=dq_reduction_steps or None,
       attn_logits_soft_cap=attn_logits_soft_cap,
       dropout_rate=dropout_rate if use_dropout else 0.0,
       dropout_fold_rescale=dropout_fold_rescale,
@@ -277,12 +278,14 @@ def _document_aware_mask_info(mask_info, seg_b, bq: int, bkv: int, *, is_dkv: bo
     `num_active_blocks` -- which the kernel uses as its grid bound -- shrinks
     with them. Pallas takes a traced grid bound, so a dropped step costs
     nothing at all: no DMA, no compute, no grid iteration.
-  - The dkv `MaskInfo` is a DENSE `[kv_block][q_block]` grid (its grid also
-    carries the head axis, which compaction would reorder), so there the
-    tiles are only zeroed. Both kernels read `block_mask == 0` as "visit,
-    initialize, write, compute nothing", which is how the dkv pass already
-    skips the statically-masked half of a causal grid; the arithmetic goes
-    away, the grid iteration and its q-side DMA do not.
+  - The dkv `MaskInfo` is, by default, a DENSE `[kv_block][q_block]` grid,
+    so there the tiles are only zeroed. Both kernels read `block_mask == 0`
+    as "visit, initialize, write, compute nothing", which is how the dkv
+    pass already skips the statically-masked half of a causal grid; the
+    arithmetic goes away, the grid iteration and its q-side DMA do not.
+    With `SbdConfig.dq_reduction_steps == 3` the dkv `MaskInfo` is a list
+    too (kv-major, the head axis outermost in the grid) and takes the
+    compaction path below, rows and cols swapped.
 
   A row that loses every step keeps its first one as an anchor, because a
   row's output tile is written on its first / last visited step: on the dkv
@@ -402,6 +405,7 @@ def sbd_attention_fwd(
     bias_per_key_dbias: bool,
     bias_per_key_dbias_mxu_reduce: bool,
     document_aware_skipping: bool,
+    dq_reduction_steps: int,
 ) -> tuple[jax.Array, jax.Array]:
   """Forward. Layouts: q `(B, S, H, D)` torch-standard; k/v `(B, S, H_kv, D)`
   with `H_kv == H` (MHA), `H % H_kv == 0` (grouped KV), or `H_kv == 1`
@@ -438,6 +442,7 @@ def sbd_attention_fwd(
       bias_per_key_rows,
       bias_per_key_dbias,
       bias_per_key_dbias_mxu_reduce,
+      dq_reduction_steps,
   )
   fwd_mi, _, mask_value, mask_fn, fwd_sp, _ = _kernel_statics(kernel)
 
@@ -530,6 +535,7 @@ def sbd_attention_bwd(
     bias_per_key_dbias: bool,
     bias_per_key_dbias_mxu_reduce: bool,
     document_aware_skipping: bool,
+    dq_reduction_steps: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
   """Backward from saved residuals -- no forward re-run. Returns
   `(dq, dk, dv, dbias)`; `dbias` is a `(0,)` placeholder when bias is None
@@ -560,6 +566,7 @@ def sbd_attention_bwd(
       bias_per_key_rows,
       bias_per_key_dbias,
       bias_per_key_dbias_mxu_reduce,
+      dq_reduction_steps,
   )
   _, dkv_mi, mask_value, mask_fn, fwd_sp, dkv_sp = _kernel_statics(kernel)
 
@@ -661,7 +668,7 @@ def _segment_ids(seg_b):
 _sbd_fwd = pallas.jax_op("pallas::sbd_splash_attn_fwd", sbd_attention_fwd)
 _sbd_bwd = pallas.jax_op("pallas::sbd_splash_attn_bwd", sbd_attention_bwd)
 
-_NUM_STATIC_ARGS = 20  # causal, scale, window, layout + 16 SbdConfig values
+_NUM_STATIC_ARGS = 21  # causal, scale, window, layout + 17 SbdConfig values
 
 
 def _setup_context(ctx, inputs, output):
