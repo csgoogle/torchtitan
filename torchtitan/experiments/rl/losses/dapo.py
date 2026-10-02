@@ -111,13 +111,18 @@ class DAPOLoss(BaseLoss):
                 torch.zeros_like(raw_log_ratio),
             )
             masked_ratio = ratio * effective_loss_mask
+            # A token is clipped when min() selects the clipped term, which
+            # zeroes its gradient: ratio above the upper bound with a positive
+            # advantage, or below the lower bound with a negative advantage.
+            # A ratio outside the band on the other side (or with a zero
+            # advantage) keeps the unclipped term, so it is not counted.
+            clipped = ((advantages > 0) & (ratio > 1 + self.ratio_clip_high)) | (
+                (advantages < 0) & (ratio < 1 - self.ratio_clip_low)
+            )
             metrics = {
                 "loss/mean": loss.detach(),
                 "loss/ratio_mean": masked_ratio.sum() / loss_denominator,
-                "loss/ratio_clipped_frac": (
-                    (torch.abs(ratio - clipped_ratio) > 1e-6).float()
-                    * effective_loss_mask
-                ).sum()
+                "loss/ratio_clipped_frac": (clipped.float() * effective_loss_mask).sum()
                 / loss_denominator,
                 # Mean per-token log-ratio (log p_trainer - log q_generator) over
                 # sampled tokens. This is the k1 Monte-Carlo estimate of -KL(q || p).
