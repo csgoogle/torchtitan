@@ -114,7 +114,10 @@ def parallelize_hf_transformers_tpu(
       compile_config=effective_compile_config,
       ac_config=ac_config,
       dump_folder=dump_folder,
-      skip_dp=True,
+      # With SimpleFSDP this lane wraps data parallelism itself (below); with it
+      # off, the shared parallelize applies its own fully_shard in this same
+      # call -- Module.parallelize() may run only once per instance.
+      skip_dp=parallelism.use_simple_fsdp,
   )
 
   if parallelism.use_simple_fsdp:
@@ -161,19 +164,6 @@ def parallelize_hf_transformers_tpu(
     )
     _defer_parametrization_during_init(model)
     logger.info("Applied SimpleFSDP (%s) to the HF backend model", dp_mode)
-  else:
-    # Opt-out path: let the backend do its own fully_shard. Kept so the two
-    # data-parallel implementations can be compared on the same config.
-    parallelize_hf_transformers(
-        model,
-        parallel_dims=parallel_dims,
-        training=training,
-        parallelism=parallelism,
-        compile_config=dataclasses.replace(effective_compile_config, enable=False),
-        ac_config=None,
-        dump_folder=dump_folder,
-        skip_dp=False,
-    )
 
   if compile_mode == "fullgraph":
     apply_spmd_safe(model)
