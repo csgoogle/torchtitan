@@ -144,7 +144,7 @@ class GraphTrainer(Trainer):
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: float,
+        global_valid_tokens: float | torch.Tensor,
     ) -> torch.Tensor:
         if self.config.compile.mode != "aot_fx_trace":
             return super().forward_backward_step(
@@ -184,7 +184,7 @@ class GraphTrainer(Trainer):
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: float,
+        global_valid_tokens: float | torch.Tensor,
     ) -> torch.Tensor:
         inputs, labels, extra_kwargs = self.post_dataloading_process(input_dict, labels)
         loss_kwargs = {"global_valid_tokens": global_valid_tokens}
@@ -238,7 +238,7 @@ class GraphTrainer(Trainer):
         model: nn.Module,
         inputs: torch.Tensor,
         labels: torch.Tensor,
-        global_valid_tokens: float,
+        global_valid_tokens: float | torch.Tensor,
         params: list[torch.Tensor],
         extra_kwargs: dict[str, Any],
     ) -> torch.Tensor:

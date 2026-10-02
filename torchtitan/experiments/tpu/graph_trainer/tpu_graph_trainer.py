@@ -253,9 +253,11 @@ class TpuGraphTrainer(GraphTrainer):
         local_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(
+            # Keep on device (no `.item()`) to avoid a host-blocking all-reduce
+            # before dispatch. Reduce in int64 for exactness, then cast.
+            global_valid_tokens = dist_utils.dist_sum_tensor(
                 local_valid_tokens, batch_mesh
-            )
+            ).to(torch.float32)
         else:
             global_valid_tokens = local_valid_tokens.float()
 
@@ -268,7 +270,7 @@ class TpuGraphTrainer(GraphTrainer):
             loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
-                global_valid_tokens=global_valid_tokens,  # type: ignore[arg-type]
+                global_valid_tokens=global_valid_tokens,
             )
             accumulated_losses.append(loss.detach())
 
@@ -298,7 +300,7 @@ class TpuGraphTrainer(GraphTrainer):
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor,
+        global_valid_tokens: float | torch.Tensor,
     ) -> torch.Tensor:
         """Override of GraphTrainer.forward_backward_step to branch into AdamW step when optimizer_in_graph is set."""
         if not self._optimizer_in_graph:
@@ -318,7 +320,7 @@ class TpuGraphTrainer(GraphTrainer):
         model: nn.Module,
         inputs: torch.Tensor,
         labels: torch.Tensor,
-        global_valid_tokens: float,
+        global_valid_tokens: float | torch.Tensor,
         params: list[torch.Tensor],
         extra_kwargs: dict[str, Any],
     ) -> torch.Tensor:
@@ -418,7 +420,7 @@ class TpuGraphTrainer(GraphTrainer):
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: float,
+        global_valid_tokens: float | torch.Tensor,
     ) -> torch.Tensor:
         """TPU/PJRT addition: lowers and runs joint forward, backward, and AdamW optimizer FX graph step."""
         from torchtitan.experiments.graph_trainer.common_utils import (

@@ -75,19 +75,24 @@ def check_dtensor_placements_match(
     return True
 
 
-def _dist_reduce(
+def _dist_reduce_tensor(
     x: torch.Tensor,
     reduceOp: str,
     mesh: DeviceMesh | None,
     extra_pg: dist.ProcessGroup | None,
-) -> float:
-    """Perform distributed reduction on a tensor.
+) -> torch.Tensor:
+    """Perform distributed reduction on a tensor without a host sync.
+
+    Unlike ``_dist_reduce``, this returns the reduced value as a device tensor
+    and does not call ``.item()``. This lets callers enqueue several
+    collectives back-to-back and pay for a single device-to-host transfer
+    afterwards, instead of blocking the host after every collective.
 
     Args:
-        x (torch.Tensor): Input tensor.
+        x (torch.Tensor): Input tensor. Must contain exactly one element.
         reduceOp (str): Reduce operation to perform.
         mesh (DeviceMesh | None): Device mesh to use for reduction.
-            If None, no reduction is performed but simply convert the tensor to a float.
+            If None, no mesh reduction is performed.
         extra_pg (dist.ProcessGroup, optional): Extra process group to use for reduction.
             Defaults to None. If provided, this all_reduce will be called for the extra
             process group, and then the result will be all_reduced for the mesh.
@@ -114,9 +119,31 @@ def _dist_reduce(
     if extra_pg is not None:
         x = funcol.all_reduce(x, reduceOp=reduceOp, group=extra_pg)
     if mesh is None:
-        return float(x.item())
-    assert x.numel() == 1  # required by `.item()`
-    return float(funcol.all_reduce(x, reduceOp=reduceOp, group=mesh).item())
+        return x
+    assert x.numel() == 1  # required by callers that call `.item()`
+    return funcol.all_reduce(x, reduceOp=reduceOp, group=mesh)
+
+
+def _dist_reduce(
+    x: torch.Tensor,
+    reduceOp: str,
+    mesh: DeviceMesh | None,
+    extra_pg: dist.ProcessGroup | None,
+) -> float:
+    """Perform distributed reduction on a tensor.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        reduceOp (str): Reduce operation to perform.
+        mesh (DeviceMesh | None): Device mesh to use for reduction.
+            If None, no reduction is performed but simply convert the tensor to a float.
+        extra_pg (dist.ProcessGroup, optional): Extra process group to use for reduction.
+            Defaults to None. If provided, this all_reduce will be called for the extra
+            process group, and then the result will be all_reduced for the mesh.
+    """
+    return float(
+        _dist_reduce_tensor(x, reduceOp=reduceOp, mesh=mesh, extra_pg=extra_pg).item()
+    )
 
 
 # TODO: rename this to maybe_dist_max
@@ -146,6 +173,39 @@ def dist_mean(
     extra_pg: dist.ProcessGroup | None = None,
 ) -> float:
     return _dist_reduce(
+        x, reduceOp=c10d.ReduceOp.AVG.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
+def dist_max_tensor(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Like ``dist_max`` but returns a device tensor without a host sync."""
+    return _dist_reduce_tensor(
+        x, reduceOp=c10d.ReduceOp.MAX.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
+def dist_sum_tensor(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Like ``dist_sum`` but returns a device tensor without a host sync."""
+    return _dist_reduce_tensor(
+        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
+def dist_mean_tensor(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Like ``dist_mean`` but returns a device tensor without a host sync."""
+    return _dist_reduce_tensor(
         x, reduceOp=c10d.ReduceOp.AVG.name, mesh=mesh, extra_pg=extra_pg
     )
 

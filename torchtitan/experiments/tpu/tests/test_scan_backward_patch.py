@@ -19,6 +19,7 @@ the thing the patch changes.
 import inspect
 import sys
 import textwrap
+from unittest import mock
 
 from absl.testing import absltest
 import torch
@@ -260,6 +261,91 @@ class ScanBackwardPatchTest(base_device_test.BaseAcceleratorDeviceTest):
     grads, flips = self._backward()
 
     self.assertNotEqual(flips, [], "the added flip was swallowed")
+    for name, want, got in zip(("init", "xs"), expected, grads):
+      torch.testing.assert_close(got, want, msg=f"{name} gradient changed")
+
+  def test_ys_grad_write_keeps_the_gradients_and_flips_only_the_outputs(self):
+    """`GradWrite.YS` trades the `index_copy` for one flip per gradient stack.
+
+    The input stacks still are not flipped; only the gradient stacks, which
+    come out in iteration order, are.
+    """
+    expected, flips_before = self._backward()
+    self.assertNotEqual(
+        flips_before, [], "unpatched torch did not flip -- test is vacuous"
+    )
+
+    self.enter_context(
+        mock.patch.dict(
+            "os.environ",
+            {
+                "TORCHTITAN_SCAN_BWD_GRAD_WRITE": (
+                    scan_backward_patch.GradWrite.YS.value
+                )
+            },
+        )
+    )
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    grads, flips = self._backward()
+
+    self.assertNotEmpty(flips, "the gradient stacks were not reversed")
+    self.assertLess(
+        len(flips), len(flips_before), "the input stacks were still flipped"
+    )
+    for name, want, got in zip(("init", "xs"), expected, grads):
+      torch.testing.assert_close(got, want, msg=f"{name} gradient changed")
+
+  def test_ys_reverse_grad_write_keeps_the_gradients_without_any_flip(self):
+    """`GradWrite.YS_REVERSE` gets the gradient stacks in order from the loop.
+
+    The gradient check is what proves torch_tpu saw the request: a loop that
+    ran forwards would return the `xs` gradient reversed.
+    """
+    if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+      self.skipTest("only torch_tpu honours the reverse-scan request")
+    expected, flips_before = self._backward()
+    self.assertNotEqual(
+        flips_before, [], "unpatched torch did not flip -- test is vacuous"
+    )
+
+    self.enter_context(
+        mock.patch.dict(
+            "os.environ",
+            {
+                "TORCHTITAN_SCAN_BWD_GRAD_WRITE": (
+                    scan_backward_patch.GradWrite.YS_REVERSE.value
+                )
+            },
+        )
+    )
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    grads, flips = self._backward()
+
+    self.assertEqual(flips, [], "the backward still reverses by copy")
+    for name, want, got in zip(("init", "xs"), expected, grads):
+      torch.testing.assert_close(got, want, msg=f"{name} gradient changed")
+
+  def test_index_copy_grad_write_keeps_the_gradients_without_any_flip(self):
+    """`GradWrite.INDEX_COPY` writes each gradient row in place with no flip."""
+    expected, flips_before = self._backward()
+    self.assertNotEqual(
+        flips_before, [], "unpatched torch did not flip -- test is vacuous"
+    )
+
+    self.enter_context(
+        mock.patch.dict(
+            "os.environ",
+            {
+                "TORCHTITAN_SCAN_BWD_GRAD_WRITE": (
+                    scan_backward_patch.GradWrite.INDEX_COPY.value
+                )
+            },
+        )
+    )
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    grads, flips = self._backward()
+
+    self.assertEqual(flips, [], "the backward still reverses by copy")
     for name, want, got in zip(("init", "xs"), expected, grads):
       torch.testing.assert_close(got, want, msg=f"{name} gradient changed")
 

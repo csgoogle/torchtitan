@@ -19,6 +19,7 @@ import torch
 import torch.distributed.checkpoint.stateful
 import tyro
 from torch.distributed.elastic.multiprocessing.errors import record
+from torch.distributed.tensor import DTensor
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
@@ -58,6 +59,26 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 from torchtitan.tools.profiler import Profiler
+
+
+@dataclass(slots=True)
+class _PendingStepMetrics:
+    """Metrics of a logged step whose host readback has not happened yet."""
+
+    step: int
+    # [global_avg_loss, global_max_loss, grad_norm] as float32.
+    float_metrics: torch.Tensor
+    # [global_valid_tokens, global_ntokens_seen] as int64.
+    int_metrics: torch.Tensor
+    extra_metrics: dict[str, Any]
+    # Device event recorded after the non-blocking host copies of the tensors
+    # above, or None if they need no wait (or are still on device).
+    ready_event: Any | None
+    # Throughput counters of this step's log interval, detached from the
+    # metrics processor at staging time so that steps run before the readback
+    # are attributed to the next interval instead.
+    ntokens_since_last_log: int
+    data_loading_times: list[float]
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
@@ -222,6 +243,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     # additional training states
     step: int
     ntokens_seen: int
+    # Metrics of the last logged step, awaiting host readback.
+    _pending_metrics: _PendingStepMetrics | None = None
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -707,7 +730,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: float,
+        global_valid_tokens: float | torch.Tensor,
     ) -> torch.Tensor:
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
@@ -783,15 +806,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 microbatches.append((input_dict, labels))
         sl.log_trace_scalar({"local_valid_tokens": int(local_valid_tokens)})
 
-        # All-reduce to get global token count across DP ranks
-        # Move to GPU for distributed communication
+        # All-reduce to get global token count across DP ranks.
+        # Keep the result on device (no `.item()`) so the host does not block on
+        # a cross-slice all-reduce before dispatching forward/backward. The
+        # reduction is done in int64 for exactness (the global count can exceed
+        # float32's 2**24 integer range) and cast to float32 afterwards.
+        local_valid_tokens_dev = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(
-                local_valid_tokens.to(self.device), batch_mesh
+            global_valid_tokens_i64 = dist_utils.dist_sum_tensor(
+                local_valid_tokens_dev, batch_mesh
             )
         else:
-            global_valid_tokens = float(local_valid_tokens.item())
+            global_valid_tokens_i64 = local_valid_tokens_dev
+        global_valid_tokens_t = global_valid_tokens_i64.to(torch.float32)
+
+        # Precompiled aot_fx_trace artifacts were traced with a Python float, so
+        # keep passing a float in that case to match the artifact signature.
+        global_valid_tokens: float | torch.Tensor
+        if getattr(self.config.compile, "precompile_artifact_dir", None):
+            global_valid_tokens = float(global_valid_tokens_t.item())
+        else:
+            global_valid_tokens = global_valid_tokens_t
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
@@ -818,14 +854,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
+        # With `metrics.defer_readback`, the previous logged step's metrics are
+        # read back only now, after this step's work has been dispatched. The
+        # host then waits on work that is a step old instead of draining the
+        # device queue, so it can keep running ahead of the device.
+        self._flush_pending_metrics()
+
         # log metrics
         if not self.metrics_processor.should_log(self.step):
             return
 
         with sl.log_trace_span("collect_dist_metrics"):
-
-            sl.log_trace_scalar({"global_valid_tokens": int(global_valid_tokens)})
-
+            # Enqueue all metric collectives before any host sync so they run
+            # back-to-back on device, then pay for a single D2H transfer.
             if parallel_dims.dp_cp_enabled:
                 loss = loss.detach()
                 loss_mesh = parallel_dims.get_optional_mesh("loss")
@@ -839,43 +880,151 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 # local_avg_loss = local_loss_sum / local_valid_tokens
                 #                = (loss * global_valid_tokens) / local_valid_tokens
                 # global_max_loss = max(local_avg_loss)
-                local_avg_loss = loss * global_valid_tokens / local_valid_tokens
-                global_avg_loss, global_max_loss, global_ntokens_seen = (
-                    dist_utils.dist_sum(loss, loss_mesh),
-                    dist_utils.dist_max(local_avg_loss, loss_mesh),
-                    dist_utils.dist_sum(
-                        torch.tensor(
-                            self.ntokens_seen, dtype=torch.int64, device=self.device
-                        ),
-                        loss_mesh,
+                local_avg_loss = (
+                    loss * global_valid_tokens_t / local_valid_tokens_dev
+                )
+                global_avg_loss_t = dist_utils.dist_sum_tensor(loss, loss_mesh)
+                global_max_loss_t = dist_utils.dist_max_tensor(
+                    local_avg_loss, loss_mesh
+                )
+                global_ntokens_seen_t = dist_utils.dist_sum_tensor(
+                    torch.tensor(
+                        self.ntokens_seen, dtype=torch.int64, device=self.device
                     ),
+                    loss_mesh,
                 )
             else:
-                global_avg_loss = global_max_loss = float(loss.detach().item())
-                global_ntokens_seen = self.ntokens_seen
+                loss = loss.detach()
+                global_avg_loss_t = global_max_loss_t = loss
+                global_ntokens_seen_t = torch.tensor(
+                    self.ntokens_seen, dtype=torch.int64, device=self.device
+                )
+
+            def _to_plain_scalar(t: torch.Tensor) -> torch.Tensor:
+                # Matches what `.item()` does on a DTensor (materialize the
+                # full value) so it can be stacked with plain tensors.
+                if isinstance(t, DTensor):
+                    t = t.full_tensor()
+                return t.reshape(())
+
+            # Coalesced device-to-host transfers: one for float metrics and one
+            # for int64 counters (kept in int64 so large counts stay exact).
+            float_metrics = torch.stack(
+                [
+                    _to_plain_scalar(global_avg_loss_t).float(),
+                    _to_plain_scalar(global_max_loss_t).float(),
+                    _to_plain_scalar(grad_norm.detach()).float(),
+                ]
+            )
+            int_metrics = torch.stack(
+                [
+                    _to_plain_scalar(global_valid_tokens_i64).long(),
+                    _to_plain_scalar(global_ntokens_seen_t).long(),
+                ]
+            )
+
+        # The MoE routing metrics read tensors stashed on the modules by the
+        # latest forward, so they must be collected before the next forward
+        # overwrites them. Note that, when enabled, this does its own blocking
+        # device-to-host copy of the per-expert counts.
+        extra_metrics: dict[str, Any] = dict(lr_metrics)
+        extra_metrics.update(get_moe_load_balancing_metrics(self.model_parts))
+
+        defer = self.metrics_processor.config.defer_readback
+        ready_event = None
+        if defer:
+            # Start the copies now; they complete once this step's metric
+            # collectives do, without making the host wait for them.
+            (float_metrics, int_metrics), ready_event = self._copy_to_host_async(
+                [float_metrics, int_metrics]
+            )
+        # Detach this interval's throughput counters so that steps which run
+        # before a deferred readback count toward the next log interval.
+        metrics_processor = self.metrics_processor
+        ntokens_since_last_log = metrics_processor.ntokens_since_last_log
+        data_loading_times = list(metrics_processor.data_loading_times)
+        metrics_processor.ntokens_since_last_log = 0
+        metrics_processor.data_loading_times.clear()
+        self._pending_metrics = _PendingStepMetrics(
+            step=self.step,
+            float_metrics=float_metrics,
+            int_metrics=int_metrics,
+            extra_metrics=extra_metrics,
+            ready_event=ready_event,
+            ntokens_since_last_log=ntokens_since_last_log,
+            data_loading_times=data_loading_times,
+        )
+        if not defer:
+            self._flush_pending_metrics()
+
+    def _copy_to_host_async(
+        self, tensors: list[torch.Tensor]
+    ) -> tuple[list[torch.Tensor], Any]:
+        """Starts non-blocking device-to-host copies of `tensors`.
+
+        Returns the host tensors and a device event recorded after the copies.
+        The host tensors must not be read before `event.synchronize()`. The
+        event is None when the tensors already live on the host.
+        """
+        if self.device.type == "cpu":
+            return tensors, None
+        host_tensors = [t.to("cpu", non_blocking=True) for t in tensors]
+        event = torch.get_device_module(self.device.type).Event()
+        event.record()
+        return host_tensors, event
+
+    def _flush_pending_metrics(self) -> None:
+        """Reads back and logs the metrics staged by the last logged step."""
+        pending = self._pending_metrics
+        if pending is None:
+            return
+        self._pending_metrics = None
+
+        with sl.log_trace_span("metrics_readback"):
+            if pending.ready_event is not None:
+                pending.ready_event.synchronize()
+            global_avg_loss, global_max_loss, grad_norm_val = (
+                pending.float_metrics.cpu().tolist()
+            )
+            global_valid_tokens_val, global_ntokens_seen = (
+                pending.int_metrics.cpu().tolist()
+            )
+        sl.log_trace_scalar({"global_valid_tokens": int(global_valid_tokens_val)})
 
         # Crash on invalid loss. global_avg_loss is a SUM reduction, so a infinite
         # loss on any rank propagates here. This reuses the D2H copy already done
-        # for logging, so it adds no extra sync.
+        # for logging, so it adds no extra sync. With `metrics.defer_readback`
+        # this fires one step after the step that produced the loss.
         # TODO: make this step work even logging is off.
         if not math.isfinite(global_avg_loss):
             raise RuntimeError(
                 f"Loss is not finite (global_avg_loss={global_avg_loss}) at "
-                f"step {self.step}. Stopping training."
+                f"step {pending.step}. Stopping training."
             )
 
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
-            **lr_metrics,
+            **pending.extra_metrics,
         }
-        extra_metrics.update(get_moe_load_balancing_metrics(self.model_parts))
-        self.metrics_processor.log(
-            self.step,
+        # `log()` computes throughput from, and then resets, the processor's
+        # counters. Log with the pending step's own counters and keep whatever
+        # later steps have accumulated since for the next interval.
+        metrics_processor = self.metrics_processor
+        later_ntokens = metrics_processor.ntokens_since_last_log
+        later_data_loading_times = list(metrics_processor.data_loading_times)
+        metrics_processor.ntokens_since_last_log = pending.ntokens_since_last_log
+        metrics_processor.data_loading_times.clear()
+        metrics_processor.data_loading_times.extend(pending.data_loading_times)
+        metrics_processor.log(
+            pending.step,
             global_avg_loss,
             global_max_loss,
-            float(grad_norm.item()),
+            grad_norm_val,
             extra_metrics=extra_metrics,
         )
+        metrics_processor.ntokens_since_last_log = later_ntokens
+        metrics_processor.data_loading_times.clear()
+        metrics_processor.data_loading_times.extend(later_data_loading_times)
 
     def _clip_grad_norm(self) -> torch.Tensor:
         return dist_utils.clip_grad_norm_(
@@ -918,10 +1067,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         logger.warning("Ran out of data; last step was canceled.")
                         break
 
-                    self.checkpointer.save(
-                        self.step,
-                        last_step=(self.step == config.training.steps),
-                    )
+                    last_step = self.step == config.training.steps
+                    # Deferred metrics carry the non-finite loss check; run it
+                    # before persisting state that may be corrupted.
+                    if self.checkpointer._should_save(self.step, last_step):
+                        self._flush_pending_metrics()
+                    self.checkpointer.save(self.step, last_step=last_step)
 
                     # Run validation if validator is available
                     if self.config.validator.enable and self.validator.should_validate(
@@ -947,6 +1098,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                             ),
                             parallel_dims=self.parallel_dims,
                         )
+
+            # Log the last deferred step, if any.
+            self._flush_pending_metrics()
 
         if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")

@@ -287,6 +287,14 @@ class MetricsProcessor(Configurable):
         enable_moe_routing: bool = False
         """Whether to collect MoE routing counts and normalized auxiliary loss"""
 
+        defer_readback: bool = False
+        """
+        Read back the metrics of a logged step only after the next step has been
+        dispatched, instead of blocking the host on them right away. This lets
+        the host run ahead of the device when logging every step. Log lines and
+        the non-finite loss check then trail training by one step.
+        """
+
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
 

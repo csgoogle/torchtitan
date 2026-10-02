@@ -31,12 +31,15 @@ Delete this file once the fix lands upstream: google-pytorch/torchtitan#396.
 """
 
 import contextlib
+import enum
 import inspect
+import os
 import sys
 
 import torch
 from torch._higher_order_ops.scan import ScanAutogradImpl, scan_op
 from torch._higher_order_ops.utils import first_slice_copy, materialize_as_graph
+from torch.fx.traceback import annotate
 import torch.utils._pytree as pytree
 
 from torchtitan.tools.logging import logger
@@ -208,8 +211,13 @@ class _ReverseByIndex:
                     combine_gm, init, xs, additional_inputs
                 )
             # The tail is the gradient stacks. Held by value so an id cannot
-            # be reused out from under us.
-            self.written_in_order = {id(t): t for t in out[len(init) :]}
+            # be reused out from under us. In `GradWrite.YS` mode they are in
+            # iteration order, so leave them to upstream's flip.
+            self.written_in_order = (
+                {}
+                if _grad_write_mode() is GradWrite.YS
+                else {id(t): t for t in out[len(init) :]}
+            )
             return out
         # Some other scan -- a nested one traced out of the step body, say.
         with self._paused():
@@ -246,8 +254,46 @@ class _ScanOpWithOneCallRewritten(type(scan_op)):
 # --- The scan that replaces the flipped one --------------------------------
 
 
+class GradWrite(enum.Enum):
+    """How `_scan_over_descending_index` stores each step's gradient row.
+
+    INDEX_COPY: carry the gradient stacks and `index_copy` each row into its
+      final position. No copy after the loop, but `index_copy` lowers to a
+      scatter that XLA expands into a masked dynamic-update-slice indexed by a
+      loaded value, which XLA's collective pipeliner cannot move collectives
+      through -- so the per-layer cross-slice gradient all-reduce always
+      finishes inside its own iteration.
+    YS: return each row as a scan output. The rows land at the loop index with
+      a plain dynamic-update-slice, which the pipeliner accepts, and torch's
+      own flip puts them back in order after the loop, at the cost of one
+      reversed copy of every gradient stack.
+    YS_REVERSE: as YS, but ask torch_tpu for a reverse loop, whose step i
+      reads and writes row `len - 1 - i`. Scanning over an ascending index
+      then visits the rows in the same descending order, and each gradient row
+      lands in its final position with a plain dynamic-update-slice at
+      `len - 1 - i` -- so neither the `index_copy` nor the flip is needed.
+      Only torch_tpu honours the request; any other backend would run the loop
+      forwards and return the gradient stacks reversed.
+    """
+
+    INDEX_COPY = "index_copy"
+    YS = "ys"
+    YS_REVERSE = "ys_reverse"
+
+
+# Must match `torch_tpu._internal.compile.scan.SCAN_REVERSE_ANNOTATION`. Spelled
+# out rather than imported so this file still imports without torch_tpu.
+_SCAN_REVERSE_ANNOTATION = "torch_tpu_scan_reverse"
+
+
+def _grad_write_mode() -> GradWrite:
+    return GradWrite(
+        os.environ.get("TORCHTITAN_SCAN_BWD_GRAD_WRITE", GradWrite.YS_REVERSE.value)
+    )
+
+
 def _scan_over_descending_index(combine_gm, init, xs, additional_inputs):
-    """`scan(combine_gm, init, xs, reverse=True)` without reversing anything.
+    """`scan(combine_gm, init, xs, reverse=True)` without reversing the inputs.
 
     The stacks move to `additional_inputs`, which scan passes through whole,
     and the thing scanned over becomes `scan_length` int64s counting down. Each
@@ -255,8 +301,13 @@ def _scan_over_descending_index(combine_gm, init, xs, additional_inputs):
     the data while running forwards over the index.
 
     `combine_gm` returns one row of gradient per step, in iteration order --
-    which is backwards. So the output stacks are carried as buffers and each
-    step writes its own row in place; they come out already in order.
+    which is backwards. With `GradWrite.INDEX_COPY` the output stacks are
+    carried as buffers and each step writes its own row in place, so they come
+    out already in order. With `GradWrite.YS` they come out as scan outputs in
+    iteration order and the caller's flip reverses them. With
+    `GradWrite.YS_REVERSE` the index counts up and the loop runs in reverse,
+    which visits the same rows in the same order and writes each output row
+    where it belongs.
     """
     n_init = len(init)
     n_additional = len(additional_inputs)
@@ -267,6 +318,36 @@ def _scan_over_descending_index(combine_gm, init, xs, additional_inputs):
     # two views of one broadcast, and scan rejects a combine_fn whose inputs
     # alias. Clone the init, one slice, instead of the stacks, the whole history.
     init = [t.clone() if isinstance(t, torch.Tensor) else t for t in init]
+
+    mode = _grad_write_mode()
+    if mode in (GradWrite.YS, GradWrite.YS_REVERSE):
+        if mode is GradWrite.YS_REVERSE:
+            index = torch.arange(scan_length, dtype=torch.int64, device=xs[0].device)
+            # On the nodes, not the graph module: scan re-traces the body into a
+            # new module, which keeps node metadata and drops attributes.
+            direction = annotate({_SCAN_REVERSE_ANNOTATION: True})
+        else:
+            index = torch.arange(
+                scan_length - 1, -1, -1, dtype=torch.int64, device=xs[0].device
+            )
+            direction = contextlib.nullcontext()
+
+        def step_ys(*args):
+            carry = args[:n_init]
+            row = args[n_init].reshape(1)
+            rest = args[n_init + 1 :]
+            additional, stacks = rest[:n_additional], rest[n_additional:]
+            rows = [torch.index_select(s, 0, row).squeeze(0) for s in stacks]
+            return list(combine_gm(*carry, *rows, *additional))
+
+        with direction:
+            step_gm = materialize_as_graph(
+                step_ys,
+                (*init, first_slice_copy(index), *additional_inputs, *xs),
+            )
+            # `(*carry, *stacked_grad_xs)`: the stacks in iteration order for
+            # YS, in final order for YS_REVERSE.
+            return scan_op(step_gm, init, [index], (*additional_inputs, *xs))
 
     buffers = [
         torch.zeros(

@@ -922,6 +922,10 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   # do (https://github.com/google-pytorch/torchtitan/issues/399).
   cfg.metrics.enable_moe_routing = False
   cfg.metrics.log_freq = 1
+  # Logging every step would otherwise block the host on each step's metrics,
+  # and the next step's first collective then absorbs the host skew across
+  # all ranks.
+  cfg.metrics.defer_readback = True
   # Left to the command line these get forgotten, and a scan step measured
   # without them runs ~10% slow.
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
