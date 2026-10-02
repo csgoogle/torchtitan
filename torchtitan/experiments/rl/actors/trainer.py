@@ -45,6 +45,22 @@ from torchtitan.tools.logging import init_logger
 logger = logging.getLogger(__name__)
 
 
+def _warn_on_bf16_master_weights(training: TrainingConfig) -> None:
+    """Warn when the optimizer would update bf16 master weights.
+
+    See ``TrainingConfig.dtype``: round-to-nearest bf16 weights drop updates
+    smaller than half a bf16 ulp, which is common at RL learning rates.
+    """
+    if training.dtype == "bfloat16":
+        logger.warning(
+            "training.dtype='bfloat16' keeps the master weights in bf16, where "
+            "optimizer updates smaller than half a bf16 ulp are rounded away; "
+            "at RL learning rates this can stall learning. The default float32 "
+            "master weights still run the forward in bf16 through FSDP mixed "
+            "precision (training.mixed_precision_param)."
+        )
+
+
 class PolicyTrainer(Actor, Configurable):
     """Updates policy based on collected TrainingSample using TorchTitan components.
 
@@ -119,6 +135,7 @@ class PolicyTrainer(Actor, Configurable):
         self.config = config
         self.compile_config = compile_config
         self.max_num_documents = max_num_documents
+        _warn_on_bf16_master_weights(config.training)
         self.loss_fn = config.loss.build()
         # TODO: add support to compile the loss.
 

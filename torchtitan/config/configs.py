@@ -91,6 +91,11 @@ class TrainingConfig:
     torch dtype for training. In contrast to mixed precision training, setting training_dtype=bfloat16 will
     put all parameters, gradients, and optimizer states in bfloat16, without an extra copy of fp32 weights.
     In the case of full bf16 training, RoPE calculations and logits will still be in fp32.
+
+    Warning: bfloat16 weights are updated with round-to-nearest, so an optimizer step smaller than half a
+    bf16 ulp of the weight (|w|/512 to |w|/256) is rounded away instead of accumulating. At small learning
+    rates, e.g. RL fine-tuning, most updates can be lost and learning stalls. Prefer the default float32
+    master weights; mixed_precision_param still controls the compute dtype.
     """
 
     mixed_precision_param: Literal["bfloat16", "float32"] = "bfloat16"
