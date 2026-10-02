@@ -382,9 +382,8 @@ def hf_moe_auto() -> TPUTransformersBackendConfig:
   at None so AutoConfig supplies them, while still being a
   TitanMoeModelConfig, which is what gates the MoE replacement.
 
-  Runs efficiently by default: per-layer compile (4.2x over eager on OLMoE,
-  measured 2026-10-02) and the experts on the Pallas grouped-matmul kernels.
-  hf_moe_auto_compile drops the kernels, hf_moe_auto_eager drops both.
+  Runs with per-layer compile and the experts on the Pallas grouped-matmul
+  kernels. hf_moe_auto_compile drops the kernels, hf_moe_auto_eager drops both.
   """
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
                         compile=True, moe_kernels=True)
