@@ -35,6 +35,7 @@ def configure_qwen_simple_fsdp_shard_dims(
     holder._fsdp_shard_dim = holder.plan_shard_dims(fsdp_degree)
 
   hidden_axis_modules: list[str] = []
+  flattened_expert_modules: list[str] = []
   for module_fqn in ("tok_embeddings", "lm_head"):
     module = getattr(model, module_fqn)
     weight = module.weight
@@ -67,6 +68,21 @@ def configure_qwen_simple_fsdp_shard_dims(
         if stacks:
           continue  # Stacking took them; the holder above shards them instead.
         raise ValueError(f"{module_fqn} has no direct parameters to FSDP-shard")
+      # As LayerStackHolder.flatten_for does for scan: when each rank's dim-0
+      # shard of [E * X, Y] stays inside one expert, store the weights that
+      # way and shard dim 0, so gathers stay contiguous and need no
+      # non-leading-axis collective.
+      ranks_per_expert, rem = divmod(fsdp_degree, module.num_experts)
+      if rem == 0 and all(
+          parameter.ndim == 3
+          and parameter.shape[0] == module.num_experts
+          and parameter.shape[1] % ranks_per_expert == 0
+          for _, parameter in parameters
+      ):
+        module.flatten_expert_weights()
+        setattr(module, "_fsdp_shard_dim", 0)
+        flattened_expert_modules.append(module_fqn)
+        continue
       incompatible = [
           f"{name}{tuple(parameter.shape)}"
           for name, parameter in parameters
@@ -90,6 +106,11 @@ def configure_qwen_simple_fsdp_shard_dims(
     logger.info(
         "Using SimpleFSDP dimension 1 for %d uneven Qwen modules",
         len(hidden_axis_modules),
+    )
+  if flattened_expert_modules:
+    logger.info(
+        "Flattened [E, X, Y] -> [E*X, Y] expert weights in %d Qwen modules",
+        len(flattened_expert_modules),
     )
 
 

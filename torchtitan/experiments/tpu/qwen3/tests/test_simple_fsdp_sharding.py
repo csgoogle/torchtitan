@@ -24,7 +24,9 @@ from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 
 
-def _model(*, hidden_dim: int = 8, vocab_size: int = 8) -> nn.Module:
+def _model(
+    *, hidden_dim: int = 8, vocab_size: int = 8, num_experts: int = 2
+) -> nn.Module:
   model = nn.Module()
   model.tok_embeddings = nn.Embedding(vocab_size, 8)
   model.lm_head = nn.Linear(8, vocab_size, bias=False)
@@ -33,8 +35,10 @@ def _model(*, hidden_dim: int = 8, vocab_size: int = 8) -> nn.Module:
   layer.moe.experts = TpuGroupedExperts.Config(
       dim=8,
       hidden_dim=hidden_dim,
-      num_experts=2,
-      token_dispatcher=LocalTokenDispatcher.Config(num_experts=2, top_k=1),
+      num_experts=num_experts,
+      token_dispatcher=LocalTokenDispatcher.Config(
+          num_experts=num_experts, top_k=1
+      ),
   ).build()
   model.layers = nn.ModuleDict({"0": layer})
   return model
@@ -62,12 +66,29 @@ def _parallel_dims(fsdp_degree: int) -> ParallelDims:
 
 class SimpleFSDPShardingTest(absltest.TestCase):
 
-  def test_uses_hidden_axis_when_leading_axis_is_uneven(self) -> None:
-    model = _model()
+  def test_uses_hidden_axis_when_ranks_are_not_a_multiple_of_experts(
+      self,
+  ) -> None:
+    model = _model(num_experts=3)
 
     configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
 
     self.assertEqual(model.layers["0"].moe.experts._fsdp_shard_dim, 1)
+
+  def test_flattens_experts_when_ranks_are_a_multiple_of_experts(self) -> None:
+    model = _model(hidden_dim=6)
+    experts = model.layers["0"].moe.experts
+    shapes = {n: p.shape for n, p in experts.named_parameters(recurse=False)}
+
+    configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
+
+    # 4 ranks over 2 experts: each rank's dim-0 shard of [2 * X, Y] stays in
+    # one expert, so the weights are stored flat and shard on dim 0.
+    self.assertEqual(experts._fsdp_shard_dim, 0)
+    for name, shape in shapes.items():
+      param = getattr(experts, name)
+      self.assertEqual(tuple(param.shape), (shape[0] * shape[1], shape[2]))
+      self.assertEqual(experts._expert_weight(name).shape, shape)
 
   def test_keeps_default_axis_when_leading_axis_is_even(self) -> None:
     model = _model()
@@ -83,7 +104,7 @@ class SimpleFSDPShardingTest(absltest.TestCase):
 
     self.assertEqual(
         model.layers["0"].inner.moe.experts._fsdp_shard_dim,
-        1,
+        0,
     )
 
   def test_plans_an_axis_per_stack_when_layers_are_stacked(self) -> None:
@@ -115,7 +136,7 @@ class SimpleFSDPShardingTest(absltest.TestCase):
       configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
 
   def test_rejects_when_hidden_axis_is_not_divisible(self) -> None:
-    model = _model(hidden_dim=6)
+    model = _model(hidden_dim=6, num_experts=3)
 
     with self.assertRaisesRegex(ValueError, "moe.experts.*hidden dimension 1"):
       configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
@@ -148,7 +169,7 @@ class SimpleFSDPShardingTest(absltest.TestCase):
       )
 
     self.assertIs(result, model)
-    self.assertEqual(model.layers["0"].moe.experts._fsdp_shard_dim, 1)
+    self.assertEqual(model.layers["0"].moe.experts._fsdp_shard_dim, 0)
     upstream_parallelize.assert_called_once_with(
         model,
         training=training,

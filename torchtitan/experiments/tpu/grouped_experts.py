@@ -136,6 +136,9 @@ class TpuGroupedExperts(GroupedExperts):
         self.pallas_grouped_mm_w2_tgmm_tiling = config.pallas_grouped_mm_w2_tgmm_tiling
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
         self._native_sharding_applied = False
+        # Original [E, X, Y] shapes of weights stored as [E * X, Y]; see
+        # flatten_expert_weights.
+        self._flattened_shapes: dict[str, torch.Size] = {}
 
         if self.use_pallas_paired_grouped_mm:
             if not self.use_pallas_grouped_mm:
@@ -150,9 +153,42 @@ class TpuGroupedExperts(GroupedExperts):
         self.register_state_dict_post_hook(self._canonical_weights_on_save)
         self.register_load_state_dict_pre_hook(self._native_weights_on_load)
 
+    def flatten_expert_weights(self) -> None:
+        """Store each [E, X, Y] expert weight as [E * X, Y].
+
+        When FSDP has more ranks than experts, sharding dim 0 of the flattened
+        weight keeps each rank's shard inside one expert, so the all-gather is
+        a plain contiguous dim-0 gather and the forward views the gathered
+        weight back to [E, X, Y] without a copy. Call before sharding, while
+        the weights are plain tensors.
+        """
+        for name, param in list(self.named_parameters(recurse=False)):
+            self._flattened_shapes[name] = param.shape
+            setattr(
+                self,
+                name,
+                torch.nn.Parameter(
+                    param.detach().flatten(0, 1),
+                    requires_grad=param.requires_grad,
+                ),
+            )
+
+    def _expert_weight(self, name: str) -> torch.Tensor:
+        weight = getattr(self, name)
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        shape = self._flattened_shapes.get(name)
+        return weight if shape is None else weight.view(shape)
+
     def _init_param(self, name: str, param: torch.nn.Parameter) -> None:
         """Initialize native storage through a canonical contiguous tensor."""
 
+        if name in self._flattened_shapes:
+            # The expert initializers are elementwise, so a flattened weight
+            # draws the same distribution as its [E, X, Y] form.
+            if self.use_kernel_native_weight_layout:
+                name = {v: k for k, v in _CANONICAL_TO_NATIVE_WEIGHT.items()}[name]
+            return Module._init_param(self, name, param)
         if not self.use_kernel_native_weight_layout:
             return super()._init_param(name, param)
 
@@ -192,6 +228,10 @@ class TpuGroupedExperts(GroupedExperts):
     def _canonical_weights_on_save(module, state_dict, prefix, local_metadata) -> None:
         """Expose kernel-native parameters in canonical checkpoint layout."""
 
+        if module._flattened_shapes:
+            raise NotImplementedError(
+                "Checkpointing flattened expert weights is not supported yet"
+            )
         for canonical_name, native_name in _CANONICAL_TO_NATIVE_WEIGHT.items():
             native = state_dict.pop(f"{prefix}{native_name}")
             state_dict[f"{prefix}{canonical_name}"] = native.transpose(
@@ -202,6 +242,10 @@ class TpuGroupedExperts(GroupedExperts):
     def _native_weights_on_load(module, state_dict, prefix, *args) -> None:
         """Load canonical checkpoint tensors into kernel-native storage."""
 
+        if module._flattened_shapes:
+            raise NotImplementedError(
+                "Checkpointing flattened expert weights is not supported yet"
+            )
         for canonical_name, native_name in _CANONICAL_TO_NATIVE_WEIGHT.items():
             canonical_key = f"{prefix}{canonical_name}"
             if canonical_key in state_dict:
@@ -219,17 +263,14 @@ class TpuGroupedExperts(GroupedExperts):
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
         if not self.use_pallas_grouped_mm:
             return super()._experts_forward(x_RD, num_tokens_per_expert_E)
-        def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.to_local() if isinstance(tensor, DTensor) else tensor
-
         if self.use_kernel_native_weight_layout:
-            w1_EKN = local_tensor(self.w1_EDF)
-            w2_EKN = local_tensor(self.w2_EFD)
-            w3_EKN = local_tensor(self.w3_EDF)
+            w1_EKN = self._expert_weight("w1_EDF")
+            w2_EKN = self._expert_weight("w2_EFD")
+            w3_EKN = self._expert_weight("w3_EDF")
         else:
-            w1_EKN = local_tensor(self.w1_EFD).transpose(-2, -1)
-            w2_EKN = local_tensor(self.w2_EDF).transpose(-2, -1)
-            w3_EKN = local_tensor(self.w3_EFD).transpose(-2, -1)
+            w1_EKN = self._expert_weight("w1_EFD").transpose(-2, -1)
+            w2_EKN = self._expert_weight("w2_EDF").transpose(-2, -1)
+            w3_EKN = self._expert_weight("w3_EFD").transpose(-2, -1)
 
         # Match GroupedExperts: expert compute is BF16 even when the surrounding
         # model is FP32, and the final result is restored to the caller's dtype.
