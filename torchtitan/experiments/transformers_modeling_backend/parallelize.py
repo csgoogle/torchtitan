@@ -164,8 +164,10 @@ def parallelize_hf_transformers(
     convert_hf_to_module(model)
 
     # 3. Set sharding configs on all non-MoE modules (they assume Llama-style
-    # block names; with no TP/EP there is nothing to place, so skip them).
-    if parallel_dims.tp_enabled or parallel_dims.ep > 1:
+    # block names; with no TP/EP/CP there is nothing to place, so skip them).
+    # CP needs this pass too: it attaches the flex kernels that step 3b wraps
+    # to all-gather K/V across the CP axis.
+    if parallel_dims.tp_enabled or parallel_dims.ep > 1 or parallel_dims.cp_enabled:
         set_hf_sharding_configs(
             model,
             enable_sp=parallel_dims.tp_enabled,

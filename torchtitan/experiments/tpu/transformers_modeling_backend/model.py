@@ -181,6 +181,62 @@ class TPUHFTransformerModel(HFTransformerModel):
             f"({emb.embedding_dim} -> {emb.num_embeddings})."
         )
 
+    if self._fused_loss:
+      blocker = self._fused_loss_blocker()
+      if blocker is not None:
+        raise ValueError(
+            f"fused_loss is not supported for {type(self.model).__name__}: "
+            f"{blocker}. The fused CE computes hidden @ weight and nothing else, "
+            "so it would train a different model. Use a config with the plain "
+            "cross entropy (hf_full_splash, hf_full_splash_compile)."
+        )
+
+  # Post-head logit transforms in HF causal-LM heads, as config fields, with the
+  # value that makes each one a no-op: Gemma-2/3/4 soft-cap, Cohere's scale,
+  # Granite's divisor, Falcon-H1's multiplier.
+  _LOGIT_TRANSFORMS = {
+      "final_logit_softcapping": None,
+      "logit_scale": 1.0,
+      "logits_scaling": 1.0,
+      "lm_head_multiplier": 1.0,
+  }
+
+  def _fused_loss_blocker(self) -> str | None:
+    """Why the fused CE cannot stand in for this model's head, or None.
+
+    The fused loss receives (trunk hidden states, head weight) and computes
+    exactly hidden @ weight -> cross entropy. That equals the model's logits
+    only for a bias-free linear head applied directly to the trunk output.
+    Anything else -- a head behind its own dense/norm block (BERT's
+    cls.predictions, DistilBERT's vocab_transform, ModernBERT's head), a head
+    bias (phi-2), or a logit transform after the head -- would be silently
+    dropped.
+    """
+    if self._added_lm_head is not None:
+      return None  # the lane's own head: tied, bias-free, applied to the trunk
+    head, path = _structure.find_head(self.model)
+    if head is None:
+      return "it has no output head"
+    if tuple(path or ()) != ("lm_head",):
+      return (
+          f"its output head ({'.'.join(path or ('?',))}) is not a top-level "
+          "lm_head, so layers between the trunk and the head would be skipped"
+      )
+    if not isinstance(head, nn.Linear):
+      return f"its lm_head is a {type(head).__name__}, not a Linear"
+    if head.bias is not None:
+      return "its lm_head has a bias"
+    configs = [self.model.config]
+    text = getattr(self.model.config, "text_config", None)
+    if text is not None:
+      configs.append(text)
+    for cfg in configs:
+      for field, neutral in self._LOGIT_TRANSFORMS.items():
+        value = getattr(cfg, field, neutral)
+        if value is not None and value != neutral:
+          return f"its head applies {field}={value} to the logits"
+    return None
+
   # ---- construction -------------------------------------------------------
 
   def _build_hf_model(self, model_cls, config):
@@ -608,6 +664,13 @@ def as_tpu_model_config(
   cfg = copy.copy(model_config)
   cfg.__class__ = TPUHFTransformerModel.Config
   cfg.fused_loss = fused_loss
+  # The shallow copy shares the flavor's override dict, which the registry
+  # writes into (attn_implementation): without its own copy, selecting splash
+  # on one config would change what every other config built from the same
+  # flavor replays in update_from_config.
+  overrides = getattr(cfg, "_titan_injected_model_args", None)
+  if overrides is not None:
+    cfg._titan_injected_model_args = dict(overrides)
   return cfg
 
 
