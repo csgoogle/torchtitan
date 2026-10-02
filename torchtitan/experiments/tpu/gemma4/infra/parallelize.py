@@ -1,7 +1,6 @@
 """Parallelization utilities for Gemma4 models on TPU."""
 
 import dataclasses
-from functools import partial
 import torch
 from torch import nn
 import torchtitan.config
@@ -28,7 +27,6 @@ from torchtitan.models.common.moe import (
     MoE,
     configure_moe_aux_loss_reduction,
 )
-from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.tools.logging import logger
 
 
@@ -244,16 +242,12 @@ def parallelize_gemma4(
 
   if parallelism.use_simple_fsdp:
     # SimpleFSDP wraps tok_embeddings with a read-only `weight` property, which
-    # is incompatible with Decoder.init_states assigning tok_embeddings.weight.
+    # is incompatible with Decoder.init_states re-tying tok_embeddings.weight.
     if getattr(model, "enable_weight_tying", False):
-      model.enable_weight_tying = False
-      tok_emb = getattr(model, "tok_embeddings", None)
-      if tok_emb is not None and getattr(tok_emb, "_param_init", None) == {
-          "weight": skip_param_init
-      }:
-        tok_emb._param_init = {
-            "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
-        }
+      raise ValueError(
+          "SimpleFSDP requires an untied Gemma4 model; build it with "
+          "model_registry(..., enable_weight_tying=False)."
+      )
 
     _parallelize_gemma4_dtensor(
         model,

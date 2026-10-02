@@ -4,10 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
 from typing import cast
 
-from torch import nn
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
@@ -20,8 +18,10 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
-from torchtitan.experiments.tpu import gemma4 as tpu_gemma4
-from torchtitan.experiments.tpu.gemma4 import model_registry
+from torchtitan.experiments.tpu.gemma4 import (
+    _build_flavor_config,
+    model_registry,
+)
 from torchtitan.experiments.tpu.gemma4.infra.parallelize import (
     parallelize_gemma4 as tpu_parallelize_gemma4,
 )
@@ -48,14 +48,10 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 def gemma4_debugmodel() -> TPUTrainerConfig:
   """Gemma4 dense debug model configuration for TPU."""
-  model_spec = model_registry("debugmodel", attn_backend="sdpa")
+  model_spec = model_registry(
+      "debugmodel", attn_backend="sdpa", enable_weight_tying=False
+  )
   model_spec.parallelize_fn = tpu_parallelize_gemma4
-
-  model_config = cast(Gemma4Model.Config, model_spec.model)
-  model_config.enable_weight_tying = False
-  model_config.tok_embeddings.param_init = {
-      "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
-  }
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
@@ -94,20 +90,15 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
 def gemma4_moe_testmodel() -> TPUTrainerConfig:
   """Gemma4 MoE test model configuration for TPU."""
   cfg = gemma4_debugmodel()
-  config = tpu_gemma4.gemma4_configs["testmodel_moe"]
   cfg.model_spec = ModelSpec(
       name="gemma4",
       flavor="testmodel_moe",
-      model=config,
+      model=_build_flavor_config("testmodel_moe", enable_weight_tying=False),
       parallelize_fn=tpu_parallelize_gemma4,
       pipelining_fn=None,
       post_optimizer_build_fn=None,
       state_dict_adapter=Gemma4StateDictAdapter,
   )
-  cfg.model_spec.model.enable_weight_tying = False
-  cfg.model_spec.model.tok_embeddings.param_init = {
-      "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
-  }
   cfg.training.seq_len = 128
   cfg.training.local_batch_size = 4
   return cfg
@@ -123,23 +114,16 @@ def gemma4_moe_debug() -> TPUTrainerConfig:
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
       ],
+      enable_weight_tying=False,
   )
-  model_config = cast(Gemma4Model.Config, cfg.model_spec.model)
-  model_config.enable_weight_tying = False
-  model_config.tok_embeddings.param_init = {
-      "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
-  }
   return cfg
 
 
 def gemma4_31b() -> TPUTrainerConfig:
   """Gemma4 31B dense model configuration for TPU."""
-  model_spec = model_registry("31B", attn_backend="sdpa")
-  model_config = cast(Gemma4Model.Config, model_spec.model)
-  model_config.enable_weight_tying = False
-  model_config.tok_embeddings.param_init = {
-      "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
-  }
+  model_spec = model_registry(
+      "31B", attn_backend="sdpa", enable_weight_tying=False
+  )
   model_spec.parallelize_fn = tpu_parallelize_gemma4
 
   return TPUTrainerConfig(
@@ -221,12 +205,9 @@ def gemma4_26b_a4b() -> TPUTrainerConfig:
           TpuTokenDispatcherConverter.Config(),
           TpuGroupedExpertsConverter.Config(),
       ],
+      enable_weight_tying=False,
   )
   model_config = cast(Gemma4Model.Config, cfg.model_spec.model)
-  model_config.enable_weight_tying = False
-  model_config.tok_embeddings.param_init = {
-      "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
-  }
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
     experts.use_pallas_paired_grouped_mm = True

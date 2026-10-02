@@ -42,15 +42,11 @@ class Gemma4Embedding(Embedding):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Embedding.Config):
-        embed_scale: float | None = None
+        pass
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
-        self.embed_scale: float = (
-            config.embed_scale
-            if config.embed_scale is not None
-            else config.embedding_dim**0.5
-        )
+        self.embed_scale: float = config.embedding_dim**0.5
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input) * self.embed_scale
@@ -99,7 +95,7 @@ class Gemma4RoPE(CosSinRoPE):
 
 
 class QKVLinearKeqV(QKVLinear):
-    """Two separate linear projections for Q and K, reusing K as V (use_k_eq_v=True)."""
+    """Two separate linear projections for Q and K, reusing K as V (global K=V layers)."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(QKVLinear.Config):
@@ -202,7 +198,6 @@ class Gemma4Attention(GQAttention):
         v_norm: RMSNorm.Config
         is_sliding: bool = True
         sliding_window_size: int | None = None
-        use_k_eq_v: bool = False
 
     def __init__(self, config: Config) -> None:
         if (
@@ -222,7 +217,6 @@ class Gemma4Attention(GQAttention):
         self.v_norm = config.v_norm.build()
         self.is_sliding = config.is_sliding
         self.sliding_window_size = config.sliding_window_size
-        self.use_k_eq_v = config.use_k_eq_v
         # Gemma4 normalizes Q, K, and V with RMSNorm and uses a softmax scale of 1.0.
         self.scaling = 1.0
         if self.is_sliding and self.sliding_window_size is not None:
@@ -300,10 +294,6 @@ class Gemma4Router(TokenChoiceTopKRouter):
         self.norm = config.norm.build()
         self.scale = nn.Parameter(torch.ones(config.dim))
         self.per_expert_scale = nn.Parameter(torch.ones(config.num_experts))
-
-    def reset_parameters(self) -> None:
-        nn.init.ones_(self.scale)
-        nn.init.ones_(self.per_expert_scale)
 
     def forward(
         self, x_BLD: torch.Tensor, expert_bias_E: torch.Tensor | None = None
@@ -642,7 +632,7 @@ class Gemma4Model(Decoder):
                 n_kv_heads = attention.n_kv_heads or n_heads
                 head_dim = attention.head_dim or dim // n_heads
 
-                if attention.use_k_eq_v:
+                if isinstance(attention.qkv_linear, QKVLinearKeqV.Config):
                     # Global K=V layers have only Q, K, and O projections (no V projection).
                     qkv_out = (n_heads + n_kv_heads) * head_dim
                 else:

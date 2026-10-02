@@ -251,7 +251,6 @@ def _build_gemma4_layers(
                     sliding_window_size=(
                         sliding_window_size if is_sliding else None
                     ),
-                    use_k_eq_v=layer_use_k_eq_v,
                     qk_norm=_gemma4_norm(layer_head_dim, eps=norm_eps),
                     v_norm=RMSNorm.Config(
                         normalized_shape=layer_head_dim,
@@ -323,11 +322,9 @@ def _testmodel(attn_backend: str = "sdpa") -> Gemma4Model.Config:
         sliding_window_size=sliding_window_size,
         final_logit_softcapping=30.0,
         norm=_gemma4_norm(dim),
-        enable_weight_tying=True,
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
-            param_init=_EMBEDDING_SKIP_INIT,
         ),
         lm_head=Linear.Config(
             in_features=dim,
@@ -372,11 +369,9 @@ def _testmodel_moe(
         sliding_window_size=sliding_window_size,
         final_logit_softcapping=30.0,
         norm=_gemma4_norm(dim),
-        enable_weight_tying=True,
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
-            param_init=_EMBEDDING_SKIP_INIT,
         ),
         lm_head=Linear.Config(
             in_features=dim,
@@ -420,7 +415,6 @@ _gemma4_factories = {
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=2048,
             embedding_dim=256,
-            param_init=_EMBEDDING_SKIP_INIT,
         ),
         norm=_gemma4_norm(256, eps=1e-6),
         lm_head=Linear.Config(
@@ -441,7 +435,6 @@ _gemma4_factories = {
             sliding_window_size=128,
             global_attn_every_n_layers=6,
         ),
-        enable_weight_tying=True,
     ),
     "debugmodel_moe": partial(
         Gemma4Model.Config,
@@ -452,7 +445,6 @@ _gemma4_factories = {
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=2048,
             embedding_dim=256,
-            param_init=_EMBEDDING_SKIP_INIT,
         ),
         norm=_gemma4_norm(256, eps=1e-6),
         lm_head=Linear.Config(
@@ -477,7 +469,6 @@ _gemma4_factories = {
             top_k=2,
             moe_inter_dim=128,
         ),
-        enable_weight_tying=True,
     ),
     "31B": partial(
         Gemma4Model.Config,
@@ -488,7 +479,6 @@ _gemma4_factories = {
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=262144,
             embedding_dim=5376,
-            param_init=_EMBEDDING_SKIP_INIT,
         ),
         norm=_gemma4_norm(5376, eps=1e-6),
         lm_head=Linear.Config(
@@ -509,7 +499,6 @@ _gemma4_factories = {
             sliding_window_size=1024,
             global_attn_every_n_layers=6,
         ),
-        enable_weight_tying=True,
     ),
     "26B-A4B": partial(
         Gemma4Model.Config,
@@ -520,7 +509,6 @@ _gemma4_factories = {
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=262144,
             embedding_dim=2816,
-            param_init=_EMBEDDING_SKIP_INIT,
         ),
         norm=_gemma4_norm(2816, eps=1e-6),
         lm_head=Linear.Config(
@@ -545,9 +533,20 @@ _gemma4_factories = {
             top_k=8,
             moe_inter_dim=704,
         ),
-        enable_weight_tying=True,
     ),
 }
+
+
+def _set_weight_tying(config: Gemma4Model.Config, enable: bool) -> None:
+    """Tie ``lm_head`` to the token embedding (HF default) or untie it.
+
+    When tied, the shared weight is initialized through ``lm_head``, so the
+    embedding's own init is skipped.
+    """
+    config.enable_weight_tying = enable
+    config.tok_embeddings.param_init = (
+        _EMBEDDING_SKIP_INIT if enable else _EMBEDDING_INIT
+    )
 
 
 def _build_flavor_config(
@@ -559,6 +558,7 @@ def _build_flavor_config(
     enable_sp: bool = True,
     enable_ep: bool = False,
     converters: list[ModelConfigConverter.Config] | None = None,
+    enable_weight_tying: bool = True,
 ) -> Gemma4Model.Config:
     if flavor == "testmodel":
         config = _testmodel(attn_backend=attn_backend)
@@ -580,6 +580,7 @@ def _build_flavor_config(
             )
         config = factory(layers=layers_partial(**extra_kw))
 
+    _set_weight_tying(config, enable_weight_tying)
     set_gemma4_sharding_config(
         config, enable_sp=enable_sp, enable_ep=enable_ep
     )
@@ -592,8 +593,8 @@ def _build_flavor_config(
 
 
 gemma4_configs = {
-    "testmodel": _testmodel("sdpa"),
-    "testmodel_moe": _testmodel_moe("sdpa"),
+    "testmodel": _build_flavor_config("testmodel", "sdpa"),
+    "testmodel_moe": _build_flavor_config("testmodel_moe", "sdpa"),
     "debugmodel": _build_flavor_config("debugmodel", "sdpa"),
     "debugmodel_moe": _build_flavor_config("debugmodel_moe", "sdpa"),
     "31B": _build_flavor_config("31B", "sdpa"),
@@ -610,6 +611,7 @@ def model_registry(
     enable_sp: bool = True,
     enable_ep: bool = False,
     converters: list[ModelConfigConverter.Config] | None = None,
+    enable_weight_tying: bool = True,
 ) -> ModelSpec:
     config = _build_flavor_config(
         flavor,
@@ -620,6 +622,7 @@ def model_registry(
         enable_sp=enable_sp,
         enable_ep=enable_ep,
         converters=converters,
+        enable_weight_tying=enable_weight_tying,
     )
     return ModelSpec(
         name="gemma4",

@@ -10,14 +10,10 @@ from typing import Any
 import torch
 
 from torchtitan.experiments.tpu.gemma4.model import Gemma4Model
-from torchtitan.models.utils import MoEStateDictAdapter
+from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
+# Non-text towers of the multimodal checkpoint, with any leading "model." removed.
 _IGNORED_HF_PREFIXES = (
-    "model.vision_tower.",
-    "model.embed_vision.",
-    "model.audio_tower.",
-    "model.embed_audio.",
-    "model.multi_modal_projector.",
     "vision_tower.",
     "embed_vision.",
     "audio_tower.",
@@ -26,23 +22,28 @@ _IGNORED_HF_PREFIXES = (
 )
 
 
-def _normalize_hf_key(key: str) -> str:
-    """Normalize text-only HF keys (``model.layers.*``) to ``model.language_model.layers.*``."""
+def _normalize_hf_key(key: str) -> str | None:
+    """Normalize text-only HF keys (``model.layers.*``) to ``model.language_model.layers.*``.
+
+    Returns None for keys of the non-text towers, which are ignored.
+    """
     if key.startswith("model.language_model."):
         return key
-    if key.startswith("model.") and not key.startswith(_IGNORED_HF_PREFIXES):
-        return "model.language_model." + key[len("model.") :]
+    bare_key = key.removeprefix("model.")
+    if bare_key.startswith(_IGNORED_HF_PREFIXES):
+        return None
+    if key.startswith("model."):
+        return "model.language_model." + bare_key
     return key
 
 
-class Gemma4StateDictAdapter(MoEStateDictAdapter):
+class Gemma4StateDictAdapter(StateDictAdapter):
     """Converts state dicts between TorchTitan Gemma4Model and HuggingFace Gemma4 format."""
 
     def __init__(
         self, model_config: Gemma4Model.Config, hf_assets_path: str | None
     ) -> None:
         super().__init__(model_config, hf_assets_path)
-        self.model_config = model_config
 
         self.from_hf_map = {
             "model.language_model.embed_tokens.weight": "tok_embeddings.weight",
@@ -139,9 +140,9 @@ class Gemma4StateDictAdapter(MoEStateDictAdapter):
             state_dict["lm_head.weight"] = embed_weight
 
         for raw_key, value in hf_state_dict.items():
-            if raw_key.startswith(_IGNORED_HF_PREFIXES):
-                continue
             key = _normalize_hf_key(raw_key)
+            if key is None:
+                continue
 
             if "layers" in key:
                 match = re.search(r"\d+", key)

@@ -1,6 +1,5 @@
 """Distributed tests for Gemma 4 DTensor/SPMD parallelization."""
 
-import copy
 from functools import partial
 import os
 
@@ -31,9 +30,6 @@ from torchtitan.experiments.tpu.gemma4.infra import (
     parallelize as gemma4_parallelize,
 )
 from torchtitan.experiments.tpu.gemma4.model import Gemma4Model
-from torchtitan.experiments.tpu.gemma4.sharding import (
-    set_gemma4_sharding_config,
-)
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 import torchtitan.experiments.tpu.tpu_job_config
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
@@ -59,14 +55,12 @@ def _get_gemma4_model_config(
     enable_ep: bool = False,
     disable_weight_tying: bool = False,
 ) -> Gemma4Model.Config:
-  config = copy.deepcopy(gemma4_tpu.gemma4_configs[flavor])
-  if disable_weight_tying:
-    config.enable_weight_tying = False
-    config.tok_embeddings.param_init = {
-        "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
-    }
-  set_gemma4_sharding_config(config, enable_sp=enable_sp, enable_ep=enable_ep)
-  return config
+  return gemma4_tpu._build_flavor_config(
+      flavor,
+      enable_sp=enable_sp,
+      enable_ep=enable_ep,
+      enable_weight_tying=not disable_weight_tying,
+  )
 
 
 class _Gemma4DistributedRunner(

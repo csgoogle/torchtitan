@@ -47,6 +47,7 @@ from torchtitan.models.common.attention import (
     ScaledDotProductAttention,
 )
 from torchtitan.models.common.config_utils import make_token_dispatcher_config
+from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 
@@ -122,6 +123,24 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
       cfg = fn()
       self.assertEqual(cfg.model_spec.name, "gemma4")
       self.assertIn(cfg.model_spec.flavor, gemma4_configs)
+      self.assertFalse(cfg.model_spec.model.enable_weight_tying)
+
+  def test_build_flavor_config_weight_tying(self):
+    tied = _build_flavor_config("testmodel")
+    untied = _build_flavor_config("testmodel", enable_weight_tying=False)
+    self.assertTrue(tied.enable_weight_tying)
+    self.assertFalse(untied.enable_weight_tying)
+    with torch.device("meta"):
+      tied_model = tied.build()
+      untied_model = untied.build()
+    self.assertIs(tied_model.tok_embeddings.weight, tied_model.lm_head.weight)
+    self.assertIsNot(
+        untied_model.tok_embeddings.weight, untied_model.lm_head.weight
+    )
+    # An untied embedding must get a real init, not skip_param_init.
+    self.assertIsNot(
+        untied.tok_embeddings.param_init["weight"], skip_param_init
+    )
 
 
 class TestGemma4StateDictAdapter(absltest.TestCase):
@@ -152,7 +171,7 @@ class TestGemma4StateDictAdapter(absltest.TestCase):
         "model.language_model.layers.0.self_attn.v_proj.weight", hf_sd
     )
     self.assertIn("model.language_model.layers.0.layer_scalar", hf_sd)
-    # Global layer with use_k_eq_v=True (layer 1 in testmodel)
+    # Global K=V layer (layer 1 in testmodel)
     self.assertIn(
         "model.language_model.layers.1.self_attn.k_proj.weight", hf_sd
     )
@@ -205,6 +224,7 @@ class TestGemma4StateDictAdapter(absltest.TestCase):
     hf_sd["model.audio_tower.encoder.layers.0.weight"] = torch.randn(4, 4)
     hf_sd["model.embed_vision.weight"] = torch.randn(4, 4)
     hf_sd["model.embed_audio.weight"] = torch.randn(4, 4)
+    hf_sd["multi_modal_projector.weight"] = torch.randn(4, 4)
 
     roundtrip_sd = adapter.from_hf(hf_sd)
     self.assertEqual(set(roundtrip_sd.keys()), set(tt_sd.keys()))
@@ -247,7 +267,6 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
         head_dim=head_dim,
         is_sliding=True,
         sliding_window_size=self._WINDOW,
-        use_k_eq_v=False,
         qk_norm=RMSNorm.Config(
             normalized_shape=head_dim, eps=1e-6, param_init=_NORM_INIT
         ),
@@ -455,7 +474,6 @@ class TestGemma4Components(BaseDeviceTest):
         head_dim=8,
         is_sliding=True,
         sliding_window_size=4,
-        use_k_eq_v=False,
         qk_norm=RMSNorm.Config(
             normalized_shape=8, eps=1e-6, param_init=_NORM_INIT
         ),
@@ -486,7 +504,7 @@ class TestGemma4Components(BaseDeviceTest):
     out_sliding = sliding_attn(x, attention_masks=None)
     self.assertEqual(out_sliding.shape, (2, 10, dim))
 
-    # Global attention with use_k_eq_v=True
+    # Global attention with K=V
     global_cfg = Gemma4Attention.Config(
         dim=dim,
         n_heads=4,
@@ -494,7 +512,6 @@ class TestGemma4Components(BaseDeviceTest):
         head_dim=16,
         is_sliding=False,
         sliding_window_size=None,
-        use_k_eq_v=True,
         qk_norm=RMSNorm.Config(
             normalized_shape=16, eps=1e-6, param_init=_NORM_INIT
         ),
