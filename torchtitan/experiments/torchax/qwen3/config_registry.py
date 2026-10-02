@@ -1,5 +1,9 @@
 """Config registry for the torchax-lane Qwen3 model."""
 
+from functools import partial
+
+import torch.nn as nn
+
 from torchtitan.experiments.torchax import qwen3 as torchax_qwen3
 from torchtitan.experiments.torchax.torchax_job_config import TorchaxJobConfig
 from torchtitan.experiments.tpu.qwen3 import config_registry as tpu_qwen3
@@ -34,8 +38,12 @@ def qwen3_debugmodel() -> TorchaxJobConfig:
       max_context_length=cfg.model_spec.max_context_length,
   )
   # tpu's qwen3_debugmodel disables weight tying on the model config — preserve
-  # that mutation on the torchax-side model args as well.
+  # that mutation on the torchax-side model args as well. Untying needs the
+  # embedding initializer too: the tied flavor skips it (see the tpu config).
   cfg.model_spec.model.enable_weight_tying = False
+  cfg.model_spec.model.tok_embeddings.param_init = {
+      "weight": partial(nn.init.normal_, std=1.0)
+  }
   cfg.torchax_config.use_torchax = True
   cfg.torchax_config.use_scan = False
   return cfg

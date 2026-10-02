@@ -90,6 +90,25 @@ def _config(registry=model_registry):
     return config
 
 
+def _untied_qwen3_config():
+    """The qwen3 debug model with weight tying off (see ``TestQwen3._build``).
+
+    The tied flavor gives ``tok_embeddings`` ``skip_param_init``, since
+    ``init_states`` points it at the initialized ``lm_head`` weight. Untied, it
+    needs an initializer of its own, or it would hold whatever ``to_empty``
+    left; ``Decoder`` rejects that combination.
+    """
+    config = _config(qwen3_registry)
+    return dataclasses.replace(
+        config,
+        enable_weight_tying=False,
+        tok_embeddings=dataclasses.replace(
+            config.tok_embeddings,
+            param_init={"weight": functools.partial(nn.init.normal_, std=1.0)},
+        ),
+    )
+
+
 def _moe_config(num_experts: int):
     """A 2-layer qwen3 MoE with ``num_experts`` experts, stackable.
 
@@ -97,9 +116,7 @@ def _moe_config(num_experts: int):
     has something to flatten. Load balancing is off because stacking refuses
     it, and weight tying is off for the reason ``TestQwen3._build`` gives.
     """
-    config = dataclasses.replace(
-        _config(qwen3_registry), enable_weight_tying=False
-    )
+    config = _untied_qwen3_config()
     config.layers = qwen3_models._build_qwen3_moe_layers(  # pylint: disable=protected-access
         fuse_qkv=True,
         n_layers=2,
@@ -608,14 +625,9 @@ class TestQwen3(unittest.TestCase):
         # gathered tensor, which `nn.Module.__setattr__` refuses. The unrolled
         # arm fails identically, so it is a gap in this lane, not in the stack.
         #
-        # With tying off nothing initializes `tok_embeddings` -- `init_states`
-        # was its only writer, and `skip_param_init` skips it -- so it holds
-        # whatever `to_empty` left. Hence `_pair` below, and the restriction of
-        # the state-dict comparison to the decoder.
-        config = dataclasses.replace(
-            _config(qwen3_registry), enable_weight_tying=False
-        )
-        return _build(config=config, **kwargs)
+        # Untied, `tok_embeddings` needs its own initializer; see
+        # `_untied_qwen3_config`.
+        return _build(config=_untied_qwen3_config(), **kwargs)
 
     def _pair(self, **kwargs):
         """A plain model and a stacked one holding exactly its weights."""

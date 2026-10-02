@@ -33,6 +33,7 @@ from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.common.token_dispatcher import update_ep_token_dispatcher_config
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
@@ -204,6 +205,19 @@ class Decoder(BaseModel):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+
+        # Tied flavors give ``tok_embeddings`` ``skip_param_init`` because the
+        # weight is re-pointed at the initialized ``lm_head`` weight. Untying
+        # such a flavor without also giving the embedding a real initializer
+        # would train it from uninitialized memory.
+        embedding_init = (config.tok_embeddings.param_init or {}).get("weight")
+        if not config.enable_weight_tying and embedding_init is skip_param_init:
+            raise ValueError(
+                "enable_weight_tying=False, but tok_embeddings.param_init['weight'] "
+                "is skip_param_init, so the untied embedding would never be "
+                "initialized. Set tok_embeddings.param_init as well, e.g. "
+                "{'weight': partial(nn.init.normal_, std=1.0)}."
+            )
 
         self.tok_embeddings = config.tok_embeddings.build()
 

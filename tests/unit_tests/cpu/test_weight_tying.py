@@ -4,15 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 import unittest
+from functools import partial
 from types import SimpleNamespace
 
+import torch
 import torch.nn as nn
 
 from torchtitan.config import ParallelismConfig
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.llama3 import llama3_configs
 from torchtitan.models.llama3.model import Llama3Model
+from torchtitan.models.qwen3 import qwen3_configs
 
 
 def _make_config(enable_weight_tying: bool = False) -> Llama3Model.Config:
@@ -98,6 +102,44 @@ class TestLlama3WeightTying(unittest.TestCase):
 
         # Should not raise
         config.update_from_config(config=runtime_config)
+
+
+def _sdpa_config(configs, flavor: str):
+    build_config, max_context_length = configs[flavor]
+    return build_config(attn_backend="sdpa", seq_len=max_context_length)
+
+
+class TestUntyingNeedsAnEmbeddingInit(unittest.TestCase):
+    """Tied flavors give tok_embeddings skip_param_init; untying must replace it."""
+
+    def _untied_qwen3_debugmodel(self):
+        config = _sdpa_config(qwen3_configs, "debugmodel")
+        self.assertTrue(config.enable_weight_tying)
+        config.enable_weight_tying = False
+        return config
+
+    def test_untying_without_an_embedding_init_raises(self):
+        for config in (
+            self._untied_qwen3_debugmodel(),
+            dataclasses.replace(
+                _sdpa_config(llama3_configs, "1B"), enable_weight_tying=False
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "tok_embeddings.param_init"):
+                config.build()
+
+    def test_untying_with_an_embedding_init_initializes_the_embedding(self):
+        config = self._untied_qwen3_debugmodel()
+        config.tok_embeddings.param_init = {"weight": partial(nn.init.normal_, std=1.0)}
+        model = config.build()
+        # Make stale memory visible: init_states must overwrite all of it.
+        with torch.no_grad():
+            model.tok_embeddings.weight.fill_(float("nan"))
+        model.init_states()
+        weight = model.tok_embeddings.weight
+        self.assertIsNot(weight, model.lm_head.weight)
+        self.assertTrue(torch.isfinite(weight).all())
+        self.assertAlmostEqual(weight.std().item(), 1.0, delta=0.1)
 
 
 if __name__ == "__main__":
