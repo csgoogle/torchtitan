@@ -1,10 +1,12 @@
-FROM python:3.12
+ARG PYTHON_VERSION=3.14
+FROM python:${PYTHON_VERSION}
 
 ARG CACHE_BUSTER=1
 
 # Install PyTorch CPU nightly first so downstream packages do not pull CUDA wheels
 ARG CACHE_BUSTER
-RUN pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+ARG TORCH_VERSION=""
+RUN pip install --pre "torch${TORCH_VERSION:+==${TORCH_VERSION}}" --index-url https://download.pytorch.org/whl/nightly/cpu
 
 # Install TPU requirements
 COPY torchtitan/experiments/tpu/requirements.txt ./requirements-tpu.txt
