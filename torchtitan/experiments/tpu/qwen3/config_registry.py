@@ -615,6 +615,26 @@ def qwen3_moe_30b_fsdp_only_full_ac_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_30b_v6e32_layer() -> TPUTrainerConfig:
+  """Q30 benchmark compiled per layer instead of as one GraphTrainer step.
+
+  For slices whose HBM cannot hold Zero-2's gathered weights (v6e-32): Zero-3
+  with the qwen3_8b recipe's per-layer compile mode and eager full AC.
+  """
+  cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+  cfg.parallelism.fsdp_reshard_after_forward = "always"
+  cfg.activation_checkpoint = FullAC.Config()
+  cfg.tpu_config = TPUConfig(
+      eager_mode="DEFER_AND_FUSE",
+      use_graph_split=True,
+      compile_mode="layer",
+      compile_grad_norm=True,
+      enable_mfu_benchmark=True,
+      mfu_benchmark_start_step=10,
+  )
+  return cfg
+
+
 def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   """Q30 benchmark adding MaxText's BF16 RoPE numerical policy.
 
