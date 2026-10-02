@@ -391,15 +391,22 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
   """The single-device CPU counterpart of a lane config, for parity tests.
 
   Everything the lane chooses because it runs on TPU is turned back into the
-  portable equivalent: the splash kernel becomes sdpa, the fused Pallas cross
-  entropy becomes the model's logits plus plain cross entropy, compile is
-  off. Model, data, optimizer and schedule are untouched, so a CPU run of
-  this config on the same batches is the reference the TPU run is compared
-  against (``base_distributed_device_test._run_cpu_verification``).
+  portable equivalent: the fused Pallas cross entropy becomes the model's
+  logits plus plain cross entropy, compile is off. Model, data, optimizer and
+  schedule are untouched, so a CPU run of this config on the same batches is
+  the reference the TPU run is compared against
+  (``base_distributed_device_test._run_cpu_verification``).
+
+  The attention implementation is deliberately left at ``splash_tpu``: on CPU
+  the adapter falls back to SDPA with the mask the kernel applies (documents
+  from positions, padding, causal, window), so both sides compute the same
+  attention. Switching to plain ``sdpa`` would not -- HF's bidirectional
+  masks (BERT) never infer documents from reset positions, so the reference
+  would attend across packed documents while the kernel does not. The
+  mask derivation itself is checked independently by the single-chip
+  reference test, which builds the dense document mask by hand.
   """
   model_config = config.model_spec.model
-  if getattr(model_config, "_attn_implementation", "") == "splash_tpu":
-    _set_attn_implementation(model_config, "sdpa")
   if getattr(model_config, "fused_loss", False):
     model_config.fused_loss = False
     config.loss = CrossEntropyLoss.Config()
