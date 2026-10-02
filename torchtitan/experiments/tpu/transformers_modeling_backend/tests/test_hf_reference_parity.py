@@ -171,6 +171,14 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
            hf_model="Qwen/Qwen3-0.6B", args=["--loss.b_block_size=256"]),
       dict(testcase_name="llama3", config="hf_debugmodel_max",
            hf_model="meta-llama/Llama-3.2-1B-Instruct", args=["--loss.b_block_size=256"]),
+      # A soft-capped head on the fused CE: the model hands the cap to the loss,
+      # which re-applies it in-kernel, so loss and gradients must match HF's own
+      # capped logits. The checkpoint's cap (30) is overridden to 0.5 on BOTH
+      # sides: at random init logits are small and 30 * tanh(x / 30) ~= x, so a
+      # cap of 30 would let a dropped cap pass unnoticed.
+      dict(testcase_name="gemma3_softcap_fused", config="hf_debugmodel_max",
+           hf_model="google/gemma-3-1b-it",
+           args=["--loss.b_block_size=256", "--hf_config_overrides=final_logit_softcapping=0.5"]),
       # Encoder at full size: bidirectional splash, native MLM head, learned
       # positions; dropout zeroed so the reference is deterministic.
       dict(testcase_name="bert_base", config="hf_full_splash",

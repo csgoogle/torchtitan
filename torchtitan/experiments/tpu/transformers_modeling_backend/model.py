@@ -132,6 +132,19 @@ class TPUHFTransformerModel(HFTransformerModel):
       # had been applied, so a MoE checkpoint selected on the command line
       # arrives with a dense flavor and the MoE replacement never runs. The
       # checkpoint is final here: say so instead of running HF's MoE unreplaced.
+      # Titan's GroupedExperts hardcodes SiLU-gated experts and a plain top-k
+      # router. A MoE whose experts use another activation (Gemma-4: GeGLU,
+      # gelu_pytorch_tanh, plus a router with RMSNorm / scale / per-expert
+      # scale) would be swapped for a different model -- the backend's own
+      # MODEL_COMPATIBILITY.md lists Gemma-4 as FAIL. Keep HF's MoE for those.
+      activation = getattr(self, "hidden_activation", None) or getattr(self, "hidden_act", "silu")
+      titan_moe_ok = activation in ("silu", "swish")
+      if getattr(self, "is_moe", False) and not titan_moe_ok:
+        raise ValueError(
+            f"{hf_model_id}'s experts use {activation!r}; Titan's MoE swap supports "
+            "SiLU-gated experts only and would train a different model. Use a dense "
+            "config (e.g. hf_full_max), which keeps HF's own MoE block."
+        )
       if not getattr(self, "is_moe", False):
         for holder in (raw, raw.get("text_config") or {}):
           experts = next(
@@ -139,11 +152,17 @@ class TPUHFTransformerModel(HFTransformerModel):
                if isinstance(holder.get(k), int) and holder.get(k) > 1),
               None,
           )
-          if experts:
+          if experts and titan_moe_ok:
             logger.warning(
                 f"{hf_model_id} declares {experts} experts but the selected flavor "
                 "is dense, so the MoE replacement will not run and HF's own MoE "
                 "executes unreplaced. Select a *_moe config for this model."
+            )
+            break
+          if experts:
+            logger.info(
+                f"{hf_model_id}: {experts} {activation} experts run on HF's own MoE "
+                "block (Titan's swap supports SiLU experts only)."
             )
             break
 
@@ -169,7 +188,53 @@ class TPUHFTransformerModel(HFTransformerModel):
               f"hf_config_overrides: {hf_model_id} config has no field {key!r}"
           )
         setattr(self, key, value)
+      self._mirror_logit_transform_into_fused_loss(config, hf_model_id)
       return self
+
+    def _mirror_logit_transform_into_fused_loss(self, job_config, hf_model_id: str) -> None:
+      """Hand the head's logit transform to the fused CE, which re-applies it.
+
+      The fused loss receives (trunk hidden, head weight) and computes
+      ``soft_cap * tanh(output_multiplier * (h @ W) / soft_cap)`` in-kernel,
+      forward and backward. Gemma's final soft-cap, Cohere's logit_scale,
+      Granite's logits_scaling divisor and Falcon-H1's lm_head_multiplier
+      are all that form, so instead of refusing those models the transform is
+      copied into the loss config. The trainer runs this hook before it builds
+      the loss, which is what makes the hand-off possible. A value the user set
+      explicitly is never overridden: a mismatch is an error.
+      """
+      if not getattr(self, "fused_loss", False):
+        return
+      from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+
+      loss_config = getattr(job_config, "loss", None)
+      if not isinstance(loss_config, PallasCrossEntropyLoss.Config):
+        return
+      cap = getattr(self, "final_logit_softcapping", None)
+      multiplier = 1.0
+      for field, invert in (("logit_scale", False), ("logits_scaling", True), ("lm_head_multiplier", False)):
+        value = getattr(self, field, None)
+        if value is not None and value != 1.0:
+          multiplier *= (1.0 / value) if invert else value
+      if cap is None and multiplier == 1.0:
+        return
+      if loss_config.soft_cap is not None and loss_config.soft_cap != cap:
+        raise ValueError(
+            f"{hf_model_id} soft-caps its logits at {cap} but --loss.soft_cap="
+            f"{loss_config.soft_cap}; leave it unset to take the model's value"
+        )
+      if loss_config.output_multiplier not in (1.0, multiplier):
+        raise ValueError(
+            f"{hf_model_id} scales its logits by {multiplier} but "
+            f"--loss.output_multiplier={loss_config.output_multiplier}"
+        )
+      loss_config.soft_cap = cap
+      loss_config.output_multiplier = multiplier
+      self.fused_loss_logit_transform = (cap, multiplier)
+      logger.info(
+          f"{hf_model_id}: fused CE re-applies the head's logit transform "
+          f"(soft_cap={cap}, output_multiplier={multiplier})"
+      )
 
     def _complete_from_hf_config(self, hf_model_id: str) -> None:
       """Carry over what the base's attribute copy misses from the HF config.
@@ -269,6 +334,9 @@ class TPUHFTransformerModel(HFTransformerModel):
     self._forward_kwargs = _structure.accepted_kwargs(self.model.forward)
     # Set on the Config by the registry's fused_loss=True configs.
     self._fused_loss = bool(getattr(config, "fused_loss", False))
+    # Set by update_from_config when the head's logit transform was handed to
+    # the fused CE (see _mirror_logit_transform_into_fused_loss).
+    self._mirrored_logit_transform = getattr(config, "fused_loss_logit_transform", None)
 
     # BERT, DistilBERT and XLM-R normalize inside every block and end without
     # a trailing norm. Callers still expect the part to exist, so stand in an
@@ -348,6 +416,8 @@ class TPUHFTransformerModel(HFTransformerModel):
       return f"its lm_head is a {type(head).__name__}, not a Linear"
     if head.bias is not None:
       return "its lm_head has a bias"
+    if getattr(self, "_mirrored_logit_transform", None) is not None:
+      return None  # the fused CE re-applies the head's transform in-kernel
     configs = [self.model.config]
     text = getattr(self.model.config, "text_config", None)
     if text is not None:
