@@ -19,7 +19,6 @@ This mirrors `experiments/tpu/llama3/infra/parallelize.py`, which does the
 same swap for the torchtitan-native llama3.
 """
 
-import contextlib
 import dataclasses
 
 import torch
@@ -33,7 +32,6 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
 )
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
-from torchtitan.experiments.transformers_modeling_backend import moe_replacement
 from torchtitan.experiments.transformers_modeling_backend.parallelize import (
     parallelize_hf_transformers,
 )
@@ -69,25 +67,6 @@ def _defer_parametrization_during_init(model: nn.Module) -> None:
       return original_init_states(*args, **kwargs)
 
   model.init_states = init_states
-
-
-@contextlib.contextmanager
-def _swapped_moe_stays_on_meta():
-  """Skip the shared MoE swap's CPU materialization of each Titan MoE.
-
-  The shared swap runs ``to_empty(cpu)`` + ``init_states(cpu)`` on every MoE
-  it builds, holding all experts unsharded in host memory: ~180 GB per process
-  for Mixtral-8x7B, which OOM-kills the host. This lane materializes after
-  parallelize and re-initializes those modules on device
-  (``_init_swapped_native_modules``), so the CPU copy was never used.
-  """
-  cls = moe_replacement._HFBatchedMoE
-  cls.to_empty = lambda self, **_: self
-  cls.init_states = lambda self, **_: None
-  try:
-    yield
-  finally:
-    del cls.to_empty, cls.init_states
 
 
 def parallelize_hf_transformers_tpu(
@@ -127,20 +106,19 @@ def parallelize_hf_transformers_tpu(
   # grouped-expert implementation.
   substitute_tpu_experts(model)
 
-  with _swapped_moe_stays_on_meta():
-    parallelize_hf_transformers(
-        model,
-        parallel_dims=parallel_dims,
-        training=training,
-        parallelism=parallelism,
-        compile_config=effective_compile_config,
-        ac_config=ac_config,
-        dump_folder=dump_folder,
-        # With SimpleFSDP this lane wraps data parallelism itself (below); with it
-        # off, the shared parallelize applies its own fully_shard in this same
-        # call -- Module.parallelize() may run only once per instance.
-        skip_dp=parallelism.use_simple_fsdp,
-    )
+  parallelize_hf_transformers(
+      model,
+      parallel_dims=parallel_dims,
+      training=training,
+      parallelism=parallelism,
+      compile_config=effective_compile_config,
+      ac_config=ac_config,
+      dump_folder=dump_folder,
+      # With SimpleFSDP this lane wraps data parallelism itself (below); with it
+      # off, the shared parallelize applies its own fully_shard in this same
+      # call -- Module.parallelize() may run only once per instance.
+      skip_dp=parallelism.use_simple_fsdp,
+  )
 
   if parallelism.use_simple_fsdp:
     # The shard axis is named "fsdp" on some bases and "dp_shard" on others

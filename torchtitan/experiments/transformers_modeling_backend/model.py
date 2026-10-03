@@ -788,6 +788,11 @@ class HFTransformerModel(BaseModel):
             )
 
         for layer in self.layers.values():
+            # moe_enabled means "swapped for a Titan MoE at ``layer.moe``",
+            # which only MoE configs do; a dense config runs HF's MoE block.
+            if not config.is_moe:
+                layer.moe_enabled = False
+                continue
             # Detect MoE layers by checking for gate/router and experts sub-modules.
             # Gemma4 has router/experts as siblings of the dense MLP at the
             # layer level (not inside ``mlp``).
