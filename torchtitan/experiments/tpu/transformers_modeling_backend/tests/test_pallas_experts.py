@@ -1,9 +1,8 @@
 """Device tests for the HF backend's Pallas expert-kernel selection.
 
-Checks that the shape-aware choice between the paired and the K/N-tiled
-unpaired kernels compiles within scoped VMEM at real expert widths (forcing
-paired at the Mixtral shape fails to compile), and that
-batches whose routed-row count is not a tile_m multiple are padded correctly.
+Checks that the default K/N-tiled kernels compile within scoped VMEM at real
+expert widths, and that batches whose routed-row count is not a tile_m
+multiple are padded correctly.
 """
 
 from absl.testing import absltest
@@ -26,6 +25,16 @@ def _reference(x, w1, w2, w3, group_sizes):
   return torch.cat(outs)
 
 
+class _ExpertsOnly:
+  """Minimal stand-in for a converted MoE config holding one experts config."""
+
+  def __init__(self, experts):
+    self.experts = experts
+
+  def traverse(self, cls):
+    yield None, self.experts, None, None
+
+
 def _rel_err(actual, expected):
   return ((actual.float() - expected).norm() / expected.norm()).item()
 
@@ -33,20 +42,17 @@ def _rel_err(actual, expected):
 class PallasExpertsTest(base_device_test.BaseAcceleratorDeviceTest):
 
   @parameterized.named_parameters(
-      # (dim, hidden, group sizes, expect paired)
-      ("qwen3_30b", 2048, 768, [0, 300, 100, 112], True),
-      ("olmoe", 2048, 1024, [256, 0, 200, 56], True),
-      # Largest paired shape (29.5 MiB estimated).
-      ("deepseek_v2_lite", 2048, 1408, [128, 128, 0, 256], True),
-      ("mixtral_8x7b", 4096, 14336, [100, 156], False),
+      # (dim, hidden, group sizes)
+      ("qwen3_30b", 2048, 768, [0, 300, 100, 112]),
+      ("mixtral_8x7b", 4096, 14336, [100, 156]),
       # 16 tokens x top-k 8 = 128 rows: below one 256-row tile.
-      ("short_batch_paired", 2048, 768, [16, 0, 40, 8, 24, 16, 8, 16], True),
-      ("short_batch_unpaired", 1024, 8192, [64, 0, 64], False),
+      ("short_batch", 2048, 768, [16, 0, 40, 8, 24, 16, 8, 16]),
+      ("small_dims", 256, 128, [100, 0, 28]),
   )
-  def test_forward_backward(self, dim, hidden, group_sizes, expect_paired):
+  def test_forward_backward(self, dim, hidden, group_sizes):
     device = self.accelerator_device
     cfg = TpuGroupedExperts.Config(dim=dim, hidden_dim=hidden, num_experts=len(group_sizes))
-    self.assertEqual(hf_model._configure_pallas_experts(cfg), expect_paired)
+    hf_model._enable_pallas_experts(_ExpertsOnly(cfg))
     experts = TpuGroupedExperts(cfg)
     gen = torch.Generator().manual_seed(0)
     with torch.no_grad():
