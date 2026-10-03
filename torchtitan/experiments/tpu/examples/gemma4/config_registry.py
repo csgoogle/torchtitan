@@ -18,15 +18,15 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
-from torchtitan.experiments.tpu.gemma4 import (
+from torchtitan.experiments.tpu.examples.gemma4 import (
     _build_flavor_config,
     model_registry,
 )
-from torchtitan.experiments.tpu.gemma4.infra.parallelize import (
+from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     parallelize_gemma4 as tpu_parallelize_gemma4,
 )
-from torchtitan.experiments.tpu.gemma4.model import Gemma4Model
-from torchtitan.experiments.tpu.gemma4.state_dict_adapter import (
+from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
+from torchtitan.experiments.tpu.examples.gemma4.state_dict_adapter import (
     Gemma4StateDictAdapter,
 )
 from torchtitan.experiments.tpu.grouped_experts import (

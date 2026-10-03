@@ -156,7 +156,7 @@ class TrainMinimalDistributedTest(
       # gemma4
       dict(
           testcase_name="gemma4_tp",
-          module="gemma4",
+          module="examples.gemma4",
           config="gemma4_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
@@ -169,7 +169,7 @@ class TrainMinimalDistributedTest(
       ),
       dict(
           testcase_name="gemma4_fsdp",
-          module="gemma4",
+          module="examples.gemma4",
           config="gemma4_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
@@ -182,7 +182,7 @@ class TrainMinimalDistributedTest(
       ),
       dict(
           testcase_name="gemma4_simplefsdp",
-          module="gemma4",
+          module="examples.gemma4",
           config="gemma4_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,

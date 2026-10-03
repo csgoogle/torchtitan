@@ -28,11 +28,11 @@ from torchtitan.experiments.tpu import distributed
 from torchtitan.experiments.tpu.base_distributed_device_test import (
     InputDistribution,
 )
-import torchtitan.experiments.tpu.gemma4 as gemma4_tpu
-from torchtitan.experiments.tpu.gemma4.infra import (
+import torchtitan.experiments.tpu.examples.gemma4 as gemma4_tpu
+from torchtitan.experiments.tpu.examples.gemma4.infra import (
     parallelize as gemma4_parallelize,
 )
-from torchtitan.experiments.tpu.gemma4.model import Gemma4Model
+from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 import torchtitan.experiments.tpu.tpu_job_config
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
@@ -513,7 +513,7 @@ class TestDTensorParallelizeGemma4(
       tensor_parallel_degree,
   ):
     args = [
-        "--module=torchtitan.experiments.tpu.gemma4",
+        "--module=torchtitan.experiments.tpu.examples.gemma4",
         f"--config={config}",
         "--optimizer.implementation=foreach",
         "--hf_assets_path=tests/assets/tokenizer",

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import spmd_types as spmd
 
-from torchtitan.experiments.tpu.gemma4.model import (
+from torchtitan.experiments.tpu.examples.gemma4.model import (
     Gemma4Attention,
     Gemma4Router,
 )
@@ -26,7 +26,7 @@ from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.protocols.sharding import ShardingConfig
 
 if TYPE_CHECKING:
-    from torchtitan.experiments.tpu.gemma4.model import (
+    from torchtitan.experiments.tpu.examples.gemma4.model import (
         Gemma4Model,
         Gemma4TransformerBlock,
     )

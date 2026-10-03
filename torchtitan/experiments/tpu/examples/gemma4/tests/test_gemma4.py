@@ -1,4 +1,4 @@
-"""Unit and numerical tests for Gemma 4 in torchtitan.experiments.tpu.gemma4."""
+"""Unit and numerical tests for Gemma 4 in torchtitan.experiments.tpu.examples.gemma4."""
 
 import copy
 from functools import partial
@@ -11,19 +11,19 @@ import torch.nn.functional as F
 from torchtitan.components.loss import cross_entropy_loss
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest as BaseDeviceTest
-from torchtitan.experiments.tpu.gemma4 import (
+from torchtitan.experiments.tpu.examples.gemma4 import (
     _build_flavor_config,
     gemma4_configs,
 )
 from torchtitan.experiments.tpu.workarounds import use_cpu_safe_histc_patch
-from torchtitan.experiments.tpu.gemma4.config_registry import (
+from torchtitan.experiments.tpu.examples.gemma4.config_registry import (
     gemma4_26b_a4b,
     gemma4_31b,
     gemma4_debugmodel,
     gemma4_moe_debug,
     gemma4_moe_testmodel,
 )
-from torchtitan.experiments.tpu.gemma4.model import (
+from torchtitan.experiments.tpu.examples.gemma4.model import (
     Gemma4Attention,
     Gemma4Embedding,
     Gemma4FeedForward,
@@ -35,7 +35,7 @@ from torchtitan.experiments.tpu.gemma4.model import (
     QKVLinearKeqV,
     SlidingWindowScaledDotProductAttention,
 )
-from torchtitan.experiments.tpu.gemma4.state_dict_adapter import (
+from torchtitan.experiments.tpu.examples.gemma4.state_dict_adapter import (
     Gemma4StateDictAdapter,
 )
 from torchtitan.experiments.tpu.grouped_experts import (

@@ -27,7 +27,7 @@ import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
-import torchtitan.experiments.tpu.gemma4  # trigger model registration
+import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 from torchtitan.experiments.tpu.graph_trainer.config import (
     to_tpu_graph_trainer_config,
 )

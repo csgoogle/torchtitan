@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from torchtitan.experiments.tpu.gemma4.model import Gemma4Model
+from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
 # Non-text towers of the multimodal checkpoint, with any leading "model." removed.

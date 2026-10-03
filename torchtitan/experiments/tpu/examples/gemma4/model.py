@@ -513,7 +513,7 @@ class Gemma4Model(Decoder):
             config,
             **kwargs,
         ) -> None:
-            from torchtitan.experiments.tpu.gemma4.sharding import (
+            from torchtitan.experiments.tpu.examples.gemma4.sharding import (
                 set_gemma4_sharding_config,
             )
             from torchtitan.models.common.config_utils import (

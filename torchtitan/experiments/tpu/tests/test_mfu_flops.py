@@ -7,7 +7,7 @@
 from absl.testing import absltest
 import torch
 
-from torchtitan.experiments.tpu.gemma4 import gemma4_configs
+from torchtitan.experiments.tpu.examples.gemma4 import gemma4_configs
 from torchtitan.experiments.tpu.qwen3 import qwen3_configs
 
 

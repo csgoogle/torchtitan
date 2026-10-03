@@ -5,11 +5,11 @@ from absl.testing import absltest
 import torch
 from torch import nn
 
-from torchtitan.experiments.tpu.gemma4 import _build_flavor_config
-from torchtitan.experiments.tpu.gemma4.infra.parallelize import (
+from torchtitan.experiments.tpu.examples.gemma4 import _build_flavor_config
+from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
     configure_gemma4_simple_fsdp_shard_dims,
 )
-from torchtitan.experiments.tpu.gemma4.sharding import (
+from torchtitan.experiments.tpu.examples.gemma4.sharding import (
     set_gemma4_sharding_config,
 )
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
