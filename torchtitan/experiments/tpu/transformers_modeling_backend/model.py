@@ -994,8 +994,11 @@ def _enable_pallas_experts(moe_config) -> None:
   Otherwise the experts run torch._grouped_mm (XLA ragged dot). Uses the
   unpaired kernels with bounded K/N tiles, which fit scoped VMEM at any expert
   width. The qwen3 lane's paired W1/W3 kernel is faster but holds full
-  (dim, hidden) weight slabs in VMEM; it can be enabled per model through
-  TpuGroupedExperts.Config when those fit.
+  (dim, hidden) weight slabs in VMEM. Where those fit, enable it in the loop
+  below with (it needs an untiled N in the dWeight tiling):
+
+    experts.use_pallas_paired_grouped_mm = True
+    experts.pallas_grouped_mm_tgmm_tiling = (256, tile, 0)
   """
   from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
