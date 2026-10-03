@@ -354,12 +354,6 @@ class TPUHFTransformerModel(HFTransformerModel):
     # Set by update_from_config when the head's logit transform was handed to
     # the fused CE (see _mirror_logit_transform_into_fused_loss).
     self._mirrored_logit_transform = getattr(config, "fused_loss_logit_transform", None)
-    # The base marks every layer with a router and experts as moe_enabled. A
-    # dense config skips the Titan MoE swap and runs HF's own MoE block, so no
-    # layer has the ``moe`` the trainer's routing-metric hooks then read.
-    if not getattr(config, "is_moe", False):
-      for layer in self.layers.values():
-        layer.moe_enabled = False
 
     # BERT, DistilBERT and XLM-R normalize inside every block and end without
     # a trailing norm. Callers still expect the part to exist, so stand in an
@@ -820,11 +814,9 @@ class TPUHFTransformerModel(HFTransformerModel):
       self.model.config.initializer_range = saved
     self._init_untouched_parameters()
 
-    # Titan MoE modules swapped in by moe_replacement initialize themselves at
-    # parallelize time (to_empty(cpu) + init_states(cpu)), but the trainer
-    # parallelizes FIRST and materializes SECOND, so the to_empty() that
-    # precedes this call hands those expert weights fresh, uninitialized
-    # storage. HF's _init_weights dispatches on module type and a stacked
+    # Titan MoE modules swapped in by moe_replacement stay on meta until the
+    # trainer's to_empty() (it parallelizes FIRST and materializes SECOND), so
+    # those expert weights arrive here as fresh, uninitialized storage. HF's _init_weights dispatches on module type and a stacked
     # [E, *, *] expert weight is not an nn.Linear, so nothing rewrites them
     # and the first MoE forward reads nan (measured: finite=0.0000 for
     # w1/w2/w3 with healthy activations and routing entering the same call).
