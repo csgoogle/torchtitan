@@ -244,6 +244,16 @@ class TpuGroupedExperts(GroupedExperts):
         # model is FP32, and the final result is restored to the caller's dtype.
         x_bf16 = x_RD.bfloat16()
         tile_m = self.pallas_grouped_mm_tile_m
+        # The kernels need a row count divisible by tile_m. Append zero rows to
+        # the last expert's group: they add nothing to dWeight and are sliced
+        # off the output. A no-op for tile-aligned batches.
+        num_rows = x_bf16.shape[0]
+        pad_rows = -num_rows % tile_m
+        if pad_rows:
+            x_bf16 = F.pad(x_bf16, (0, 0, 0, pad_rows))
+            num_tokens_per_expert_E = torch.cat(
+                [num_tokens_per_expert_E[:-1], num_tokens_per_expert_E[-1:] + pad_rows]
+            )
         tile_k = self.pallas_grouped_mm_tile_k
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
@@ -291,7 +301,7 @@ class TpuGroupedExperts(GroupedExperts):
             tile_n=tile_n,
             tgmm_tiling=tgmm_tiling,
             dweight_output_dtype=self._unpaired_dweight_output_dtype,
-        ).type_as(x_RD)
+        )[:num_rows].type_as(x_RD)
 
 
 def configure_expert_dweight_output_dtype(
