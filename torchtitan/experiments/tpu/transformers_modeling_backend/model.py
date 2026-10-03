@@ -340,6 +340,12 @@ class TPUHFTransformerModel(HFTransformerModel):
     # Set by update_from_config when the head's logit transform was handed to
     # the fused CE (see _mirror_logit_transform_into_fused_loss).
     self._mirrored_logit_transform = getattr(config, "fused_loss_logit_transform", None)
+    # The base marks every layer with a router and experts as moe_enabled. A
+    # dense config skips the Titan MoE swap and runs HF's own MoE block, so no
+    # layer has the ``moe`` the trainer's routing-metric hooks then read.
+    if not getattr(config, "is_moe", False):
+      for layer in self.layers.values():
+        layer.moe_enabled = False
 
     # BERT, DistilBERT and XLM-R normalize inside every block and end without
     # a trailing norm. Callers still expect the part to exist, so stand in an
