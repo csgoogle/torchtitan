@@ -42,7 +42,7 @@ class DeviceMemoryMonitor:
         # pyrefly: ignore [read-only]
         self.device = torch.device(device)  # device object
         self.device_name = device_module.get_device_name(self.device)
-        self.device_index = device_module.current_device()
+        self.device_index = utils.current_device_index()
         self.device_capacity = device_module.get_device_properties(
             self.device
         ).total_memory

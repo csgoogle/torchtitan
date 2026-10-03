@@ -60,8 +60,7 @@ def main():
 
     # Initialize devices
     device = torch.device("tpu")
-    device_module = utils.get_device_module()
-    device_module.set_device(device)
+    utils.set_current_device(device)
 
     logger.info(f"Using device: {device}")
     dtype = TORCH_DTYPE_MAP[config.training.mixed_precision_param]

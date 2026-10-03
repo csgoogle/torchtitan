@@ -347,11 +347,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.config = config
         model_spec = config.model_spec
 
-        device_module, device_type = utils.device_module, utils.device_type
+        device_type = utils.device_type
         # pyrefly: ignore [read-only]
         self.device = utils.get_local_device()
         # Device has to be set before creating TorchFT manager.
-        device_module.set_device(self.device)
+        utils.set_current_device(self.device)
 
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()

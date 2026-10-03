@@ -135,6 +135,35 @@ def get_device_info() -> tuple[str, ModuleType]:
 device_type, device_module = get_device_info()
 
 
+# The helpers below use torch.accelerator rather than the device module, because
+# TorchTPU makes device-module APIs with torch.accelerator equivalents (e.g.
+# torch.tpu.set_device) internal to PyTorch.
+
+
+def set_current_device(device: torch.device) -> None:
+    """Makes `device` the current device of this process.
+
+    cpu and index-free devices (e.g. tpu, where a process owns exactly one
+    device) need no selection.
+    """
+    if device.type != "cpu" and device.index is not None:
+        torch.accelerator.set_device_index(device.index)
+
+
+def current_device_index() -> int:
+    """Returns the index of this process's current device."""
+    if device_type == "cpu":
+        # A process has exactly one CPU device, so it is always index 0.
+        return 0
+    return torch.accelerator.current_device_index()
+
+
+def synchronize_device() -> None:
+    """Waits for all pending work on this process's current device."""
+    if device_type != "cpu":
+        torch.accelerator.synchronize()
+
+
 def get_local_device() -> torch.device:
     """Return this process's device under LOCAL_RANK or visible-device launch.
 

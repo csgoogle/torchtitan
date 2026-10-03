@@ -110,7 +110,7 @@ def build_trainer_model(
     hf_assets_path = config.hf_assets_path
 
     device = utils.get_local_device()
-    utils.device_module.set_device(device)
+    utils.set_current_device(device)
 
     parallelism = config.trainer.parallelism
     dist_utils.set_spmd_backend(parallelism.spmd_backend)

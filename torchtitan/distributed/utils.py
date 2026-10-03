@@ -27,7 +27,11 @@ from torch.distributed.tensor.placement_types import Placement, Shard
 
 from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import device_module, device_type
+from torchtitan.tools.utils import (
+    current_device_index,
+    device_type,
+    synchronize_device,
+)
 
 if TYPE_CHECKING:
     from torchtitan.distributed.parallel_dims import ParallelDims
@@ -581,8 +585,8 @@ def set_pg_timeouts(
     # otherwise, some ranks may issue collectives with the new/shorter timeout and
     # those may time out, before other ranks have finished with initialization done
     # under the old/slow timeout.
-    torch.distributed.barrier(device_ids=[device_module.current_device()])
-    device_module.synchronize()
+    torch.distributed.barrier(device_ids=[current_device_index()])
+    synchronize_device()
 
     # None represents the 'default' PG, not part of the mesh
     groups: list[torch.distributed.ProcessGroup | None] = [

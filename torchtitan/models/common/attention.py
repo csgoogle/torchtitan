@@ -420,11 +420,8 @@ class ScaledDotProductInnerAttention(InnerAttention):
             ]
 
         # Only use overrideable SDPA when TPU backend is available.
-        try:
-            tpu_mod = torch.get_device_module("tpu")
-            is_tpu = tpu_mod is not None and tpu_mod.is_available()
-        except (RuntimeError, ValueError, ImportError):
-            is_tpu = False
+        accelerator = torch.accelerator.current_accelerator(check_available=True)
+        is_tpu = accelerator is not None and accelerator.type == "tpu"
 
         if is_tpu:
             self.sdpa_backends = [
