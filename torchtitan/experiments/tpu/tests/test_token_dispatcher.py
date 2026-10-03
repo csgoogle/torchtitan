@@ -217,19 +217,9 @@ def test_local_combine_matches_standard_dispatcher():
         10, 4, dtype=torch.bfloat16, generator=generator, requires_grad=True
     )
     reference_routed = actual_routed.detach().requires_grad_()
-    actual = actual_dispatcher.combine(
-        actual_routed,
-        actual_metadata,
-        x,
-        num_local_tokens_after_padding=5,
-        local_seq_len_after_padding=5,
-    )
+    actual = actual_dispatcher.combine(actual_routed, actual_metadata, x)
     reference = reference_dispatcher.combine(
-        reference_routed,
-        reference_metadata,
-        x,
-        num_local_tokens_after_padding=5,
-        local_seq_len_after_padding=5,
+        reference_routed, reference_metadata, x
     )
     grad_output = torch.randn(5, 4, dtype=torch.bfloat16, generator=generator)
     actual_grads = torch.autograd.grad(
@@ -257,11 +247,7 @@ def test_ep_combine_delegates_to_standard_dispatcher():
         AllToAllTokenDispatcher, "combine", return_value=expected
     ) as combine:
         actual = dispatcher.combine(
-            torch.empty(0),
-            mock.sentinel.metadata,
-            torch.empty(0),
-            num_local_tokens_after_padding=0,
-            local_seq_len_after_padding=0,
+            torch.empty(0), mock.sentinel.metadata, torch.empty(0)
         )
 
     assert actual is expected

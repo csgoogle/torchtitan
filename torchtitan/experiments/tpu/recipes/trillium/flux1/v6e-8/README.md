@@ -15,6 +15,15 @@ export CLUSTER_NAME=YOUR_CLUSTER_NAME
 export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
 ```
 
+> [!NOTE]
+> As of upstream `d771abb0` (9/11/26), `--dataloader.img_size` and
+> `--training.local_batch_size` no longer exist. The image size now lives on the
+> dataset processor, which is not exposed on the CLI (`flux_dev` defaults to
+> `img_size=256`), so use the TPU-side `--flux.img_size=1024` instead. It sets
+> the processor image size and `max_context_length` (64 x 64 image patches +
+> 512 T5 tokens = 4608). The batch size is expressed as a token budget:
+> `num_tokens_per_microbatch_per_dp_rank` = samples x 4608.
+
 ## SimpleFSDP + SplashAttention + torch.compile
 
 ### float32 + MixedPrecision bfloat16
@@ -45,8 +54,8 @@ xpk workload create \
     --metrics.log_freq=1 \
     --training.steps=40 \
     --training.dtype=float32 \
-    --training.local_batch_size=2 \
-    --dataloader.img_size=1024 \
+    --training.num_tokens_per_microbatch_per_dp_rank=9216 \
+    --flux.img_size=1024 \
     --flux.random_dataset \
     --parallelism.use_simple_fsdp \
     --splash-attention-kernel.use-splash-attention-kernel \
@@ -90,8 +99,8 @@ xpk workload create \
     --metrics.log_freq=1 \
     --training.steps=40 \
     --training.dtype=bfloat16 \
-    --training.local_batch_size=3 \
-    --dataloader.img_size=1024 \
+    --training.num_tokens_per_microbatch_per_dp_rank=13824 \
+    --flux.img_size=1024 \
     --flux.random_dataset \
     --parallelism.use_simple_fsdp \
     --splash-attention-kernel.use-splash-attention-kernel \

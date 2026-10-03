@@ -11,9 +11,12 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from torchtitan.models.common.attention import AttentionMasksType, VarlenAttention
+from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.models.utils import get_dense_model_nparams_and_flops
+from torchtitan.models.utils import (
+    get_nparams_and_active_nparams,
+    quadratic_attention_flops_per_token,
+)
 
 
 class Llama3TransformerBlock(TransformerBlock):
@@ -75,14 +78,6 @@ class Llama3Model(Decoder):
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
 
-            if parallelism.context_parallel_degree > 1 and isinstance(
-                self.layers[0].attention.inner_attention, VarlenAttention.Config
-            ):
-                raise NotImplementedError(
-                    "Context Parallel only supports SDPA and FlexAttention. "
-                    "Varlen attention is not supported with CP."
-                )
-
             from torchtitan.models.llama3.sharding import set_llama3_sharding_config
 
             set_llama3_sharding_config(
@@ -93,11 +88,19 @@ class Llama3Model(Decoder):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            return get_dense_model_nparams_and_flops(
-                model,
-                n_layers=len(self.layers),
-                n_heads=self.layers[0].attention.n_heads,
-                head_dims=2 * (self.dim // self.layers[0].attention.n_heads),
-                seq_len=seq_len,
-                enable_weight_tying=self.enable_weight_tying,
-            )
+            nparams, active_nparams = get_nparams_and_active_nparams(model)
+            attention_op_flops = 0
+            for layer in self.layers:
+                attention = layer.attention
+                head_dim = (
+                    attention.head_dim
+                    if attention.head_dim is not None
+                    else attention.dim // attention.n_heads
+                )
+                attention_op_flops += quadratic_attention_flops_per_token(
+                    num_heads=attention.n_heads,
+                    qk_head_dim=head_dim,
+                    v_head_dim=head_dim,
+                    seq_len=seq_len,
+                )
+            return nparams, 6 * active_nparams + attention_op_flops

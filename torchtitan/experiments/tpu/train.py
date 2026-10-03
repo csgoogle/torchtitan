@@ -89,48 +89,128 @@ class TPUTrainer(torchtitan.train.Trainer):
   def forward_backward_step(
       self,
       *,
-      input_dict: dict[str, torch.Tensor],
-      labels: torch.Tensor,
-      global_valid_tokens: float,
+      input_dict: dict[str, Any] | list[dict[str, Any]],
+      global_valid_tokens: torch.Tensor,
   ) -> torch.Tensor:
+    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
+    from torchtitan.protocols.model import BaseModel  # pylint: disable=g-import-not-at-top
+
     config = self.config
-    use_graph_split = (
-        isinstance(config, tpu_job_config_module.TPUTrainerConfig)
-        and config.tpu_config.use_graph_split
-        and not self.parallel_dims.pp_enabled
-    )
-    if not use_graph_split:
-      return super().forward_backward_step(
-          input_dict=input_dict,
-          labels=labels,
-          global_valid_tokens=global_valid_tokens,
+    with set_unflatten_seq_len(config.training.max_context_length):
+      use_graph_split = (
+          isinstance(config, tpu_job_config_module.TPUTrainerConfig)
+          and config.tpu_config.use_graph_split
+          and not self.parallel_dims.pp_enabled
+      )
+      if not use_graph_split:
+        return super().forward_backward_step(
+            input_dict=input_dict,
+            global_valid_tokens=global_valid_tokens,
+        )
+
+      # Graph-split forward/backward for TPU:
+      # The forward pass and loss computation are materialized as one XLA graph,
+      # and the backward pass is compiled separately. This reduces peak
+      # compilation time vs. one monolithic forward+backward graph.
+      from torch_tpu._internal.sync import synchronize  # pylint: disable=g-import-not-at-top
+
+      assert len(self.model_parts) == 1
+      assert isinstance(input_dict, dict)
+      inputs, labels, extra_kwargs = cast(
+          BaseModel, self.model_parts[0]
+      ).preprocess_inputs(
+          input_dict,
+          parallel_dims=self.parallel_dims,
+          parallelism=self.config.parallelism,
+          max_num_documents=self.dataloader.max_num_documents,
+          max_context_length=self.config.training.max_context_length,
+      )
+      self.ntokens_seen += (
+          labels[0].numel() if isinstance(labels, tuple) else labels.numel()
       )
 
-    # Graph-split forward/backward for TPU:
-    # The forward pass and loss computation are materialized as one XLA graph,
-    # and the backward pass is compiled separately. This reduces peak
-    # compilation time vs. one monolithic forward+backward graph.
-    from torch_tpu._internal.sync import synchronize  # pylint: disable=g-import-not-at-top
+      with self.train_context():
+        pred = self.model_parts[0](inputs, **extra_kwargs)
+        loss_kwargs = {}
+        if "positions" in extra_kwargs:
+          loss_kwargs["positions"] = extra_kwargs["positions"]
+        loss, _ = self.loss_fn(pred, labels, global_valid_tokens, **loss_kwargs)
+        del pred
 
-    assert len(self.model_parts) == 1
-    inputs, labels, extra_kwargs = self.post_dataloading_process(
-        input_dict, labels
+        # Materialize the forward graph without waiting for execution to
+        # complete. This splits the deferred-op graph so the backward pass
+        # compiles as a separate (smaller) XLA program. Autograd state is
+        # unaffected — loss.backward() can still propagate gradients.
+        synchronize(loss, wait=False)
+
+        loss.backward()
+
+      return loss
+
+
+def _apply_flux_img_size(
+    train_config: tpu_job_config_module.TPUTrainerConfig,
+) -> None:
+  """Applies `--flux.img_size` to the dataset processors and context length."""
+  img_size = train_config.flux.img_size
+  if img_size is None:
+    return
+  import dataclasses  # pylint: disable=g-import-not-at-top
+  from torchtitan.models.flux import utils as flux_utils  # pylint: disable=g-import-not-at-top
+
+  def _with_img_size(dataset):
+    if hasattr(dataset, "processor"):
+      return dataclasses.replace(
+          dataset,
+          processor=dataclasses.replace(dataset.processor, img_size=img_size),
+      )
+    if hasattr(dataset, "dataset"):  # e.g. FluxValidationDatasetConfig
+      return dataclasses.replace(dataset, dataset=_with_img_size(dataset.dataset))
+    return dataset
+
+  dataloader = train_config.dataloader
+  train_config.dataloader = dataclasses.replace(
+      dataloader, dataset=_with_img_size(dataloader.dataset)
+  )
+  validator = getattr(train_config, "validator", None)
+  if validator is not None and getattr(validator, "dataloader", None):
+    validator.dataloader = dataclasses.replace(
+        validator.dataloader,
+        dataset=_with_img_size(validator.dataloader.dataset),
     )
+  latent = img_size // flux_utils.IMAGE_LATENT_SIZE_RATIO
+  train_config.training.max_context_length = (
+      latent // flux_utils.PATCH_HEIGHT
+  ) * (latent // flux_utils.PATCH_WIDTH) + (
+      train_config.tokenizer.max_t5_encoding_len
+  )
+  logger.info(
+      f"--flux.img_size={img_size}: max_context_length="
+      f"{train_config.training.max_context_length}"
+  )
 
-    with self.train_context():
-      pred = self.model_parts[0](inputs, **extra_kwargs)
-      loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
-      del pred
 
-      # Materialize the forward graph without waiting for execution to
-      # complete. This splits the deferred-op graph so the backward pass
-      # compiles as a separate (smaller) XLA program. Autograd state is
-      # unaffected — loss.backward() can still propagate gradients.
-      synchronize(loss, wait=False)
+def _fit_rope_to_context(model_config: Any, max_context_length: int) -> None:
+  """Sizes every RoPE cache to `max_context_length` (pre-d771abb0 behaviour).
 
-      loss.backward()
+  Upstream d771abb0 dropped the resize from `Decoder.Config.update_from_config`
+  and expects callers to pass `seq_len=` to `model_registry`; the TPU configs do
+  not, so caches were built for the flavor's full context (e.g. 131072 for
+  llama3), which ran llama3-70b on tpu7x-2x2x4 out of program HBM.
+  """
+  import dataclasses  # pylint: disable=g-import-not-at-top
+  from torchtitan.models.common.rope import RoPE  # pylint: disable=g-import-not-at-top
 
-    return loss
+  if model_config is None or max_context_length <= 0:
+    return
+  for _, rope, parent, attr in model_config.traverse(RoPE.Config):
+    if parent is None or rope.max_context_length <= max_context_length:
+      continue
+    new_rope = dataclasses.replace(rope, max_context_length=max_context_length)
+    if isinstance(parent, list):
+      parent[attr] = new_rope
+    else:
+      setattr(parent, attr, new_rope)
 
 
 def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
@@ -145,6 +225,10 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   model_spec = train_config.model_spec
   assert model_spec is not None
   model_name = model_spec.name
+  if model_name != "flux":
+    _fit_rope_to_context(
+        model_spec.model, train_config.training.max_context_length
+    )
   use_graph_trainer = model_name != "flux" and (
       train_config.tpu_config.use_graph_trainer
       or train_config.tpu_config.compile_mode == "aot_fx_trace"
@@ -154,6 +238,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     if train_config.tpu_config.compile_grad_norm:
       raise ValueError("compile_grad_norm does not support FluxTrainer")
     from torchtitan.models.flux.trainer import FluxTrainer
+    _apply_flux_img_size(train_config)
     trainer_cls = FluxTrainer
   # Note: TpuGraphTrainer is designed primarily for joint full-graph tracing
   # ("aot_fx_trace" / "fullgraph"). We keep `--tpu-config.use-graph-trainer`
@@ -193,6 +278,29 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
     gt_cfg = to_tpu_graph_trainer_config(
         train_config, gt_registry, target_cls=TpuGraphTrainer.Config
     )
+    if gt_cfg.model_spec is not None:
+      _fit_rope_to_context(
+          gt_cfg.model_spec.model, gt_cfg.training.max_context_length
+      )
+      if train_config.tpu_config.bld_block_layout:
+        # The graph trainer's parallelize_fn binds instance-level forward
+        # wrappers (`annotate_module_fqns`, `apply_spmd_safe`), after which a
+        # class swap no longer takes effect; the post-init
+        # `workarounds.apply_patches` call is too late. See bld_layout.py.
+        gt_parallelize = gt_cfg.model_spec.parallelize_fn
+
+        def _bld_then_parallelize(model, *args, **kwargs):
+          from torchtitan.experiments.tpu.bld_layout import apply_bld_layout, bld_skip_reason
+
+          apply_bld_layout(
+              model,
+              skip_reason=bld_skip_reason(
+                  train_config.parallelism, train_config.tpu_config
+              ),
+          )
+          return gt_parallelize(model, *args, **kwargs)
+
+        gt_cfg.model_spec.parallelize_fn = _bld_then_parallelize
 
     splash_obj = cast(Any, getattr(train_config, "splash_attention_kernel", None))
     moe_obj = cast(Any, getattr(train_config, "moe", getattr(train_config, "redacted", None)))
@@ -331,7 +439,12 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
               "Training with config: %s",
               json.dumps(train_config.to_dict(), indent=2),
           )
-        trainer.train()
+        # TT-UNFLATTEN-SHIM:
+        from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+        # Upstream d771abb0 renamed training.seq_len ->
+        # training.max_context_length.
+        with set_unflatten_seq_len(train_config.training.max_context_length):
+          trainer.train()
   except Exception:
     if trainer:
       trainer.close()

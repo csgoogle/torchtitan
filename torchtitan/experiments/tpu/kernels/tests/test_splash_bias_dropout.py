@@ -17,6 +17,7 @@ import torch
 from torch.nn import attention
 import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.tpu import unflatten_shim
 from torchtitan.experiments.tpu.kernels import splash_bias_dropout
 from torchtitan.experiments.tpu.kernels import tokamax_splash_attention
 
@@ -266,6 +267,31 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
       torch.testing.assert_close(
           got.cpu(), want.cpu(), rtol=8e-2, atol=8e-2, msg=name
       )
+
+  def test_unflatten_shim_leaves_batch_shared_bias_alone(self):
+    """Under the trainer's unflatten shim only q/k/v are token streams.
+
+    The (H, S, S) bias is batch-shared and must not be unflattened (H is not
+    divisible by S here, so doing so would raise). Flat [T, H, D] inputs come
+    back flat, and documented 4-D inputs come back 4-D.
+    """
+    device = self.accelerator_device
+    b, s, h, d = 2, 512, 4, 64
+    q, k, v = self._qkv(b, s, h, h, d, device, seed=7)
+    g = torch.Generator().manual_seed(11)
+    bias = (torch.randn(h, s, s, generator=g) * 0.5).to(device)
+    want = splash_bias_dropout.sbd_splash_attention(q, k, v, bias)
+
+    with unflatten_shim.set_unflatten_seq_len(s):
+      got_flat = splash_bias_dropout.sbd_splash_attention(
+          q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1), bias
+      )
+      got_4d = splash_bias_dropout.sbd_splash_attention(q, k, v, bias)
+
+    self.assertEqual(tuple(got_flat.shape), (b * s, h, d))
+    self.assertEqual(tuple(got_4d.shape), (b, s, h, d))
+    torch.testing.assert_close(got_flat.cpu(), want.flatten(0, 1).cpu())
+    torch.testing.assert_close(got_4d.cpu(), want.cpu())
 
   # ---------------- per-key bias (+ trainable rank-reduced dbias) --------
 

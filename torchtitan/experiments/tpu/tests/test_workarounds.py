@@ -4,178 +4,24 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 from torchtitan.experiments.tpu import workarounds
-from torchtitan.models.common import rope
 
 
 class WorkaroundsTest(parameterized.TestCase):
   """Unit tests for TPU workarounds."""
 
-  @parameterized.named_parameters(
-      (
-          "cossin_rope_float32",
-          torch.float32,
-          False,  # is_complex
-      ),
-      (
-          "cossin_rope_bfloat16",
-          torch.bfloat16,
-          False,  # is_complex
-      ),
-      (
-          "complex_rope_complex64",
-          torch.complex64,
-          True,  # is_complex
-      ),
-  )
-  def test_rope_tpu_optimization_patch(self, dtype, is_complex):
-    """Tests rope TPU optimization patch correctness across formats and position patterns.
+  # NOTE: `test_rope_tpu_optimization_patch` and
+  # `test_benchmark_rope_gather_vs_2d_indexing` were removed alongside
+  # `workarounds.use_rope_tpu_optimization_patch` in the d771abb0 upstream
+  # import. Upstream's `_reshape_for_broadcast` now performs the same 2D
+  # advanced indexing over the folded `[T]` token stream, so there is no longer
+  # a patched-vs-original pair to compare.
 
-    Covers both CosSinRoPE and ComplexRoPE cache formats across four position
-    patterns:
-      1. Uniform sequential positions: [0, 1, 2, ..., seqlen-1] per batch item
-      2. Sequence packing positions: document boundaries resetting to 0
-      (e.g., [0..9, 0..19, 0..4, ...])
-      3. Offset positions: non-zero KV cache start position offsets
-      4. Arbitrary position IDs
-    """
-    # Save original function
-    original_reshape = (
-        rope._reshape_for_broadcast  # pylint: disable=protected-access
-    )
-
-    try:
-      # Apply monkey patch
-      workarounds.use_rope_tpu_optimization_patch()
-      patched_reshape = (
-          rope._reshape_for_broadcast  # pylint: disable=protected-access
-      )
-
-      self.assertNotEqual(
-          original_reshape,
-          patched_reshape,
-          "rope._reshape_for_broadcast should be monkey-patched.",
-      )
-
-      bsz, seqlen, num_heads, head_dim = 2, 32, 8, 64
-      max_seq_len = 128
-
-      if is_complex:
-        query_shape = (bsz, seqlen, num_heads, head_dim // 2)
-        cfg = rope.ComplexRoPE.Config(dim=head_dim, max_seq_len=max_seq_len)
-        rope_cache = rope.ComplexRoPE(cfg).cache.to(dtype=dtype)
-      else:
-        query_shape = (bsz, seqlen, num_heads, head_dim)
-        cfg = rope.CosSinRoPE.Config(dim=head_dim, max_seq_len=max_seq_len)
-        rope_cache = rope.CosSinRoPE(cfg).cache.to(dtype=dtype)
-
-      cache_width = rope_cache.shape[-1]
-
-      # Define real position patterns
-      # Pattern 1: Uniform sequential positions
-      uniform_positions = torch.arange(seqlen).unsqueeze(0).repeat(bsz, 1)
-
-      # Pattern 2: Sequence packing positions (document boundaries resetting to 0)
-      # Heterogeneous packed documents per batch item:
-      # Batch item 0: 2 docs of len 20 and 12 -> [0..19, 0..11] (32 tokens)
-      # Batch item 1: 3 docs of len 10, 14, and 8 -> [0..9, 0..13, 0..7] (32 tokens)
-      packed_b0 = torch.cat([torch.arange(20), torch.arange(12)])
-      packed_b1 = torch.cat(
-          [torch.arange(10), torch.arange(14), torch.arange(8)]
-      )
-      packed_positions = torch.stack([packed_b0, packed_b1])
-
-      # Pattern 3: Position offsets (non-zero start offsets per batch item)
-      offset_b0 = torch.arange(10, 10 + seqlen)
-      offset_b1 = torch.arange(50, 50 + seqlen)
-      offset_positions = torch.stack([offset_b0, offset_b1])
-
-      # Pattern 4: Arbitrary position IDs
-      arbitrary_positions = torch.randint(0, max_seq_len, (bsz, seqlen))
-
-      position_patterns = [
-          ("uniform", uniform_positions),
-          ("packed", packed_positions),
-          ("offset", offset_positions),
-          ("arbitrary", arbitrary_positions),
-      ]
-
-      # 1. Test positions is None (Sequential)
-      out_orig_none = original_reshape(rope_cache, query_shape, None)
-      out_patch_none = patched_reshape(rope_cache, query_shape, None)
-      torch.testing.assert_close(out_orig_none, out_patch_none)
-      self.assertEqual(out_patch_none.shape, (1, seqlen, 1, cache_width))
-
-      # 2. Test singleton positions (bsz=1)
-      singleton_positions = torch.arange(seqlen).unsqueeze(0)
-      singleton_query_shape = (1, seqlen, num_heads, query_shape[-1])
-      out_orig_single = original_reshape(
-          rope_cache, singleton_query_shape, singleton_positions
-      )
-      out_patch_single = patched_reshape(
-          rope_cache, singleton_query_shape, singleton_positions
-      )
-      torch.testing.assert_close(out_orig_single, out_patch_single)
-      self.assertEqual(out_patch_single.shape, (1, seqlen, 1, cache_width))
-
-      # 3. Test per-batch positions (bsz > 1) across all position patterns
-      for pattern_name, pos_tensor in position_patterns:
-        out_orig_batch = original_reshape(rope_cache, query_shape, pos_tensor)
-        out_patch_batch = patched_reshape(rope_cache, query_shape, pos_tensor)
-
-        self.assertEqual(out_patch_batch.shape, (bsz, seqlen, 1, cache_width))
-        torch.testing.assert_close(
-            out_orig_batch,
-            out_patch_batch,
-            msg=(
-                "TPU patched rope reshape output must match original"
-                f" torch.gather output for pattern '{pattern_name}'."
-            ),
-        )
-
-    finally:
-      # Restore original function
-      rope._reshape_for_broadcast = (
-          original_reshape  # pylint: disable=protected-access
-      )
-
-  def test_benchmark_rope_gather_vs_2d_indexing(self):
-    """Benchmarks and verifies memory/index size reduction of 2D indexing vs torch.gather."""
-    bsz, seqlen, cache_width = 8, 4096, 128
-    max_seq_len = 8192
-
-    rope_cache = torch.randn(max_seq_len, cache_width)
-    positions = torch.randint(0, max_seq_len, (bsz, seqlen))
-
-    # 1. Upstream 4D gather index creation
-    upstream_index = positions.view(bsz, seqlen, 1, 1).expand(
-        bsz, seqlen, 1, cache_width
-    )
-    patched_positions = positions
-
-    # Upstream index tensor elements vs patched 2D positions elements
-    upstream_numel = upstream_index.numel()
-    patched_numel = patched_positions.numel()
-    reduction_factor = upstream_numel / patched_numel
-
-    # Verify that patched positions index is exactly 1 / cache_width size of upstream 4D index
-    self.assertEqual(reduction_factor, cache_width)
-    self.assertEqual(upstream_numel, bsz * seqlen * cache_width)
-    self.assertEqual(patched_numel, bsz * seqlen)
-
-    # 2. Verify bitwise parity
-    upstream_out = (
-        rope_cache[None, :, None, :]
-        .expand(bsz, -1, -1, -1)
-        .gather(dim=1, index=upstream_index)
-    )
-    patched_out = rope_cache[positions].unsqueeze(2)
-
-    torch.testing.assert_close(upstream_out, patched_out)
 
   def test_wrapper_conversion_positions_to_segment_ids(self):
     """Patched splash attention converts positions to segment ids."""
     import unittest.mock
     from torchtitan.experiments.tpu import workarounds
+    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
     from torchtitan.models.common.attention import GQAttention as Attention
     from torchtitan.experiments.tpu.llama3 import llama3_configs
 
@@ -207,28 +53,33 @@ class WorkaroundsTest(parameterized.TestCase):
       patch_kwargs = {"block_q": 128}
       workarounds.use_splash_attention_patch(attention_block, patch_kwargs)
 
-      # Force the CPU to run the patched kernel by removing the CPU fallback
-      attention_block.inner_attention.original_module = None
+      # TT-UNFLATTEN-SHIM: the patch wraps the kernel in `UnflattenShim`, so
+      # `inner_attention` is the shim and the kernel is its `.inner`. Remove the
+      # kernel's CPU fallback so the patched path actually runs here.
+      attention_block.inner_attention.inner.original_module = None
 
-      # Ensure seq_len >= 128 to avoid fallback
-      seq_len = 128
+      # Upstream d771abb0 folds the batch axis away: the decoder now passes a
+      # packed `[T, D]` token stream and `[T]` positions. The splash kernel is
+      # still `[B, S, H, D]`, so the shim has to be active for this seam to
+      # work at all -- that is what it is for.
+      #
+      # Both documents share one sequence (B=1, S=T). Splitting them across two
+      # batch rows would make the unflattening itself separate them, and the
+      # positions-to-segment-ids conversion under test would have nothing to do.
+      num_tokens = 128
       tokens = torch.randn(
-          1,
-          seq_len,
+          num_tokens,
           config.dim,
           requires_grad=False,
           device="cpu",
       )
 
       # Create positions for two segments of length 64
-      positions = (
-          torch.cat([torch.arange(64), torch.arange(64)])
-          .unsqueeze(0)
-          .to("cpu")
-      )
+      positions = torch.cat([torch.arange(64), torch.arange(64)]).to("cpu")
       kwargs = {"positions": positions}
 
-      out = attention_block(tokens, None, **kwargs)
+      with set_unflatten_seq_len(num_tokens):
+        out = attention_block(tokens, None, **kwargs)
 
       self.assertEqual(
           len(captured_segment_ids),
@@ -243,15 +94,11 @@ class WorkaroundsTest(parameterized.TestCase):
           " trigger.",
       )
 
-      # Expected: 64 zeros followed by 64 ones
-      expected_segment_ids = (
-          torch.cat([
-              torch.zeros(64, dtype=torch.int32),
-              torch.ones(64, dtype=torch.int32),
-          ])
-          .unsqueeze(0)
-          .to("cpu")
-      )
+      # Expected: 64 zeros followed by 64 ones, on the one unflattened row.
+      expected_segment_ids = torch.cat([
+          torch.zeros(64, dtype=torch.int32),
+          torch.ones(64, dtype=torch.int32),
+      ]).unsqueeze(0).to("cpu")
       torch.testing.assert_close(segment_ids, expected_segment_ids)
 
 
@@ -321,12 +168,13 @@ class WorkaroundsTest(parameterized.TestCase):
     fused_head = fused_loss_lm_head(linear_config).build()
     fused_head.load_state_dict(unfused_head.state_dict())
 
-    unfused_hidden = torch.randn(2, 4, 8, requires_grad=True)
+    # Upstream d771abb0 folds the batch axis away: `cross_entropy_loss` takes
+    # `pred[T, V]` and `labels[T]`.
+    unfused_hidden = torch.randn(8, 8, requires_grad=True)
     fused_hidden = unfused_hidden.detach().clone().requires_grad_(True)
-    labels = torch.tensor([
-        [1, 4, components_loss.IGNORE_INDEX, 2],
-        [5, 3, 0, 7],
-    ])
+    labels = torch.tensor(
+        [1, 4, components_loss.IGNORE_INDEX, 2, 5, 3, 0, 7]
+    )
 
     expected_loss = components_loss.cross_entropy_loss(
         unfused_head(unfused_hidden), labels
@@ -410,7 +258,11 @@ class WorkaroundsTest(parameterized.TestCase):
     from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
     from torchtitan.experiments.tpu import workarounds
 
-    config = llama3_configs["debugmodel"](attn_backend="sdpa")
+    # Upstream d771abb0 made `llama3_configs[flavor]` a
+    # `(builder, max_context_length)` pair with a required keyword-only
+    # `seq_len`.
+    build_config, max_context_length = llama3_configs["debugmodel"]
+    config = build_config(attn_backend="sdpa", seq_len=max_context_length)
     adapter = Llama3StateDictAdapter(config, None)
 
     with torch.device("meta"):
@@ -438,7 +290,11 @@ class WorkaroundsTest(parameterized.TestCase):
     from torchtitan.models.llama3 import llama3_configs
     from torchtitan.experiments.tpu import workarounds
 
-    config = llama3_configs["debugmodel"](attn_backend="sdpa")
+    # Upstream d771abb0 made `llama3_configs[flavor]` a
+    # `(builder, max_context_length)` pair with a required keyword-only
+    # `seq_len`.
+    build_config, max_context_length = llama3_configs["debugmodel"]
+    config = build_config(attn_backend="sdpa", seq_len=max_context_length)
 
     def build(patch):
       torch.manual_seed(0)
@@ -461,15 +317,15 @@ class WorkaroundsTest(parameterized.TestCase):
 
 
   def _tokamax_patch_fixture(self):
-    """A module with one ScaledDotProductAttention, and a populated splash config."""
+    """A module with one ScaledDotProductInnerAttention, and a populated splash config."""
     from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig  # pylint: disable=g-import-not-at-top
-    from torchtitan.models.common.attention import ScaledDotProductAttention  # pylint: disable=g-import-not-at-top
+    from torchtitan.models.common.attention import ScaledDotProductInnerAttention  # pylint: disable=g-import-not-at-top
 
     class _Tiny(torch.nn.Module):
 
       def __init__(self):
         super().__init__()
-        attn = ScaledDotProductAttention.__new__(ScaledDotProductAttention)
+        attn = ScaledDotProductInnerAttention.__new__(ScaledDotProductInnerAttention)
         torch.nn.Module.__init__(attn)
         self.attn = attn
 

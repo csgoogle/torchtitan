@@ -22,7 +22,10 @@ from torch._functorch import config as functorch_config, partitioners
 from torch._higher_order_ops.scan import ScanAutogradImpl
 from torch.distributed.tensor import DTensor, Shard
 
-from torchtitan.components.optimizer import default_adamw, OptimizersContainer
+from torchtitan.components.optimizer.optimizer import (
+    default_adamw,
+    OptimizersContainer,
+)
 from torchtitan.config import apply_overrides, derive, OverrideConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
@@ -45,6 +48,7 @@ from torchtitan.models.qwen3 import model_registry as qwen3_registry
 
 
 SEQ_LEN = 32
+TOKENS = 2 * SEQ_LEN
 SEED = 1234
 
 # `scan` re-traces its body through functionalization, which has no derivative
@@ -52,7 +56,10 @@ SEED = 1234
 # the same reason; here there is no recipe to carry it. qwen3 uses `CosSinRoPE`
 # and needs nothing.
 # https://github.com/google-pytorch/torchtitan/issues/386
-_REAL_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.real_rope"
+_REAL_ROPE_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.real_rope"
+    ".tpu_real_arithmetic_complex_rope"
+)
 
 
 def _layer_loop(config):
@@ -61,7 +68,7 @@ def _layer_loop(config):
 
 
 def _config(registry=model_registry):
-    """A debug model, shortened to ``SEQ_LEN`` so the RoPE cache stays small.
+    """A debug model, shortened to ``TOKENS`` so the RoPE cache stays small.
 
     Stock and unconverted; ``_build`` applies the rewrite. Every arm gets one,
     so that stacking is the only difference between them: a stock ``Decoder``
@@ -70,7 +77,7 @@ def _config(registry=model_registry):
     config = registry("debugmodel", attn_backend="sdpa").model
     for layer in config.layers:
         layer.attention.rope = dataclasses.replace(
-            layer.attention.rope, max_seq_len=SEQ_LEN
+            layer.attention.rope, max_context_length=TOKENS
         )
     if registry is model_registry:
         apply_overrides(OverrideConfig(imports=[_REAL_ROPE_OVERRIDE]), config)
@@ -100,7 +107,9 @@ def _moe_config(num_experts: int):
         load_balance_coeff=None,
         attn_backend="sdpa",
         moe_comm_backend="standard",
-        rope=CosSinRoPE.Config(dim=128, max_seq_len=SEQ_LEN, theta=1000000.0),
+        rope=CosSinRoPE.Config(
+            dim=128, max_context_length=SEQ_LEN, theta=1000000.0
+        ),
     )
     return config
 
@@ -275,7 +284,7 @@ class TestLayerStack(unittest.TestCase):
     def test_forward_matches_unrolled(self):
         model = _build(stacked=False)
         stacked = _build(stacked=True)
-        tokens = torch.randint(0, model.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, model.config.vocab_size, (TOKENS,))
 
         torch.testing.assert_close(
             stacked(tokens), model(tokens), rtol=0, atol=0
@@ -284,7 +293,7 @@ class TestLayerStack(unittest.TestCase):
     def test_scan_forward_matches_the_loop(self):
         plain = _build(stacked=False)
         scanned = _build(stacked=True, scan=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
 
         # Bit-exact on x86, but on arm traced scan and eager loop pick
         # different kernels and drift in the lowest bits (~1e-6).
@@ -324,7 +333,7 @@ class TestLayerStack(unittest.TestCase):
             return forward, backward
 
         model = _build(stacked=True, scan=True)
-        tokens = torch.randint(0, model.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, model.config.vocab_size, (TOKENS,))
         default = functorch_config.activation_memory_budget
         with patch.object(
             partitioners, "min_cut_rematerialization_partition", capture
@@ -349,7 +358,7 @@ class TestLayerStack(unittest.TestCase):
         """
         plain = _build(stacked=False)
         scanned = _build(stacked=True, scan=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
 
         for model in (plain, scanned):
             model(tokens).sum().backward()
@@ -387,7 +396,7 @@ class TestLayerStack(unittest.TestCase):
         # construction would read meta tensors, find nothing sharded, and run
         # each layer on this rank's slice.
         self.assertFalse(stack.fsdp_plan, "the plan was built before a forward")
-        model(torch.randint(0, model.config.vocab_size, (2, SEQ_LEN)))
+        model(torch.randint(0, model.config.vocab_size, (TOKENS,)))
         self.assertTrue(stack.fsdp_plan, "no gather plan was installed")
 
         holder = getattr(model, STACK_ATTR)
@@ -430,7 +439,7 @@ class TestLayerStack(unittest.TestCase):
         """A checkpoint written by the unrolled model loads into the stacked one."""
         plain = _build(stacked=False)
         stacked = _build(stacked=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
 
         # Perturb the source so a no-op load cannot pass.
         with torch.no_grad():
@@ -627,7 +636,7 @@ class TestQwen3(unittest.TestCase):
 
     def test_scan_forward_matches_the_loop(self):
         plain, scanned = self._pair(stacked=True, scan=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
 
         # Bit-exact on x86, but on arm traced scan and eager loop pick
         # different kernels and drift in the lowest bits (~1e-6).

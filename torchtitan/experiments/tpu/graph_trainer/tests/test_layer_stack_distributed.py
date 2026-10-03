@@ -39,6 +39,7 @@ from torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack import (
     _build,
     _moe_config,
     SEQ_LEN,
+    TOKENS,
 )
 
 
@@ -58,7 +59,7 @@ def forward_matches_unrolled(device, rank, world_size):
     """One batched matmul per op must give the same bits as n separate ones."""
     del rank
     plain, stacked = _models(device, world_size)
-    tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN), device=device)
+    tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,), device=device)
     torch.testing.assert_close(stacked(tokens), plain(tokens), rtol=0, atol=0)
 
 
@@ -109,10 +110,13 @@ def flattened_forward_matches_unrolled(device, rank, world_size):
         for k, v in stacked.state_dict().items()
     })
 
-    tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN), device=device)
+    tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,), device=device)
+    # `TOKENS` packs `TOKENS // SEQ_LEN` sequences; `_moe_config`'s RoPE cache
+    # only covers `SEQ_LEN` positions.
+    positions = torch.arange(SEQ_LEN, device=device).repeat(TOKENS // SEQ_LEN)
     # One forward at a time, so only one model's gathered weights are live.
-    expected = plain(tokens).detach()
-    got = stacked(tokens).detach()
+    expected = plain(tokens, positions).detach()
+    got = stacked(tokens, positions).detach()
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 

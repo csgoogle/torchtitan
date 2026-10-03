@@ -174,7 +174,9 @@ class RayTPUPolicyTrainer(PolicyTrainer):
 
         model_spec.model.update_from_config(config=config)
         max_seq_len = model_spec.model.max_seq_len
-        seq_len = config.training.seq_len
+        # Upstream d771abb0 renamed training.seq_len ->
+        # training.max_context_length.
+        seq_len = config.training.max_context_length
         if seq_len > max_seq_len:
             raise ValueError(
                 f"Training sequence length {seq_len} exceeds "
@@ -184,7 +186,7 @@ class RayTPUPolicyTrainer(PolicyTrainer):
         for layer_cfg in model_spec.model.layers:
             attention_cfg = getattr(layer_cfg, "attention", None)
             if attention_cfg is not None:
-                attention_cfg.rope = replace(attention_cfg.rope, max_seq_len=seq_len)
+                attention_cfg.rope = replace(attention_cfg.rope, max_context_length=seq_len)
 
         if config.override.imports:
             apply_overrides(config.override, model_spec.model)

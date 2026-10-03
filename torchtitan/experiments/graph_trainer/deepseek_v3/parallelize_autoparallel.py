@@ -35,6 +35,7 @@ from torchtitan.experiments.graph_trainer.configs import (
     validate_autoparallel_config,
 )
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import device_type
 
 
 def _load_autoparallel_dsv3_dependency():
@@ -160,15 +161,17 @@ def parallelize_autoparallel_deepseekv3(
         )
 
     def input_fn():
-        global_batch_size = training.global_batch_size
-        if global_batch_size < 0:
-            dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-            global_batch_size = training.local_batch_size * dp_degree
+        dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
+        num_tokens_per_train_step = training.num_tokens_per_train_step
+        if num_tokens_per_train_step < 0:
+            num_tokens_per_train_step = (
+                training.num_tokens_per_microbatch_per_dp_rank * dp_degree
+            )
         tokens = torch.randint(
             0,
             ap_model.model_args.vocab_size,
-            (global_batch_size, training.seq_len),
-            device=torch.device("cuda"),
+            (num_tokens_per_train_step,),
+            device=torch.device(device_type),
         )
         return tokens
 

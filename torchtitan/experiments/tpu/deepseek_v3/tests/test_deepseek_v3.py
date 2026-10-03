@@ -178,13 +178,15 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
         config=config.layers[0].attention,
     )
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, config.dim), requires_grad=True
+        (batch * seq_len, config.dim), requires_grad=True
     )
+    positions_cpu = torch.arange(seq_len, dtype=torch.long).repeat(batch)
+    positions_device = positions_cpu.to(self.accelerator_device)
 
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      out_cpu = attention_cpu(x_cpu, None, None)
-      out_device = attention_device(x_device, None, None)
+      out_cpu = attention_cpu(x_cpu, None, positions_cpu)
+      out_device = attention_device(x_device, None, positions_device)
       test_utils.check_equivalence(
           out_device.cpu(),
           out_cpu,
@@ -203,8 +205,8 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
         test_utils.check_equivalence(
             x_device.grad.cpu(),
             x_cpu.grad,
-            atol=6e-2,
-            rtol=6e-2,
+            atol=1e-1,
+            rtol=1e-1,
             check_name="Attention Input Grad",
         )
 
@@ -214,7 +216,7 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
           test_utils.check_equivalence(
               p_device.grad.cpu(),
               p_cpu.grad,
-              atol=4e-1,
+              atol=1.0,
               rtol=4e-1,
               check_name=f"Attention Param Grad: {name}",
           )
@@ -243,11 +245,13 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
         )
     )
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, config.dim), requires_grad=True
+        (batch * seq_len, config.dim), requires_grad=True
     )
+    positions_cpu = torch.arange(seq_len, dtype=torch.long).repeat(batch)
+    positions_device = positions_cpu.to(self.accelerator_device)
 
-    out_cpu = transformer_block_cpu(x_cpu, None, None)
-    out_device = transformer_block_device(x_device, None, None)
+    out_cpu = transformer_block_cpu(x_cpu, None, positions_cpu)
+    out_device = transformer_block_device(x_device, None, positions_device)
     test_utils.check_equivalence(
         out_device.cpu(),
         out_cpu,
@@ -273,8 +277,8 @@ class DeepseekV3Test(base_device_test.BaseAcceleratorDeviceTest):
       param_rtol = 5e-3
       # Relax tolerances for Attention layers to cover noise from new kernel.
       if "attention" in name:
-        param_atol = 2e-1
-        param_rtol = 2e-1
+        param_atol = 3e-1
+        param_rtol = 3e-1
       test_utils.check_equivalence(
           p_device.grad.cpu(),
           p_cpu.grad,

@@ -28,22 +28,29 @@ from tests.integration_tests import OverrideDefinitions
 from torchtitan.tools.logging import logger
 
 
+_KEEP_ZERO_STD_REWARD_GROUPS = (
+    "--async-loop.training-sample-builder.no-drop-zero-std-reward-groups"
+)
+
+
 def build_rl_test_list() -> list[OverrideDefinitions]:
-    return [
+    test_list = [
         OverrideDefinitions(
             [
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 5",
                     # trainer FSDP=2 (dp_shard=2, tp=1) + 3 generators TP=2 = 8 GPUs.
                     "--trainer.parallelism.data_parallel_shard_degree 2",
                     "--trainer.parallelism.tensor_parallel_degree 1",
                     "--generator.parallelism.tensor_parallel_degree 2",
                     "--num_generators 3",
-                    "--async-loop.group-size 2",
-                    "--async-loop.batcher.batch.seq-len 1024",
-                    "--renderer.enable-thinking False",
+                    "--async-loop.num-samples-per-prompt 2",
+                    "--trainer.training.max_context_length 1024",
+                    "--trainer.training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--generator.sampling.max_tokens 256",
                     "--trainer.debug.no_batch_invariant",
                     "--generator.debug.no_batch_invariant",
@@ -61,15 +68,17 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 5",
                     # trainer FSDP=2 (dp_shard=2, tp=1) + 3 generators TP=2 = 8 GPUs.
                     "--trainer.parallelism.data_parallel_shard_degree 2",
                     "--trainer.parallelism.tensor_parallel_degree 1",
                     "--generator.parallelism.tensor_parallel_degree 2",
                     "--num_generators 3",
-                    "--async-loop.group-size 2",
-                    "--async-loop.batcher.batch.seq-len 1024",
-                    "--renderer.enable-thinking False",
+                    "--async-loop.num-samples-per-prompt 2",
+                    "--trainer.training.max_context_length 1024",
+                    "--trainer.training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--generator.sampling.max_tokens 256",
                     "--trainer.debug.no_batch_invariant",
                     "--generator.debug.no_batch_invariant",
@@ -85,6 +94,8 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_gpt_oss_debug_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 5",
                     "--hf_assets_path tests/assets/tokenizer",
                     "--trainer.parallelism.tensor_parallel_degree 4",
@@ -93,9 +104,9 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                     "--generator.parallelism.tensor_parallel_degree 4",
                     "--generator.parallelism.expert_parallel_degree 4",
                     "--generator.parallelism.data_parallel_degree 1",
-                    "--async-loop.group-size 2",
-                    "--async-loop.batcher.batch.seq-len 1024",
-                    "--renderer.enable-thinking False",
+                    "--async-loop.num-samples-per-prompt 2",
+                    "--trainer.training.max_context_length 1024",
+                    "--trainer.training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--generator.sampling.max_tokens 256",
                     "--trainer.debug.no_batch_invariant",
                     "--generator.debug.no_batch_invariant",
@@ -126,14 +137,16 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 2",
                     "--num_generators 2",
                     "--trainer.parallelism.data_parallel_shard_degree 2",
                     "--trainer.parallelism.tensor_parallel_degree 1",
                     "--generator.parallelism.tensor_parallel_degree 2",
-                    "--async-loop.group-size 2",
-                    "--async-loop.batcher.batch.seq-len 1024",
-                    "--renderer.enable-thinking False",
+                    "--async-loop.num-samples-per-prompt 2",
+                    "--trainer.training.max_context_length 1024",
+                    "--trainer.training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--generator.sampling.max_tokens 256",
                     "--trainer.debug.no_batch_invariant",
                     "--generator.debug.no_batch_invariant",
@@ -144,14 +157,16 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 4",
                     "--num_generators 1",
                     "--trainer.parallelism.data_parallel_shard_degree 1",
                     "--trainer.parallelism.tensor_parallel_degree 2",
                     "--generator.parallelism.tensor_parallel_degree 4",
-                    "--async-loop.group-size 2",
-                    "--async-loop.batcher.batch.seq-len 1024",
-                    "--renderer.enable-thinking False",
+                    "--async-loop.num-samples-per-prompt 2",
+                    "--trainer.training.max_context_length 1024",
+                    "--trainer.training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--generator.sampling.max_tokens 256",
                     "--trainer.debug.no_batch_invariant",
                     "--generator.debug.no_batch_invariant",
@@ -169,6 +184,8 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_0_6b_varlen_batch_invariant",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 3",
                     # The config defaults to trainer TP=2 + 3 generators TP=2. Override
                     # to trainer TP=4 + 1 generator TP=4 so batch-invariant mode fits
@@ -178,10 +195,10 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                     "--num_generators 1",
                     # On-policy (lockstep) + real weights that update each step:
                     # trainer/generator weights match, so bit_wise/logprob_diff/max == 0.
-                    "--async-loop.max-offpolicy-steps 0",
-                    "--async-loop.group-size 2",
-                    "--async-loop.batcher.batch.seq-len 1024",
-                    "--renderer.enable-thinking False",
+                    "--async-loop.target-offpolicy-steps 0",
+                    "--async-loop.num-samples-per-prompt 2",
+                    "--trainer.training.max_context_length 1024",
+                    "--trainer.training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--generator.sampling.max_tokens 128",
                     "--metrics.no-enable-wandb",
                 ],
@@ -195,11 +212,13 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
                 [
                     "--module alphabet_sort",
                     "--config rl_grpo_qwen3_moe_debug_varlen_batch_invariant",
+                    "--trainer.parallelism.spmd_backend spmd_types",
+                    "--generator.parallelism.spmd_backend spmd_types",
                     "--async-loop.num-training-steps 5",
                     "--hf_assets_path tests/assets/tokenizer",
-                    "--async-loop.group-size 2",
-                    "--async-loop.batcher.batch.seq-len 1024",
-                    "--renderer.enable-thinking False",
+                    "--async-loop.num-samples-per-prompt 2",
+                    "--trainer.training.max_context_length 1024",
+                    "--trainer.training.num_tokens_per_microbatch_per_dp_rank 2048",
                     "--generator.sampling.max_tokens 256",
                     "--trainer.checkpoint.no-enable",  # use random-init weights
                     "--generator.checkpoint.no-enable",
@@ -210,7 +229,50 @@ def build_rl_test_list() -> list[OverrideDefinitions]:
             "rl_grpo_moe_debug_tp4_ep4_batch_invariant",
             ngpu=8,
         ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module alphabet_sort",
+                    "--config rl_grpo_qwen3_5_debug_varlen_batch_invariant",
+                    "--async-loop.num-training-steps 3",
+                    "--hf_assets_path tests/assets/tokenizer",
+                    # The debug model has two GDN key heads, so TP cannot exceed 2.
+                    "--trainer.parallelism.data_parallel_shard_degree 2",
+                    "--trainer.parallelism.tensor_parallel_degree 2",
+                    "--generator.parallelism.tensor_parallel_degree 2",
+                    "--num_generators 2",
+                    "--async-loop.target-offpolicy-steps 0",
+                    "--async-loop.num-samples-per-prompt 2",
+                    "--trainer.training.max_context_length 1024",
+                    "--trainer.training.num_tokens_per_microbatch_per_dp_rank 1024",
+                    "--generator.sampling.max_tokens 128",
+                    "--trainer.checkpoint.no-enable",  # random-init weights
+                    "--generator.checkpoint.no-enable",
+                    "--metrics.no-enable-wandb",
+                ],
+            ],
+            "RL GRPO Qwen3.5 hybrid GDN TP=2 batch-invariant",
+            "rl_grpo_qwen3_5_debug_tp2_batch_invariant",
+            ngpu=8,
+        ),
     ]
+
+    # CI can use random-init policies whose rollout groups all receive the same
+    # reward. Keep those groups so the trainer cannot wait forever for a batch.
+    for test in test_list:
+        updated_override_args = []
+        for override_args in test.override_args:
+            if _KEEP_ZERO_STD_REWARD_GROUPS not in override_args:
+                logger.warning(
+                    f"RL integration test {test.test_name} overrides "
+                    "drop_zero_std_reward_groups=False to prevent a random-init "
+                    "policy from stalling the trainer"
+                )
+                override_args = [*override_args, _KEEP_ZERO_STD_REWARD_GROUPS]
+            updated_override_args.append(override_args)
+        test.override_args = updated_override_args
+
+    return test_list
 
 
 def run_single_test(

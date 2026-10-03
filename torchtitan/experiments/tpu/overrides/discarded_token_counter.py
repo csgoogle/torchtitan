@@ -38,7 +38,10 @@ class TpuDiscardedTokenCounterMoE(MoE):
 
 
 @override(
-    "tpu_discarded_token_counter",
+    # Upstream d771abb0 made `override()` keyword-only and removed the separate
+    # name argument: an override is now identified by the decorated factory's
+    # import path (`...overrides.discarded_token_counter.tpu_discarded_token_counter`),
+    # which is what `override.imports` lists.
     target=MoE.Config,
     exact=True,
     description=(

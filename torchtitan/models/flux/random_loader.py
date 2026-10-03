@@ -60,10 +60,15 @@ class RandomDataloader:
             # Yield a dictionary copy so inplace `.to(device)` calls in
             # trainer.py don't overwrite the cached CPU tensors in self.batches,
             # which grows memory usage and can cause TPU OOM.
+            # FluxTrainer expects a single TrainerBatch dict keyed by "labels".
             data_copy = {
+                "labels": img_enc,
                 "img_encodings": data["img_encodings"],
                 "t5_encodings": data["t5_encodings"],
                 "clip_encodings": data["clip_encodings"],
             }
-            yield data_copy, img_enc
+            yield data_copy
             step += 1
+
+    def close(self) -> None:
+        """No-op; called by Trainer.close()."""

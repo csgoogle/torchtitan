@@ -21,7 +21,6 @@ from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
     configure_qwen_simple_fsdp_shard_dims,
 )
-from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 
 
 def _model(*, hidden_dim: int = 8, vocab_size: int = 8) -> nn.Module:
@@ -34,7 +33,6 @@ def _model(*, hidden_dim: int = 8, vocab_size: int = 8) -> nn.Module:
       dim=8,
       hidden_dim=hidden_dim,
       num_experts=2,
-      token_dispatcher=LocalTokenDispatcher.Config(num_experts=2, top_k=1),
   ).build()
   model.layers = nn.ModuleDict({"0": layer})
   return model

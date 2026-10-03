@@ -226,11 +226,18 @@ class Mamba2LM(model_protocol.BaseModel):
           nn.init.normal_(target, mean=0.0, std=0.02)
 
   def forward(self, input_ids: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    # TT-UNFLATTEN-SHIM:
+    from torchtitan.experiments.tpu.unflatten_shim import unflatten_tensor, flatten_tensor
+    input_ids = unflatten_tensor(input_ids, expected_flat_ndim=1)
+    
     h = self.tok_embeddings(input_ids)
     for layer in self.layers.values():
       h = layer(h)
     h = self.norm(h)
-    return self.lm_head(h)
+    out = self.lm_head(h)
+    
+    # TT-UNFLATTEN-SHIM:
+    return flatten_tensor(out, original_flat_ndim=2)
 
 
 # Aliases for backwards compatibility

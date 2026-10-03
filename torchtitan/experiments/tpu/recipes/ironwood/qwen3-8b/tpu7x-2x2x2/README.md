@@ -22,6 +22,10 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
   `--libtpu-init-flags` and exported before PJRT initialization.
 - **Graph Capture**: The optimizer and backward pass are fully captured into a single XLA graph via `--tpu_config.compile_optimizer` and `--tpu_config.optimizer_in_graph`.
 - **Splash Attention**: Splash Attention block sizes are manually tuned to 1024 across the board for optimal tile sizing.
+- **Batch shape**: 6 sequences of 2048 tokens per data-parallel rank. Batch size
+  is expressed in tokens, so the command passes
+  `--training.num_tokens_per_microbatch_per_dp_rank=12288` (6 sequences * 2048
+  tokens) together with `--training.max_context_length=2048`.
 
 ## Training Command
 
@@ -49,8 +53,8 @@ xpk workload create \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.qwen3 \
     --config=qwen3_8b \
-    --training.local_batch_size=6 \
-    --training.seq_len=2048 \
+    --training.num_tokens_per_microbatch_per_dp_rank=12288 \
+    --training.max_context_length=2048 \
     --training.steps=30 \
     --training.mixed_precision_reduce=float32 \
     --parallelism.use_simple_fsdp \

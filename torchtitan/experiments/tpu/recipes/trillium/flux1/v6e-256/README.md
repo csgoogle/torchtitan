@@ -44,8 +44,8 @@ xpk workload create \
     --metrics.log_freq=1 \
     --training.steps=40 \
     --training.dtype=float32 \
-    --training.local_batch_size=2 \
-    --dataloader.img_size=1024 \
+    --training.num_tokens_per_microbatch_per_dp_rank=9216 \
+    --flux.img_size=1024 \
     --flux.random_dataset \
     --parallelism.use_simple_fsdp \
     --splash-attention-kernel.use-splash-attention-kernel \
@@ -89,8 +89,8 @@ xpk workload create \
     --metrics.log_freq=1 \
     --training.steps=40 \
     --training.dtype=bfloat16 \
-    --training.local_batch_size=3 \
-    --dataloader.img_size=1024 \
+    --training.num_tokens_per_microbatch_per_dp_rank=13824 \
+    --flux.img_size=1024 \
     --flux.random_dataset \
     --parallelism.use_simple_fsdp \
     --splash-attention-kernel.use-splash-attention-kernel \

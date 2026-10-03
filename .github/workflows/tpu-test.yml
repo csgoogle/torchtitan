@@ -300,6 +300,8 @@ jobs:
       # prevents a 10 minute 404 retry loop for tests importing torch_tpu that
       # run on CPU only.
       TPU_SKIP_MDS_QUERY: 1
+      # Per-test disables from .ci/discover_tpu_tests.py (DESELECTED_TESTS).
+      PYTEST_DESELECT: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).pytest_deselect }}
 
     steps:
       - name: Checkout repository
@@ -316,7 +318,9 @@ jobs:
             echo "=================================================="
             echo "Running test file: $test_file"
             echo "=================================================="
-            timeout 900 python -m pytest -v "$test_file" || failed="$failed $test_file"
+            # Unquoted on purpose: one --deselect=<node-id> word per test.
+            # shellcheck disable=SC2086
+            timeout 900 python -m pytest -v "$test_file" $PYTEST_DESELECT || failed="$failed $test_file"
           done
 
           if [ -n "$failed" ]; then

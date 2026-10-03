@@ -8,13 +8,11 @@ from typing import TYPE_CHECKING
 
 import spmd_types as spmd
 import torch
-from torch import nn
+from spmd_types import SpmdType
 
-from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.parallel_dims import MeshAxisName
-from torchtitan.distributed.spmd_types import set_current_spmd_mesh
 from torchtitan.distributed.utils import get_spmd_backend
-from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig, SpmdLayout
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
 if TYPE_CHECKING:
     from torchtitan.models.flux.model.model import FluxModel
@@ -27,8 +25,8 @@ CP = MeshAxisName.CP
 def flux_activation_placement(
     *,
     cp: spmd.PerMeshAxisSpmdType,
-) -> SpmdLayout:
-    return SpmdLayout(
+) -> SpmdType:
+    return SpmdType(
         {
             DP: spmd.S(0),
             CP: cp,
@@ -44,14 +42,14 @@ def set_flux_inner_attention_local_map(inner_attention_cfg) -> None:
 
     inner_attention_cfg.sharding_config = ShardingConfig(
         in_src_shardings={
-            "q_BLNH": q_layout,
-            "k_BLNH": kv_src_layout,
-            "v_BLNH": kv_src_layout,
+            "q_BLHK": q_layout,
+            "k_BLHK": kv_src_layout,
+            "v_BLHV": kv_src_layout,
         },
         in_dst_shardings={
-            "q_BLNH": q_layout,
-            "k_BLNH": kv_dst_layout,
-            "v_BLNH": kv_dst_layout,
+            "q_BLHK": q_layout,
+            "k_BLHK": kv_dst_layout,
+            "v_BLHV": kv_dst_layout,
         },
         out_src_shardings=q_layout,
         local_map=LocalMapConfig(
@@ -68,13 +66,6 @@ def set_flux_sharding_config(config: "FluxModel.Config") -> None:
 
     for block_cfg in config.single_blocks:
         set_flux_inner_attention_local_map(block_cfg.inner_attention)
-
-
-def annotate_dp_cp_params_as_r(model: nn.Module, parallel_dims: ParallelDims) -> None:
-    # TODO(pianpwk): Infer these from the active SPMD mesh instead.
-    with set_current_spmd_mesh(parallel_dims.spmd_dense_mesh()):
-        for param in model.parameters():
-            spmd.assert_type(param, spmd.R)
 
 
 def annotate_flux_forward_inputs(

@@ -122,12 +122,18 @@ class TpuPackedQKVLinear(BaseQKVLinear):
     super().parallelize(parallel_dims)
 
   @spmd.local_map(
-      out_types=({"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},) * 3
+      out_types=(
+          (
+              {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
+              spmd.PartitionSpec(("dp", "cp"), "tp", None),
+          ),
+      )
+      * 3
   )
   def forward(  # pyrefly: ignore[bad-override]
-      self, x: torch.Tensor
+      self, x_TD: torch.Tensor
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch, sequence, _ = x.shape
+    num_tokens = x_TD.shape[0]
     weight = self.wqkv_packed.weight
     bias = self.wqkv_packed.bias
     split_sizes = (self.q_rows, self.kv_rows, self.kv_rows)
@@ -139,22 +145,22 @@ class TpuPackedQKVLinear(BaseQKVLinear):
       q_bias = k_bias = v_bias = None
     else:
       q_bias, k_bias, v_bias = torch.split(bias, split_sizes, dim=0)
-    q = F.linear(
-        x,
+    q_THK = F.linear(
+        x_TD,
         q_weight,
         q_bias,
-    ).view(batch, sequence, -1, self.head_dim)
-    k = F.linear(
-        x,
+    ).view(num_tokens, -1, self.head_dim)
+    k_THK = F.linear(
+        x_TD,
         k_weight,
         k_bias,
-    ).view(batch, sequence, -1, self.head_dim)
-    v = F.linear(
-        x,
+    ).view(num_tokens, -1, self.head_dim)
+    v_THV = F.linear(
+        x_TD,
         v_weight,
         v_bias,
-    ).view(batch, sequence, -1, self.head_dim)
-    return q, k, v
+    ).view(num_tokens, -1, self.head_dim)
+    return q_THK, k_THK, v_THV
 
   @staticmethod
   def _split_qkv_on_save(module, state_dict, prefix, _local_metadata) -> None:

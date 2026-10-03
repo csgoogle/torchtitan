@@ -15,6 +15,7 @@ from typing import Callable, Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from torchtitan.protocols.model import BaseModel
 
 
 # ---------------------------------------------------------------------------
@@ -22,7 +23,10 @@ from flax import nnx
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ModelArgs:
+class ModelArgs(BaseModel.Config):
+    def build(self):
+        raise NotImplementedError("JAX Llama3 ModelArgs is built via nnx, not build().")
+
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32

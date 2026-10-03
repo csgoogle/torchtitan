@@ -91,14 +91,20 @@ class _Projection(nn.Module):
 class _Block(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
+        # Mirror upstream d771abb0's module tree: `RoutedExperts` now sits
+        # between the MoE and its grouped experts, so the expert parameters are
+        # at `moe.routed_experts.inner_experts.*`. `remat_schedule` keys its
+        # expert-gradient ordering off that path.
         self.moe = nn.Module()
-        self.moe.experts = _Projection(dim)
+        self.moe.routed_experts = nn.Module()
+        self.moe.routed_experts.inner_experts = _Projection(dim)
         self.attention = _Projection(dim)
 
     def forward(
         self, x: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        return torch.relu(self.moe.experts(x)) + self.attention(x, mask)
+        experts = self.moe.routed_experts.inner_experts
+        return torch.relu(experts(x)) + self.attention(x, mask)
 
 
 class _Epilogue(nn.Module):
@@ -159,7 +165,12 @@ def _trace_simple_fsdp_remat_graph(n_layers: int = 3):
             parallelism=SimpleNamespace(
                 fsdp_reshard_after_forward="always",
                 pipeline_parallel_degree=1,
-            )
+            ),
+            # Upstream d771abb0 added `--compile.full_recompute_save_ops`,
+            # read here by `_full_memory_policy_pass`. Its default, the empty
+            # string, means "save nothing" -- full recompute, which is what
+            # this test wants.
+            compile=SimpleNamespace(full_recompute_save_ops=""),
         ),
     )
     selective_activation_remat_pass(traced.gm)
@@ -507,7 +518,7 @@ class TestTpuRematSchedule(unittest.TestCase):
                             ),
                             "ordering": (
                                 (("layers.1.attention.weight",), "torch.float32"),
-                                (("layers.1.moe.experts.weight",), "torch.bfloat16"),
+                                (("layers.1.moe.routed_experts.inner_experts.weight",), "torch.bfloat16"),
                             ),
                         },
                         1: {

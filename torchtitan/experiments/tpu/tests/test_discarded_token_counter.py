@@ -1,5 +1,7 @@
 """Tests for the discarded MoE token-counter override."""
 
+import contextlib
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
@@ -9,26 +11,32 @@ from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
     tpu_discarded_token_counter,
 )
-from torchtitan.models.common.config_utils import make_moe_config
+from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+from torchtitan.models.common.config_utils import make_aux_loss_config, make_moe_config
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import (
     GroupedExperts,
     MoE,
+    RoutedExperts,
     TokenChoiceTopKRouter,
 )
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 
 
 _NUM_EXPERTS, _TOP_K, _DIM = 4, 2, 8
+# Upstream d771abb0 folds `[B, S]` into one packed `[T]` token stream, so the
+# MoE sees `[T, D]`. `_SEQ` is only kept around because the fork's
+# sequence-wise aux loss still needs to know where the sequences are; it
+# learns that from the TT-UNFLATTEN-SHIM context, not from the input's shape.
+_BATCH, _SEQ = 2, 6
+_TOKENS = _BATCH * _SEQ
 
 
 def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
   aux = load_balance_coeff is None
-  return make_moe_config(
+  config = make_moe_config(
       num_experts=_NUM_EXPERTS,
       load_balance_coeff=load_balance_coeff,
-      aux_loss_type="sequence_wise" if aux else None,
-      aux_loss_coeff=1e-3 if aux else None,
       router=TokenChoiceTopKRouter.Config(
           num_experts=_NUM_EXPERTS,
           top_k=_TOP_K,
@@ -36,15 +44,41 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
               in_features=_DIM, out_features=_NUM_EXPERTS, bias=False
           ),
       ),
-      experts=GroupedExperts.Config(
-          dim=_DIM,
-          hidden_dim=_DIM,
-          num_experts=_NUM_EXPERTS,
+      routed_experts=RoutedExperts.Config(
+          inner_experts=GroupedExperts.Config(
+              dim=_DIM,
+              hidden_dim=_DIM,
+              num_experts=_NUM_EXPERTS,
+          ),
           token_dispatcher=LocalTokenDispatcher.Config(
               num_experts=_NUM_EXPERTS, top_k=_TOP_K
           ),
       ),
   )
+  if aux:
+    # Upstream d771abb0 dropped `make_moe_config(aux_loss_type=...)`; its
+    # `aux_loss_coeff` only builds the microbatch-wise loss. The sequence-wise
+    # variant this test exercises is a fork addition that hangs off
+    # `MoE.Config.aux_loss`.
+    config.aux_loss = make_aux_loss_config(
+        type="sequence_wise", coeff=1e-3, top_k=_TOP_K
+    )
+  return config
+
+
+@contextlib.contextmanager
+def _sequence_boundaries(active: bool):
+  """TT-UNFLATTEN-SHIM: tell the sequence-wise aux loss where sequences end.
+
+  Only the fork's `_sequence_wise_load_balance_loss` needs this; the bias
+  scheme counts tokens and does not care. Delete this along with the shim once
+  that loss is `[T]`-native.
+  """
+  if not active:
+    yield
+    return
+  with set_unflatten_seq_len(_SEQ):
+    yield
 
 
 class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
@@ -57,9 +91,10 @@ class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
     for p in moe.parameters():
       nn.init.normal_(p, std=0.02)
 
-    moe(torch.randn(2, 6, _DIM))
+    with _sequence_boundaries(coeff is None):
+      moe(torch.randn(_TOKENS, _DIM))
 
-    expected = 2 * 6 * _TOP_K if coeff is not None else 0
+    expected = _TOKENS * _TOP_K if coeff is not None else 0
     self.assertEqual(moe.tokens_per_expert_E.sum().item(), expected)
 
   def test_output_matches_the_base_class(self):
@@ -70,8 +105,9 @@ class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
     overridden = tpu_discarded_token_counter(_moe_config(load_balance_coeff=None)).build()
     overridden.load_state_dict(base.state_dict())
 
-    x = torch.randn(2, 6, _DIM)
-    torch.testing.assert_close(overridden(x), base(x), rtol=0, atol=0)
+    x = torch.randn(_TOKENS, _DIM)
+    with _sequence_boundaries(True):
+      torch.testing.assert_close(overridden(x), base(x), rtol=0, atol=0)
 
 
 if __name__ == "__main__":

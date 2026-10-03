@@ -96,13 +96,15 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
   def setUp(self) -> None:
     super().setUp()
     self.config_manager = ConfigManager()
+    # Upstream replaced seq_len/local_batch_size with a token budget:
+    # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 2 * 16.
     self.config = typing.cast(
         TPUTrainerConfig,
         self.config_manager.parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            "--training.local_batch_size=2",
-            "--training.seq_len=16",
+            "--training.num_tokens_per_microbatch_per_dp_rank=32",
+            "--training.max_context_length=16",
             "--tpu_config.compile_mode=fullgraph",
         ]),
     )
@@ -126,13 +128,15 @@ class TpuGraphTrainerUnitTest(BaseAcceleratorDeviceTest):
 
   def test_pallas_ce_loss_override(self) -> None:
     """Verifies build_cross_entropy_loss returns PallasCrossEntropyLoss when use_loss_kernel=True."""
+    # Upstream replaced seq_len/local_batch_size with a token budget:
+    # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 2 * 16.
     config = typing.cast(
         TPUTrainerConfig,
         self.config_manager.parse_args([
             "--module=torchtitan.experiments.tpu.qwen3",
             "--config=qwen3_debugmodel",
-            "--training.local_batch_size=2",
-            "--training.seq_len=16",
+            "--training.num_tokens_per_microbatch_per_dp_rank=32",
+            "--training.max_context_length=16",
             "--tpu_config.compile_mode=fullgraph",
             "--loss-kernel.use-loss-kernel",
         ]),

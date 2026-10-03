@@ -12,13 +12,14 @@ import torch
 import torchax
 import torch_xla2.amp as torchax_amp
 import torch_xla2.train  # required for ``torchax.train.make_train_step``
-from torchtitan.components.dataloader import DataloaderExhaustedError
+from torchtitan.components.data.loader import DataloaderExhaustedError
 import torchtitan.components.tokenizer
 from torchtitan.experiments.torchax import data_utils
 from torchtitan.experiments.jax.metrics import JaxMetricsProcessor
 from torchtitan.experiments.torchax import distributed
 from torchtitan.experiments.torchax import jit_utils
 from torchtitan.experiments.torchax import moe_utils
+from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 import torchtitan.tools.logging
 
 
@@ -159,16 +160,32 @@ class TorchaxTrainer:
     # DataLoader must fetch the data for all replicas globally.
     # Torchtitan defines `local_batch_size` as the PER CHIP batch size.
     # So we temporarily override `local_batch_size` to be the global batch size.
-    expected_global_batch_size = job_config.training.global_batch_size
+    #
+    # Upstream d771abb0 replaced the sample-denominated `training.seq_len` /
+    # `training.local_batch_size` / `training.global_batch_size` with the
+    # token-denominated `training.max_context_length` /
+    # `training.num_tokens_per_microbatch_per_dp_rank` /
+    # `training.num_tokens_per_train_step`, so sample counts are now derived by
+    # dividing the token counts by the context length (and the override below
+    # is expressed in tokens).
+    seq_len = job_config.training.max_context_length
+    expected_global_batch_size = (
+        job_config.training.num_tokens_per_train_step // seq_len
+    )
     if expected_global_batch_size <= 0:
       expected_global_batch_size = (
-          job_config.training.local_batch_size
+          job_config.training.num_tokens_per_microbatch_per_dp_rank
+          // seq_len
           * self.parallel_dims.dp_shard
           * self.parallel_dims.dp_replicate
       )
 
-    original_local_batch_size = job_config.training.local_batch_size
-    job_config.training.local_batch_size = expected_global_batch_size
+    original_num_tokens_per_microbatch_per_dp_rank = (
+        job_config.training.num_tokens_per_microbatch_per_dp_rank
+    )
+    job_config.training.num_tokens_per_microbatch_per_dp_rank = (
+        expected_global_batch_size * seq_len
+    )
 
     dataset = job_config.dataloader.dataset
     if not dataset or dataset.startswith('fake'):
@@ -176,7 +193,7 @@ class TorchaxTrainer:
       tokenizer = None
       train_loader = data_utils.fake_dataloader(
           job_config.training.steps,
-          job_config.training.seq_len,
+          seq_len,
           expected_global_batch_size,
           vocab_size=self.model_args.vocab_size,
       )
@@ -189,15 +206,23 @@ class TorchaxTrainer:
           ),
       )
 
+      # Upstream d771abb0 dropped `HuggingFaceTextDataLoader` in favour of
+      # `torchtitan.components.data.GrainDataLoader`, which takes
+      # `max_context_length` / `num_tokens_per_batch` instead of `seq_len` /
+      # `local_batch_size`.
       train_loader = job_config.dataloader.build(
           dp_world_size=1,
           dp_rank=0,
           tokenizer=tokenizer,
-          seq_len=job_config.training.seq_len,
-          local_batch_size=job_config.training.local_batch_size,
+          max_context_length=seq_len,
+          num_tokens_per_batch=(
+              job_config.training.num_tokens_per_microbatch_per_dp_rank
+          ),
       )
 
-    job_config.training.local_batch_size = original_local_batch_size
+    job_config.training.num_tokens_per_microbatch_per_dp_rank = (
+        original_num_tokens_per_microbatch_per_dp_rank
+    )
     return tokenizer, train_loader
 
   def setup_model(self, job_config):
@@ -241,7 +266,9 @@ class TorchaxTrainer:
     if hasattr(model_args, 'max_seq_len'):
       # Some ModelArgs (llama3/qwen3) hold ``max_seq_len`` to size RoPE/attn
       # caches; redacted/redacted handle that internally and don't expose it.
-      model_args.max_seq_len = job_config.training.seq_len
+      # Only the job config side was renamed (``training.seq_len`` ->
+      # ``training.max_context_length``) by upstream d771abb0.
+      model_args.max_seq_len = job_config.training.max_context_length
     self.model_args = model_args
 
     if job_config.torchax_config.model_layer_override is not None:
@@ -509,12 +536,21 @@ class TorchaxTrainer:
     )
     autocast_dtype = torch.bfloat16 if use_autocast else None
 
+    # TT-UNFLATTEN-SHIM: the decoder now takes flat [T] tokens. Without the
+    # per-sequence length, the SDPA shim treats the whole batch as one sequence;
+    # set it like the TPU trainers do. Entered inside model_fn so it is active
+    # whenever JAX traces the forward.
+    seq_len = job_config.training.max_context_length
+
     def model_fn(weights, buffers, args):
-      if autocast_dtype is not None:
-        with torchax_amp.autocast('jax', dtype=autocast_dtype):
+      with set_unflatten_seq_len(seq_len):
+        if autocast_dtype is not None:
+          with torchax_amp.autocast('jax', dtype=autocast_dtype):
+            return jittable_mod.functional_call(
+                'forward', weights, buffers, args
+            )
+        else:
           return jittable_mod.functional_call('forward', weights, buffers, args)
-      else:
-        return jittable_mod.functional_call('forward', weights, buffers, args)
 
     if job_config.model_spec.name == 'conformer':
       if job_config.conformer.use_ctc_loss:
@@ -561,16 +597,22 @@ class TorchaxTrainer:
       else:
         raise ValueError(f'Unsupported MoE model: {job_config.model_spec.name}')
 
+      # Upstream d771abb0 renamed ``training.seq_len`` to
+      # ``training.max_context_length``; the callees still take a plain
+      # sequence length.
       _, metrics_processor.num_flops_per_token = (  # pyrefly: ignore[bad-assignment]
           moe_utils.get_moe_model_nparams_and_flops(
-              self.model_args, model, head_dims, job_config.training.seq_len
+              self.model_args,
+              model,
+              head_dims,
+              job_config.training.max_context_length,
           )
       )
     else:
       if hasattr(self.model_args, 'get_nparams_and_flops'):
         _, metrics_processor.num_flops_per_token = (
             self.model_args.get_nparams_and_flops(
-                model, job_config.training.seq_len
+                model, job_config.training.max_context_length
             )
         )
       else:

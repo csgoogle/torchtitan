@@ -128,10 +128,11 @@ class GraphSplitTest(absltest.TestCase):
     _full_memory_policy_pass(
         traced.gm,
         config=SimpleNamespace(
+            compile=SimpleNamespace(full_recompute_save_ops=""),
             parallelism=SimpleNamespace(
                 fsdp_reshard_after_forward=fsdp_reshard_after_forward,
                 pipeline_parallel_degree=1,
-            )
+            ),
         ),
     )
     selective_activation_remat_pass(traced.gm)

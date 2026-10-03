@@ -11,14 +11,13 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from torchtitan.models.common.attention import (
-    AttentionMasksType,
-    GQAttention,
-    VarlenAttention,
-)
+from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.config_utils import update_moe_aux_loss_configs
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.models.utils import get_moe_model_nparams_and_flops
+from torchtitan.models.utils import (
+    get_nparams_and_active_nparams,
+    quadratic_attention_flops_per_token,
+)
 
 
 class Qwen3TransformerBlock(TransformerBlock):
@@ -91,12 +90,22 @@ class Qwen3Model(Decoder):
         ) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
+            # Upstream d771abb0 replaced the sample-based training fields with
+            # token-based ones; the aux-loss normalization still counts
+            # samples, so convert. The trainer passes both explicitly (and
+            # scales the local one by the data-parallel degree); these
+            # fallbacks only cover callers that do not.
+            max_context_length = config.training.max_context_length
             local_global_batch_size = kwargs.get(
-                "local_global_batch_size", config.training.local_batch_size
+                "local_global_batch_size",
+                config.training.num_tokens_per_microbatch_per_dp_rank
+                // max_context_length,
             )
-            global_batch_size = kwargs.get(
-                "global_batch_size", config.training.global_batch_size
-            )
+            global_batch_size = kwargs.get("global_batch_size")
+            if global_batch_size is None:
+                global_batch_size = config.training.num_tokens_per_train_step
+                if global_batch_size > 0:
+                    global_batch_size //= max_context_length
             if global_batch_size < 0:
                 global_batch_size = local_global_batch_size
 
@@ -106,14 +115,6 @@ class Qwen3Model(Decoder):
                 local_global_batch_size=local_global_batch_size,
                 global_batch_size=global_batch_size,
             )
-
-            if parallelism.context_parallel_degree > 1 and isinstance(
-                self.layers[0].attention.inner_attention, VarlenAttention.Config
-            ):
-                raise NotImplementedError(
-                    "Context Parallel only supports SDPA and FlexAttention. "
-                    "Varlen attention is not supported with CP."
-                )
 
             from torchtitan.models.qwen3.sharding import set_qwen3_sharding_config
 
@@ -126,13 +127,19 @@ class Qwen3Model(Decoder):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-
-            assert isinstance(self.layers[0].attention, GQAttention.Config)
-            assert self.layers[0].attention.head_dim is not None
-            return get_moe_model_nparams_and_flops(
-                self,
-                model,
-                self.layers[0].attention.n_heads,
-                2 * self.layers[0].attention.head_dim,
-                seq_len,
-            )
+            nparams, active_nparams = get_nparams_and_active_nparams(model)
+            attention_op_flops = 0
+            for layer in self.layers:
+                attention = layer.attention
+                head_dim = (
+                    attention.head_dim
+                    if attention.head_dim is not None
+                    else attention.dim // attention.n_heads
+                )
+                attention_op_flops += quadratic_attention_flops_per_token(
+                    num_heads=attention.n_heads,
+                    qk_head_dim=head_dim,
+                    v_head_dim=head_dim,
+                    seq_len=seq_len,
+                )
+            return nparams, 6 * active_nparams + attention_op_flops

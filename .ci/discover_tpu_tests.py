@@ -72,8 +72,8 @@ DISABLED_TESTS = {
     # TODO: RuntimeError: create_process_group(): PjRtClient is not initialized.
     "torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack_distributed",
     # TODO: imports torchtitan.scripts; this fork keeps scripts/ at the repo root.
-    "tests.unit_tests.test_download_hf_assets",
-    "tests.unit_tests.test_tokenizer",
+    "tests.unit_tests.cpu.test_download_hf_assets",
+    "tests.unit_tests.cpu.test_tokenizer",
     # TODO: mark_dynamic() no longer sets _dynamo_dynamic_range, so the copy assertion is stale.
     "torchtitan.experiments.graph_trainer.tests.test_trace_module",
     # Missing optional dependency renderers
@@ -83,22 +83,55 @@ DISABLED_TESTS = {
     "torchtitan.experiments.rl.tests.test_rollout_utils",
     "torchtitan.experiments.rl.tests.test_search_r1",
     "torchtitan.experiments.rl.tests.test_weight_sync",
+    "torchtitan.experiments.rl.tests.test_dapo_math",
+    "torchtitan.experiments.rl.tests.test_muse_glimmer_renderer",
+    "torchtitan.experiments.rl.tests.test_renderer",
+    "torchtitan.experiments.rl.tests.test_rollouter_pool",
+    "torchtitan.experiments.rl.tests.test_rollout_worker",
+    "torchtitan.experiments.rl.tests.test_token_env",
     # Missing optional dependency torchstore
     "torchtitan.experiments.rl.tests.test_engine_loop",
     # Missing optional dependency monarch
     "torchtitan.experiments.rl.tests.test_shutdown",
+    "torchtitan.experiments.rl.tests.test_inter_generator_router",
+    "torchtitan.experiments.rl.tests.test_intra_generator_router",
     # Missing optional dependency vllm
     "torchtitan.experiments.rl.tests.test_generator",
     "torchtitan.experiments.rl.tests.test_bitwise_parity",
+    "torchtitan.experiments.rl.tests.test_vllm_otel_stat_logger",
+    "torchtitan.experiments.rl.tests.test_vllm_wrapper",
+    # Missing optional dependency verifiers
+    "torchtitan.experiments.rl.tests.test_verifiers",
+    "torchtitan.experiments.rl.tests.test_verifiers_example",
+    # Missing optional dependency torch_checkpointing
+    "tests.unit_tests.cpu.test_torch_checkpointing",
     # Requires CUDA; upstream runs these tests only on CUDA
     "torchtitan.experiments.graph_trainer.tests.test_passes",
     "torchtitan.experiments.graph_trainer.tests.test_profiler",
     "torchtitan.experiments.graph_trainer.tests.test_cpu_offload",
     "torchtitan.experiments.graph_trainer.tests.test_numerics",
     # Requires optional dependency fla from requirements-vlm.txt
-    "tests.unit_tests.test_rope",
+    "tests.unit_tests.cpu.test_rope",
+    "tests.unit_tests.cpu.test_qwen3_5",
     # Missing optional dependency torchvision
-    "tests.unit_tests.test_mm_dataset_checkpointing",
+    "tests.unit_tests.cpu.test_mm_dataset_checkpointing",
+    "tests.unit_tests.cpu.components.data.test_qwen_multimodal_data",
+    "tests.unit_tests.cpu.test_packed_vision",
+    "tests.unit_tests.cpu.test_qwen3_6",
+    "tests.unit_tests.cpu.test_qwen3_8",
+    "tests.unit_tests.cpu.test_mm_dataset_preprocessing",
+    "tests.unit_tests.cpu.test_debug_config_defaults",
+    "tests.unit_tests.cpu.test_no_new_cli_options",
+    # Upstream test assumes spmd_backend defaults to "spmd_types"; this fork
+    # pins "partial_dtensor" (copy.bara.sky), so the CP backend gate fires first.
+    "tests.unit_tests.cpu.test_context_parallel_validation",
+    # TPUGrainDataLoader.Config overrides `dataset` as a plain str.
+    "tests.unit_tests.cpu.test_dataset_flux",
+    # set_gqa_inner_attention_local_map also registers the SDPA q_BLHK/k_BLHK/
+    # v_BLHV keys; the test asserts the exact varlen key set.
+    "tests.unit_tests.cpu.test_varlen_attention",
+    # Image torch rejects 'reorder_for_locality' in nested compile-region options.
+    "torchtitan.experiments.graph_trainer.tests.test_subgraph_regions",
     # Missing optional dependency autoparallel
     "torchtitan.experiments.graph_trainer.tests.test_autoparallel",
     # Missing optional dependency torchax
@@ -107,6 +140,38 @@ DISABLED_TESTS = {
     # TODO: get_peak_flops() rejects 'cpu', so MFU setup raises; make MFU optional.
     "torchtitan.experiments.jax.tests.test_train_distributed",
 }
+
+# Upstream GPU-only tests; upstream runs these only on CUDA runners.
+GPU_ONLY_DIRS = ("tests/unit_tests/gpu",)
+
+# Individual upstream pytest tests that are disabled, as node-ID prefixes passed
+# to `pytest --deselect`. Use this instead of DISABLED_TESTS when the rest of
+# the file passes.
+DESELECTED_TESTS = (
+    # Upstream tests; MXFP8 needs torchao's 32x32 swizzled cast kernels, which
+    # are not in any torchao release the image installs.
+    "tests/unit_tests/cpu/test_quantization.py::test_mxfp8_converter_replaces_a_root_linear_config",
+    "tests/unit_tests/cpu/test_quantization.py::test_mxfp8_converter_applies_mxfp8_saved_input_fqns",
+    "tests/unit_tests/cpu/test_quantization.py::test_mxfp8_converter_rejects_unmatched_saved_input_fqns",
+    # Upstream tests assume spmd_backend defaults to "spmd_types"; this fork
+    # pins "partial_dtensor" (copy.bara.sky).
+    "tests/unit_tests/cpu/test_config_manager.py::TestConfigManager::test_suppressed_model_spec_is_opaque_to_tyro",
+    "tests/unit_tests/cpu/test_router_gate_linear.py::TestRouterGateLinearSPMD::test_autograd_function_propagates_router_types",
+    # Upstream test; the fork's Qwen3 Config.update_from_config reads
+    # config.training, which the test's SimpleNamespace config lacks.
+    "tests/unit_tests/cpu/test_expert_parallel.py::TestExpertParallelConfigValidation::test_all_moe_layers_divisible",
+    # Upstream tests; the fork's train_step calls self._clip_grad_norm()
+    # (_GOOGLE_PATCHES), which the tests' SimpleNamespace trainer lacks.
+    "tests/unit_tests/cpu/test_trainer.py::test_train_step_replay_checks_only_first_forward_backward",
+    "tests/unit_tests/cpu/test_trainer.py::test_trainer_accumulates_reused_cuda_graph_losses",
+    "tests/unit_tests/cpu/test_trainer.py::test_pure_fsdp_does_not_toggle_requires_all_reduce",
+    "tests/unit_tests/cpu/test_trainer.py::test_hsdp_skips_replicate_all_reduce_until_last_accum_group",
+    "tests/unit_tests/cpu/test_trainer.py::test_hsdp_keeps_all_reduce_on_single_accum_group",
+    "tests/unit_tests/cpu/test_trainer.py::test_hsdp_does_not_toggle_requires_all_reduce_under_cuda_graphs",
+    # Upstream test; the fork passes cache_dir= to load_dataset (copy.bara.sky),
+    # so the exact-call assertion fails.
+    "tests/unit_tests/cpu/components/data/test_grain_data.py::test_hf_explicit_fields_are_passed_to_load_dataset",
+)
 
 
 def _iter_test_files():
@@ -187,6 +252,8 @@ def discover_tests():
 
     for path in _iter_test_files():
         relative = path.relative_to(REPO_ROOT)
+        if str(relative).startswith(GPU_ONLY_DIRS):
+            continue
         module = str(relative.with_suffix("")).replace("/", ".")
         if module in DISABLED_TESTS:
             continue
@@ -278,6 +345,7 @@ def main():
         ),
         "cpu_shards": chunk_tests(tests["cpu"], NUM_CPU_SHARDS, durations),
         "pytest_shards": chunk_tests(tests["pytest"], NUM_PYTEST_SHARDS, durations),
+        "pytest_deselect": " ".join(f"--deselect={test}" for test in DESELECTED_TESTS),
     }
     
     # We output a JSON object of shard arrays to stdout

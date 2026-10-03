@@ -4,8 +4,11 @@ from unittest.mock import patch
 import jax
 import jax.numpy as jnp
 import pytest
+# With torch_tpu, torch must be imported before spmd_types to avoid a circular
+# import error. Import of torch autoloads torch_tpu which imports
+# torch.distributed.fsdp which imports spmd_types still initializing.
+import torch  # isort: skip
 import spmd_types as spmd
-import torch
 
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.experiments.tpu.grouped_experts import (
@@ -22,8 +25,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
 )
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.models.common.moe_sharding import expert_param_placement_dense
-from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
-from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
+from torchtitan.protocols.sharding import ShardingConfig
 
 
 def _build_experts(
@@ -45,10 +47,6 @@ def _build_experts(
         ),
         use_kernel_native_weight_layout=use_kernel_native_weight_layout,
         param_init=param_init,
-        token_dispatcher=LocalTokenDispatcher.Config(
-            num_experts=num_experts,
-            top_k=1,
-        ),
     )
     experts = config.build()
     if param_init is None:
@@ -64,10 +62,6 @@ def test_model_converter_preserves_config_fields():
                 dim=16,
                 hidden_dim=24,
                 num_experts=8,
-                token_dispatcher=LocalTokenDispatcher.Config(
-                    num_experts=8,
-                    top_k=2,
-                ),
             )
 
         def traverse(self, config_type):
@@ -84,7 +78,6 @@ def test_model_converter_preserves_config_fields():
     assert root.experts.dim == original.dim
     assert root.experts.hidden_dim == original.hidden_dim
     assert root.experts.num_experts == original.num_experts
-    assert root.experts.token_dispatcher == original.token_dispatcher
     assert not root.experts.use_pallas_paired_grouped_mm
     assert root.experts.pallas_grouped_mm_tile_k == 0
     assert root.experts.pallas_grouped_mm_tile_n == 0
@@ -168,7 +161,7 @@ def test_unpaired_kernels_get_bf16_weights_whatever_the_param_dtype(param_dtype)
         "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
         side_effect=grouped_mm,
     ) as unpaired:
-        out = experts._experts_forward(x, counts)
+        out = experts.forward(x, counts)
 
     assert out.dtype == param_dtype
     assert unpaired.call_count == 3
@@ -224,7 +217,6 @@ def test_paired_grouped_mm_validates_supported_configuration():
         num_experts=1,
         use_pallas_grouped_mm=True,
         use_pallas_paired_grouped_mm=True,
-        token_dispatcher=LocalTokenDispatcher.Config(num_experts=1, top_k=1),
     )
     with pytest.raises(ValueError, match="requires a full N TGMM tile"):
         config.build()
@@ -237,7 +229,6 @@ def test_paired_grouped_mm_validates_supported_configuration():
         use_pallas_grouped_mm=True,
         use_pallas_paired_grouped_mm=True,
         pallas_grouped_mm_tgmm_tiling=(128, 128, 0),
-        token_dispatcher=LocalTokenDispatcher.Config(num_experts=1, top_k=1),
     ).build()
 
     experts = _build_experts(
@@ -268,7 +259,6 @@ def test_paired_grouped_mm_forwards_tgmm_tile_k():
         use_pallas_grouped_mm=True,
         use_pallas_paired_grouped_mm=True,
         pallas_grouped_mm_tgmm_tiling=(128, 8, 0),
-        token_dispatcher=LocalTokenDispatcher.Config(num_experts=2, top_k=1),
     ).build()
     for param in experts.parameters():
         torch.nn.init.normal_(param, std=0.02)
@@ -291,7 +281,7 @@ def test_paired_grouped_mm_forwards_tgmm_tile_k():
         "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
         side_effect=paired_grouped_mm,
     ) as paired:
-        experts._experts_forward(x, counts)
+        experts.forward(x, counts)
 
     paired.assert_called_once()
     assert paired.call_args.kwargs["tgmm_tile_m"] == 128
@@ -317,7 +307,6 @@ def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired):
         use_pallas_paired_grouped_mm=paired,
         pallas_grouped_mm_tgmm_tiling=shared,
         pallas_grouped_mm_w2_tgmm_tiling=w2_own,
-        token_dispatcher=LocalTokenDispatcher.Config(num_experts=2, top_k=1),
     ).build()
     for param in experts.parameters():
         torch.nn.init.normal_(param, std=0.02)
@@ -340,7 +329,7 @@ def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired):
         "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
         side_effect=paired_grouped_mm,
     ) as paired_kernel:
-        experts._experts_forward(x, counts)
+        experts.forward(x, counts)
 
     if paired:
         paired_kernel.assert_called_once()
@@ -452,7 +441,7 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
     def paired_grouped_mm(x, w1, w3, counts, **kwargs):
         return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
 
-    expected = stock._experts_forward(x, counts)
+    expected = stock.forward(x, counts)
     with patch(
         "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
         side_effect=grouped_mm,
@@ -460,7 +449,7 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
         "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
         side_effect=paired_grouped_mm,
     ):
-        actual = native._experts_forward(x_native, counts)
+        actual = native.forward(x_native, counts)
     torch.testing.assert_close(actual, expected)
 
     actual.float().square().sum().backward()
@@ -485,13 +474,16 @@ def test_kernel_native_layout_transposes_tp_sharding_axes():
     )
     native = _native_weight_sharding(config)
     assert set(native.state_shardings) == {"w1_EDF", "w2_EFD", "w3_EDF"}
-    assert native.state_shardings["w1_EDF"].axis_types[MeshAxisName.TP] == spmd.S(2)
-    assert native.state_shardings["w2_EFD"].axis_types[MeshAxisName.TP] == spmd.S(1)
-    assert native.state_shardings["w3_EDF"].axis_types[MeshAxisName.TP] == spmd.S(2)
+    assert native.state_shardings["w1_EDF"].local_type[MeshAxisName.TP] == spmd.S(2)
+    assert native.state_shardings["w2_EFD"].local_type[MeshAxisName.TP] == spmd.S(1)
+    assert native.state_shardings["w3_EDF"].local_type[MeshAxisName.TP] == spmd.S(2)
 
 
 def test_kernel_native_layout_transposes_rank_aware_partition_spec():
-    layout = SpmdLayout(
+    # Upstream d771abb0 deleted `protocols.sharding.SpmdLayout` in favour of
+    # `spmd_types.SpmdType`, renaming the per-axis field `axis_types` ->
+    # `local_type`.
+    layout = spmd.SpmdType(
         {
             MeshAxisName.DP_SHARD: spmd.V,
             MeshAxisName.TP: spmd.V,

@@ -44,8 +44,8 @@ python -m torchtitan.experiments.jax.train_minimal \
     --model.flavor=8B \
     --training.dataset_path=tests/assets/c4_test \
     --model.hf_assets_path=tests/assets/tokenizer \
-    --training.seq_len=2048 \
-    --training.global_batch_size=4 \
+    --training.max_context_length=2048 \
+    --training.num_tokens_per_train_step=8192 \
     --training.steps=10 \
     --jax_config.use_scan \
     --activation_checkpoint.mode=full

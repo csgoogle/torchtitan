@@ -184,6 +184,8 @@ class TrainMinimalDistributedTest(
     implementation
     is correct.
     """
+    # Upstream replaced seq_len/local_batch_size with a token budget:
+    # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 2 * 128.
     self._run_trainer_distributed_parity_test(
         config_args=[
             f"--module=torchtitan.experiments.tpu.{module}",
@@ -191,12 +193,12 @@ class TrainMinimalDistributedTest(
             f"--optimizer.implementation={optimizer_implementation}",
             "--hf_assets_path=tests/assets/tokenizer",
             "--dataloader.dataset_path=tests/assets/c4_test",
-            "--training.seq_len=128",
+            "--training.max_context_length=128",
             "--dataloader.dataset=c4_test",
             "--training.steps=3",
             "--training.mixed_precision_param=float32",
             "--training.mixed_precision_reduce=float32",
-            "--training.local_batch_size=2",
+            "--training.num_tokens_per_microbatch_per_dp_rank=256",
         ] + (args or []),
         tensor_parallel_degree=tensor_parallel_degree,
         data_parallel_shard_degree=data_parallel_shard_degree,

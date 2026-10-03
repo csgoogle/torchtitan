@@ -43,8 +43,7 @@ xpk workload create \
     --config=conformer_test \
     --parallelism.data_parallel_shard_degree=1 \
     --parallelism.data_parallel_replicate_degree=-1 \
-    --activation_checkpoint.mode=full \
-    --training.local_batch_size=512 \
+    --training.num_tokens_per_microbatch_per_dp_rank=262144 \
     --training.dtype=float32 \
     --training.mixed_precision_param=bfloat16 \
     --tpu_config.use_simple_fsdp \
@@ -54,7 +53,8 @@ xpk workload create \
     --conformer.use-ctc-loss \
     --compile.enable \
     --dataloader.dataset=random \
-    --training.steps=20
+    --training.steps=20 \
+    activation-checkpoint:full
 "
 ```
 
@@ -92,8 +92,7 @@ xpk workload create \
     --config=conformer_test \
     --parallelism.data_parallel_shard_degree=1 \
     --parallelism.data_parallel_replicate_degree=-1 \
-    --activation_checkpoint.mode=full \
-    --training.local_batch_size=512 \
+    --training.num_tokens_per_microbatch_per_dp_rank=262144 \
     --training.dtype=float32 \
     --training.mixed_precision_param=bfloat16 \
     --tpu_config.use_simple_fsdp \
@@ -102,7 +101,8 @@ xpk workload create \
     --metrics.log_freq=1 \
     --conformer.use-ctc-loss \
     --dataloader.dataset=random \
-    --training.steps=20
+    --training.steps=20 \
+    activation-checkpoint:full
 "
 ```
 

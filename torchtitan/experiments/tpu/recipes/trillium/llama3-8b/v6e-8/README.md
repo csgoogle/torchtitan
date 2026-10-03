@@ -25,8 +25,11 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ## Training Configuration Details
 
 We are running with the following key configurations (explicitly passed as flags):
-- **Sequence Length**: 8192
-- **Local Batch Size**: 2 (Global batch size = 2 * 8 = 16)
+- **Sequence Length**: 8192 (passed as `--training.max_context_length=8192`)
+- **Local Batch Size**: 2 sequences per data-parallel rank (Global batch size =
+  2 * 8 = 16 sequences). Batch size is expressed in tokens on the command line:
+  `--training.num_tokens_per_microbatch_per_dp_rank=16384` (2 sequences * 8192
+  tokens).
 - **Torch Compile**: Enabled for `model` component.
 - **Simple FSDP**: Enabled.
 - **Splash Attention**: Enabled with block size 2048.
@@ -60,8 +63,8 @@ xpk workload create \
     --hf_assets_path=tests/assets/tokenizer \
     --dataloader.dataset_path=tests/assets/c4_test \
     --training.steps=20 \
-    --training.local_batch_size=2 \
-    --training.seq_len=8192 \
+    --training.num_tokens_per_microbatch_per_dp_rank=16384 \
+    --training.max_context_length=8192 \
     --compile.enable \
     --parallelism.use_simple_fsdp \
     --splash_attention_kernel.use_splash_attention_kernel \

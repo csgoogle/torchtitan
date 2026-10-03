@@ -25,8 +25,11 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 
 ## Training Configuration Details
 We are running with the following key optimizations built into the configuration:
-- **Sequence Length**: 2048
-- **Local Batch Size**: 6 (Global batch size = 6 * 8 = 48)
+- **Sequence Length**: 2048 (passed as `--training.max_context_length=2048`)
+- **Local Batch Size**: 6 sequences per data-parallel rank (Global batch size =
+  6 * 8 = 48 sequences). Batch size is expressed in tokens on the command line:
+  `--training.num_tokens_per_microbatch_per_dp_rank=12288` (6 sequences * 2048
+  tokens).
 - **Parallelism**: Simple FSDP with Topology Aware Mesh (`enable_tpu_topo_mesh=True`) mapped to the 2x4 ICI physical layout.
 - **Activation Checkpointing**: FullAC (`SelectiveAC` causes OOM on v6e due to XLA activation limits).
 - **Compile Mode**: Layer-by-layer compilation (`compile_mode="layer"`).
@@ -57,8 +60,8 @@ xpk workload create \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.qwen3 \
     --config=reg_trainer_qwen3_8b \
-    --training.local_batch_size=6 \
-    --training.seq_len=2048 \
+    --training.num_tokens_per_microbatch_per_dp_rank=12288 \
+    --training.max_context_length=2048 \
     --training.mixed_precision_reduce=float32 \
     --compile.enable \
     --parallelism.use_simple_fsdp \

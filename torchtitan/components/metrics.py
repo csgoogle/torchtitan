@@ -307,6 +307,10 @@ class MetricsProcessor(Configurable):
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
 
+        def __post_init__(self) -> None:
+            if self.log_freq <= 0:
+                raise ValueError("metrics.log_freq must be greater than 0.")
+
     config: Config
     logger: BaseLogger
     parallel_dims: ParallelDims
@@ -317,6 +321,7 @@ class MetricsProcessor(Configurable):
     ntokens_since_last_log: int
     data_loading_times: list[float]
     time_last_log: float
+    step_last_log: int | None
 
     num_flops_per_token: int
     has_quantization: bool
@@ -358,6 +363,7 @@ class MetricsProcessor(Configurable):
         self.ntokens_since_last_log = 0
         self.data_loading_times = []
         self.time_last_log = time.perf_counter()
+        self.step_last_log = None
         self.device_memory_monitor.reset_peak_stats()
 
         self.has_quantization = has_quantization
@@ -368,6 +374,8 @@ class MetricsProcessor(Configurable):
         self.model_parts = None
 
     def should_log(self, step: int) -> bool:
+        if self.step_last_log is None:
+            self.step_last_log = step - 1
         return step == 1 or step % self.config.log_freq == 0
 
     def _build_metric_logger(
@@ -496,7 +504,8 @@ class MetricsProcessor(Configurable):
         else:
             mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
 
-        time_end_to_end = time_delta / self.config.log_freq
+        assert self.step_last_log is not None
+        time_end_to_end = time_delta / (step - self.step_last_log)
         time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
         time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
 
@@ -543,6 +552,7 @@ class MetricsProcessor(Configurable):
         self.ntokens_since_last_log = 0
         self.data_loading_times.clear()
         self.time_last_log = time.perf_counter()
+        self.step_last_log = step
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(
@@ -582,6 +592,7 @@ class MetricsProcessor(Configurable):
 
         self.ntokens_since_last_log = 0
         self.time_last_log = time.perf_counter()
+        self.step_last_log = step
         self.device_memory_monitor.reset_peak_stats()
 
     def close(self):
