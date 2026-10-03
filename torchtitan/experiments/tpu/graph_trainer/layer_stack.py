@@ -58,6 +58,9 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
     plan_stacked_gathers,
     ScanFSDPSpec,
 )
+from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
+    scan_body_remat_window,
+)
 from torchtitan.experiments.tpu.layer_loop import (
     model_subclass,
     tpu_model_class,
@@ -731,9 +734,15 @@ class LayerStack:
             # which the body's re-trace drops before it reaches any node inside
             # the scan. Switch once the meta survives.
             #
+            # The one exception is the MoE aux loss's expert counts: redoing
+            # their all-reduce in backward is an exposed DCN round trip per
+            # layer on multi-slice. The window tags the re-traced joint graph
+            # to save just those, and is exactly budget 0.0 for a body without
+            # them. See `scan_remat_policy`.
+            #
             # The patch is process-global, so it has to be a window; it closes
             # when this call returns. `test_layer_stack.py` checks both halves.
-            with torch._functorch.config.patch(activation_memory_budget=0.0):
+            with scan_body_remat_window():
                 carry, _ = scan(scan_body, h, xs)
             return carry
 
