@@ -972,76 +972,39 @@ def substitute_tpu_experts(model: nn.Module) -> None:
 
   converter = TpuGroupedExpertsConverter(TpuGroupedExpertsConverter.Config())
   use_pallas = bool(getattr(model, "_tpu_moe_pallas", False))
-  paired = True
   n = 0
   for layer in model.layers.values():
     cfg = getattr(layer, "_native_moe_config", None)
     if cfg is not None:
       cfg = converter.convert(cfg)
       if use_pallas:
-        paired = _enable_pallas_experts(cfg) and paired
+        _enable_pallas_experts(cfg)
       layer._native_moe_config = cfg
       n += 1
   if n:
     logger.info(
         "Substituted the TPU grouped-expert implementation in %d MoE layer(s)%s.",
-        n,
-        (" (Pallas grouped matmul, %s W1/W3)" % ("paired" if paired else "unpaired, K/N-tiled"))
-        if use_pallas else "",
+        n, " (Pallas grouped matmul)" if use_pallas else "",
     )
 
 
-# Paired W1/W3 holds both full (dim, hidden) weight slabs in VMEM in forward,
-# and the dWeight kernels hold full-width output slabs. These Pallas calls get
-# 32 MiB of scoped VMEM on v6e; the estimate below slightly overstates usage
-# (36 MiB estimated for a call that needed 35 MiB), so it is compared directly.
-_EXPERT_VMEM_BUDGET = 32 << 20
-_EXPERT_TILE_M = 256
+def _enable_pallas_experts(moe_config) -> None:
+  """Turn on the TPU Pallas expert kernels in a converted MoE config.
 
-
-def _paired_expert_vmem(dim: int, hidden: int, tile_k: int) -> int:
-  """Largest per-call VMEM estimate (double-buffered blocks plus FP32 scratch)
-  of the paired path: paired forward, paired dWeight, and the W2 dWeight with a
-  full-width (tile_k, dim) output slab."""
-  tm, bf16, f32 = _EXPERT_TILE_M, 2, 4
-  fwd = 2 * tm * dim * bf16 + 2 * 2 * dim * hidden * bf16 + 2 * 2 * tm * hidden * bf16 + 2 * tm * hidden * f32
-  dw13 = 2 * tm * tile_k * bf16 + 2 * 2 * tm * hidden * bf16 + 2 * 2 * tile_k * hidden * bf16 + 2 * tile_k * hidden * f32
-  dw2 = 2 * tm * tile_k * bf16 + 2 * tm * dim * bf16 + 2 * tile_k * dim * f32 + tile_k * dim * f32
-  return max(fwd, dw13, dw2)
-
-
-def _enable_pallas_experts(moe_config) -> bool:
-  """Turn on the qwen3 TPU lane's expert kernels in a converted MoE config.
-
-  Otherwise the experts run torch._grouped_mm (XLA ragged dot). The qwen3
-  recipe (paired W1/W3, tile_m 256, kernel-native weight layout, K-tiled
-  dWeight) is used when its VMEM estimate fits; wider experts (e.g. Mixtral's
-  4096 x 14336) use the unpaired kernels with every K/N tile bounded instead.
-  Returns whether the paired kernel was selected.
+  Otherwise the experts run torch._grouped_mm (XLA ragged dot). Uses the
+  unpaired kernels with bounded K/N tiles, which fit scoped VMEM at any expert
+  width. The qwen3 lane's paired W1/W3 kernel is faster but holds full
+  (dim, hidden) weight slabs in VMEM; it can be enabled per model through
+  TpuGroupedExperts.Config when those fit.
   """
   from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
-  paired = True
   for _, experts, _, _ in moe_config.traverse(TpuGroupedExperts.Config):
-    paired = _configure_pallas_experts(experts) and paired
-  return paired
-
-
-def _configure_pallas_experts(experts) -> bool:
-  """Set one TpuGroupedExperts.Config's kernel options; True if paired."""
-  dim, hidden = int(experts.dim), int(experts.hidden_dim)
-  tile_k = next((t for t in (1024, 512, 256, 128) if dim % t == 0 and t <= dim // 2), 0)
-  experts.use_pallas_grouped_mm = True
-  experts.pallas_grouped_mm_tile_m = _EXPERT_TILE_M
-  experts.use_kernel_native_weight_layout = True
-  if tile_k and _paired_expert_vmem(dim, hidden, tile_k) <= _EXPERT_VMEM_BUDGET:
-    experts.use_pallas_paired_grouped_mm = True
-    experts.pallas_grouped_mm_tgmm_tiling = (_EXPERT_TILE_M, tile_k, 0)
-    return True
-  # MegaBlox masks a partial last K/N tile, so the tile need not divide.
-  tile = next((t for t in (512, 256, 128) if t <= min(dim, hidden)), 0)
-  experts.use_pallas_paired_grouped_mm = False
-  experts.pallas_grouped_mm_tile_k = tile
-  experts.pallas_grouped_mm_tile_n = tile
-  experts.pallas_grouped_mm_tgmm_tiling = (_EXPERT_TILE_M, tile, tile)
-  return False
+    # 0 selects the full dimension, which is small enough below 512.
+    tile = 512 if min(experts.dim, experts.hidden_dim) >= 512 else 0
+    experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tile_k = tile
+    experts.pallas_grouped_mm_tile_n = tile
+    experts.pallas_grouped_mm_tgmm_tiling = (256, tile, tile)
+    experts.use_kernel_native_weight_layout = True
