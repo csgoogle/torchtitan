@@ -18,10 +18,7 @@ from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
-from torchtitan.experiments.tpu.grouped_experts import (
-    TpuGroupedExperts,
-    configure_expert_dweight_output_dtype,
-)
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.models.common.moe import (
     GroupedExperts,
@@ -76,7 +73,7 @@ def _apply_compile_gemma4(
   )
 
 
-def _parallelize_gemma4_dtensor(
+def _parallelize_gemma4(
     model: nn.Module,
     *,
     parallel_dims: torchtitan.distributed.ParallelDims,
@@ -249,10 +246,6 @@ def parallelize_gemma4(
   """Parallelizes the Gemma4 model, optionally applying Simple FSDP."""
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
-  reduce_dtype = torchtitan.config.TORCH_DTYPE_MAP[
-      training.mixed_precision_reduce
-  ]
-  configure_expert_dweight_output_dtype(model, reduce_dtype)
   if effective_compile_config.enable and hasattr(model, "layers"):
     for layer in model.layers.values():
       has_moe = any(isinstance(m, MoE) for m in layer.modules())
@@ -271,7 +264,7 @@ def parallelize_gemma4(
           "model_registry(..., enable_weight_tying=False)."
       )
 
-    _parallelize_gemma4_dtensor(
+    _parallelize_gemma4(
         model,
         ac_config=None,
         compile_config=dataclasses.replace(
@@ -298,7 +291,7 @@ def parallelize_gemma4(
     ):
       _apply_compile_gemma4(model, effective_compile_config)
   else:
-    _parallelize_gemma4_dtensor(
+    _parallelize_gemma4(
         model,
         ac_config=ac_config,
         compile_config=effective_compile_config,

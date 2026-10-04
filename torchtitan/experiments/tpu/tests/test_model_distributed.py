@@ -231,14 +231,14 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           enable_compile=True,
       ),
       dict(
-          testcase_name="gemma4_tp_dtensor",
+          testcase_name="gemma4_tp",
           module="torchtitan.experiments.tpu.examples.gemma4",
           config="gemma4_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
       ),
       dict(
-          testcase_name="gemma4_tp_dtensor_compile",
+          testcase_name="gemma4_tp_compile",
           module="torchtitan.experiments.tpu.examples.gemma4",
           config="gemma4_debugmodel",
           data_parallel_shard_degree=1,

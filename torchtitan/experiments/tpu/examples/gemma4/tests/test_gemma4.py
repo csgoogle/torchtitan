@@ -25,14 +25,8 @@ from torchtitan.experiments.tpu.examples.gemma4.config_registry import (
 )
 from torchtitan.experiments.tpu.examples.gemma4.model import (
     Gemma4Attention,
-    Gemma4Embedding,
-    Gemma4FeedForward,
-    Gemma4MoE,
     Gemma4Model,
     Gemma4RoPE,
-    Gemma4Router,
-    Gemma4TransformerBlock,
-    QKVLinearKeqV,
     SlidingWindowScaledDotProductAttention,
 )
 from torchtitan.experiments.tpu.examples.gemma4.state_dict_adapter import (
@@ -50,6 +44,7 @@ from torchtitan.models.common.config_utils import make_token_dispatcher_config
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
+import transformers
 
 
 _NORM_INIT = {"weight": nn.init.ones_}
@@ -342,508 +337,202 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
         self.assertIs(type(inner), ScaledDotProductAttention)
 
 
-class TestGemma4Components(BaseDeviceTest):
-  """Tests individual Gemma 4 modules and numerical parity on CPU/TPU."""
+class TestGemma4HFReferenceParity(BaseDeviceTest):
+  """Single-chip parity of TorchTitan Gemma4Model against HuggingFace Gemma4ForCausalLM."""
 
-  def test_gemma4_embedding_scaling(self):
-    vocab_size, dim = 64, 16
-    cfg = Gemma4Embedding.Config(
-        num_embeddings=vocab_size,
-        embedding_dim=dim,
-        param_init={"weight": partial(nn.init.normal_, mean=0.0, std=1.0)},
-    )
-    emb = cfg.build().to(self.accelerator_device)
-    emb.init_states()
+  def setUp(self):
+    super().setUp()
+    if not hasattr(transformers, "Gemma4ForCausalLM"):
+      self.skipTest(
+          "transformers.Gemma4ForCausalLM requires transformers >= 5.0"
+      )
 
-    tokens = torch.tensor(
-        [[1, 2, 3], [4, 5, 6]], device=self.accelerator_device, dtype=torch.long
-    )
-    out = emb(tokens)
-    expected = F.embedding(tokens, emb.weight) * (dim**0.5)
-    torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
-
-  def test_gemma4_rope_proportional(self):
-    dim = 16
-    max_seq_len = 32
-    theta = 1000000.0
-    partial_rotary_factor = 0.25
-    rope_dims = int(dim * partial_rotary_factor)  # 4
-    nope_dims = dim - rope_dims  # 12
-
-    cfg = Gemma4RoPE.Config(
-        dim=dim,
-        max_seq_len=max_seq_len,
-        theta=theta,
-        partial_rotary_factor=partial_rotary_factor,
-    )
-    rope = cfg.build().to(self.accelerator_device)
-    rope.init_states()
-
-    self.assertEqual(rope.cache.shape, (max_seq_len, dim * 2))
-    cos, sin = rope.cache.chunk(2, dim=-1)
-    torch.testing.assert_close(
-        cos[:, rope_dims // 2 : rope_dims // 2 + nope_dims // 2],
-        torch.ones(max_seq_len, nope_dims // 2, device=self.accelerator_device),
-    )
-    torch.testing.assert_close(
-        sin[:, rope_dims // 2 : rope_dims // 2 + nope_dims // 2],
-        torch.zeros(max_seq_len, nope_dims // 2, device=self.accelerator_device),
-    )
-
-    q = torch.randn(2, 8, 4, dim, device=self.accelerator_device)
-    k = torch.randn(2, 8, 2, dim, device=self.accelerator_device)
-    q_rot, k_rot = rope(q, k)
-
-    torch.testing.assert_close(
-        q_rot[..., rope_dims // 2 : rope_dims // 2 + nope_dims // 2],
-        q[..., rope_dims // 2 : rope_dims // 2 + nope_dims // 2],
-    )
-    torch.testing.assert_close(
-        q_rot[..., dim // 2 + rope_dims // 2 :],
-        q[..., dim // 2 + rope_dims // 2 :],
-    )
-    self.assertFalse(
-        torch.allclose(
-            q_rot[:, 1:, :, : rope_dims // 2],
-            q[:, 1:, :, : rope_dims // 2],
-        )
-    )
-
-  def test_gemma4_rope_full(self):
-    dim = 16
-    max_seq_len = 32
-    cfg = Gemma4RoPE.Config(
-        dim=dim,
-        max_seq_len=max_seq_len,
-        theta=10000.0,
-        partial_rotary_factor=1.0,
-    )
-    rope = cfg.build().to(self.accelerator_device)
-    rope.init_states()
-
-    freqs = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(
-                0, dim, 2, dtype=torch.float32, device=self.accelerator_device
-            )
-            / dim
-        )
-    )
-    t = torch.arange(max_seq_len, dtype=torch.float32, device=self.accelerator_device)
-    freqs_outer = torch.outer(t, freqs)
-    emb = torch.cat((freqs_outer, freqs_outer), dim=-1)
-    expected_cache = torch.cat((emb.cos(), emb.sin()), dim=-1)
-    torch.testing.assert_close(rope.cache, expected_cache, atol=1e-5, rtol=1e-5)
-
-  def test_qkv_linear_keqv_shapes(self):
-    dim = 32
-    head_dim = 8
-    n_heads = 4
-    n_kv_heads = 2
-
-    cfg_keqv = QKVLinearKeqV.Config(
-        head_dim=head_dim,
-        wq=Linear.Config(
-            in_features=dim,
-            out_features=n_heads * head_dim,
-            param_init=_LINEAR_INIT,
-        ),
-        wkv=Linear.Config(
-            in_features=dim,
-            out_features=n_kv_heads * head_dim,
-            param_init=_LINEAR_INIT,
-        ),
-    )
-    qkv_keqv = cfg_keqv.build().to(self.accelerator_device)
-    qkv_keqv.init_states()
-    self.assertFalse(hasattr(qkv_keqv, "wv"))
-
-    x = torch.randn(2, 6, dim, device=self.accelerator_device)
-    xq, xk, xv = qkv_keqv(x)
-    self.assertEqual(xq.shape, (2, 6, n_heads, head_dim))
-    self.assertEqual(xk.shape, (2, 6, n_kv_heads, head_dim))
-    self.assertIs(xk, xv)
-
-  def test_gemma4_attention_sliding_and_global(self):
-    dim = 32
-    sliding_cfg = Gemma4Attention.Config(
-        dim=dim,
-        n_heads=4,
-        n_kv_heads=2,
-        head_dim=8,
-        is_sliding=True,
-        sliding_window_size=4,
-        qk_norm=RMSNorm.Config(
-            normalized_shape=8, eps=1e-6, param_init=_NORM_INIT
-        ),
-        v_norm=RMSNorm.Config(
-            normalized_shape=8, eps=1e-6, elementwise_affine=False
-        ),
-        qkv_linear=QKVLinear.Config(
-            head_dim=8,
-            wq=Linear.Config(
-                in_features=dim, out_features=32, param_init=_LINEAR_INIT
-            ),
-            wkv=Linear.Config(
-                in_features=dim, out_features=16, param_init=_LINEAR_INIT
-            ),
-        ),
-        wo=Linear.Config(
-            in_features=32, out_features=dim, param_init=_LINEAR_INIT
-        ),
-        inner_attention=ScaledDotProductAttention.Config(),
-        rope=Gemma4RoPE.Config(
-            dim=8, max_seq_len=16, theta=10000.0, partial_rotary_factor=1.0
-        ),
-    )
-    sliding_attn = sliding_cfg.build().to(self.accelerator_device)
-    sliding_attn.init_states()
-
-    x = torch.randn(2, 10, dim, device=self.accelerator_device)
-    out_sliding = sliding_attn(x, attention_masks=None)
-    self.assertEqual(out_sliding.shape, (2, 10, dim))
-
-    # Global attention with K=V
-    global_cfg = Gemma4Attention.Config(
-        dim=dim,
-        n_heads=4,
-        n_kv_heads=2,
+  @staticmethod
+  def _build_hf_reference(enable_moe: bool, sliding_window: int):
+    hf_config = transformers.Gemma4TextConfig(
+        vocab_size=2048,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_global_key_value_heads=8,
         head_dim=16,
-        is_sliding=False,
-        sliding_window_size=None,
-        qk_norm=RMSNorm.Config(
-            normalized_shape=16, eps=1e-6, param_init=_NORM_INIT
-        ),
-        v_norm=RMSNorm.Config(
-            normalized_shape=16, eps=1e-6, elementwise_affine=False
-        ),
-        qkv_linear=QKVLinearKeqV.Config(
-            head_dim=16,
-            wq=Linear.Config(
-                in_features=dim, out_features=64, param_init=_LINEAR_INIT
-            ),
-            wkv=Linear.Config(
-                in_features=dim, out_features=32, param_init=_LINEAR_INIT
-            ),
-        ),
-        wo=Linear.Config(
-            in_features=64, out_features=dim, param_init=_LINEAR_INIT
-        ),
-        inner_attention=ScaledDotProductAttention.Config(),
-        rope=Gemma4RoPE.Config(
-            dim=16,
-            max_seq_len=16,
-            theta=1000000.0,
-            partial_rotary_factor=0.25,
-        ),
+        global_head_dim=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=128,
+        sliding_window=sliding_window,
+        layer_types=["sliding_attention", "full_attention"],
+        final_logit_softcapping=30.0,
+        hidden_size_per_layer_input=0,
+        attention_k_eq_v=True,
+        num_kv_shared_layers=0,
+        tie_word_embeddings=True,
+        pad_token_id=None,
+        enable_moe_block=enable_moe,
+        num_experts=8 if enable_moe else None,
+        top_k_experts=2 if enable_moe else None,
+        moe_intermediate_size=128 if enable_moe else None,
+        attn_implementation="sdpa",
     )
-    global_attn = global_cfg.build().to(self.accelerator_device)
-    global_attn.init_states()
-
-    out_global = global_attn(x, attention_masks=None)
-    self.assertEqual(out_global.shape, (2, 10, dim))
-
-  def test_gemma4_router_math(self):
-    dim = 16
-    num_experts = 8
-    top_k = 2
-    eps = 1e-6
-    cfg = Gemma4Router.Config(
-        dim=dim,
-        num_experts=num_experts,
-        top_k=top_k,
-        score_func="softmax",
-        route_norm=True,
-        norm=RMSNorm.Config(
-            normalized_shape=dim, eps=eps, elementwise_affine=False
-        ),
-        gate=Linear.Config(
-            in_features=dim,
-            out_features=num_experts,
-            param_init=_LINEAR_INIT,
-        ),
-        param_init={"scale": nn.init.ones_, "per_expert_scale": nn.init.ones_},
-    )
-    router = cfg.build().to(self.accelerator_device)
-    router.init_states()
+    hf_model = transformers.Gemma4ForCausalLM(hf_config).float().eval()
+    # Perturb unit-initialized norms/scales/buffers so scaling bugs are caught.
     with torch.no_grad():
-      router.scale.copy_(torch.linspace(0.5, 1.5, dim, device=self.accelerator_device))
-      router.per_expert_scale.copy_(
-          torch.linspace(0.8, 1.2, num_experts, device=self.accelerator_device)
-      )
-
-    x = torch.randn(2, 5, dim, device=self.accelerator_device)
-    top_scores, selected_experts_indices, _ = router(x)
-
-    # Reference calculation
-    x_normed = F.rms_norm(x.float(), (dim,), weight=None, eps=eps).to(x.dtype)
-    x_scaled = x_normed * (dim**-0.5) * router.scale.to(x.dtype)
-    logits = router.gate(x_scaled)
-    probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-    ref_weights, ref_indices = torch.topk(probs, k=top_k, dim=-1)
-    ref_weights = ref_weights / ref_weights.sum(dim=-1, keepdim=True)
-    ref_weights = (
-        ref_weights.to(x.dtype)
-        * router.per_expert_scale[ref_indices].to(x.dtype)
-    )
-
-    torch.testing.assert_close(
-        top_scores.to(x.dtype), ref_weights, atol=1e-5, rtol=1e-5
-    )
-    torch.testing.assert_close(selected_experts_indices, ref_indices)
-
-  def test_gemma4_grouped_experts_gelu_tanh_with_empty_experts(self):
-    dim, hidden_dim, num_experts = 16, 32, 4
-    cfg = TpuGroupedExperts.Config(
-        dim=dim,
-        hidden_dim=hidden_dim,
-        num_experts=num_experts,
-        activation="gelu_tanh",
-        use_pallas_grouped_mm=False,
-        token_dispatcher=make_token_dispatcher_config(
-            num_experts=num_experts,
-            top_k=2,
-            comm_backend="standard",
-            non_blocking_capacity_factor=None,
-            hidden_dim=dim,
-        ),
-        param_init=_EXPERTS_INIT,
-    )
-    experts = cfg.build().to(self.accelerator_device)
-    experts.init_states()
-
-    # Experts 0 and 2 receive no tokens.
-    counts = [0, 5, 0, 3]
-    x = torch.randn(sum(counts), dim, device=self.accelerator_device)
-    num_tokens_per_expert = torch.tensor(
-        counts, device=self.accelerator_device, dtype=torch.int32
-    )
-    out = experts._experts_forward(x, num_tokens_per_expert)
-    self.assertEqual(out.shape, (sum(counts), dim))
-
-    expected_chunks = []
-    for i, chunk in enumerate(x.split(counts, dim=0)):
-      c_bf16 = chunk.bfloat16()
-      w1 = experts.w1_EFD[i].bfloat16().t()
-      w2 = experts.w2_EDF[i].bfloat16().t()
-      w3 = experts.w3_EFD[i].bfloat16().t()
-      h = F.gelu(c_bf16 @ w1, approximate="tanh") * (c_bf16 @ w3)
-      expected_chunks.append((h @ w2).type_as(x))
-    expected = torch.cat(expected_chunks, dim=0)
-    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
-
-  def test_gemma4_transformer_block_parallel_moe_and_layer_scalar(self):
-    config = _build_flavor_config("testmodel_moe")
-    block = config.layers[0].build().to(self.accelerator_device)
-    block.init_states()
-
-    x = torch.randn(2, 8, config.dim, device=self.accelerator_device)
-    out = block(x, attention_masks=None)
-    self.assertEqual(out.shape, (2, 8, config.dim))
-
-    # If layer_scalar is set to 0, output must be all zeros
-    with torch.no_grad():
-      block.layer_scalar.zero_()
-    out_zero = block(x, attention_masks=None)
-    torch.testing.assert_close(out_zero, torch.zeros_like(out_zero))
-
-  @parameterized.named_parameters(
-      ("dense_testmodel", "testmodel"),
-      ("moe_testmodel", "testmodel_moe"),
-  )
-  def test_gemma4_model_forward_backward_and_softcap(self, flavor):
-    config: Gemma4Model.Config = _build_flavor_config(flavor)
-    model = config.build().to(self.accelerator_device)
-    model.init_states()
-
-    tokens = torch.randint(
-        0, config.vocab_size, (2, 16), device=self.accelerator_device
-    )
-    logits = model(tokens)
-    self.assertEqual(logits.shape, (2, 16, config.vocab_size))
-    self.assertLessEqual(
-        logits.abs().max().item(), config.final_logit_softcapping + 1e-4
-    )
-
-    loss = logits.sum()
-    loss.backward()
-    for name, param in model.named_parameters():
-      self.assertIsNotNone(param.grad, f"Missing gradient for {name}")
-      self.assertTrue(
-          torch.isfinite(param.grad).all(), f"Non-finite gradient for {name}"
-      )
-
-
-  @parameterized.named_parameters(
-      ("dense_testmodel", "testmodel", False),
-      ("moe_testmodel", "testmodel_moe", True),
-  )
-  def test_gemma4_transformer_block_cpu_device_parity(self, flavor, is_moe):
-    """Tests CPU vs. DEVICE forward and backward parity of Gemma4TransformerBlock."""
-    use_cpu_safe_histc_patch()
-    config = _build_flavor_config(flavor)
-    batch, seq_len = 2, 8
-    for layer_id, block_config in enumerate(config.layers):
-      with self.subTest(layer_id=layer_id):
-        block_cpu, block_device = self._setup_module_cpu_device(
-            Gemma4TransformerBlock,
-            lambda m: m.init_states(buffer_device=torch.device("cpu")),
-            config=block_config,
-        )
-        x_cpu, x_device = self._create_input_tensor_cpu_device(
-            (batch, seq_len, config.dim), requires_grad=True
-        )
-        positions_cpu = (
-            torch.arange(seq_len, dtype=torch.long, device="cpu")
-            .unsqueeze(0)
-            .expand(batch, seq_len)
-        )
-        positions_device = positions_cpu.to(self.accelerator_device)
-
-        out_cpu = block_cpu(x_cpu, None, positions_cpu)
-        out_device = block_device(x_device, None, positions_device)
-        test_utils.check_equivalence(
-            out_device.cpu(),
-            out_cpu,
-            atol=1e-1,
-            rtol=1e-1,
-            check_name=f"TransformerBlock Layer {layer_id} Forward",
-        )
-
-        out_cpu.sum().backward()
-        out_device.sum().backward()
-        test_utils.check_equivalence(
-            x_device.grad.cpu(),
-            x_cpu.grad,
-            atol=4e-1,
-            rtol=1e-1,
-            check_name=f"TransformerBlock Layer {layer_id} Input Grad",
-        )
-        for (name, p_cpu), p_device in zip(
-            block_cpu.named_parameters(),
-            block_device.parameters(),
-        ):
-          param_atol = 6.5
-          param_rtol = 1e-1
-          if "moe" in name:
-            param_atol = 6.5
-            param_rtol = 2e-1
-          test_utils.check_equivalence(
-              p_device.grad.cpu(),
-              p_cpu.grad,
-              atol=param_atol,
-              rtol=param_rtol,
-              check_name=f"TransformerBlock Layer {layer_id} Param Grad: {name}",
-          )
+      for name, param in hf_model.named_parameters():
+        if "norm" in name or "scale" in name:
+          param.copy_(1.0 + 0.1 * torch.randn_like(param))
+      for layer in hf_model.model.layers:
+        layer.layer_scalar.fill_(0.85)
+    return hf_model
 
   @parameterized.named_parameters(
       dict(
-          testcase_name="dense_testmodel",
+          testcase_name="dense",
           flavor="testmodel",
-          loss_atol=1e-1,
-          loss_rtol=1e-2,
-          grad_atol=2.5,
-          grad_rtol=1e-2,
-          param_atol=8e-2,
-          param_rtol=1e-2,
+          enable_moe=False,
+          use_tpu_experts=False,
+          logit_atol=5e-2,
+          logit_rtol=1e-2,
+          loss_atol=5e-3,
+          loss_rtol=1e-3,
+          grad_atol=8e-2,
+          grad_rtol=2e-2,
       ),
       dict(
-          testcase_name="moe_testmodel",
+          testcase_name="moe",
           flavor="testmodel_moe",
-          loss_atol=1e-1,
-          loss_rtol=1e-2,
-          grad_atol=2.5,
-          grad_rtol=1e-2,
-          param_atol=8e-2,
-          param_rtol=1e-2,
+          enable_moe=True,
+          use_tpu_experts=False,
+          logit_atol=1e-1,
+          logit_rtol=2e-2,
+          loss_atol=5e-3,
+          loss_rtol=2e-3,
+          grad_atol=8e-2,
+          grad_rtol=2e-2,
+      ),
+      dict(
+          testcase_name="moe_tpu_grouped_experts",
+          flavor="testmodel_moe",
+          enable_moe=True,
+          use_tpu_experts=True,
+          logit_atol=1e-1,
+          logit_rtol=2e-2,
+          loss_atol=5e-3,
+          loss_rtol=2e-3,
+          grad_atol=8e-2,
+          grad_rtol=2e-2,
       ),
   )
-  def test_gemma4_full_model_training_steps_cpu_device_parity(
+  def test_one_step_matches_hf(
       self,
-      flavor,
-      loss_atol,
-      loss_rtol,
-      grad_atol,
-      grad_rtol,
-      param_atol,
-      param_rtol,
+      flavor: str,
+      enable_moe: bool,
+      use_tpu_experts: bool,
+      logit_atol: float,
+      logit_rtol: float,
+      loss_atol: float,
+      loss_rtol: float,
+      grad_atol: float,
+      grad_rtol: float,
   ):
-    """Tests CPU vs. DEVICE parity of full Gemma4 model after 3 training steps."""
     use_cpu_safe_histc_patch()
-    config = _build_flavor_config(flavor)
-    batch, seq_len = 2, 8
+    torch.manual_seed(42)
 
-    model_cpu = Gemma4Model(config)
-    model_cpu.init_weights(buffer_device=torch.device("cpu"))
-    model_cpu = model_cpu.cpu()
+    # Use a sliding window smaller than seq_len so layer 0 actively masks keys
+    # beyond the window while layer 1 attends globally.
+    sliding_window = 8
+    batch_size, seq_len = 2, 16
 
-    self._run_full_model_training_steps_parity_test(
-        model_cpu=model_cpu,
-        loss_atol=loss_atol,
-        loss_rtol=loss_rtol,
-        grad_atol=grad_atol,
-        grad_rtol=grad_rtol,
-        param_atol=param_atol,
-        param_rtol=param_rtol,
-        vocab_size=config.vocab_size,
-        batch=batch,
-        seq_len=seq_len,
+    hf_model = self._build_hf_reference(
+        enable_moe=enable_moe, sliding_window=sliding_window
     )
 
-
-class TestGemma4EndToEndLossConvergence(BaseDeviceTest):
-  """Tests multi-step training loss convergence for Dense and MoE Gemma 4."""
-
-  @parameterized.named_parameters(
-      ("dense_testmodel", "testmodel", False),
-      ("moe_testmodel", "testmodel_moe", True),
-  )
-  def test_dense_and_moe_loss_decreases(self, flavor, use_tpu_experts):
-    torch.manual_seed(42)
-    config: Gemma4Model.Config = _build_flavor_config(flavor)
+    tt_config: Gemma4Model.Config = _build_flavor_config(flavor)
+    tt_config.sliding_window_size = sliding_window
+    for layer_cfg in tt_config.layers:
+      if layer_cfg.attention.is_sliding:
+        layer_cfg.attention.sliding_window_size = sliding_window
     if use_tpu_experts:
       converter = TpuGroupedExpertsConverter(
           TpuGroupedExpertsConverter.Config()
       )
-      config = converter.convert(config)
-      for layer in config.layers:
-        if layer.moe is not None:
-          layer.moe.experts.use_pallas_grouped_mm = False
+      tt_config = converter.convert(tt_config)
+      for layer_cfg in tt_config.layers:
+        if layer_cfg.moe is not None:
+          layer_cfg.moe.experts.use_pallas_grouped_mm = False
 
-    model = config.build().to(self.accelerator_device)
-    model.init_states()
+    tt_model = tt_config.build().to(self.accelerator_device)
+    tt_model.init_states()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
-    tokens = torch.randint(
-        0, config.vocab_size, (2, 16), device=self.accelerator_device
+    adapter = Gemma4StateDictAdapter(tt_config, hf_assets_path=None)
+    converted_sd = adapter.from_hf(
+        {k: v.detach().clone() for k, v in hf_model.state_dict().items()}
     )
-    labels = torch.randint(
-        0, config.vocab_size, (2, 16), device=self.accelerator_device
+    missing, unexpected = tt_model.load_state_dict(converted_sd, strict=False)
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+
+    tokens_cpu = torch.randint(0, tt_config.vocab_size, (batch_size, seq_len))
+    labels_cpu = torch.randint(0, tt_config.vocab_size, (batch_size, seq_len))
+    tokens_dev = tokens_cpu.to(self.accelerator_device)
+    labels_dev = labels_cpu.to(self.accelerator_device)
+    num_tokens = labels_cpu.numel()
+
+    tt_logits = tt_model(tokens_dev)
+    tt_loss = cross_entropy_loss(tt_logits, labels_dev) / num_tokens
+    tt_loss.backward()
+
+    hf_logits = hf_model(input_ids=tokens_cpu).logits
+    hf_loss = cross_entropy_loss(hf_logits, labels_cpu) / num_tokens
+    hf_loss.backward()
+
+    labels = dict(
+        test_label=f"TorchTitan Gemma4Model ({self.accelerator_device.type})",
+        ref_label="HF Gemma4ForCausalLM (CPU)",
+    )
+    test_utils.check_equivalence(
+        tt_logits.detach().float().cpu(),
+        hf_logits.detach().float(),
+        atol=logit_atol,
+        rtol=logit_rtol,
+        check_name="Logits",
+        **labels,
+    )
+    test_utils.check_equivalence(
+        tt_loss.detach().float().cpu(),
+        hf_loss.detach().float(),
+        atol=loss_atol,
+        rtol=loss_rtol,
+        check_name="Loss",
+        **labels,
     )
 
-    losses = []
-    for _ in range(8):
-      optimizer.zero_grad()
-      logits = model(tokens)
-      loss = cross_entropy_loss(logits, labels)
-      loss.backward()
-      optimizer.step()
-      losses.append(loss.item())
+    tt_grads = {
+        name: param.grad.detach().float().cpu()
+        for name, param in tt_model.named_parameters()
+        if param.grad is not None
+    }
+    raw_hf_grads = {
+        name: param.grad.detach().float().cpu()
+        for name, param in hf_model.named_parameters()
+        if param.grad is not None
+    }
+    hf_grads_in_tt_keys = adapter.from_hf(raw_hf_grads)
+    # When weights are tied, both models accumulate the embedding + lm_head
+    # gradient into the single shared parameter (tok_embeddings.weight in TT).
+    if tt_config.enable_weight_tying:
+      hf_grads_in_tt_keys.pop("lm_head.weight", None)
 
-    self.assertLess(
-        losses[-1],
-        losses[0],
-        f"Expected loss to decrease over 8 steps for {flavor}, got {losses}",
-    )
-
-    for i, layer in enumerate(model.layers.values()):
-      if layer.moe is not None:
-        for attr in ("scale", "per_expert_scale"):
-          grad = getattr(layer.moe.router, attr).grad
-          self.assertIsNotNone(grad, f"Layer {i} router.{attr} grad is None")
-          self.assertTrue(torch.isfinite(grad).all())
-        self.assertIsNotNone(layer.moe.router.gate.weight.grad)
+    self.assertEqual(set(tt_grads.keys()), set(hf_grads_in_tt_keys.keys()))
+    for name in sorted(tt_grads.keys()):
+      test_utils.check_equivalence(
+          tt_grads[name],
+          hf_grads_in_tt_keys[name],
+          atol=grad_atol,
+          rtol=grad_rtol,
+          check_name=f"Gradient ({name})",
+          **labels,
+      )
 
 
 if __name__ == "__main__":
