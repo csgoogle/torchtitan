@@ -10,14 +10,14 @@ from torch.nn.attention import sdpa_kernel
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.attention import (
     AttentionMasksType,
-    FlexAttention,
+    FlexInnerAttention,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
     GQAttention,
     QKVLinear,
-    ScaledDotProductAttention,
-    VarlenAttention,
+    ScaledDotProductInnerAttention,
+    VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
@@ -60,7 +60,7 @@ class Gemma4RoPE(CosSinRoPE):
     def _precompute_cache(self) -> torch.Tensor:
         cfg = self.config
         dim = cfg.dim
-        max_seq_len = cfg.max_seq_len
+        max_seq_len = cfg.max_context_length
         base = cfg.theta
         assert cfg.scaling == "none", f"RoPE scaling {cfg.scaling} is not supported"
         rope_angles = int(self.partial_rotary_factor * (dim // 2))
@@ -104,15 +104,17 @@ class QKVLinearKeqV(QKVLinear):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bs, seqlen, _ = x.shape
+        num_tokens = x.shape[0]
         xq, xk = self.wq(x), self.wk(x)
 
         def local_qkv_head_split(tensor: torch.Tensor) -> torch.Tensor:
             with spmd.local():
-                tensor_ = tensor.view(bs, seqlen, -1, self.head_dim)
-                if get_spmd_backend() == "spmd_types":
+                tensor_ = tensor.view(num_tokens, -1, self.head_dim)
+                if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
                     spmd.assert_type(
-                        tensor_, spmd.V, spmd.PartitionSpec("dp", "cp", "tp", None)
+                        tensor_,
+                        spmd.V,
+                        spmd.PartitionSpec(("dp", "cp"), "tp", None),
                     )
             return tensor_
 
@@ -121,19 +123,19 @@ class QKVLinearKeqV(QKVLinear):
         return xq, xk, xk
 
 
-class SlidingWindowScaledDotProductAttention(ScaledDotProductAttention):
-    """``ScaledDotProductAttention`` that honors ``sliding_window_size``.
+class SlidingWindowScaledDotProductAttention(ScaledDotProductInnerAttention):
+    """``ScaledDotProductInnerAttention`` that honors ``sliding_window_size``.
 
     Upstream SDPA only supports plain causal attention. When
     ``sliding_window_size`` is set, each query attends to itself and the
     ``sliding_window_size`` previous keys, via an explicit band mask. This is
     the same attribute and convention the TPU splash patches read, and the
-    class name keeps matching their ``"ScaledDotProductAttention"`` lookup, so
+    class name keeps matching their ``"ScaledDotProduct"`` lookup, so
     enabling a splash kernel still replaces this module.
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(ScaledDotProductAttention.Config):
+    class Config(ScaledDotProductInnerAttention.Config):
         pass
 
     def __init__(self, config: Config) -> None:
@@ -142,9 +144,9 @@ class SlidingWindowScaledDotProductAttention(ScaledDotProductAttention):
 
     def forward(
         self,
-        q_BLNH: torch.Tensor,
-        k_BLNH: torch.Tensor,
-        v_BLNH: torch.Tensor,
+        q_BLHK: torch.Tensor,
+        k_BLHK: torch.Tensor,
+        v_BLHV: torch.Tensor,
         *,
         attention_masks: AttentionMasksType | None = None,
         scale: float | None = None,
@@ -154,9 +156,9 @@ class SlidingWindowScaledDotProductAttention(ScaledDotProductAttention):
     ) -> torch.Tensor:
         if self.sliding_window_size is None:
             return super().forward(
-                q_BLNH,
-                k_BLNH,
-                v_BLNH,
+                q_BLHK,
+                k_BLHK,
+                v_BLHV,
                 attention_masks=attention_masks,
                 scale=scale,
                 enable_gqa=enable_gqa,
@@ -168,20 +170,46 @@ class SlidingWindowScaledDotProductAttention(ScaledDotProductAttention):
                 "SlidingWindowScaledDotProductAttention does not support "
                 "attention_masks."
             )
-        seq_len = q_BLNH.shape[1]
-        pos = torch.arange(seq_len, device=q_BLNH.device)
+        was_3d = q_BLHK.ndim == 3
+        if was_3d:
+            seq_len = None
+            try:
+                from torchtitan.experiments.tpu.unflatten_shim import (
+                    get_unflatten_seq_len,
+                )
+
+                seq_len = get_unflatten_seq_len()
+            except ImportError:
+                pass
+            num_tokens = q_BLHK.shape[0]
+            if seq_len is None:
+                seq_len = num_tokens
+            elif num_tokens % seq_len != 0:
+                raise ValueError(
+                    f"TT-UNFLATTEN-SHIM: num_tokens ({num_tokens}) is not cleanly "
+                    f"divisible by seq_len ({seq_len})."
+                )
+            batch_size = num_tokens // seq_len
+            q_BLHK = q_BLHK.reshape(batch_size, seq_len, *q_BLHK.shape[1:])
+            k_BLHK = k_BLHK.reshape(batch_size, seq_len, *k_BLHK.shape[1:])
+            v_BLHV = v_BLHV.reshape(batch_size, seq_len, *v_BLHV.shape[1:])
+        seq_len = q_BLHK.shape[1]
+        pos = torch.arange(seq_len, device=q_BLHK.device)
         dist = pos[:, None] - pos[None, :]
         mask_LL = (dist >= 0) & (dist <= self.sliding_window_size)
         with sdpa_kernel(self.sdpa_backends, set_priority=True):
-            out_BNLH = F.scaled_dot_product_attention(
-                q_BLNH.transpose(1, 2),
-                k_BLNH.transpose(1, 2),
-                v_BLNH.transpose(1, 2),
+            out_BHLV = F.scaled_dot_product_attention(
+                q_BLHK.transpose(1, 2),
+                k_BLHK.transpose(1, 2),
+                v_BLHV.transpose(1, 2),
                 attn_mask=mask_LL,
                 scale=scale,
                 enable_gqa=enable_gqa,
             )
-        return out_BNLH.transpose(1, 2)
+        out_BLHV = out_BHLV.transpose(1, 2)
+        if was_3d:
+            return out_BLHV.reshape(-1, *out_BLHV.shape[2:])
+        return out_BLHV
 
 
 class Gemma4Attention(GQAttention):
@@ -197,7 +225,8 @@ class Gemma4Attention(GQAttention):
         if (
             config.is_sliding
             and config.sliding_window_size is not None
-            and type(config.inner_attention) is ScaledDotProductAttention.Config
+            and type(config.inner_attention)
+            is ScaledDotProductInnerAttention.Config
         ):
             # Plain SDPA is causal-only and would silently drop the window.
             config = dataclasses.replace(
@@ -222,21 +251,21 @@ class Gemma4Attention(GQAttention):
 
     def forward(
         self,
-        x_BLD: torch.Tensor,
+        x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
         segment_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        B, L, _ = x_BLD.shape
-        xq_BLNH, xk_BLNH, xv_BLNH = self.qkv_linear(x_BLD)
+        xq_THK, xk_THK, xv_THV = self.qkv_linear(x_TD)
 
         if self.q_norm is not None or self.k_norm is not None:
             assert self.q_norm is not None and self.k_norm is not None
-            xq_BLNH = self.q_norm(xq_BLNH)
-            xk_BLNH = self.k_norm(xk_BLNH)
-        xv_BLNH = self.v_norm(xv_BLNH)
+            xq_THK = self.q_norm(xq_THK)
+            xk_THK = self.k_norm(xk_THK)
+        xv_THV = self.v_norm(xv_THV)
 
-        xq_BLNH, xk_BLNH = self.rope(xq_BLNH, xk_BLNH, positions)
+        if self.rope is not None:
+            xq_THK, xk_THK = self.rope(xq_THK, xk_THK, positions)
 
         mask: AttentionMasksType | None
         if isinstance(attention_masks, dict):
@@ -248,18 +277,18 @@ class Gemma4Attention(GQAttention):
         else:
             mask = attention_masks
 
-        out_BLNH = self.inner_attention(
-            xq_BLNH,
-            xk_BLNH,
-            xv_BLNH,
+        out_THV = self.inner_attention(
+            xq_THK,
+            xk_THK,
+            xv_THV,
             attention_masks=mask,
             scale=self.scaling,
             enable_gqa=self.enable_gqa,
             positions=positions,
             segment_ids=segment_ids,
         ).contiguous()
-        out_BLD = out_BLNH.view(B, L, -1)
-        return self.wo(out_BLD)
+        out_TD = out_THV.view(out_THV.shape[0], -1)
+        return self.wo(out_TD)
 
 
 class Gemma4FeedForward(FeedForward):
@@ -290,22 +319,27 @@ class Gemma4Router(TokenChoiceTopKRouter):
         self.per_expert_scale = nn.Parameter(torch.ones(config.num_experts))
 
     def forward(
-        self, x_BLD: torch.Tensor, expert_bias_E: torch.Tensor | None = None
+        self,
+        x_TD: torch.Tensor,
+        expert_bias_E: torch.Tensor | None = None,
+        **router_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_normed = self.norm(x_BLD) * self.root_size * self.scale.to(x_BLD.dtype)
-        topk_scores_BLK, topk_expert_ids_BLK, scores_BLE = super().forward(
-            x_normed, expert_bias_E
+        x_normed = self.norm(x_TD) * self.root_size * self.scale.to(x_TD.dtype)
+        topk_scores_TK, topk_expert_ids_TK, routing_map_TE = super().forward(
+            x_normed, expert_bias_E, **router_kwargs
         )
-        expert_scales_BLK = (
-            scores_BLE.new_zeros(scores_BLE.shape)
-            + self.per_expert_scale.to(topk_scores_BLK.dtype)
-        ).gather(dim=-1, index=topk_expert_ids_BLK)
-        topk_scores_BLK = topk_scores_BLK * expert_scales_BLK
-        return topk_scores_BLK, topk_expert_ids_BLK, scores_BLE
+        expert_scales_TK = (
+            routing_map_TE.new_zeros(
+                routing_map_TE.shape, dtype=topk_scores_TK.dtype
+            )
+            + self.per_expert_scale.to(topk_scores_TK.dtype)
+        ).gather(dim=-1, index=topk_expert_ids_TK)
+        topk_scores_TK = topk_scores_TK * expert_scales_TK
+        return topk_scores_TK, topk_expert_ids_TK, routing_map_TE
 
 
 class Gemma4MoE(MoE):
-    """Gemma4 MoE module applying ``pre_feedforward_layernorm_2`` to expert inputs while routing on residual ``x_BLD``."""
+    """Gemma4 MoE module applying ``pre_feedforward_layernorm_2`` to expert inputs while routing on residual ``x_TD``."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(MoE.Config):
@@ -319,97 +353,39 @@ class Gemma4MoE(MoE):
             else None
         )
 
-    def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
-        from torch.distributed.tensor import DTensor
-        from torchtitan.models.common.moe import _tokens_per_expert
-        from torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
-
-        B, L, _ = x_BLD.shape
-        sp_size = getattr(self.experts.token_dispatcher, "sp_size", 1)
-        if not isinstance(x_BLD, DTensor) and self.seq_dim_tp_sharded:
-            seq_pad = 0
-            seq_dim_pad_tokens = 0
-            num_local_tokens_after_seq_dim_padding = B * L
-        else:
-            seq_pad = sp_size - L if L < sp_size else 0
-            if seq_pad:
-                x_BLD = F.pad(x_BLD, (0, 0, 0, seq_pad))
-                L = L + seq_pad
-            seq_dim_pad_tokens = (-L) % sp_size
-            local_batch_size = (
-                x_BLD._local_tensor.shape[0] if isinstance(x_BLD, DTensor) else B
-            )
-            num_local_tokens_after_seq_dim_padding = (
-                local_batch_size * (L + seq_dim_pad_tokens) // sp_size
-            )
-
-        # Router receives unnormalized residual x_BLD (applies its own scale-free RMSNorm).
+    def forward(self, x_TD: torch.Tensor, **router_kwargs) -> torch.Tensor:
+        # Router receives unnormalized residual x_TD (applies its own scale-free RMSNorm).
         (
-            topk_scores_BLK,
-            topk_expert_ids_BLK,
-            scores_BLE,
-        ) = self.router(x_BLD, self.expert_bias_E)
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            routing_map_TE,
+        ) = self.router(x_TD, self.expert_bias_E, **router_kwargs)
+        num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
 
-        if self.training and self.aux_loss is not None:
-            topk_scores_BLK = self.aux_loss(
-                topk_scores_BLK,
-                scores_BLE,
-                topk_expert_ids_BLK,
-            )
+        if self.training:
+            with torch.no_grad():
+                self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
 
-        num_local_tokens_per_expert_E = _tokens_per_expert(
-            topk_expert_ids_BLK,
-            scores_BLE.size(-1),
-        )
-        if (
-            self.training
-            and self.aux_loss is not None
-            and self.aux_loss.collect_routing_metrics
-        ):
-            self.aux_loss._last_local_tokens_per_expert_E = (
-                num_local_tokens_per_expert_E.detach().float()
-            )
-
-        with torch.no_grad():
-            self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
-
-        # Routed experts receive pre_feedforward_layernorm_2(x_BLD).
-        x_experts_BLD = (
-            self.pre_feedforward_layernorm_2(x_BLD)
+        # Routed experts receive pre_feedforward_layernorm_2(x_TD).
+        x_experts_TD = (
+            self.pre_feedforward_layernorm_2(x_TD)
             if self.pre_feedforward_layernorm_2 is not None
-            else x_BLD
+            else x_TD
         )
-        out_BLD = self.experts(
-            x_experts_BLD,
-            topk_scores_BLK,
-            topk_expert_ids_BLK,
+        out_TD = self.routed_experts(
+            x_experts_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
-            num_local_tokens_after_seq_dim_padding=(
-                num_local_tokens_after_seq_dim_padding
-            ),
         )
 
-        shared_out_BLD = (
-            self.shared_experts(x_BLD) if self.shared_experts is not None else None
+        shared_out_TD = (
+            self.shared_experts(x_TD) if self.shared_experts is not None else None
         )
 
-        if (
-            isinstance(self.experts.token_dispatcher, DeepEPTokenDispatcher)
-            and self.experts.token_dispatcher.sp_size == 1
-        ):
-            from torchtitan.distributed.deepep.deepep import sync_combine
-
-            sync_combine()
-
-        if seq_dim_pad_tokens:
-            out_BLD = out_BLD[:, :L, :]
-
-        if shared_out_BLD is not None:
-            out_BLD = out_BLD + shared_out_BLD
-
-        if seq_pad:
-            out_BLD = out_BLD[:, : L - seq_pad, :]
-        return out_BLD
+        if shared_out_TD is not None:
+            out_TD = out_TD + shared_out_TD
+        return out_TD
 
 
 class Gemma4TransformerBlock(TransformerBlock):
@@ -516,7 +492,7 @@ class Gemma4Model(Decoder):
 
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
-            seq_len = config.training.seq_len
+            max_context_length = config.training.max_context_length
             tp = parallelism.tensor_parallel_degree
             if tp > 1:
                 for idx, layer in enumerate(self.layers):
@@ -531,19 +507,24 @@ class Gemma4Model(Decoder):
                             f"n_kv_heads ({attn.n_kv_heads})."
                         )
             if parallelism.context_parallel_degree > 1 and isinstance(
-                self.layers[0].attention.inner_attention, VarlenAttention.Config
+                self.layers[0].attention.inner_attention,
+                VarlenInnerAttention.Config,
             ):
                 raise NotImplementedError(
-                    "Context Parallelism is not supported with VarlenAttention "
+                    "Context Parallelism is not supported with VarlenInnerAttention "
                     "in Gemma4."
                 )
 
             local_global_batch_size = kwargs.get(
-                "local_global_batch_size", config.training.local_batch_size
+                "local_global_batch_size",
+                config.training.num_tokens_per_microbatch_per_dp_rank
+                // max_context_length,
             )
-            global_batch_size = kwargs.get(
-                "global_batch_size", config.training.global_batch_size
-            )
+            global_batch_size = kwargs.get("global_batch_size")
+            if global_batch_size is None:
+                global_batch_size = config.training.num_tokens_per_train_step
+                if global_batch_size > 0:
+                    global_batch_size //= max_context_length
             if global_batch_size < 0:
                 global_batch_size = local_global_batch_size
 
@@ -559,11 +540,11 @@ class Gemma4Model(Decoder):
                 attn = layer.attention
                 assert isinstance(attn, Gemma4Attention.Config)
                 if (
-                    isinstance(attn.inner_attention, VarlenAttention.Config)
+                    isinstance(attn.inner_attention, VarlenInnerAttention.Config)
                     and attn.is_sliding
                     and attn.sliding_window_size is not None
                 ):
-                    attn.inner_attention = VarlenAttention.Config(
+                    attn.inner_attention = VarlenInnerAttention.Config(
                         window_size=(attn.sliding_window_size - 1, 0)
                     )
                 if (
@@ -584,13 +565,17 @@ class Gemma4Model(Decoder):
                 )
 
             if isinstance(
-                self.layers[0].attention.inner_attention, FlexAttention.Config
+                self.layers[0].attention.inner_attention,
+                FlexInnerAttention.Config,
             ):
                 block_size = self.layers[0].attention.inner_attention.block_size
-                if isinstance(block_size, int) and seq_len % block_size != 0:
+                if (
+                    isinstance(block_size, int)
+                    and max_context_length % block_size != 0
+                ):
                     logger.warning(
-                        f"training.seq_len ({seq_len}) is not divisible by "
-                        f"FlexAttention block_size ({block_size})."
+                        f"training.max_context_length ({max_context_length}) is not divisible by "
+                        f"FlexInnerAttention block_size ({block_size})."
                     )
 
             set_gemma4_sharding_config(
@@ -650,9 +635,12 @@ class Gemma4Model(Decoder):
                 if moe is not None:
                     if not isinstance(moe, MoE.Config):
                         raise ValueError("Expected MoE.Config")
+                    experts_hidden_dim = (
+                        moe.routed_experts.inner_experts.hidden_dim
+                    )
                     forward_weight_flops += (
                         2 * dim * moe.num_experts
-                        + 6 * dim * moe.experts.hidden_dim * moe.router.top_k
+                        + 6 * dim * experts_hidden_dim * moe.router.top_k
                     )
 
             return nparams, 3 * (forward_weight_flops + forward_attention_flops)
@@ -665,12 +653,16 @@ class Gemma4Model(Decoder):
     def get_attention_masks(
         self,
         positions: torch.Tensor,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        max_num_documents: int | None = None,
+        max_context_length: int | None = None,
     ) -> AttentionMasksType | None:
         attn_config = self.config.first_attention
         if attn_config is None:
             return None
         inner_attn = attn_config.inner_attention
-        if isinstance(inner_attn, FlexAttention.Config):
+        if isinstance(inner_attn, FlexInnerAttention.Config):
             base_mods = [
                 get_causal_mask_mod(),
                 get_efficient_causal_mask_mod_for_packed_document(positions),
@@ -692,7 +684,12 @@ class Gemma4Model(Decoder):
                 "basic_mask": basic_mask,
                 "sliding_window_mask": sliding_window_mask,
             }
-        return super().get_attention_masks(positions)
+        return super().get_attention_masks(
+            positions,
+            padding_mask=padding_mask,
+            max_num_documents=max_num_documents,
+            max_context_length=max_context_length,
+        )
 
     def forward(
         self,

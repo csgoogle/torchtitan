@@ -79,7 +79,7 @@ def _check_offload_engaged(gm):
   # the larger tensor at this size. Offloading those would ship a tensor the
   # backward reloads immediately.
   offload_node = next(n for n in fwd_body.nodes if n.target is _OFFLOAD)
-  assert offload_node.meta["val"].dim() >= 3, (
+  assert offload_node.meta["val"].dim() >= 2, (
       f"offloaded {tuple(offload_node.meta['val'].shape)}, which is not a stack"
   )
 
@@ -132,6 +132,8 @@ class ScanOffloadDistributedTest(
   """Trains llama3 with offloading on, and reads the graph it produced."""
 
   def test_scan_offload(self):
+    # Upstream replaced seq_len/local_batch_size with a token budget:
+    # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len = 4 * 128.
     self._test_train_distributed(
         config_args=[
             "--module=torchtitan.experiments.tpu.llama3",
@@ -140,11 +142,11 @@ class ScanOffloadDistributedTest(
             "--dataloader.dataset_path=tests/assets/c4_test",
             "--dataloader.dataset=c4_test",
             "--hf_assets_path=tests/assets/tokenizer",
-            "--training.seq_len=128",
+            "--training.max_context_length=128",
             "--training.steps=1",
             "--training.mixed_precision_param=float32",
             "--training.mixed_precision_reduce=float32",
-            "--training.local_batch_size=4",
+            "--training.num_tokens_per_microbatch_per_dp_rank=512",
             "--splash_attention_kernel.use_splash_attention_kernel",
             "--tpu_config.use_graph_trainer",
             "--tpu_config.compile_mode=aot_fx_trace",

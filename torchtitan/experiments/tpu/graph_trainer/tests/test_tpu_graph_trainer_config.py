@@ -73,6 +73,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
     qwen3_moe_235b_fsdp_activation_offload_4x4x4,
+    qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4,
     qwen3_moe_235b_scan,
     qwen3_moe_235b_scan_maxtext,
     qwen3_moe_235b_scan_proxy,
@@ -83,6 +84,9 @@ from torchtitan.experiments.tpu.token_dispatcher import (
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
 from torchtitan.models.common import ComplexRoPE, Linear
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.llama3.config_registry import (
+    model_registry as llama3_model_registry,
+)
 
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
@@ -165,9 +169,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_scanning_needs_the_graph_trainer(self) -> None:
     """Off the graph-trainer lane nothing applies the flag, so it must not be
     silently accepted."""
+    # Upstream d771abb0 made `model_spec` required; the flag check under test
+    # does not look at it.
     with self.assertRaisesRegex(ValueError, "use-graph-trainer"):
       TPUTrainerConfig(
-          tpu_config=TPUConfig(use_scan_layers=True, use_graph_trainer=False)
+          model_spec=llama3_model_registry("debugmodel", attn_backend="sdpa"),
+          tpu_config=TPUConfig(use_scan_layers=True, use_graph_trainer=False),
       )
 
   @parameterized.parameters("sac_and_offload", "full_and_offload")
@@ -440,7 +447,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(config.training.mixed_precision_reduce, "bfloat16")
     self.assertFalse(config.tpu_config.use_scan_layers)
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.bf16_rope",
+        "torchtitan.experiments.tpu.overrides.bf16_rope"
+        ".tpu_activation_dtype_cossin_rope",
         config.override.imports,
     )
     splash = config.splash_attention_kernel
@@ -482,9 +490,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertLen(
         list(config.model_spec.model.traverse(TpuPackedQKVLinear.Config)), 64
     )
-    self.assertEqual(config.training.local_batch_size, 8)
-    self.assertEqual(config.training.global_batch_size, 1024)
-    self.assertEqual(config.training.seq_len, 4096)
+    self.assertEqual(config.training.max_context_length, 4096)
+    self.assertEqual(
+        config.training.num_tokens_per_microbatch_per_dp_rank, 8 * 4096
+    )
+    self.assertEqual(config.training.num_tokens_per_train_step, 1024 * 4096)
     self.assertEqual(config.training.mixed_precision_reduce, reduce_dtype)
     self.assertEqual(config.parallelism, zero3.parallelism)
     self.assertEqual(
@@ -498,6 +508,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
     self.assertEqual(
         "torchtitan.experiments.tpu.overrides.bf16_rope"
+        ".tpu_activation_dtype_cossin_rope"
         in config.override.imports,
         bf16_rope,
     )
@@ -525,7 +536,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_32b_4x8x8()
     base = qwen3_32b()
 
-    self.assertEqual(config.training.global_batch_size, 4096)
+    self.assertEqual(config.training.num_tokens_per_train_step, 4096 * 4096)
     self.assertEqual(
         config.tpu_config,
         dataclasses.replace(
@@ -545,6 +556,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
 
     self.assertEqual(config.optimizer.implementation, "fused")
+    self.assertTrue(
+        config.splash_attention_kernel.use_tokamax_splash_attention_kernel
+    )
     self.assertTrue(config.splash_attention_kernel.use_vmap_bwd)
     self.assertFalse(
         config.splash_attention_kernel.sa_use_document_aware_block_skipping
@@ -656,21 +670,21 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           target_cls=TpuGraphTrainer.Config,
       )
 
-  def test_fsdp_allreduce_slice_requires_fp32_reductions(self) -> None:
+  def test_fsdp_allreduce_slice_allows_bf16_reductions(self) -> None:
     config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
     config.training.mixed_precision_reduce = "bfloat16"
 
-    with self.assertRaisesRegex(ValueError, "FP32 FSDP reductions"):
-      to_tpu_graph_trainer_config(
-          config,
-          qwen3_gt.model_registry,
-          target_cls=TpuGraphTrainer.Config,
-      )
+    to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
 
   def test_attention_parity_recipe_adds_bf16_rope(self) -> None:
     config = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.bf16_rope",
+        "torchtitan.experiments.tpu.overrides.bf16_rope"
+        ".tpu_activation_dtype_cossin_rope",
         config.override.imports,
     )
     assert config.model_spec is not None
@@ -739,6 +753,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       self.assertEqual(moe.aux_loss.coeff, 1e-3)
       self.assertEqual(moe.aux_loss.top_k, moe.router.top_k)
 
+  def test_235b_splitter_uses_tokamax_splash_attention(self) -> None:
+    for config in (
+        qwen3_moe_235b_fsdp_activation_offload_4x4x4(),
+        qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4(),
+    ):
+      with self.subTest(reduce_dtype=config.training.mixed_precision_reduce):
+        splash = config.splash_attention_kernel
+        self.assertTrue(splash.use_tokamax_splash_attention_kernel)
+        self.assertFalse(splash.sa_use_document_aware_block_skipping)
+
   def test_235b_4x4x4_uses_hierarchical_reduce_scatter(self) -> None:
     config = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
 
@@ -764,8 +788,14 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_235b_recipe_matches_the_maxtext_shape(self) -> None:
     config = qwen3_moe_235b_scan()
 
-    self.assertEqual(config.training.local_batch_size, 16)
-    self.assertEqual(config.training.seq_len, 4096)
+    # local_batch_size is now
+    # num_tokens_per_microbatch_per_dp_rank // max_context_length.
+    self.assertEqual(
+        config.training.num_tokens_per_microbatch_per_dp_rank
+        // config.training.max_context_length,
+        16,
+    )
+    self.assertEqual(config.training.max_context_length, 4096)
     self.assertTrue(config.tpu_config.use_scan_layers)
     self.assertEqual(
         config.tpu_config.graph_trainer_memory_policy, "full_and_scan_offload"
@@ -777,11 +807,14 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     assert proxy.model_spec is not None
     self.assertLen(proxy.model_spec.model.layers, 12)
+    # The 32x global-to-local ratio, now in token counts: both sides scale by
+    # the same max_context_length, so the ratio carries over unchanged.
     self.assertEqual(
-        proxy.training.global_batch_size, 32 * proxy.training.local_batch_size
+        proxy.training.num_tokens_per_train_step,
+        32 * proxy.training.num_tokens_per_microbatch_per_dp_rank,
     )
 
-  def test_235b_maxtext_twin_changes_only_the_three_numerics_knobs(self) -> None:
+  def test_235b_maxtext_twin_changes_only_the_two_numerics_knobs(self) -> None:
     base = qwen3_moe_235b_scan()
     maxtext = qwen3_moe_235b_scan_maxtext()
 
@@ -789,20 +822,29 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(maxtext.training.mixed_precision_reduce, "bfloat16")
     self.assertEqual(
         set(maxtext.override.imports) - set(base.override.imports),
-        {"torchtitan.experiments.tpu.overrides.bf16_rope"},
+        {
+            "torchtitan.experiments.tpu.overrides.bf16_rope"
+            ".tpu_activation_dtype_cossin_rope"
+        },
     )
     assert base.model_spec is not None and maxtext.model_spec is not None
-    for config, expected in ((base, False), (maxtext, True)):
+    # The FP32 route-score fusion is not a numerics knob: every Q235 recipe
+    # uses it.
+    splitter = qwen3_moe_235b_fsdp_activation_offload_4x4x4()
+    assert splitter.model_spec is not None
+    for config in (base, maxtext, splitter):
       dispatchers = list(
           config.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
       )
       self.assertLen(dispatchers, 94)
-      self.assertTrue(
-          all(d.fuse_route_score_backward is expected for _, d, _, _ in dispatchers)
-      )
+      self.assertTrue(all(d.fuse_route_score_backward for _, d, _, _ in dispatchers))
     # Everything the base recipe works around is inherited, not re-derived.
     self.assertEqual(maxtext.model_spec.flavor, base.model_spec.flavor)
-    self.assertEqual(maxtext.training.local_batch_size, 16)
+    self.assertEqual(
+        maxtext.training.num_tokens_per_microbatch_per_dp_rank
+        // maxtext.training.max_context_length,
+        16,
+    )
     self.assertTrue(maxtext.tpu_config.use_scan_layers)
 
   def test_optimizer_implementation_cli_override_is_authoritative(self) -> None:
@@ -891,7 +933,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.real_rope",
+        "torchtitan.experiments.tpu.overrides.real_rope"
+        ".tpu_real_arithmetic_complex_rope",
         graph_config.override.imports,
     )
     apply_overrides(graph_config.override, graph_config)
@@ -920,7 +963,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
     self.assertIn(
-        "torchtitan.experiments.tpu.overrides.fused_loss",
+        "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head",
         graph_config.override.imports,
     )
     apply_overrides(graph_config.override, graph_config)
@@ -1088,6 +1131,63 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           typing.cast(typing.Any, SimpleNamespace(num_static_inputs=0)),
           graph_config,
       )
+
+  def test_to_tpu_graph_trainer_config_configures_simple_fsdp_shard_dims_with_scan(
+      self,
+  ) -> None:
+    config = llama3_8b_scan()
+    config.parallelism.data_parallel_shard_degree = 512
+    called_with: list[nn.Module] = []
+
+    def stub_registry(flavor: str):
+      spec = llama3_gt.model_registry(flavor)
+      return dataclasses.replace(
+          spec,
+          parallelize_fn=lambda model, **kwargs: (
+              called_with.append(model) or model
+          ),
+      )
+
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        stub_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    wrapped_fn = graph_config.model_spec.parallelize_fn
+
+    class DummyHolder(nn.Module):
+      def __init__(self):
+        super().__init__()
+        self.flattened_for = None
+        self.split_meshes_built = False
+
+      def flatten_for(self, degree: int) -> list[str]:
+        self.flattened_for = degree
+        return []
+
+      def plan_shard_dims(self, degree: int) -> dict[str, int]:
+        return {"w": 1}
+
+      def build_split_meshes(self) -> None:
+        self.split_meshes_built = True
+
+    class DummyModel(nn.Module):
+      def __init__(self):
+        super().__init__()
+        self.tok_embeddings = nn.Embedding(128256, 4096)
+        self.lm_head = nn.Linear(4096, 128256, bias=False)
+        self.layer_stacks = DummyHolder()
+
+    m = DummyModel()
+    pdims = SimpleNamespace(dp_shard=512, cp=1)
+    out = wrapped_fn(m, parallel_dims=pdims)
+    self.assertIs(out, m)
+    self.assertEqual(called_with, [m])
+    self.assertEqual(getattr(m.tok_embeddings, "_fsdp_shard_dim", None), 1)
+    self.assertEqual(getattr(m.lm_head, "_fsdp_shard_dim", None), 1)
+    self.assertEqual(m.layer_stacks.flattened_for, 512)
+    self.assertEqual(getattr(m.layer_stacks, "_fsdp_shard_dim", None), {"w": 1})
+    self.assertTrue(m.layer_stacks.split_meshes_built)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,9 @@ from absl.testing import parameterized
 import torch
 
 from torchtitan.config import derive
+from torchtitan.experiments.graph_trainer.common_utils import (
+    build_decoder_config_for_backend,
+)
 from torchtitan.experiments.tpu.layer_loop import (
     _forward,
     builds_layer_loop,
@@ -30,14 +33,28 @@ from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.protocols.module import ModuleDict
 
 BATCH, SEQ = 2, 16
+# Upstream d771abb0 folds `[B, S]` into one packed `[T]` stream.
+TOKENS = BATCH * SEQ
 
 
 def _stock_config():
-  config = llama3_configs["debugmodel"](attn_backend="sdpa")
-  # The flavor defaults to max_seq_len=131072; keep the RoPE cache small.
+  # Upstream d771abb0 made `llama3_configs[flavor]` a
+  # `(builder, max_context_length)` pair and `seq_len` a required
+  # keyword-only argument of the builder.
+  build_config, max_context_length = llama3_configs["debugmodel"]
+  # The same release folded `[B, S]` into a packed `[T]` token stream.
+  # `ScaledDotProductInnerAttention` was left behind on the rank-4 interface and
+  # is no longer a valid decoder backend, so go through the helper that builds
+  # the flex config and swaps in the `[T]`-native SDPA adapter.
+  config = build_decoder_config_for_backend(
+      build_config, "sdpa", seq_len=max_context_length
+  )
+  # The flavor defaults to max_context_length=131072; keep the RoPE cache small.
+  # It has to hold every packed token, not just one document's worth: with
+  # `positions=None` the decoder reads `cache[:T]`, and `T` is `BATCH * SEQ`.
   for layer_cfg in config.layers:
     layer_cfg.attention.rope = dataclasses.replace(
-        layer_cfg.attention.rope, max_seq_len=SEQ
+        layer_cfg.attention.rope, max_context_length=TOKENS
     )
   return config
 
@@ -63,13 +80,13 @@ def _tpu_model():
 
 
 def _tokens(model, *, with_positions):
+  # Upstream d771abb0 folds the batch axis away: the decoder takes a packed
+  # `[T]` token stream and `[T]` positions that reset to 0 per document.
   g = torch.Generator().manual_seed(1)
-  tokens = torch.randint(0, model.config.vocab_size, (BATCH, SEQ), generator=g)
-  positions = (
-      torch.arange(SEQ).unsqueeze(0).expand(BATCH, SEQ).clone()
-      if with_positions
-      else None
+  tokens = torch.randint(
+      0, model.config.vocab_size, (TOKENS,), generator=g
   )
+  positions = torch.arange(SEQ).repeat(BATCH) if with_positions else None
   return tokens, positions
 
 
@@ -124,7 +141,7 @@ class ForwardParityTest(parameterized.TestCase):
     model.lm_head = None
     model.layers = ModuleDict()
 
-    h = torch.randn(BATCH, SEQ, model.config.dim)
+    h = torch.randn(TOKENS, model.config.dim)
     with torch.no_grad():
       torch.testing.assert_close(model(h), h, rtol=0, atol=0)
 

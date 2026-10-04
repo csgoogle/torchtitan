@@ -16,7 +16,17 @@ __all__ = [
     "qwen3_debugmodel",
     "qwen3_debugmodel_moe",
     "model_registry",
+    "TESTMODEL_MAX_CONTEXT_LENGTH",
 ]
+
+# Context lengths of the flavors this module defines itself, named so the
+# `ModelSpec.max_context_length` that upstream d771abb0 made required can reuse
+# the exact value each flavor's RoPE config is built with.
+# `_testmodel`/`_testmodel_moe` match upstream's `("testmodel", 128)` entry;
+# `_8b_tpu` matches upstream's `("8B", 40960)` entry.
+TESTMODEL_MAX_CONTEXT_LENGTH = 128
+_8B_MAX_CONTEXT_LENGTH = 40960
+
 
 def _testmodel(attn_backend: str = "sdpa") -> MaxTextQwen3Config:
     dim = 128
@@ -50,7 +60,7 @@ def _testmodel(attn_backend: str = "sdpa") -> MaxTextQwen3Config:
             attn_backend=attn_backend,
             rope=common_models.CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=128,
+                max_context_length=TESTMODEL_MAX_CONTEXT_LENGTH,
                 theta=1000000.0,
             ),
         ),
@@ -93,7 +103,7 @@ def _testmodel_moe(
             moe_comm_backend=moe_comm_backend,
             rope=common_models.CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=128,
+                max_context_length=TESTMODEL_MAX_CONTEXT_LENGTH,
                 theta=1000000.0,
             ),
         ),
@@ -137,7 +147,7 @@ def _8b_tpu(attn_backend: str = "sdpa") -> MaxTextQwen3Config:
             attn_backend=attn_backend,
             rope=common_models.CosSinRoPE.Config(
                 dim=head_dim,
-                max_seq_len=40960,
+                max_context_length=_8B_MAX_CONTEXT_LENGTH,
                 theta=1000000.0,
             ),
         ),
@@ -145,30 +155,35 @@ def _8b_tpu(attn_backend: str = "sdpa") -> MaxTextQwen3Config:
     )
 
 
+def _upstream_flavor(flavor: str, attn_backend: str):
+  """Builds an upstream qwen3 flavor at that flavor's full context length.
+
+  Upstream d771abb0 changed `qwen3_models.qwen3_configs[flavor]` from a
+  `(attn_backend) -> Config` callable into a `(builder, max_context_length)`
+  pair, and made `seq_len` a required keyword-only argument of the builder.
+  Passing the flavor's own `max_context_length` reproduces what the old
+  callable produced.
+  """
+  build_config, max_context_length = qwen3_models.qwen3_configs[flavor]
+  return build_config(attn_backend, seq_len=max_context_length)
+
+
 qwen3_configs = {
     "testmodel": _testmodel("sdpa"),
     "testmodel_moe": _testmodel_moe("sdpa"),
     "debugmodel": MaxTextQwen3Config.from_qwen3(
-        qwen3_models.qwen3_configs["debugmodel"]("sdpa")
+        _upstream_flavor("debugmodel", "sdpa")
     ),
     "debugmodel_moe": MaxTextQwen3Config.from_qwen3(
-        qwen3_models.qwen3_configs["debugmodel_moe"]("sdpa")
+        _upstream_flavor("debugmodel_moe", "sdpa")
     ),
-    "0.6B": MaxTextQwen3Config.from_qwen3(
-        qwen3_models.qwen3_configs["0.6B"]("sdpa")
-    ),
-    "1.7B": MaxTextQwen3Config.from_qwen3(
-        qwen3_models.qwen3_configs["1.7B"]("sdpa")
-    ),
-    "4B": MaxTextQwen3Config.from_qwen3(
-        qwen3_models.qwen3_configs["4B"]("sdpa")
-    ),
+    "0.6B": MaxTextQwen3Config.from_qwen3(_upstream_flavor("0.6B", "sdpa")),
+    "1.7B": MaxTextQwen3Config.from_qwen3(_upstream_flavor("1.7B", "sdpa")),
+    "4B": MaxTextQwen3Config.from_qwen3(_upstream_flavor("4B", "sdpa")),
     "8B": _8b_tpu("sdpa"),
-    "32B": MaxTextQwen3Config.from_qwen3(
-        qwen3_models.qwen3_configs["32B"]("sdpa")
-    ),
+    "32B": MaxTextQwen3Config.from_qwen3(_upstream_flavor("32B", "sdpa")),
     "30B-A3B": MaxTextQwen3Config.from_qwen3(
-        qwen3_models.qwen3_configs["30B-A3B"]("sdpa")
+        _upstream_flavor("30B-A3B", "sdpa")
     ),
 }
 
@@ -193,10 +208,12 @@ def model_registry(
       for c in converters:
         config = c.build().convert(config)
     config = MaxTextQwen3Config.from_qwen3(config)
+    # Upstream d771abb0 made ModelSpec.max_context_length required.
     return ModelSpec(
         name="qwen3",
         flavor=flavor,
         model=config,
+        max_context_length=_8B_MAX_CONTEXT_LENGTH,
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=qwen3_models.pipeline_llm,
         post_optimizer_build_fn=qwen3_models.register_moe_load_balancing_hook,

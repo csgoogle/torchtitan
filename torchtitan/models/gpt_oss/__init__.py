@@ -18,19 +18,20 @@ from torchtitan.models.common import (
     Linear,
     RMSNorm,
     RoPE,
+    RouterGateLinear,
     TransformerBlock,
 )
 from torchtitan.models.common.attention import (
     FusedQKVLinear,
     QKVLinear,
-    VarlenAttention,
+    VarlenInnerAttention,
 )
 from torchtitan.models.common.config_utils import (
     get_attention_config,
     make_token_dispatcher_config,
 )
 from torchtitan.models.common.linear import ScaledBiasRowwiseLinear
-from torchtitan.models.common.moe import TokenChoiceTopKRouter
+from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
@@ -88,7 +89,7 @@ def _make_gptoss_attn_config(
     inner_attention = get_attention_config(attn_backend)
 
     if sliding_window_size is not None and isinstance(
-        inner_attention, VarlenAttention.Config
+        inner_attention, VarlenInnerAttention.Config
     ):
         inner_attention = dataclasses.replace(
             inner_attention, window_size=(sliding_window_size - 1, 0)
@@ -155,8 +156,8 @@ def _make_gptoss_experts_config(
     top_k: int,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
-) -> GptOssGroupedExperts.Config:
-    """Build a fully-specified GptOssGroupedExperts.Config for a single layer."""
+) -> RoutedExperts.Config:
+    """Build a fully-specified RoutedExperts.Config for a single GPT-OSS layer."""
     std = depth_scaled_std(0.02, layer_id)
     experts_init = {
         "mlp1_weight_EGD": partial(nn.init.trunc_normal_, std=std),
@@ -164,11 +165,13 @@ def _make_gptoss_experts_config(
         "mlp2_weight_EDF": partial(nn.init.trunc_normal_, std=std),
         "mlp2_bias_ED": partial(nn.init.trunc_normal_, std=std),
     }
-    return GptOssGroupedExperts.Config(
-        dim=dim,
-        hidden_dim=hidden_dim,
-        num_experts=num_experts,
-        param_init=experts_init,
+    return RoutedExperts.Config(
+        inner_experts=GptOssGroupedExperts.Config(
+            dim=dim,
+            hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            param_init=experts_init,
+        ),
         token_dispatcher=make_token_dispatcher_config(
             num_experts=num_experts,
             top_k=top_k,
@@ -208,7 +211,7 @@ def _build_gptoss_layers(
             fuse_qkv=fuse_qkv,
             rope=rope,
         )
-        experts_cfg = _make_gptoss_experts_config(
+        routed_experts_cfg = _make_gptoss_experts_config(
             dim=dim,
             hidden_dim=hidden_dim,
             num_experts=num_experts,
@@ -220,12 +223,12 @@ def _build_gptoss_layers(
         moe_cfg = GptOssMoE.Config(
             num_experts=num_experts,
             load_balance_coeff=load_balance_coeff,
-            experts=experts_cfg,
+            routed_experts=routed_experts_cfg,
             router=TokenChoiceTopKRouter.Config(
                 num_experts=num_experts,
                 score_func="softmax",
                 route_norm=True,
-                gate=Linear.Config(
+                gate=RouterGateLinear.Config(
                     in_features=dim,
                     out_features=num_experts,
                     bias=True,
@@ -247,6 +250,8 @@ def _build_gptoss_layers(
 def _debugmodel(
     moe_comm_backend: str,
     attn_backend: str = "varlen",
+    *,
+    seq_len: int,
 ) -> GptOssModel.Config:
     dim = 256
     hidden_dim = 2880
@@ -275,7 +280,7 @@ def _debugmodel(
             moe_comm_backend=moe_comm_backend,
             rope=CosSinRoPE.Config(
                 dim=64,
-                max_seq_len=131072,
+                max_context_length=seq_len,
                 theta=150000.0,
                 scaling="yarn",
                 rope_factor=32,
@@ -291,6 +296,8 @@ def _debugmodel(
 def _20b(
     moe_comm_backend: str,
     attn_backend: str = "varlen",
+    *,
+    seq_len: int,
 ) -> GptOssModel.Config:
     dim = 2880
     hidden_dim = 2880
@@ -319,7 +326,7 @@ def _20b(
             moe_comm_backend=moe_comm_backend,
             rope=CosSinRoPE.Config(
                 dim=64,
-                max_seq_len=131072,
+                max_context_length=seq_len,
                 theta=150000.0,
                 scaling="yarn",
                 rope_factor=32,
@@ -335,6 +342,8 @@ def _20b(
 def _120b(
     moe_comm_backend: str,
     attn_backend: str = "varlen",
+    *,
+    seq_len: int,
 ) -> GptOssModel.Config:
     dim = 2880
     hidden_dim = 2880
@@ -363,7 +372,7 @@ def _120b(
             moe_comm_backend=moe_comm_backend,
             rope=CosSinRoPE.Config(
                 dim=64,
-                max_seq_len=131072,
+                max_context_length=seq_len,
                 theta=150000.0,
                 scaling="yarn",
                 rope_factor=32,
@@ -377,21 +386,31 @@ def _120b(
 
 
 gptoss_configs = {
-    "debugmodel": _debugmodel,
-    "20b": _20b,
-    "120b": _120b,
+    "debugmodel": (_debugmodel, 131072),
+    "20b": (_20b, 131072),
+    "120b": (_120b, 131072),
 }
 
 
 def model_registry(
     flavor: str,
+    *,
+    seq_len: int | None = None,
     moe_comm_backend: str = "standard",
     attn_backend: str = "varlen",
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
-    config = gptoss_configs[flavor](
+    get_config, max_context_len = gptoss_configs[flavor]
+    context_len = seq_len or max_context_len
+    if context_len > max_context_len:
+        raise ValueError(
+            f"Requested seq_len {context_len} exceeds max context length "
+            f"{max_context_len} for flavor {flavor}"
+        )
+    config = get_config(
         moe_comm_backend=moe_comm_backend,
         attn_backend=attn_backend,
+        seq_len=context_len,
     )
     if converters is not None:
         validate_converter_order(converters)
@@ -401,6 +420,7 @@ def model_registry(
         name="gpt_oss",
         flavor=flavor,
         model=config,
+        max_context_length=context_len,
         parallelize_fn=parallelize_gptoss,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=register_moe_load_balancing_hook,

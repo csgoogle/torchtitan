@@ -8,11 +8,14 @@ from functools import partial
 import os
 from typing import cast
 from torch import nn
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer, default_adamw
+from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer.optimizer import (
+    default_adamw,
+    OptimizersContainer,
+)
 from torchtitan.components.validate import Validator
 from torchtitan.config.configs import (
     CompileConfig,
@@ -40,7 +43,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUConfig,
     TPUTrainerConfig,
 )
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.experiments.tpu.datasets import c4_test_dataloader, TPUGrainDataLoader
 from torchtitan.models.common.config_utils import make_aux_loss_config
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.qwen3.config_registry import qwen3_30b_a3b_global_aux
@@ -50,10 +53,18 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.profiler import Profiler
 
 
-_FUSED_LOSS_OVERRIDE = "torchtitan.experiments.tpu.overrides.fused_loss"
-_BF16_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.bf16_rope"
+# Upstream d771abb0 identifies an override by the import path of its decorated
+# `@override` factory, so each target is `module.function`, not just `module`.
+_FUSED_LOSS_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
+)
+_BF16_ROPE_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.bf16_rope"
+    ".tpu_activation_dtype_cossin_rope"
+)
 _DISCARDED_TOKEN_COUNTER_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.discarded_token_counter"
+    ".tpu_discarded_token_counter"
 )
 
 
@@ -136,13 +147,11 @@ def qwen3_debugmodel() -> TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=TrainingConfig(
-          local_batch_size=8,
-          seq_len=2048,
+          num_tokens_per_microbatch_per_dp_rank=8 * 2048,
+          max_context_length=2048,
           steps=10,
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           pipeline_parallel_schedule="Interleaved1F1B"
@@ -163,10 +172,15 @@ def qwen3_moe_testmodel() -> TPUTrainerConfig:
   """Qwen3 MoE test model configuration for TPU."""
   cfg = qwen3_debugmodel()
   config = tpu_qwen3.qwen3_configs["testmodel_moe"]
+  # Upstream d771abb0 made ModelSpec.max_context_length required.
+  # `testmodel_moe` is built by `_testmodel_moe`, whose RoPE config pins
+  # `TESTMODEL_MAX_CONTEXT_LENGTH`; `training.max_context_length` below is set
+  # to the same value.
   cfg.model_spec = ModelSpec(
       name="qwen3_tpu",
       flavor="testmodel_moe",
       model=config,
+      max_context_length=tpu_qwen3.TESTMODEL_MAX_CONTEXT_LENGTH,
       parallelize_fn=tpu_parallelize_qwen3,
       pipelining_fn=None,
       post_optimizer_build_fn=None,
@@ -175,8 +189,11 @@ def qwen3_moe_testmodel() -> TPUTrainerConfig:
   cfg.model_spec.model.enable_weight_tying = False
 
   # Override with previous debug_model train_config values
-  cfg.training.seq_len = 128
-  cfg.training.local_batch_size = 4
+  # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
+  # token budgets. Set the context length first; the microbatch budget is four
+  # sequences at that new context.
+  cfg.training.max_context_length = 128
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 4 * 128
 
   return cfg
 
@@ -204,14 +221,12 @@ def qwen3_1_7b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           max_norm=1.0,
-          local_batch_size=1,
-          seq_len=2048,
+          num_tokens_per_microbatch_per_dp_rank=1 * 2048,
+          max_context_length=2048,
           steps=15,
           mixed_precision_reduce="bfloat16",
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
@@ -280,14 +295,12 @@ def reg_trainer_qwen3_8b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           max_norm=1.0,
-          local_batch_size=6,
-          seq_len=2048,
+          num_tokens_per_microbatch_per_dp_rank=6 * 2048,
+          max_context_length=2048,
           steps=15,
           mixed_precision_reduce="float32",
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
@@ -363,14 +376,12 @@ def qwen3_8b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           max_norm=1.0,
-          local_batch_size=6,
-          seq_len=2048,
+          num_tokens_per_microbatch_per_dp_rank=6 * 2048,
+          max_context_length=2048,
           steps=15,
           mixed_precision_reduce="float32",
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
@@ -407,6 +418,10 @@ def qwen3_8b() -> TPUTrainerConfig:
       ),
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
+          use_tokamax_splash_attention_kernel=True,
+          # Tokamax masks packed documents with segment IDs and has no
+          # document-aware block skipping.
+          sa_use_document_aware_block_skipping=False,
           sa_q_layout="SEQ_MINOR",
           sa_k_layout="SEQ_MINOR",
           sa_v_layout="HEAD_DIM_MINOR",
@@ -479,9 +494,12 @@ def qwen3_32b() -> TPUTrainerConfig:
   cfg.model_spec.model = (
       TpuPackedQKVConverter.Config().build().convert(cfg.model_spec.model)
   )
-  cfg.training.local_batch_size = 8
-  cfg.training.global_batch_size = 1024
-  cfg.training.seq_len = 4096
+  # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
+  # token budgets. Set the context length first; the budgets are 8 local and
+  # 1024 global sequences at that context.
+  cfg.training.max_context_length = 4096
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 8 * 4096
+  cfg.training.num_tokens_per_train_step = 1024 * 4096
   # Prefetch beats interleave by 0.3-0.6% here for ~4 GiB more peak HBM.
   cfg.tpu_config.graph_trainer_fsdp_schedule = "prefetch"
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
@@ -499,7 +517,8 @@ def qwen3_32b_4x8x8() -> TPUTrainerConfig:
   SparseCore: 14.33 -> 12.34 s, for +49 GiB peak HBM.
   """
   cfg = qwen3_32b()
-  cfg.training.global_batch_size = 4096
+  # 4096 global sequences (upstream d771abb0 token budget).
+  cfg.training.num_tokens_per_train_step = 4096 * 4096
   # Before the w1/w3 rewrite, interleave beat prefetch here by 2.3% step time
   # and 56 GiB peak HBM.
   cfg.tpu_config.graph_trainer_fsdp_schedule = "interleave"
@@ -533,8 +552,15 @@ def qwen3_moe_30b() -> TPUTrainerConfig:
       ],
   )
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
-  cfg.training.local_batch_size = 6
-  cfg.training.global_batch_size = 768
+  # Real C4 as on main, through the TPU loader so `--dataloader.dataset_path`
+  # can point at a local mirror. Upstream's GrainDataLoader shuffles by
+  # default; main's HuggingFaceTextDataLoader did not. Keep main's data order.
+  cfg.dataloader = TPUGrainDataLoader.Config(dataset="c4", shuffle=False)
+  # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
+  # token budgets. `qwen3_30b_a3b_global_aux` leaves max_context_length at its
+  # 2048 default.
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 6 * 2048
+  cfg.training.num_tokens_per_train_step = 768 * 2048
   cfg.parallelism = ParallelismConfig(
       use_simple_fsdp=True,
       data_parallel_shard_degree=-1,
@@ -597,9 +623,11 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
     experts.pallas_grouped_mm_tile_m = 256
     experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
     experts.use_kernel_native_weight_layout = True
-  cfg.training.local_batch_size = 6
-  cfg.training.global_batch_size = 768
-  cfg.training.seq_len = 2048
+  # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
+  # token budgets.
+  cfg.training.max_context_length = 2048
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 6 * 2048
+  cfg.training.num_tokens_per_train_step = 768 * 2048
   cfg.training.steps = 8
   cfg.tpu_config = TPUConfig(
       use_graph_trainer=True,
@@ -626,6 +654,7 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   )
   cfg.splash_attention_kernel = SplashAttentionKernelConfig(
       use_splash_attention_kernel=True,
+      use_tokamax_splash_attention_kernel=True,
       # Batch-native masking lets the always-vmapped forward avoid a serial
       # batch loop; use_vmap_bwd applies the same optimization to backward.
       # Runtime segment IDs still preserve exact packed-document boundaries.
@@ -704,6 +733,23 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+def _fuse_route_score_backward(cfg: TPUTrainerConfig) -> None:
+  """Compute dScore in one fusion instead of saving an FP32 expert output.
+
+  The multiply and hidden-dimension reduction stay FP32, as in native
+  autograd; only the reduction order changes. On Q235 at 512 ranks this
+  removes a per-layer ``f32[524288, 4096]`` copy and reduction (1.12 s/step).
+  """
+  assert cfg.model_spec is not None
+  dispatchers = list(
+      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
+  )
+  if not dispatchers:
+    raise ValueError("Qwen3 MoE route-score fusion needs a TPU token dispatcher")
+  for _, dispatcher, _, _ in dispatchers:
+    dispatcher.fuse_route_score_backward = True
+
+
 def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   """Build the common Qwen3 235B-A22B FSDP configuration."""
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
@@ -724,33 +770,32 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   # Replacing model_spec also replaces nested MoE policy inherited from the
   # 30B base recipe, so apply the intended Q235 routing policy afterwards.
   _use_global_batch_aux_loss(cfg)
+  cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
+  _fuse_route_score_backward(cfg)
   # The TPU Qwen parallelizer shards the uneven vocabulary and expert banks on
   # their divisible hidden axes when the FSDP mesh is wider than dim 0.
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
     experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
-    # Four K slabs. The paired dWeight needs 105 MB at 4096 x 1536 against
-    # Mosaic's 64 MB, which the K tile this PR adds brings under 30 MB. The N
-    # tile must stay full; the unpaired alternative is (256, 0, 512).
+    # A dWeight is tiled along K, the weight's input dimension: D = 4096 for
+    # the paired W1/W3, F = 1536 for W2. Untiled, the paired dWeight needs
+    # 105 MB at 4096 x 1536 against Mosaic's 64 MB. Its N tile must stay full.
     #
-    # This element feeds TWO kernels, and 1024 is bounded by the SECOND of them.
-    # In isolation the paired dWeight prefers 2048 - measured 20.824 -> 18.576 ms
-    # p50 (1.121x), bit-exact - but the same value also tiles the unpaired dW2,
-    # whose corresponding axis is 1536, not 4096. A 2048 tile on a 1536 axis does
-    # not clamp: it allocates a f32[1,2048,4096] window, 33.55 MB, doubled by the
-    # two buffering levels to exactly the 64 MB budget, and the module OOMs at
-    # 103.04M before the first step. Measured end to end on 64 v7x, not inferred.
-    #
-    # So 2048 is reachable only by giving the two kernels independent K tiles.
-    # Until then this stays at 1024.
-    # perf: see wiki/experiments/qwen3_autoresearch_optimization/tpu/
-    #       2026-09-20-v016-tgmm-tile-k-2048-e2e.md
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
+    # The paired dWeight prefers a 2048 K tile, which W2 cannot take. A 2048
+    # tile on a 1536 axis does not clamp: it allocates a f32[1,2048,4096]
+    # window, 33.55 MB, doubled by the two buffering levels to the whole 64 MB
+    # budget, and the module OOMs before the first step (measured on 64 v7x).
+    # So the two kernels are tiled independently.
+    experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
+    # A K tile that does not divide F leaves a masked remainder tile.
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 768, 0)
     experts.use_kernel_native_weight_layout = True
-  cfg.training.local_batch_size = 16
-  cfg.training.global_batch_size = 8192
-  cfg.training.seq_len = 4096
+  # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
+  # token budgets.
+  cfg.training.max_context_length = 4096
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 16 * 4096
+  cfg.training.num_tokens_per_train_step = 8192 * 4096
   cfg.training.steps = 15
   cfg.parallelism.fsdp_reshard_after_forward = "always"
   cfg.tpu_config.use_graph_split = True
@@ -794,14 +839,6 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
   cfg.training.mixed_precision_reduce = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  assert cfg.model_spec is not None
-  dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-  )
-  if not dispatchers:
-    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
-  for _, dispatcher, _, _ in dispatchers:
-    dispatcher.fuse_route_score_backward = True
   return cfg
 
 
@@ -813,7 +850,13 @@ def _configure_qwen3_moe_235b_fsdp_128(
   """Configure an FSDP-128 mesh and its matching global batch size."""
   cfg.parallelism.data_parallel_replicate_degree = replicate_degree
   cfg.parallelism.data_parallel_shard_degree = 128
-  cfg.training.global_batch_size = 2048 * replicate_degree
+  # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
+  # token budgets. Every caller passes a config descended from
+  # `_qwen3_moe_235b_fsdp_only`, which has already set `max_context_length`, so
+  # scale the 2048-sequence global batch by the context length in effect.
+  cfg.training.num_tokens_per_train_step = (
+      2048 * replicate_degree * cfg.training.max_context_length
+  )
 
 
 def qwen3_moe_235b_hsdp_activation_offload_maxtext() -> TPUTrainerConfig:
@@ -859,8 +902,16 @@ def qwen3_moe_235b_fsdp_smoke() -> TPUTrainerConfig:
   assert cfg.model_spec is not None
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   model_config.layers = model_config.layers[:4]
-  cfg.training.local_batch_size = 1
-  cfg.training.seq_len = 128
+  # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
+  # token budgets. Set the context length first; the microbatch budget below is
+  # one sequence at the new, shorter context.
+  cfg.training.max_context_length = 128
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 1 * 128
+  # `num_tokens_per_train_step` has to be restated, not inherited: under the
+  # old fields `_qwen3_moe_235b_fsdp_only`'s `global_batch_size = 8192` was a
+  # sequence count that re-scaled automatically with this shorter context, but
+  # a token budget is absolute. 8192 * 128 keeps the pre-import behaviour.
+  cfg.training.num_tokens_per_train_step = 8192 * 128
   cfg.training.steps = 2
   cfg.tpu_config.enable_mfu_benchmark = False
   return cfg
@@ -873,8 +924,9 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   (`tpu-recipes/training/ironwood/qwen3-235b-a22b/4k-bf16-tpu7x-4x8x8`): 256
   chips, sequence 4096, batch 16 per device, activation offloading on, no
   expert parallelism. Batch and global batch are the two things to override on
-  a smaller slice -- `global_batch_size` must equal ranks x `local_batch_size`
-  or config validation fails with a message that reads like a scan error.
+  a smaller slice -- `num_tokens_per_train_step` must equal ranks x
+  `num_tokens_per_microbatch_per_dp_rank` or config validation fails with a
+  message that reads like a scan error.
   """
   cfg = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
   cfg.model_spec = model_registry(
@@ -888,6 +940,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.model_spec.parallelize_fn = tpu_parallelize_qwen3
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   _use_global_batch_aux_loss(cfg)
+  _fuse_route_score_backward(cfg)
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.
@@ -898,15 +951,22 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
     # The splitter's expert kernels: W1/W3 paired, with its K-tiled dWeight.
     experts.use_pallas_paired_grouped_mm = True
     experts.pallas_grouped_mm_tile_m = 256
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
+    # A dWeight is tiled along K, the weight's input dimension: D for the
+    # paired W1/W3, the smaller F for W2. The K tile that measures best for
+    # W1/W3 does not fit W2, so tile them independently.
+    experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
+    # A K tile that does not divide F leaves a masked remainder tile.
+    experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 768, 0)
     experts.use_kernel_native_weight_layout = True
-  cfg.training.local_batch_size = 16
-  cfg.training.global_batch_size = 8192
-  cfg.training.seq_len = 4096
+  # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
+  # token budgets.
+  cfg.training.max_context_length = 4096
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 16 * 4096
+  cfg.training.num_tokens_per_train_step = 8192 * 4096
   cfg.training.steps = 15
   # The 30B chain leaves this at the real `c4`, whose only builder config is
   # `default`; asking for `en` fails before the first step.
-  cfg.dataloader = HuggingFaceTextDataLoader.Config(dataset="c4_test")
+  cfg.dataloader = c4_test_dataloader()
   # 94 layers of 128 experts do not fit without Zero-3 plus offloading, which
   # is also what MaxText does here (`remat_policy=custom`,
   # `decoder_layer_input=offload`).
@@ -946,30 +1006,24 @@ def qwen3_moe_235b_scan_proxy() -> TPUTrainerConfig:
   assert cfg.model_spec is not None
   model_config = cast(Qwen3Model.Config, cfg.model_spec.model)
   model_config.layers = model_config.layers[:12]
-  cfg.training.local_batch_size = 1
-  cfg.training.global_batch_size = 32
+  # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
+  # token budgets. `qwen3_moe_235b_scan` leaves max_context_length at 4096.
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 1 * 4096
+  cfg.training.num_tokens_per_train_step = 32 * 4096
   return cfg
 
 
 def qwen3_moe_235b_scan_maxtext() -> TPUTrainerConfig:
   """`qwen3_moe_235b_scan` with MaxText's numerics instead of torchtitan's.
 
-  Three changes, all of them bf16 where torchtitan keeps f32: the gradient
-  reduce, the rotary arithmetic, and the route-score backward. None is
-  bit-preserving, so the base recipe stays the accuracy reference and this one
-  is the speed comparison against MaxText's published Ironwood number.
+  Two changes, both bf16 where torchtitan keeps f32: the gradient reduce and
+  the rotary arithmetic. Neither is bit-preserving, so the base recipe stays the
+  accuracy reference and this one is the speed comparison against MaxText's
+  published Ironwood number.
   """
   cfg = qwen3_moe_235b_scan()
   cfg.training.mixed_precision_reduce = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  assert cfg.model_spec is not None
-  dispatchers = list(
-      cfg.model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config)
-  )
-  if not dispatchers:
-    raise ValueError("MaxText-parity Qwen3 MoE requires a TPU token dispatcher")
-  for _, dispatcher, _, _ in dispatchers:
-    dispatcher.fuse_route_score_backward = True
   return cfg
 
 

@@ -7,14 +7,11 @@ import torchtitan.config
 import torchtitan.distributed
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.compile import _maybe_regional_inductor_backend
-from torchtitan.distributed.context_parallel import apply_cp_to_forward
-from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
-from torchtitan.distributed.full_dtensor import (
+from torchtitan.distributed.fsdp import (
+    apply_fsdp_to_decoder,
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
-    validate_config,
 )
-from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
@@ -89,25 +86,14 @@ def _parallelize_gemma4(
       compile_config.enable and "model" in compile_config.components
   )
 
-  if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
-    validate_config(parallel_dims, model)
+  if (
+      parallelism.spmd_backend == "spmd_types"
+      or parallel_dims.tp_enabled
+      or parallel_dims.ep_enabled
+  ):
     model.parallelize(parallel_dims)
-  else:
-    if parallel_dims.cp_enabled:
-      apply_cp_to_forward(
-          # pyrefly: ignore [missing-attribute]
-          [block.attention.inner_attention for block in model.layers.values()],
-          parallel_dims.get_mesh("cp"),
-      )
-    if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
-      model.parallelize(parallel_dims)
 
   configure_moe_aux_loss_reduction(model, parallel_dims)
-
-  if parallel_dims.tp_enabled:
-    maybe_enable_async_tp(
-        parallelism, compile_config, parallel_dims.get_mesh("tp")
-    )
 
   if ac_config is not None:
     _apply_ac_gemma4(model, ac_config, dump_folder=dump_folder)
@@ -118,7 +104,7 @@ def _parallelize_gemma4(
   if skip_dp:
     return model
 
-  if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+  if parallelism.spmd_backend == "spmd_types":
     dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
     edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
   else:

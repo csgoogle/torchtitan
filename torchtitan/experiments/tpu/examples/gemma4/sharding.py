@@ -7,6 +7,7 @@ from torchtitan.experiments.tpu.examples.gemma4.model import (
     Gemma4Router,
 )
 from torchtitan.models.common.decoder_sharding import (
+    attention_activation_placement,
     dense_activation_placement,
     dense_param_placement,
     dense_sequence_parallel_placement,
@@ -78,20 +79,21 @@ def _set_gemma4_layer_sharding(
     set_gqa_attention_sharding(attention, enable_sp=enable_sp)
     set_gqa_inner_attention_local_map(attention.inner_attention)
 
-    # Q, K, and V norms operate on (B, L, local_heads, head_dim) with TP sharding dim 2.
+    # Q, K, and V norms operate on (T, local_heads, head_dim) with TP sharding dim 1.
+    head_layout = attention_activation_placement()
     if attention.qk_norm is not None:
         attention.qk_norm.sharding_config = ShardingConfig(
             state_shardings={"weight": dense_param_placement(tp=spmd.R)},
-            in_src_shardings={"input": dense_activation_placement(tp=spmd.S(2))},
-            in_dst_shardings={"input": dense_activation_placement(tp=spmd.S(2))},
-            out_src_shardings=dense_activation_placement(tp=spmd.S(2)),
-            out_dst_shardings=dense_activation_placement(tp=spmd.S(2)),
+            in_src_shardings={"input": head_layout},
+            in_dst_shardings={"input": head_layout},
+            out_src_shardings=head_layout,
+            out_dst_shardings=head_layout,
         )
     attention.v_norm.sharding_config = ShardingConfig(
-        in_src_shardings={"input": dense_activation_placement(tp=spmd.S(2))},
-        in_dst_shardings={"input": dense_activation_placement(tp=spmd.S(2))},
-        out_src_shardings=dense_activation_placement(tp=spmd.S(2)),
-        out_dst_shardings=dense_activation_placement(tp=spmd.S(2)),
+        in_src_shardings={"input": head_layout},
+        in_dst_shardings={"input": head_layout},
+        out_src_shardings=head_layout,
+        out_dst_shardings=head_layout,
     )
 
     # Dense FFN (present on both dense and MoE layers in Gemma4)
@@ -99,7 +101,7 @@ def _set_gemma4_layer_sharding(
         attn_x_layout = (
             dense_sequence_parallel_placement()
             if enable_sp
-            else dense_activation_placement(tp=spmd.I)
+            else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
         )
         set_dense_ffn_sharding(
             layer_cfg.feed_forward,
@@ -119,10 +121,10 @@ def _set_gemma4_layer_sharding(
             (
                 dense_sequence_parallel_placement()
                 if enable_sp
-                else dense_activation_placement(tp=spmd.I)
+                else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
             )
             if enable_ep
-            else dense_activation_placement(tp=spmd.R)
+            else dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
         )
         moe_norm_weight_tp = (
             (spmd.R if enable_sp else spmd.I) if enable_ep else spmd.R

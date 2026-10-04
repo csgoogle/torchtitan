@@ -51,8 +51,13 @@ def parallelize_mamba2(
   if skip_dp:
     return model
 
-  if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
-    from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh
+  if parallelism.spmd_backend == "spmd_types":
+    # Upstream d771abb0 deleted the `full_dtensor` SPMD backend (#4217) and
+    # moved `resolve_fsdp_mesh` from `torchtitan.distributed.full_dtensor` into
+    # `torchtitan.distributed.fsdp`. `resolve_fsdp_mesh` now asserts
+    # `spmd_backend == "spmd_types"`, so the branch matches upstream
+    # `models/llama3/parallelize.py`.
+    from torchtitan.distributed.fsdp import resolve_fsdp_mesh
 
     dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
   else:

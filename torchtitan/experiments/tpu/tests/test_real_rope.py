@@ -72,12 +72,14 @@ class TpuRealArithmeticComplexRoPETest(base_device_test.BaseAcceleratorDeviceTes
     return torch.view_as_real(x_ * self.rope_cache).flatten(3).type_as(x)
 
   def test_override_preserves_config_and_builds_tpu_rope(self):
-    source = ComplexRoPE.Config(dim=8, max_seq_len=16, theta=5000.0)
+    source = ComplexRoPE.Config(dim=8, max_context_length=16, theta=5000.0)
     replacement = tpu_real_arithmetic_complex_rope(source)
 
     self.assertIsInstance(replacement, TpuRealArithmeticComplexRoPE.Config)
     self.assertEqual(replacement.dim, source.dim)
-    self.assertEqual(replacement.max_seq_len, source.max_seq_len)
+    self.assertEqual(
+        replacement.max_context_length, source.max_context_length
+    )
     self.assertEqual(replacement.theta, source.theta)
     self.assertIsInstance(replacement.build(), TpuRealArithmeticComplexRoPE)
 

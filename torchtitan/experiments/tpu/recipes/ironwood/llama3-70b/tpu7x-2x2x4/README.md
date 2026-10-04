@@ -40,7 +40,8 @@ Defaults from [`llama3_70b`](../../../../llama3/config_registry.py):
 - **Activation Checkpointing**: Full.
 
 Overridden on the command line:
-- **Local Batch Size**: 4 (Global batch size = 4 * 32 = 128)
+- **Batch**: 4 sequences of 8192 tokens per device, passed as
+  `--training.num_tokens_per_microbatch_per_dp_rank=32768` (Global batch size = 4 * 32 = 128)
 - **Topology-Aware Mesh**: Enabled via `--parallelism.enable_tpu_topo_mesh`.
 
 ## Training Command
@@ -51,7 +52,7 @@ export WORKLOAD_NAME="llama3-70b-tpu7x32-$(date +%Y%m%d-%H%M%S)"
 xpk workload create \
   --workload="$WORKLOAD_NAME" \
   --cluster="$CLUSTER_NAME" \
-  --tpu-type="tpu7x-2x4x4" \
+  --tpu-type="tpu7x-2x2x4" \
   --project="$PROJECT_ID" \
   --zone="$ZONE" \
   --no-use-parallel-containers \
@@ -71,7 +72,7 @@ xpk workload create \
     --hf_assets_path=tests/assets/tokenizer \
     --dataloader.dataset_path=tests/assets/c4_test \
     --training.steps=20 \
-    --training.local_batch_size=4 \
+    --training.num_tokens_per_microbatch_per_dp_rank=32768 \
     --parallelism.enable_tpu_topo_mesh \
     --libtpu-init-flags=xla_tpu_scoped_vmem_limit_kib=131072"
 ```

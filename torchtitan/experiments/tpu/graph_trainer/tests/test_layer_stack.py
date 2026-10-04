@@ -22,7 +22,10 @@ from torch._functorch import config as functorch_config, partitioners
 from torch._higher_order_ops.scan import ScanAutogradImpl
 from torch.distributed.tensor import DTensor, Shard
 
-from torchtitan.components.optimizer import default_adamw, OptimizersContainer
+from torchtitan.components.optimizer.optimizer import (
+    default_adamw,
+    OptimizersContainer,
+)
 from torchtitan.config import apply_overrides, derive, OverrideConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed import ParallelDims
@@ -38,11 +41,14 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import gather_slice
 # below: it captures that method at import time.
 from torchtitan.experiments.tpu import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
 from torchtitan.experiments.tpu.layer_loop import tpu_model_class
+from torchtitan.models import qwen3 as qwen3_models
+from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.llama3 import model_registry
 from torchtitan.models.qwen3 import model_registry as qwen3_registry
 
 
 SEQ_LEN = 32
+TOKENS = 2 * SEQ_LEN
 SEED = 1234
 
 # `scan` re-traces its body through functionalization, which has no derivative
@@ -50,7 +56,10 @@ SEED = 1234
 # the same reason; here there is no recipe to carry it. qwen3 uses `CosSinRoPE`
 # and needs nothing.
 # https://github.com/google-pytorch/torchtitan/issues/386
-_REAL_ROPE_OVERRIDE = "torchtitan.experiments.tpu.overrides.real_rope"
+_REAL_ROPE_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.real_rope"
+    ".tpu_real_arithmetic_complex_rope"
+)
 
 
 def _layer_loop(config):
@@ -59,7 +68,7 @@ def _layer_loop(config):
 
 
 def _config(registry=model_registry):
-    """A debug model, shortened to ``SEQ_LEN`` so the RoPE cache stays small.
+    """A debug model, shortened to ``TOKENS`` so the RoPE cache stays small.
 
     Stock and unconverted; ``_build`` applies the rewrite. Every arm gets one,
     so that stacking is the only difference between them: a stock ``Decoder``
@@ -68,10 +77,40 @@ def _config(registry=model_registry):
     config = registry("debugmodel", attn_backend="sdpa").model
     for layer in config.layers:
         layer.attention.rope = dataclasses.replace(
-            layer.attention.rope, max_seq_len=SEQ_LEN
+            layer.attention.rope, max_context_length=TOKENS
         )
     if registry is model_registry:
         apply_overrides(OverrideConfig(imports=[_REAL_ROPE_OVERRIDE]), config)
+    return config
+
+
+def _moe_config(num_experts: int):
+    """A 2-layer qwen3 MoE with ``num_experts`` experts, stackable.
+
+    Few experts, so that a small mesh already exceeds them and ``flatten_for``
+    has something to flatten. Load balancing is off because stacking refuses
+    it, and weight tying is off for the reason ``TestQwen3._build`` gives.
+    """
+    config = dataclasses.replace(
+        _config(qwen3_registry), enable_weight_tying=False
+    )
+    config.layers = qwen3_models._build_qwen3_moe_layers(  # pylint: disable=protected-access
+        fuse_qkv=True,
+        n_layers=2,
+        dim=config.dim,
+        n_heads=16,
+        n_kv_heads=8,
+        head_dim=128,
+        moe_hidden_dim=768,
+        num_experts=num_experts,
+        top_k=2,
+        load_balance_coeff=None,
+        attn_backend="sdpa",
+        moe_comm_backend="standard",
+        rope=CosSinRoPE.Config(
+            dim=128, max_context_length=SEQ_LEN, theta=1000000.0
+        ),
+    )
     return config
 
 
@@ -83,6 +122,7 @@ def _build(
     config=None,
     device: str | torch.device = "cpu",
     world_size: int = 1,
+    flatten: bool = False,
 ):
     """Build a model the way the trainer does: convert, build, parallelize, init.
 
@@ -93,6 +133,10 @@ def _build(
 
     ``device`` and ``world_size`` exist for ``test_layer_stack_distributed``,
     which builds the same two models on a real mesh.
+
+    ``flatten`` runs the stack half of ``configure_qwen_simple_fsdp_shard_dims``
+    before sharding, and the ``build_split_meshes`` both Qwen3 parallelize
+    paths run right after it.
     """
     parallel_dims = ParallelDims(
         dp_replicate=1,
@@ -112,11 +156,21 @@ def _build(
         convert = _layer_loop
     with torch.device("meta"):
         model = convert(config or _config()).build()
+    holders = [m for m in model.modules() if hasattr(m, "flatten_for")]
+    if flatten:
+        for holder in holders:
+            holder.flatten_for(world_size)
+            holder._fsdp_shard_dim = holder.plan_shard_dims(world_size)  # pylint: disable=protected-access
     model = apply_simple_fsdp(
         model,
         parallel_dims=parallel_dims,
         training=training,
     )
+    if flatten:
+        # Creates process groups, so every rank runs it, before anything
+        # (here `init_weights`) views a flattened layer.
+        for holder in holders:
+            holder.build_split_meshes()
     # `to_empty` leaves garbage, and `init_weights` does not necessarily write
     # every parameter (qwen3's `tok_embeddings`, with tying off). Garbage is
     # sometimes NaN, and NaN fails `assert_close` at any tolerance, so zero
@@ -230,7 +284,7 @@ class TestLayerStack(unittest.TestCase):
     def test_forward_matches_unrolled(self):
         model = _build(stacked=False)
         stacked = _build(stacked=True)
-        tokens = torch.randint(0, model.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, model.config.vocab_size, (TOKENS,))
 
         torch.testing.assert_close(
             stacked(tokens), model(tokens), rtol=0, atol=0
@@ -239,7 +293,7 @@ class TestLayerStack(unittest.TestCase):
     def test_scan_forward_matches_the_loop(self):
         plain = _build(stacked=False)
         scanned = _build(stacked=True, scan=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
 
         # Bit-exact on x86, but on arm traced scan and eager loop pick
         # different kernels and drift in the lowest bits (~1e-6).
@@ -279,7 +333,7 @@ class TestLayerStack(unittest.TestCase):
             return forward, backward
 
         model = _build(stacked=True, scan=True)
-        tokens = torch.randint(0, model.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, model.config.vocab_size, (TOKENS,))
         default = functorch_config.activation_memory_budget
         with patch.object(
             partitioners, "min_cut_rematerialization_partition", capture
@@ -304,7 +358,7 @@ class TestLayerStack(unittest.TestCase):
         """
         plain = _build(stacked=False)
         scanned = _build(stacked=True, scan=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
 
         for model in (plain, scanned):
             model(tokens).sum().backward()
@@ -342,7 +396,7 @@ class TestLayerStack(unittest.TestCase):
         # construction would read meta tensors, find nothing sharded, and run
         # each layer on this rank's slice.
         self.assertFalse(stack.fsdp_plan, "the plan was built before a forward")
-        model(torch.randint(0, model.config.vocab_size, (2, SEQ_LEN)))
+        model(torch.randint(0, model.config.vocab_size, (TOKENS,)))
         self.assertTrue(stack.fsdp_plan, "no gather plan was installed")
 
         holder = getattr(model, STACK_ATTR)
@@ -385,7 +439,7 @@ class TestLayerStack(unittest.TestCase):
         """A checkpoint written by the unrolled model loads into the stacked one."""
         plain = _build(stacked=False)
         stacked = _build(stacked=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
 
         # Perturb the source so a no-op load cannot pass.
         with torch.no_grad():
@@ -582,7 +636,7 @@ class TestQwen3(unittest.TestCase):
 
     def test_scan_forward_matches_the_loop(self):
         plain, scanned = self._pair(stacked=True, scan=True)
-        tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN))
+        tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,))
 
         # Bit-exact on x86, but on arm traced scan and eager loop pick
         # different kernels and drift in the lowest bits (~1e-6).

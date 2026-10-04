@@ -36,11 +36,11 @@ from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
+from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.attention import (
     QKVLinear,
-    ScaledDotProductAttention,
+    ScaledDotProductInnerAttention,
 )
-from torchtitan.models.common.config_utils import make_token_dispatcher_config
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
@@ -72,19 +72,12 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
         num_experts=num_experts,
         use_pallas_grouped_mm=False,
         activation="gelu_tanh",
-        token_dispatcher=make_token_dispatcher_config(
-            num_experts=num_experts,
-            top_k=2,
-            comm_backend="standard",
-            non_blocking_capacity_factor=None,
-            hidden_dim=dim,
-        ),
         param_init=_EXPERTS_INIT,
     )
     experts_gelu = cfg_gelu.build().to(self.accelerator_device)
     experts_gelu.init_states()
 
-    out_gelu = experts_gelu._experts_forward(x, num_tokens_per_expert)
+    out_gelu = experts_gelu(x, num_tokens_per_expert)
 
     # Compute reference gelu_tanh in bfloat16 (matching GroupedExperts compute)
     expected_chunks = []
@@ -104,8 +97,9 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
     config = converter.convert(config)
     for layer in config.layers:
       if layer.moe is not None:
-        self.assertIsInstance(layer.moe.experts, TpuGroupedExperts.Config)
-        self.assertEqual(layer.moe.experts.activation, "gelu_tanh")
+        inner_experts = layer.moe.routed_experts.inner_experts
+        self.assertIsInstance(inner_experts, TpuGroupedExperts.Config)
+        self.assertEqual(inner_experts.activation, "gelu_tanh")
 
   def test_config_registry_valid(self):
     for fn in (
@@ -241,14 +235,21 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
     def masked_sdpa(
         q, k, v, *, scale=None, enable_gqa=False, **unused_kwargs
     ):
-      return F.scaled_dot_product_attention(
-          q.transpose(1, 2),
-          k.transpose(1, 2),
-          v.transpose(1, 2),
-          attn_mask=mask_LL,
-          scale=scale,
-          enable_gqa=enable_gqa,
-      ).transpose(1, 2)
+      q_4d = q.unflatten(0, (-1, self._SEQ_LEN)).transpose(1, 2)
+      k_4d = k.unflatten(0, (-1, self._SEQ_LEN)).transpose(1, 2)
+      v_4d = v.unflatten(0, (-1, self._SEQ_LEN)).transpose(1, 2)
+      return (
+          F.scaled_dot_product_attention(
+              q_4d,
+              k_4d,
+              v_4d,
+              attn_mask=mask_LL,
+              scale=scale,
+              enable_gqa=enable_gqa,
+          )
+          .transpose(1, 2)
+          .flatten(0, 1)
+      )
 
     ref.inner_attention.forward = masked_sdpa
     return ref
@@ -280,9 +281,9 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
         wo=Linear.Config(
             in_features=32, out_features=self._DIM, param_init=_LINEAR_INIT
         ),
-        inner_attention=ScaledDotProductAttention.Config(),
+        inner_attention=ScaledDotProductInnerAttention.Config(),
         rope=Gemma4RoPE.Config(
-            dim=head_dim, max_seq_len=self._SEQ_LEN, theta=10000.0
+            dim=head_dim, max_context_length=self._SEQ_LEN, theta=10000.0
         ),
     )
     torch.manual_seed(0)
@@ -297,15 +298,18 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
     hf_mask = (dist >= 0) & (dist < self._WINDOW)
     causal_mask = dist >= 0
 
-    x = torch.randn(2, self._SEQ_LEN, self._DIM)
-    with torch.no_grad():
-      actual = attn(x, attention_masks=None)
+    x = torch.randn(2 * self._SEQ_LEN, self._DIM)
+    positions = torch.arange(self._SEQ_LEN).repeat(2)
+    with torch.no_grad(), set_unflatten_seq_len(self._SEQ_LEN):
+      actual = attn(x, attention_masks=None, positions=positions).view(
+          2, self._SEQ_LEN, self._DIM
+      )
       expected = self._attention_with_mask(attn, hf_mask)(
-          x, attention_masks=None
-      )
+          x, attention_masks=None, positions=positions
+      ).view(2, self._SEQ_LEN, self._DIM)
       full_causal = self._attention_with_mask(attn, causal_mask)(
-          x, attention_masks=None
-      )
+          x, attention_masks=None, positions=positions
+      ).view(2, self._SEQ_LEN, self._DIM)
 
     torch.testing.assert_close(actual, expected)
     # Rows that see fewer than W tokens are unaffected by the window; every
@@ -334,7 +338,7 @@ class TestGemma4SdpaSlidingWindow(absltest.TestCase):
             layer.attention.sliding_window_size - 1,
         )
       else:
-        self.assertIs(type(inner), ScaledDotProductAttention)
+        self.assertIs(type(inner), ScaledDotProductInnerAttention)
 
 
 class TestGemma4HFReferenceParity(BaseDeviceTest):
@@ -459,7 +463,9 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
       tt_config = converter.convert(tt_config)
       for layer_cfg in tt_config.layers:
         if layer_cfg.moe is not None:
-          layer_cfg.moe.experts.use_pallas_grouped_mm = False
+          layer_cfg.moe.routed_experts.inner_experts.use_pallas_grouped_mm = (
+              False
+          )
 
     tt_model = tt_config.build().to(self.accelerator_device)
     tt_model.init_states()
@@ -476,9 +482,15 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
     labels_cpu = torch.randint(0, tt_config.vocab_size, (batch_size, seq_len))
     tokens_dev = tokens_cpu.to(self.accelerator_device)
     labels_dev = labels_cpu.to(self.accelerator_device)
+    positions_dev = torch.arange(
+        seq_len, device=self.accelerator_device
+    ).repeat(batch_size)
     num_tokens = labels_cpu.numel()
 
-    tt_logits = tt_model(tokens_dev)
+    with set_unflatten_seq_len(seq_len):
+      tt_logits = tt_model(
+          tokens_dev.view(-1), positions=positions_dev
+      ).view(batch_size, seq_len, -1)
     tt_loss = cross_entropy_loss(tt_logits, labels_dev) / num_tokens
     tt_loss.backward()
 

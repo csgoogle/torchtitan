@@ -72,13 +72,6 @@ def main() -> None:
     trainer: Trainer | None = None
 
     try:
-        # TODO(local_tensor): Remove this special case once LocalTensor supports
-        # init_states() and foreach_allgather. In local tensor mode, skip
-        # training/checkpointing as the # model is not fully initialized
-        if config.comm.mode == "local_tensor":  # pyrefly: ignore [missing-attribute]
-            logger.info("Local tensor mode enabled - skipping training execution")
-            return
-
         # The planner selection has to span model construction, since
         # redistribution plans are resolved while tracing, not just at runtime.
         with contextlib.ExitStack() as stack:

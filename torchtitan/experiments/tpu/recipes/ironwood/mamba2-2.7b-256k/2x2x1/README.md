@@ -39,11 +39,16 @@ This recipe runs in the standard TorchTitan TPU container (`torchtitan-container
 - **SSM State Dimension (d_state)**: 16
 - **SSM Chunk Size**: 64 (N_chunks = 262,144 / 64 = 4,096 chunks)
 - **Sequence Length (S)**: **262,144 (256K tokens)**
-- **Batch Size Configuration**:
-  - **Local Batch Size**: 8 (Global Batch Size = 8 * 8 = 64, processing
-    **16,777,216 tokens / step**)
-  - **Single-Core Global Batch Size 8**: `local_batch_size = 1` across 8 TPU
-    cores (Global Batch Size = 8, processing **2,097,152 tokens / step**)
+  (passed as `--training.max_context_length=262144`)
+- **Batch Size Configuration**: batch size is expressed in tokens, so the
+  commands below pass `--training.num_tokens_per_microbatch_per_dp_rank`
+  (sequences per core * 262,144 tokens) rather than a sequence count:
+  - **Local Batch Size**: 8 sequences per core (Global Batch Size = 8 * 8 = 64,
+    processing **16,777,216 tokens / step**) ->
+    `--training.num_tokens_per_microbatch_per_dp_rank=2097152` (8 * 262,144)
+  - **Single-Core Global Batch Size 8**: 1 sequence per core across 8 TPU
+    cores (Global Batch Size = 8, processing **2,097,152 tokens / step**) ->
+    `--training.num_tokens_per_microbatch_per_dp_rank=262144` (1 * 262,144)
 
 ## Memory Utilization Breakdown on Ironwood TPU (96 GiB / Core)
 
@@ -94,8 +99,8 @@ xpk workload create \
     --hf_assets_path=tests/assets/tokenizer \
     --dataloader.dataset=c4_test \
     --training.steps=100 \
-    --training.local_batch_size=8 \
-    --training.seq_len=262144 \
+    --training.num_tokens_per_microbatch_per_dp_rank=2097152 \
+    --training.max_context_length=262144 \
     --training.mixed_precision_param=bfloat16"
 ```
 
@@ -126,8 +131,8 @@ xpk workload create \
     --hf_assets_path=tests/assets/tokenizer \
     --dataloader.dataset=c4_test \
     --training.steps=100 \
-    --training.local_batch_size=1 \
-    --training.seq_len=262144 \
+    --training.num_tokens_per_microbatch_per_dp_rank=262144 \
+    --training.max_context_length=262144 \
     --training.mixed_precision_param=bfloat16"
 ```
 

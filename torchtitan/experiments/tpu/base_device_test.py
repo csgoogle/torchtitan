@@ -175,12 +175,16 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
     optimizer_cpu = optim.Adam(model_cpu.parameters(), lr=0.01)
     optimizer_device = optim.Adam(model_device.parameters(), lr=0.01)
 
+    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    from torchtitan.models.common.decoder import Decoder
+
+    is_decoder = isinstance(model_cpu, Decoder)
+
     # Run 3 training steps
     for step in range(n_steps):
       # Generate new tokens for each step
-      tokens_cpu = torch.randint(
-          0, vocab_size, (batch, seq_len), device="cpu"
-      )
+      token_shape = (batch * seq_len,) if is_decoder else (batch, seq_len)
+      tokens_cpu = torch.randint(0, vocab_size, token_shape, device="cpu")
       tokens_device = tokens_cpu.to(self.accelerator_device)
 
       with self.subTest(name=f"Step_{step}_ForwardPass"):
@@ -188,30 +192,35 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
         optimizer_cpu.zero_grad()
         optimizer_device.zero_grad()
         # Forward pass
-        out_cpu = model_cpu(tokens_cpu)
-        out_device = model_device(tokens_device)
-        loss_cpu = loss_fn(
-            out_cpu.view(-1, vocab_size),
-            tokens_cpu.view(-1)
-        )
-        loss_device = loss_fn(
-            out_device.view(-1, vocab_size),
-            tokens_device.view(-1)
-        )
+        positions_cpu = torch.arange(
+            seq_len, dtype=torch.long, device="cpu"
+        ).repeat(batch)
+        positions_device = positions_cpu.to(self.accelerator_device)
+        with set_unflatten_seq_len(seq_len):
+          if is_decoder:
+            out_cpu = model_cpu(tokens_cpu, positions_cpu)
+            out_device = model_device(tokens_device, positions_device)
+          else:
+            out_cpu = model_cpu(tokens_cpu)
+            out_device = model_device(tokens_device)
+          loss_cpu = loss_fn(out_cpu.view(-1, vocab_size), tokens_cpu.view(-1))
+          loss_device = loss_fn(
+              out_device.view(-1, vocab_size), tokens_device.view(-1)
+          )
 
-        test_utils.check_equivalence(
-            tensor_test=loss_device.cpu(),
-            tensor_reference=loss_cpu,
-            check_name="Loss Function parity",
-            step=step,
-            atol=loss_atol,
-            rtol=loss_rtol,
-        )
+          test_utils.check_equivalence(
+              tensor_test=loss_device.cpu(),
+              tensor_reference=loss_cpu,
+              check_name="Loss Function parity",
+              step=step,
+              atol=loss_atol,
+              rtol=loss_rtol,
+          )
 
-        with self.subTest(name=f"Step_{step}_BackwardPass"):
-          # Backward pass
-          loss_cpu.backward()
-          loss_device.backward()
+          with self.subTest(name=f"Step_{step}_BackwardPass"):
+            # Backward pass
+            loss_cpu.backward()
+            loss_device.backward()
           # Gradient check
           for i, (p_cpu, p_device) in enumerate(
               zip(model_cpu.parameters(), model_device.parameters())

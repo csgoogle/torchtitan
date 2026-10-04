@@ -19,12 +19,14 @@ the thing the patch changes.
 import inspect
 import sys
 import textwrap
+from unittest import mock
 
 from absl.testing import absltest
 import torch
 from torch._higher_order_ops.scan import ScanAutogradImpl, scan
 from torch.utils._python_dispatch import TorchDispatchMode
 import torch.utils._pytree as pytree
+from torch_tpu._internal.compile import scan as tpu_scan
 
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
@@ -114,6 +116,10 @@ class ScanBackwardPatchTest(base_device_test.BaseAcceleratorDeviceTest):
     scan_backward_patch._UPSTREAM_CALL_BACKWARD = bumped
 
   def test_it_removes_the_flips_and_leaves_the_gradients_alone(self):
+    """The gradient check also proves torch_tpu honoured the reverse request.
+
+    A loop that ran forwards would return the `xs` gradient reversed.
+    """
     before, flips_before = self._backward()
     # Asserted, not assumed: without this the next assertion passes for any
     # reason at all, including the test no longer reaching a scan.
@@ -127,6 +133,68 @@ class ScanBackwardPatchTest(base_device_test.BaseAcceleratorDeviceTest):
     self.assertEqual(flips_after, [], "the backward still reverses by copy")
     for name, b, a in zip(("init", "xs"), before, after):
       torch.testing.assert_close(a, b, msg=f"{name} gradient changed")
+
+  def _record_rewritten_scans(self):
+    """Calls through to the patch's own `scan_op`, keeping what it was given."""
+    real_scan_op = scan_backward_patch.scan_op
+    seen = []
+
+    def recording(combine_gm, init, xs, additional_inputs=(), **kwargs):
+      seen.append(combine_gm)
+      return real_scan_op(combine_gm, init, xs, additional_inputs, **kwargs)
+
+    self.enter_context(
+        mock.patch.object(scan_backward_patch, "scan_op", recording)
+    )
+    return seen
+
+  def test_it_asks_torch_tpu_for_a_reverse_loop_without_index_copy(self):
+    """The structure the collective pipeliner needs, checked on the graph.
+
+    The step body has to carry torch_tpu's reverse annotation -- checked with
+    torch_tpu's own predicate, so the two cannot drift apart -- and must not
+    write its gradient rows with `index_copy`, which lowers to a scatter that
+    XLA's collective pipeliner cannot move collectives through.
+    """
+    seen = self._record_rewritten_scans()
+
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    self._backward()
+
+    self.assertNotEmpty(seen, "the rewrite never ran -- test is vacuous")
+    for combine_gm in seen:
+      self.assertTrue(
+          tpu_scan._body_asks_for_reverse(combine_gm),
+          "the step body does not ask torch_tpu for a reverse loop",
+      )
+      targets = [str(node.target) for node in combine_gm.graph.nodes]
+      self.assertFalse(
+          [t for t in targets if "index_copy" in t or "scatter" in t],
+          f"the step body still writes rows by scatter: {targets}",
+      )
+
+  def test_the_gradients_depend_on_torch_tpu_reversing_the_loop(self):
+    """Why the gradient check above also covers the reverse request.
+
+    With the annotation key changed to one torch_tpu does not know, the loop
+    runs forwards and the gradients come out wrong. If they did not, the
+    gradient check would pass whether or not torch_tpu reversed anything.
+    """
+    expected, _ = self._backward()
+    self.enter_context(
+        mock.patch.object(
+            scan_backward_patch, "SCAN_REVERSE_ANNOTATION", "not_the_key"
+        )
+    )
+
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    grads, _ = self._backward()
+
+    self.assertFalse(
+        torch.allclose(grads[1], expected[1]),
+        "the xs gradient is right without the reverse request -- the gradient"
+        " check does not cover it",
+    )
 
   def test_it_launches_its_scan_with_torch_s_own_names(self):
     """A scan of ours has to be traced as the real HOP, not as the stand-in.
@@ -260,6 +328,34 @@ class ScanBackwardPatchTest(base_device_test.BaseAcceleratorDeviceTest):
     grads, flips = self._backward()
 
     self.assertNotEqual(flips, [], "the added flip was swallowed")
+    for name, want, got in zip(("init", "xs"), expected, grads):
+      torch.testing.assert_close(got, want, msg=f"{name} gradient changed")
+
+  def test_it_falls_back_on_a_device_that_ignores_the_reverse_request(self):
+    """Off TPU: a forward loop and one flip, same gradients, no annotation.
+
+    CPU tests and meta-device traces install this patch too, so it must not
+    raise there, and must not ask a backend that ignores the request for a
+    reverse loop. Simulated by naming another device as the one that honours
+    it, since this test only runs on TPU.
+    """
+    expected, _ = self._backward()
+    self.enter_context(
+        mock.patch.object(
+            scan_backward_patch, "_REVERSE_SCAN_DEVICE_TYPE", "not_a_device"
+        )
+    )
+    seen = self._record_rewritten_scans()
+
+    self.assertTrue(scan_backward_patch.apply_scan_reverse_backward_patch())
+    grads, _ = self._backward()
+
+    self.assertNotEmpty(seen, "the rewrite never ran -- test is vacuous")
+    for combine_gm in seen:
+      self.assertFalse(
+          tpu_scan._body_asks_for_reverse(combine_gm),
+          "asked for a reverse loop on a device that ignores the request",
+      )
     for name, want, got in zip(("init", "xs"), expected, grads):
       torch.testing.assert_close(got, want, msg=f"{name} gradient changed")
 

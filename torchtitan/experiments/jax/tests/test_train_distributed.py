@@ -58,9 +58,12 @@ class TestJaxDistributed(parameterized.TestCase):
         f"--jax_config.model_layer_override={layer_override}",
         "--dataloader.dataset_path=tests/assets/c4_test",
         "--hf_assets_path=tests/assets/tokenizer",
-        "--training.seq_len=128",
+        "--training.max_context_length=128",
         "--training.steps=3",
-        "--training.local_batch_size=8",
+        # Upstream d771abb0 renamed `--training.local_batch_size` to the
+        # token-denominated `--training.num_tokens_per_microbatch_per_dp_rank`:
+        # 8 samples x 128 tokens.
+        "--training.num_tokens_per_microbatch_per_dp_rank=1024",
         "activation-checkpoint:full",
     ]
 

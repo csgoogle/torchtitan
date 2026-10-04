@@ -12,6 +12,7 @@ import torchtitan.config
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
+from torchtitan.experiments.tpu import local_tpu_device
 import torchtitan.experiments.tpu.examples.gemma4  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
@@ -93,14 +94,19 @@ def _run_model_distributed(
   loss_fn = train_config.loss.build(compile_config=train_config.compile)
   if isinstance(loss_fn, torchtitan.components.loss.ChunkedLossWrapper):
     loss_fn.set_lm_head(model.lm_head)
+    model._skip_lm_head = True
 
   train_context = dist_utils.get_spmd_context(
       parallel_dims=parallel_dims, spmd_typechecking=False
   )
 
   n_steps = train_config.training.steps
-  batch_size = train_config.training.local_batch_size
-  seq_len = train_config.training.seq_len
+  # Upstream replaced seq_len/local_batch_size with a token budget:
+  # local_batch_size = num_tokens_per_microbatch_per_dp_rank // max_context_length.
+  seq_len = train_config.training.max_context_length
+  batch_size = (
+      train_config.training.num_tokens_per_microbatch_per_dp_rank // seq_len
+  )
   for step in range(n_steps):
     logging.info("Step %s / %s", step, n_steps)
     # Generate new inputs for each step
@@ -135,14 +141,19 @@ def _run_model_distributed(
         logging.info("calling loss.backward()")
         loss.backward()
     else:
+      from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
+
       tokens_cpu = torch.randint(
-          0, model_args.vocab_size, (batch_size, seq_len), device="cpu"
+          0, model_args.vocab_size, (batch_size * seq_len,), device="cpu"
       )
       tokens_device = tokens_cpu.to(device)
+      positions_device = (
+          torch.arange(seq_len, device=device).repeat(batch_size)
+      )
       optimizer.zero_grad()
-      with train_context():  # pytype: disable=not-callable
+      with train_context(), set_unflatten_seq_len(seq_len):  # pytype: disable=not-callable
         logging.info("calling model()")
-        out_device = model(tokens_device)
+        out_device = model(tokens_device, positions=positions_device)
         loss = loss_fn(out_device, tokens_device)
         if isinstance(loss, tuple):
           loss, _ = loss
@@ -186,6 +197,8 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
+          # TODO(jeremiahhsu): Failing only on TPU7x b/568843473
+          skip_on_tpu7x=True,
       ),
       dict(
           testcase_name="deepseek_v3_tp_dtensor",
@@ -256,7 +269,15 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       enable_compile=False,
       dataset_path="tests/assets/c4_test",
       dataset="c4_test",
+      skip_on_tpu7x=False,
   ):
+    if (
+        skip_on_tpu7x
+        and self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU
+        and local_tpu_device.get_local_chips()[0]
+        == local_tpu_device.TpuChip.V7X
+    ):
+      self.skipTest("Failing only on TPU7x: b/568843473")
     args = [
         f"--module={module}",
         f"--config={config}",
@@ -264,7 +285,7 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
         "--hf_assets_path=tests/assets/tokenizer",
         f"--dataloader.dataset_path={dataset_path}",
         f"--dataloader.dataset={dataset}",
-        "--training.seq_len=32",
+        "--training.max_context_length=32",
         "--training.steps=3",
     ]
     if module == "flux":

@@ -10,10 +10,8 @@ from torchtitan.models.qwen3 import parallelize as dtensor_parallelize
 from torchtitan.experiments.graph_trainer.common_utils import (
     apply_simple_fsdp,
 )
-from torchtitan.experiments.tpu.grouped_experts import (
-    TpuGroupedExperts,
-    configure_expert_dweight_output_dtype,
-)
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import configure_simple_fsdp_shard_dims
 from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 from torchtitan.tools.logging import logger
 
@@ -27,27 +25,8 @@ def configure_qwen_simple_fsdp_shard_dims(
   if fsdp_degree <= 1:
     return
 
-  # Layer stacking moves the layer weights into a holder, which plans an axis
-  # per stack -- dim 1 of a stack is one axis further in than dim 1 of a layer.
-  stacks = [m for m in model.modules() if hasattr(m, "plan_shard_dims")]
-  for holder in stacks:
-    holder._fsdp_shard_dim = holder.plan_shard_dims(fsdp_degree)
-
-  hidden_axis_modules: list[str] = []
-  for module_fqn in ("tok_embeddings", "lm_head"):
-    module = getattr(model, module_fqn)
-    weight = module.weight
-    if weight.shape[0] % fsdp_degree == 0:
-      continue
-    if weight.ndim != 2 or weight.shape[1] % fsdp_degree != 0:
-      raise ValueError(
-          f"Cannot FSDP-shard {module_fqn}.weight with shape "
-          f"{tuple(weight.shape)} over {fsdp_degree} ranks"
-      )
-    # This is apply_simple_fsdp's documented per-submodule shard-axis hook,
-    # also used by LayerStackHolder for stacked layer weights.
-    setattr(module, "_fsdp_shard_dim", 1)
-    hidden_axis_modules.append(module_fqn)
+  hidden_axis_modules = configure_simple_fsdp_shard_dims(model, parallel_dims)
+  stacks = any(hasattr(m, "plan_shard_dims") for m in model.modules())
 
   # With EP, apply_simple_fsdp separately wraps each expert bank on the EDP
   # mesh and owns its shard-axis selection.
@@ -113,12 +92,6 @@ def parallelize_qwen3(
   """
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
-  reduce_dtype = torchtitan.config.TORCH_DTYPE_MAP[
-      training.mixed_precision_reduce
-  ]
-  # Match unpaired expert dWeight stores to the final, post-CLI FSDP reduction
-  # dtype before tracing or FSDP wrapping.
-  configure_expert_dweight_output_dtype(model, reduce_dtype)
   if effective_compile_config.enable and hasattr(model, "layers"):
     from torchtitan.models.common.moe import MoE
 
@@ -151,6 +124,10 @@ def parallelize_qwen3(
         parallel_dims=parallel_dims,
         training=training,
     )
+    # Creates process groups, so every rank runs it here, right after sharding.
+    for holder in model.modules():
+      if hasattr(holder, "build_split_meshes"):
+        holder.build_split_meshes()
   else:
     dtensor_parallelize.parallelize_qwen3(
           model,  # pyrefly: ignore[bad-argument-type]

@@ -8,11 +8,15 @@
 
 import dataclasses
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
+from torch import nn
 from torchtitan.experiments.graph_trainer.configs import to_graph_trainer_config
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
     with_tpu_stacked_layers,
+)
+from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
+    configure_simple_fsdp_shard_dims,
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
@@ -51,10 +55,6 @@ def _validate_fsdp_allreduce_slice(
     raise ValueError(
         "fsdp all-reduce-plus-slice currently requires full-world FSDP "
         "with DP-replicate/TP/CP/PP/EP degrees all equal to 1"
-    )
-  if train_config.training.mixed_precision_reduce != "float32":
-    raise ValueError(
-        "fsdp all-reduce-plus-slice currently requires FP32 FSDP reductions"
     )
 
 
@@ -98,10 +98,10 @@ def to_tpu_graph_trainer_config(
   graph_config.compile.cpu_offload_budget_gb = budget
   if tpu_config.use_scan_layers:
     check_scan_parallelism(train_config.parallelism)
-    # Expert parallelism shards `moe.experts` on a mesh of its own. A stack is
-    # one tensor sharded once, so there is nowhere to put that. Refusing MoE
-    # already covers every model that can set this; the check is here so the
-    # flag gets named instead of failing somewhere further in.
+    # Expert parallelism shards the routed experts on a mesh of their own. A
+    # stack is one tensor sharded once, so there is nowhere to put that.
+    # Refusing MoE already covers every model that can set this; the check is
+    # here so the flag gets named instead of failing somewhere further in.
     if train_config.parallelism.expert_parallel_degree > 1:
       raise ValueError(
           "--tpu-config.use-scan-layers cannot be combined with "
@@ -116,11 +116,24 @@ def to_tpu_graph_trainer_config(
     # The rewrite happens here rather than in the recipe because the
     # GraphTrainer model spec built above comes from a fixed class in the
     # graph-trainer registry, which discards whatever the recipe had set.
+    orig_parallelize_fn = graph_config.model_spec.parallelize_fn
+
+    def parallelize_fn_with_shard_dims(
+        model: nn.Module, **kwargs: Any
+    ) -> nn.Module:
+      configure_simple_fsdp_shard_dims(model, kwargs.get("parallel_dims"))
+      model = orig_parallelize_fn(model, **kwargs)
+      for holder in model.modules():
+        if hasattr(holder, "build_split_meshes"):
+          holder.build_split_meshes()
+      return model
+
     graph_config.model_spec = dataclasses.replace(
         graph_config.model_spec,
         model=with_tpu_stacked_layers(
             graph_config.model_spec.model, use_scan=True
         ),
+        parallelize_fn=parallelize_fn_with_shard_dims,
     )
     # The rewrite is only a config edit, so anything added after it that
     # rebuilds `model_spec` from a fixed class drops it again -- and an

@@ -21,7 +21,6 @@ from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
     configure_qwen_simple_fsdp_shard_dims,
 )
-from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 
 
 def _model(*, hidden_dim: int = 8, vocab_size: int = 8) -> nn.Module:
@@ -34,7 +33,6 @@ def _model(*, hidden_dim: int = 8, vocab_size: int = 8) -> nn.Module:
       dim=8,
       hidden_dim=hidden_dim,
       num_experts=2,
-      token_dispatcher=LocalTokenDispatcher.Config(num_experts=2, top_k=1),
   ).build()
   model.layers = nn.ModuleDict({"0": layer})
   return model
@@ -98,8 +96,13 @@ class SimpleFSDPShardingTest(absltest.TestCase):
 
     configure_qwen_simple_fsdp_shard_dims(model, _parallel_dims(4))
 
+    # 2 experts can't split over 4 ranks, so the stack is flattened to
+    # [2, 2*8, 8] and shards on dim 1 instead of the hidden dim.
     self.assertEqual(
-        model.layer_stacks._fsdp_shard_dim, {"moe__experts__w1_EDF": 2}
+        model.layer_stacks._fsdp_shard_dim, {"moe__experts__w1_EDF": 1}
+    )
+    self.assertEqual(
+        tuple(model.layer_stacks.moe__experts__w1_EDF.shape), (2, 16, 8)
     )
 
   def test_rejects_an_empty_expert_module_when_nothing_is_stacked(self) -> None:
@@ -131,17 +134,11 @@ class SimpleFSDPShardingTest(absltest.TestCase):
         SimpleNamespace(mixed_precision_reduce="bfloat16"),
     )
 
-    with (
-        mock.patch.object(
-            graph_trainer_qwen3,
-            "configure_expert_dweight_output_dtype",
-        ),
-        mock.patch.object(
-            graph_trainer_qwen3,
-            "graph_trainer_parallelize_qwen3",
-            return_value=model,
-        ) as upstream_parallelize,
-    ):
+    with mock.patch.object(
+        graph_trainer_qwen3,
+        "graph_trainer_parallelize_qwen3",
+        return_value=model,
+    ) as upstream_parallelize:
       result = graph_trainer_qwen3.parallelize_qwen3(
           cast(GraphTrainerQwen3Model, model),
           training=training,

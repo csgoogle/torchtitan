@@ -157,14 +157,16 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
         init_fn=lambda m: None,
         config=config.layers[0].attention,
     )
-    x_cpu, x_device = self._create_input_tensor_cpu_device((batch, seq_len, config.dim), requires_grad=True)
-    positions_cpu = torch.arange(seq_len, dtype=torch.long, device="cpu").unsqueeze(0).expand(batch, seq_len)
+    x_cpu, x_device = self._create_input_tensor_cpu_device((batch * seq_len, config.dim), requires_grad=True)
+    positions_cpu = torch.arange(seq_len, dtype=torch.long, device="cpu").repeat(batch)
     positions_device = positions_cpu.to(self.accelerator_device)
 
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      out_cpu = attention_cpu(x_cpu, None, positions_cpu)
-      out_device = attention_device(x_device, None, positions_device)
+      from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+      with set_unflatten_seq_len(seq_len):
+        out_cpu = attention_cpu(x_cpu, None, positions_cpu)
+        out_device = attention_device(x_device, None, positions_device)
       # Note looser tolerance.
       test_utils.check_equivalence(
           out_device.cpu(),
@@ -260,7 +262,7 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
         config=config.layers[0].feed_forward,
     )
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, config.dim), requires_grad=True
+        (batch * seq_len, config.dim), requires_grad=True
     )
 
     with self.subTest(name="ForwardPass"):
@@ -319,13 +321,15 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
     moe_device.load_state_dict(moe_cpu.state_dict())
     moe_device = moe_device.to(self.accelerator_device)
     x_cpu, x_device = self._create_input_tensor_cpu_device(
-        (batch, seq_len, config.dim), requires_grad=True
+        (batch * seq_len, config.dim), requires_grad=True
     )
 
     with self.subTest(name="ForwardPass"):
       # Forward pass
-      out_cpu = moe_cpu(x_cpu)
-      out_device = moe_device(x_device)
+      from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+      with set_unflatten_seq_len(seq_len):
+        out_cpu = moe_cpu(x_cpu)
+        out_device = moe_device(x_device)
       test_utils.check_equivalence(
           out_device.cpu(),
           out_cpu,
@@ -382,12 +386,14 @@ class Qwen3Test(base_device_test.BaseAcceleratorDeviceTest):
             config=block_config,
         )
     )
-    x_cpu, x_device = self._create_input_tensor_cpu_device((batch, seq_len, config.dim), requires_grad=True)
-    positions_cpu = torch.arange(seq_len, dtype=torch.long, device="cpu").unsqueeze(0).expand(batch, seq_len)
+    x_cpu, x_device = self._create_input_tensor_cpu_device((batch * seq_len, config.dim), requires_grad=True)
+    positions_cpu = torch.arange(seq_len, dtype=torch.long, device="cpu").repeat(batch)
     positions_device = positions_cpu.to(self.accelerator_device)
 
-    out_cpu = transformer_block_cpu(x_cpu, None, positions_cpu)
-    out_device = transformer_block_device(x_device, None, positions_device)
+    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    with set_unflatten_seq_len(seq_len):
+      out_cpu = transformer_block_cpu(x_cpu, None, positions_cpu)
+      out_device = transformer_block_device(x_device, None, positions_device)
     test_utils.check_equivalence(
         out_device.cpu(),
         out_cpu,

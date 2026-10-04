@@ -1,10 +1,10 @@
 from typing import cast
 
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer.optimizer import default_adamw
 from torchtitan.components.validate import Validator
 from torchtitan.config.configs import (
     CompileConfig,
@@ -12,6 +12,8 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.experiments.tpu import tpu_flags
+from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.examples.gemma4 import (
     _build_flavor_config,
     model_registry,
@@ -36,7 +38,6 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUConfig,
     TPUTrainerConfig,
 )
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_spec import ModelSpec
 
 
@@ -58,13 +59,11 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=TrainingConfig(
-          local_batch_size=4,
-          seq_len=512,
+          num_tokens_per_microbatch_per_dp_rank=4 * 512,
+          max_context_length=512,
           steps=10,
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           pipeline_parallel_schedule="Interleaved1F1B"
@@ -88,13 +87,14 @@ def gemma4_moe_testmodel() -> TPUTrainerConfig:
       name="gemma4",
       flavor="testmodel_moe",
       model=_build_flavor_config("testmodel_moe", enable_weight_tying=False),
+      max_context_length=128,
       parallelize_fn=tpu_parallelize_gemma4,
       pipelining_fn=None,
       post_optimizer_build_fn=None,
       state_dict_adapter=Gemma4StateDictAdapter,
   )
-  cfg.training.seq_len = 128
-  cfg.training.local_batch_size = 4
+  cfg.training.max_context_length = 128
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 4 * 128
   return cfg
 
 
@@ -133,14 +133,12 @@ def gemma4_31b() -> TPUTrainerConfig:
       ),
       training=TrainingConfig(
           max_norm=1.0,
-          local_batch_size=2,
-          seq_len=4096,
+          num_tokens_per_microbatch_per_dp_rank=2 * 4096,
+          max_context_length=4096,
           steps=15,
           mixed_precision_reduce="float32",
       ),
-      dataloader=HuggingFaceTextDataLoader.Config(
-          dataset="c4_test",
-      ),
+      dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=1),
       parallelism=ParallelismConfig(
           use_simple_fsdp=True,
@@ -159,6 +157,9 @@ def gemma4_31b() -> TPUTrainerConfig:
           use_jax_profiler=False,
           compile_mode="layer",
           compile_grad_norm=True,
+      ),
+      libtpu_init_flags=tpu_flags.merge_flags(
+          xla_tpu_scoped_vmem_limit_kib=61440,
       ),
       compile=CompileConfig(
           enable=True,

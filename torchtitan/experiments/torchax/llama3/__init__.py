@@ -7,10 +7,15 @@ from .sharding import sharding_map_scan_moe
 from torchtitan.models.llama3 import Llama3Model, llama3_configs
 
 # Materialize upstream factory configs into per-flavor model-args instances.
-# Upstream ``llama3_configs[flavor]`` is a callable ``(attn_backend) -> Config``;
-# torchax overrides flash attention separately (see
+# Upstream d771abb0 changed ``llama3_configs[flavor]`` from a callable
+# ``(attn_backend) -> Config`` into a ``(builder, max_context_length)`` pair,
+# with ``seq_len`` now a required keyword-only argument; each flavor is built at
+# its own max context length. torchax overrides flash attention separately (see
 # ``splash_attn.declare_splash_attention``), so default to ``"sdpa"`` here.
-args = {k: v("sdpa") for k, v in llama3_configs.items()}
+args = {
+    flavor: build_config(attn_backend="sdpa", seq_len=max_context_length)
+    for flavor, (build_config, max_context_length) in llama3_configs.items()
+}
 model = Llama3Model
 
 __all__ = [

@@ -349,14 +349,31 @@ class DistributedUnitTestRunner:
     if backward:
       model.zero_grad()
 
-    output = model(inputs)
-    loss = None
+    import contextlib
+    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    from torchtitan.models.common.decoder import Decoder
 
-    if backward and targets is not None:
-      if targets.dtype != output.dtype:
-        targets = targets.to(output.dtype)
-      loss = nn.MSELoss()(output, targets)
-      loss.backward()
+    loss = None
+    if isinstance(model, Decoder) and inputs.ndim == 2:
+      bs, seq_len = inputs.shape
+      positions = torch.arange(
+          seq_len, dtype=torch.long, device=inputs.device
+      ).repeat(bs)
+      ctx = set_unflatten_seq_len(seq_len)
+      call_fn = lambda: model(inputs.reshape(-1), positions).reshape(
+          bs, seq_len, -1
+      )
+    else:
+      ctx = contextlib.nullcontext()
+      call_fn = lambda: model(inputs)
+
+    with ctx:
+      output = call_fn()
+      if backward and targets is not None:
+        if targets.dtype != output.dtype:
+          targets = targets.to(output.dtype)
+        loss = nn.MSELoss()(output, targets)
+        loss.backward()
 
     return output, loss
 

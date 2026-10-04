@@ -77,7 +77,7 @@ def _optimization_barrier_fake(
 def _ensure_optimization_barrier_fake() -> None:
     # Temporary compatibility shim for TorchTPU 0.0.42.1. The upstream fix is
     # https://github.com/google-pytorch/torch_tpu/pull/2562.
-    op_name = "tpu::optimization_barrier"
+    op_name = "tpu::_optimization_barrier"
     if torch._C._dispatch_has_kernel_for_dispatch_key(op_name, "Meta"):
         return
     torch.library.register_fake(op_name, _optimization_barrier_fake)

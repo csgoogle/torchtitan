@@ -39,18 +39,33 @@ def _testmodel(attn_backend: str = "flex") -> llama3_models.Llama3Model.Config:
           attn_backend=attn_backend,
           rope=common_models.ComplexRoPE.Config(
               dim=dim // n_heads,
-              max_seq_len=512,
+              max_context_length=512,
           ),
       ),
   )
 
 
+def _upstream_flavor(
+    flavor: str, attn_backend: str
+) -> llama3_models.Llama3Model.Config:
+  """Builds an upstream llama3 flavor at that flavor's full context length.
+
+  Upstream d771abb0 changed `llama3_models.llama3_configs[flavor]` from a
+  `(attn_backend) -> Config` callable into a `(builder, max_context_length)`
+  pair, and made `seq_len` a required keyword-only argument of the builder.
+  Passing the flavor's own `max_context_length` reproduces what the old
+  callable produced.
+  """
+  build_config, max_context_length = llama3_models.llama3_configs[flavor]
+  return build_config(attn_backend=attn_backend, seq_len=max_context_length)
+
+
 llama3_configs = {
     "testmodel": _testmodel("sdpa"),
-    "debugmodel": llama3_models.llama3_configs["debugmodel"]("sdpa"),
-    "debugmodel_flex_attn": llama3_models.llama3_configs["debugmodel"]("flex"),
-    "1B": llama3_models.llama3_configs["1B"]("sdpa"),
-    "8B": llama3_models.llama3_configs["8B"]("sdpa"),
-    "70B": llama3_models.llama3_configs["70B"]("sdpa"),
-    "405B": llama3_models.llama3_configs["405B"]("sdpa"),
+    "debugmodel": _upstream_flavor("debugmodel", "sdpa"),
+    "debugmodel_flex_attn": _upstream_flavor("debugmodel", "flex"),
+    "1B": _upstream_flavor("1B", "sdpa"),
+    "8B": _upstream_flavor("8B", "sdpa"),
+    "70B": _upstream_flavor("70B", "sdpa"),
+    "405B": _upstream_flavor("405B", "sdpa"),
 }

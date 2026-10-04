@@ -52,6 +52,7 @@ xpk workload create \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.qwen3 \
     --config=qwen3_moe_30b_fsdp_only_full_ac_benchmark \
+    --hf_assets_path=tests/assets/tokenizer \
     --libtpu-init-flags='$LIBTPU_INIT_FLAGS'"
 ```
 

@@ -1,4 +1,4 @@
-"""FX pass: insert `torch_tpu::optimization_barrier` around the MoE
+"""FX pass: insert `tpu::_optimization_barrier` around the MoE
 padded-combine region.
 
 Motivation
@@ -13,7 +13,7 @@ training graph the trajectories diverge: XLA cross-fuses the combine
 with adjacent ops and the fused kernel's bf16 layout / SC offload
 choices change the numerics enough to break the loss curve.
 
-Wrapping the combine inputs+outputs in `torch_tpu::optimization_barrier`
+Wrapping the combine inputs+outputs in `tpu::_optimization_barrier`
 ("compiler-scheduling-barrier" in HLO) prevents that cross-fusion. The
 eager-mode confirmation lives at
 `opt_barrier_exp/RECOMMENDATIONS.md`:
@@ -26,7 +26,7 @@ eager-mode confirmation lives at
 | MFU           | 21%       | 31.7%        | 0.33%           |
 
 For compile mode the Python-source barrier breaks autograd because
-`torch_tpu::optimization_barrier` has no Autograd registration in the
+`tpu::_optimization_barrier` has no Autograd registration in the
 wheel. We therefore insert the barriers at the FX-graph level AFTER
 `make_fx` (and after `_copy_fwd_metadata_to_bw_nodes` has copied the
 forward annotation to backward nodes via seq_nr).
@@ -133,9 +133,14 @@ def apply_combine_barrier_pass(
         """
         if not users_to_redirect:
             return
+        # FX nodes must target the op overload rather than the public
+        # `torch.tpu.ops.optimization_barrier` Python wrapper: the graph is
+        # already traced, so a node targeting the wrapper would be opaque to
+        # the downstream passes and lowering, which only handle ATen/custom op
+        # overloads.
         with graph.inserting_after(node):
             barrier = graph.call_function(
-                torch.ops.torch_tpu.optimization_barrier.default,
+                torch.ops.tpu._optimization_barrier.default,  # pylint: disable=protected-access
                 ([node],),
             )
         with graph.inserting_after(barrier):

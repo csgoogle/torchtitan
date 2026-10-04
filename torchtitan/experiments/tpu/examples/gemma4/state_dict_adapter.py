@@ -65,7 +65,7 @@ class Gemma4StateDictAdapter(StateDictAdapter):
             "model.language_model.layers.{}.router.proj.weight": "layers.{}.moe.router.gate.weight",
             "model.language_model.layers.{}.router.scale": "layers.{}.moe.router.scale",
             "model.language_model.layers.{}.router.per_expert_scale": "layers.{}.moe.router.per_expert_scale",
-            "model.language_model.layers.{}.experts.down_proj": "layers.{}.moe.experts.w2_EDF",
+            "model.language_model.layers.{}.experts.down_proj": "layers.{}.moe.routed_experts.inner_experts.w2_EDF",
             # Final norm & output head
             "model.language_model.norm.weight": "norm.weight",
             "lm_head.weight": "lm_head.weight",
@@ -86,7 +86,10 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                 layer_num = match.group(0)
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
 
-                if abstract_key == "layers.{}.moe.experts.w1_EFD":
+                if (
+                    abstract_key
+                    == "layers.{}.moe.routed_experts.inner_experts.w1_EFD"
+                ):
                     pending_w1[layer_num] = value
                     if layer_num in pending_w3:
                         hf_key = f"model.language_model.layers.{layer_num}.experts.gate_up_proj"
@@ -96,7 +99,10 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                         )
                     continue
 
-                if abstract_key == "layers.{}.moe.experts.w3_EFD":
+                if (
+                    abstract_key
+                    == "layers.{}.moe.routed_experts.inner_experts.w3_EFD"
+                ):
                     pending_w3[layer_num] = value
                     if layer_num in pending_w1:
                         hf_key = f"model.language_model.layers.{layer_num}.experts.gate_up_proj"
@@ -150,12 +156,12 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                     == "model.language_model.layers.{}.experts.gate_up_proj"
                 ):
                     w1_EFD, w3_EFD = torch.chunk(value, 2, dim=1)
-                    state_dict[f"layers.{layer_num}.moe.experts.w1_EFD"] = (
-                        w1_EFD.contiguous()
-                    )
-                    state_dict[f"layers.{layer_num}.moe.experts.w3_EFD"] = (
-                        w3_EFD.contiguous()
-                    )
+                    state_dict[
+                        f"layers.{layer_num}.moe.routed_experts.inner_experts.w1_EFD"
+                    ] = w1_EFD.contiguous()
+                    state_dict[
+                        f"layers.{layer_num}.moe.routed_experts.inner_experts.w3_EFD"
+                    ] = w3_EFD.contiguous()
                     continue
 
                 if abstract_key in self.from_hf_map:

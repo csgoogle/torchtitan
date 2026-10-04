@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.config import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.distributed.utils import get_spmd_context
 from torchtitan.experiments.graph_trainer.configs import (
@@ -27,6 +28,7 @@ def build_minimal_trainer(
     *,
     activation_checkpoint_mode: str = "none",
     compile_enable_passes: bool = True,
+    compile_enable_inplace_graph_gradient_accumulation: bool = False,
     compile_passes: list[str] | None = None,
     compile_ep_overlap_enabled: bool = False,
     compile_ep_overlap_chunk_dim: str = "batch",
@@ -43,11 +45,17 @@ def build_minimal_trainer(
     trainer = object.__new__(trainer_cls)
     trainer.model_parts = [model]
     trainer.loss_fn = CrossEntropyLoss.Config().build()
-    trainer.parallel_dims = SimpleNamespace(pp_enabled=False, cp_enabled=False)
+    trainer.parallel_dims = SimpleNamespace(
+        pp_enabled=False,
+        cp_enabled=False,
+        spmd_backend="partial_dtensor",
+    )
     trainer.train_context = get_spmd_context()
+    trainer.fwd_bwd_fn = trainer._forward_backward_body
     trainer.model_config = model_config
     trainer.device = torch.device("cuda")
     trainer.tokenizer = tokenizer
+    trainer.dataloader = SimpleNamespace(max_num_documents=None)
     trainer.ntokens_seen = 0
 
     if trainer_cls is GraphTrainer:
@@ -56,6 +64,9 @@ def build_minimal_trainer(
                 enable=True,
                 mode="aot_fx_trace",
                 enable_passes=compile_enable_passes,
+                enable_inplace_graph_gradient_accumulation=(
+                    compile_enable_inplace_graph_gradient_accumulation
+                ),
                 passes=[] if compile_passes is None else list(compile_passes),
                 disable_passes=(
                     []
@@ -80,18 +91,24 @@ def build_minimal_trainer(
                 "selective": SelectiveAC.Config(),
                 "full": FullAC.Config(),
             }[activation_checkpoint_mode],
+            dataloader=SimpleNamespace(max_num_documents=None),
+            training=TrainingConfig(),
             parallelism=SimpleNamespace(
                 pipeline_parallel_degree=1,
                 fsdp_reshard_after_forward=fsdp_reshard_after_forward,
-                enable_async_tensor_parallel=False,
-                spmd_backend="default",
+                spmd_backend="partial_dtensor",
             ),
         )
         trainer._fwd_bwd_step_module = None
         trainer._traced_step = None
+        trainer._graph_runner = None
+        trainer._trainable_params = None
+        trainer._graph_gradient_state = None
     else:
         trainer.config = SimpleNamespace(
-            parallelism=SimpleNamespace(spmd_backend="default"),
+            dataloader=SimpleNamespace(max_num_documents=None),
+            training=TrainingConfig(),
+            parallelism=SimpleNamespace(spmd_backend="partial_dtensor"),
         )
 
     return trainer

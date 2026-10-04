@@ -60,6 +60,10 @@ class TPUConfig:
   use_simple_fsdp: bool = False
   compile_mode: str = "layer"
   apply_rope_complex_workaround: bool = False
+  # Compute dense Llama3/Qwen3 transformer blocks on [B, L, ...] views instead
+  # of upstream's folded [T, ...] tensors, which make XLA pick slow TPU layouts
+  # (see experiments/tpu/bld_layout.py). Numerics match to rounding order.
+  bld_block_layout: bool = True
   use_jax_profiler: bool = False
   # For GraphTrainer, partition the transformed joint FX graph into separately
   # compiled forward and backward modules. All finer splitting is nested under
@@ -176,6 +180,12 @@ class FluxConfig:
   """Path to the precomputed embeddings"""
   random_dataset: bool = False
   """Whether to train on random instead of real data"""
+  img_size: int | None = None
+  """Overrides the image size (and derived max_context_length) of the config.
+
+  Upstream nests img_size under the tyro-suppressed dataloader.dataset, so it
+  cannot be set from the command line otherwise.
+  """
 
 
 @dataclasses.dataclass
@@ -272,6 +282,12 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
   )
 
   def __post_init__(self):
+    # Upstream d771abb0 validates CUDA-graph capturability in
+    # `Trainer.Config.__post_init__`, and rejects any MoE token dispatcher it
+    # does not recognize -- which is all of the TPU ones. There is no CUDA
+    # graph to capture in this lane, so opt out before the check runs. Must
+    # come before `super()`, which is what calls `_validate_cuda_graphs`.
+    self.training.disable_cuda_graphs = True
     # NOTE: explicit ``super(...)`` (rather than zero-arg ``super()``) is
     # required because ``@dataclass(slots=True)`` replaces the class object
     # after decoration, leaving the ``__class__`` cell that zero-arg

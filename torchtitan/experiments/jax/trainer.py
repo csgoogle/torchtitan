@@ -19,7 +19,7 @@ import numpy as np
 import optax
 from flax import nnx
 
-from torchtitan.components.dataloader import DataloaderExhaustedError
+from torchtitan.components.data.loader import DataloaderExhaustedError
 from torchtitan.experiments.jax import data_utils
 from torchtitan.experiments.jax import distributed
 from torchtitan.experiments.jax import jax_profiling
@@ -112,15 +112,28 @@ class JaxTrainer:
 
     def setup_dataloader(self, job_config):
         """Build a dataloader that returns (inputs, labels) numpy arrays."""
-        expected_global_batch_size = job_config.training.global_batch_size
+        # Upstream d771abb0 replaced the sample-denominated
+        # ``training.seq_len`` / ``training.local_batch_size`` /
+        # ``training.global_batch_size`` knobs with the token-denominated
+        # ``training.max_context_length`` /
+        # ``training.num_tokens_per_microbatch_per_dp_rank`` /
+        # ``training.num_tokens_per_train_step``. The JAX trainer reasons in
+        # samples, so divide the token counts back out by the context length.
+        seq_len = job_config.training.max_context_length
+        expected_global_batch_size = (
+            job_config.training.num_tokens_per_train_step // seq_len
+        )
         if expected_global_batch_size <= 0:
-            expected_global_batch_size = job_config.training.local_batch_size
+            expected_global_batch_size = (
+                job_config.training.num_tokens_per_microbatch_per_dp_rank
+                // seq_len
+            )
 
         dataset = job_config.dataloader.dataset
         if not dataset or dataset.startswith('fake'):
             train_loader = data_utils.fake_dataloader(
                 job_config.training.steps,
-                job_config.training.seq_len,
+                seq_len,
                 expected_global_batch_size,
             )
             logger.warning('Using fake data loader.')
@@ -130,8 +143,12 @@ class JaxTrainer:
         # ``build_tokenizer_fn`` / ``build_dataloader_fn`` callables were
         # removed in the 2026-05-04 OSS sync; ``config_registry`` factories
         # now pin the concrete tokenizer / dataloader configs on the job
-        # config). ``HuggingFaceTextDataLoader`` takes ``local_batch_size`` as
-        # a build kwarg so we don't need to mutate ``job_config.training``.
+        # config). Upstream d771abb0 also dropped
+        # ``HuggingFaceTextDataLoader`` in favour of
+        # ``torchtitan.components.data.GrainDataLoader``, whose build kwargs
+        # are ``max_context_length`` / ``num_tokens_per_batch`` rather than
+        # ``seq_len`` / ``local_batch_size``; both are still build kwargs so we
+        # don't need to mutate ``job_config.training``.
         tokenizer = job_config.tokenizer.build(
             tokenizer_path=job_config.hf_assets_path,
         )
@@ -139,10 +156,10 @@ class JaxTrainer:
             dp_world_size=1,
             dp_rank=0,
             tokenizer=tokenizer,
-            seq_len=job_config.training.seq_len,
-            local_batch_size=expected_global_batch_size,
+            max_context_length=seq_len,
+            num_tokens_per_batch=expected_global_batch_size * seq_len,
         )
-        return data_utils.torch_loader_to_jax(torch_loader)
+        return data_utils.torch_loader_to_jax(torch_loader, seq_len=seq_len)
 
     # ------------------------------------------------------------------
     # Model
@@ -171,7 +188,10 @@ class JaxTrainer:
             raise ValueError(f'Unsupported model: {model_name}')
 
         model_args = jax_model_mod.args[model_flavor]
-        model_args.max_seq_len = job_config.training.seq_len
+        # ``max_seq_len`` is a JAX-side dataclass field; only the job config
+        # side was renamed (``training.seq_len`` -> ``training.
+        # max_context_length``) by upstream d771abb0.
+        model_args.max_seq_len = job_config.training.max_context_length
 
         if jax_config.model_layer_override is not None:
             old = getattr(model_args, layer_attr)

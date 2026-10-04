@@ -16,7 +16,13 @@ import torch
 import torch.distributed._functional_collectives as funcol
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+from torch.distributed.tensor import (
+    distribute_tensor,
+    DTensor,
+    Partial,
+    Replicate,
+    Shard,
+)
 
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
@@ -31,7 +37,9 @@ from torchtitan.experiments.tpu.graph_trainer.scan_fsdp import (
 )
 from torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack import (
     _build,
+    _moe_config,
     SEQ_LEN,
+    TOKENS,
 )
 
 
@@ -51,8 +59,65 @@ def forward_matches_unrolled(device, rank, world_size):
     """One batched matmul per op must give the same bits as n separate ones."""
     del rank
     plain, stacked = _models(device, world_size)
-    tokens = torch.randint(0, plain.config.vocab_size, (2, SEQ_LEN), device=device)
+    tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,), device=device)
     torch.testing.assert_close(stacked(tokens), plain(tokens), rtol=0, atol=0)
+
+
+def flattened_forward_matches_unrolled(device, rank, world_size):
+    """A flattened stack must compute what the unrolled experts do.
+
+    With 2 experts and at least 4 ranks, ``flatten_for`` stores the expert and
+    router stacks as ``[L, E*X, ...]`` and the body views each gathered layer
+    back to ``[E, X, ...]``. Getting that view wrong mixes rows across experts
+    and still runs, so compare against the plain model bit for bit.
+    """
+    del rank
+    if world_size < 4 or world_size % 2:
+        logging.warning("skipped: 2 experts flatten only on an even mesh of >= 4")
+        return
+    import torchtitan.distributed.parallel_dims as parallel_dims  # pylint: disable=g-import-not-at-top
+
+    parallel_dims.device_type = device.type
+    plain = _build(
+        stacked=False,
+        config=_moe_config(num_experts=2),
+        device=device,
+        world_size=world_size,
+    )
+    stacked = _build(
+        stacked=True,
+        flatten=True,
+        config=_moe_config(num_experts=2),
+        device=device,
+        world_size=world_size,
+    )
+    holder = getattr(stacked, STACK_ATTR)
+    assert holder.layer_shapes, "nothing was flattened, so this checks nothing"
+
+    # The two arms initialize on different meshes, so their random weights
+    # differ; copy the plain one's. `distribute_tensor` places each whole
+    # tensor on the stacked view's own mesh -- the split mesh, for a flattened
+    # layer -- and `src_data_rank=None` slices locally, since every rank already
+    # holds the whole tensor.
+    want = {
+        k: v.full_tensor() if isinstance(v, DTensor) else v
+        for k, v in plain.state_dict().items()
+    }
+    stacked.load_state_dict({
+        k: distribute_tensor(want[k], v.device_mesh, v.placements, src_data_rank=None)
+        if isinstance(v, DTensor)
+        else want[k]
+        for k, v in stacked.state_dict().items()
+    })
+
+    tokens = torch.randint(0, plain.config.vocab_size, (TOKENS,), device=device)
+    # `TOKENS` packs `TOKENS // SEQ_LEN` sequences; `_moe_config`'s RoPE cache
+    # only covers `SEQ_LEN` positions.
+    positions = torch.arange(SEQ_LEN, device=device).repeat(TOKENS // SEQ_LEN)
+    # One forward at a time, so only one model's gathered weights are live.
+    expected = plain(tokens, positions).detach()
+    got = stacked(tokens, positions).detach()
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
 def stacks_are_sharded_off_the_layer_axis(device, rank, world_size):
@@ -341,6 +406,9 @@ class TestLayerStackDistributed(
 
     def test_forward_matches_unrolled(self):
         self._on_devices(forward_matches_unrolled)
+
+    def test_flattened_forward_matches_unrolled(self):
+        self._on_devices(flattened_forward_matches_unrolled)
 
     def test_stacks_are_sharded_off_the_layer_axis(self):
         self._on_devices(stacks_are_sharded_off_the_layer_axis)

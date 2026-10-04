@@ -27,9 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       test_matrix: ${{ steps.set-matrix.outputs.test_matrix }}
-      # Callers may pass an image; push/pull_request runs get no inputs at all,
-      # so fall back to :latest here rather than in each job.
-      image: ${{ inputs.image || 'us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: Generate Matrix
@@ -38,9 +35,96 @@ jobs:
           test_matrix=$(python .ci/discover_tpu_tests.py)
           echo "test_matrix=${test_matrix}" >> "$GITHUB_OUTPUT"
 
+  # Picks the image the suite runs in: :latest, or, when this change edits the
+  # image's dependencies, an image rebuilt from them. See .ci/tpu_image/.
+  resolve-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      image: ${{ steps.pick.outputs.image || steps.build-ref.outputs.image }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      IMAGE_REPO: us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container
+    steps:
+      - name: Checkout repository
+        if: ${{ !inputs.image }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          # Full history so the commit :latest was built from can be diffed.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Log in to GAR
+        if: ${{ !inputs.image }}
+        env:
+          GAR_JSON_KEY: ${{ secrets.GAR_JSON_KEY }}
+        run: echo "${GAR_JSON_KEY}" | docker login -u _json_key --password-stdin https://us-west1-docker.pkg.dev
+
+      - name: Pick image
+        id: pick
+        env:
+          INPUT_IMAGE: ${{ inputs.image }}
+        run: |
+          if [[ -n "${INPUT_IMAGE}" ]]; then
+            echo "Using caller-provided image ${INPUT_IMAGE}"
+            echo "image=${INPUT_IMAGE}" >> "${GITHUB_OUTPUT}"
+          else
+            .ci/tpu_image/pick_image.sh
+          fi
+
+      # :latest is ~7GB unpacked and the rebuild is as large again, which is
+      # more than a stock runner's free disk; drop preinstalled toolchains.
+      - name: Free disk space
+        if: ${{ steps.pick.outputs.build == 'true' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Extract torch_tpu wheel and tokenizers from :latest
+        id: base
+        if: ${{ steps.pick.outputs.build == 'true' }}
+        env:
+          BASE_REF: ${{ steps.pick.outputs.base_ref }}
+        run: .ci/tpu_image/extract_base.sh "${BASE_REF}"
+
+      - name: Setup Docker Buildx
+        if: ${{ steps.pick.outputs.build == 'true' }}
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: Build and push image with this change's dependencies
+        id: build
+        if: ${{ steps.pick.outputs.build == 'true' }}
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          file: torchtitan/experiments/tpu/Dockerfile
+          push: true
+          tags: ${{ steps.pick.outputs.deps_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=torchtitan-tpu-deps
+            org.opencontainers.image.base.name=${{ steps.pick.outputs.base_ref }}
+          build-args: |
+            PYTHON_VERSION=${{ steps.base.outputs.python_version }}
+            TORCH_VERSION=${{ steps.base.outputs.torch_version }}
+
+      - name: Reference built image by digest
+        id: build-ref
+        if: ${{ steps.pick.outputs.build == 'true' }}
+        env:
+          DEPS_TAG: ${{ steps.pick.outputs.deps_tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "image=${IMAGE_REPO}@${DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "Test image: \`${DEPS_TAG}\` (rebuilt for changed dependencies)" >> "${GITHUB_STEP_SUMMARY}"
+
   distributed-tests:
     if: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).distributed_shards[0] != null }}
-    needs: setup-matrix
+    needs: [setup-matrix, resolve-image]
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +133,7 @@ jobs:
     timeout-minutes: 30
 
     container:
-      image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
+      image: ${{ needs.resolve-image.outputs.image }} # zizmor: ignore[unpinned-images]
       credentials:
         username: _json_key
         password: ${{ secrets.GAR_JSON_KEY }}
@@ -92,7 +176,7 @@ jobs:
 
   single-tpu-tests:
     if: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).single_tpu_shards[0] != null }}
-    needs: setup-matrix
+    needs: [setup-matrix, resolve-image]
     strategy:
       fail-fast: false
       matrix:
@@ -101,7 +185,7 @@ jobs:
     timeout-minutes: 30
 
     container:
-      image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
+      image: ${{ needs.resolve-image.outputs.image }} # zizmor: ignore[unpinned-images]
       credentials:
         username: _json_key
         password: ${{ secrets.GAR_JSON_KEY }}
@@ -144,7 +228,7 @@ jobs:
 
   cpu-tests:
     if: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).cpu_shards[0] != null }}
-    needs: setup-matrix
+    needs: [setup-matrix, resolve-image]
     strategy:
       fail-fast: false
       matrix:
@@ -153,7 +237,7 @@ jobs:
     timeout-minutes: 30
 
     container:
-      image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
+      image: ${{ needs.resolve-image.outputs.image }} # zizmor: ignore[unpinned-images]
       credentials:
         username: _json_key
         password: ${{ secrets.GAR_JSON_KEY }}
@@ -195,7 +279,7 @@ jobs:
 
   pytest-tests:
     if: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).pytest_shards[0] != null }}
-    needs: setup-matrix
+    needs: [setup-matrix, resolve-image]
     strategy:
       fail-fast: false
       matrix:
@@ -204,7 +288,7 @@ jobs:
     timeout-minutes: 30
 
     container:
-      image: ${{ needs.setup-matrix.outputs.image }} # zizmor: ignore[unpinned-images]
+      image: ${{ needs.resolve-image.outputs.image }} # zizmor: ignore[unpinned-images]
       credentials:
         username: _json_key
         password: ${{ secrets.GAR_JSON_KEY }}
@@ -216,6 +300,8 @@ jobs:
       # prevents a 10 minute 404 retry loop for tests importing torch_tpu that
       # run on CPU only.
       TPU_SKIP_MDS_QUERY: 1
+      # Per-test disables from .ci/discover_tpu_tests.py (DESELECTED_TESTS).
+      PYTEST_DESELECT: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).pytest_deselect }}
 
     steps:
       - name: Checkout repository
@@ -232,7 +318,9 @@ jobs:
             echo "=================================================="
             echo "Running test file: $test_file"
             echo "=================================================="
-            timeout 900 python -m pytest -v "$test_file" || failed="$failed $test_file"
+            # Unquoted on purpose: one --deselect=<node-id> word per test.
+            # shellcheck disable=SC2086
+            timeout 900 python -m pytest -v "$test_file" $PYTEST_DESELECT || failed="$failed $test_file"
           done
 
           if [ -n "$failed" ]; then

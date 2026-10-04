@@ -18,16 +18,19 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     BaseQKVLinear,
     create_varlen_metadata_for_document,
-    FlexAttention,
+    FlexInnerAttention,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
-    VarlenAttention,
+    VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.utils import get_moe_model_nparams_and_flops
+from torchtitan.models.utils import (
+    get_nparams_and_active_nparams,
+    quadratic_attention_flops_per_token,
+)
 from torchtitan.protocols.module import Module
 
 
@@ -54,7 +57,7 @@ class Attention(BaseAttention):
         qkv_linear: BaseQKVLinear.Config
         wo: Linear.Config  # output projection
         inner_attention: Module.Config = dataclasses.field(
-            default_factory=VarlenAttention.Config
+            default_factory=VarlenInnerAttention.Config
         )
         sliding_window_size: int | None = None
         """Per-layer causal sliding-window size"""
@@ -94,14 +97,14 @@ class Attention(BaseAttention):
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
+            x: Input tensor with shape ``[T, D]``.
             attention_masks: a ``BlockMask`` (flex) or ``VarlenMetadata`` (varlen).
             positions: Optional position indices (unused, for API compatibility).
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        bsz, seqlen, _ = x.size()
+        num_tokens = x.shape[0]
 
         q, k, v = self.qkv_linear(x)
 
@@ -120,11 +123,8 @@ class Attention(BaseAttention):
         )
 
         # Reshape and project output
-        output = output.reshape(
-            bsz, seqlen, -1
-        ).contiguous()  # (bsz, seqlen, n_heads * v_head_dim)
-        output = self.wo(output)  # (bsz, seqlen, dim)
-        return output
+        output = output.reshape(num_tokens, -1).contiguous()
+        return self.wo(output)
 
     def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
         """out_transform hook: rescale attention output by this layer's sinks."""
@@ -170,12 +170,12 @@ class GptOssTransformerBlock(TransformerBlock):
         Forward pass for the Transformer block.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
+            x (torch.Tensor): Input tensor of shape (num_tokens, dim).
             attention_masks (AttentionMasksType): with flex, a dict of per-window
                 ``BlockMask``s from which this layer picks its mask; with varlen,
                 a single ``VarlenMetadata`` shared by all layers (the per-layer
                 causal window is baked into each layer's
-                ``VarlenAttention.window_size``).
+                ``VarlenInnerAttention.window_size``).
             positions: Optional position indices.
 
         Returns:
@@ -219,18 +219,21 @@ class GptOssModel(Decoder):
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
 
-        # pyrefly: ignore [bad-override]
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
-        ) -> tuple[int, float]:
-            assert isinstance(self.layers[0].attention, Attention.Config)
-            return get_moe_model_nparams_and_flops(
-                self,
-                model,
-                self.layers[0].attention.n_heads,
-                2 * self.layers[0].attention.head_dim,
-                seq_len,
-            )
+        ) -> tuple[int, int]:
+            nparams, active_nparams = get_nparams_and_active_nparams(model)
+            attention_op_flops = 0
+            for layer in self.layers:
+                attention = layer.attention
+                attention_op_flops += quadratic_attention_flops_per_token(
+                    num_heads=attention.n_heads,
+                    qk_head_dim=attention.head_dim,
+                    v_head_dim=attention.head_dim,
+                    seq_len=seq_len,
+                    sliding_window_size=attention.sliding_window_size,
+                )
+            return nparams, 6 * active_nparams + attention_op_flops
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -238,14 +241,23 @@ class GptOssModel(Decoder):
     def get_attention_masks(
         self,
         positions: torch.Tensor,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        max_num_documents: int | None = None,
+        max_context_length: int | None = None,
     ) -> AttentionMasksType:
         attn_cfg = self.config.layers[0].attention
         assert isinstance(attn_cfg, Attention.Config)
         inner_attn = attn_cfg.inner_attention
 
-        if isinstance(inner_attn, VarlenAttention.Config):
-            return create_varlen_metadata_for_document(positions)
-        elif isinstance(inner_attn, FlexAttention.Config):
+        if isinstance(inner_attn, VarlenInnerAttention.Config):
+            return create_varlen_metadata_for_document(
+                positions,
+                padding_mask=padding_mask,
+                max_num_documents=max_num_documents,
+                max_context_length=max_context_length,
+            )
+        elif isinstance(inner_attn, FlexInnerAttention.Config):
             base_mask_mods = [
                 get_causal_mask_mod(),
                 get_efficient_causal_mask_mod_for_packed_document(positions),
@@ -277,6 +289,6 @@ class GptOssModel(Decoder):
             return masks
         else:
             raise TypeError(
-                f"GPT-OSS supports FlexAttention and VarlenAttention inner attention, "
+                f"GPT-OSS supports FlexInnerAttention and VarlenInnerAttention inner attention, "
                 f"got {type(inner_attn).__name__}"
             )

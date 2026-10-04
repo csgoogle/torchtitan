@@ -163,13 +163,13 @@ requiring a captured graph.
 1. Set the env var **before `torch_tpu` is imported** (it's read at libtpu init):
 
    ```bash
-   export TPU_DEFER_AND_FUSE=1
+   export TORCH_TPU_DEFER_AND_FUSE=1
    ```
 
    ```python
    # or, in Python, before the first `import torch_tpu`:
    import os
-   os.environ["TPU_DEFER_AND_FUSE"] = "1"
+   os.environ["TORCH_TPU_DEFER_AND_FUSE"] = "1"
    ```
 
 2. Wrap the region you want deferred-and-fused (e.g. the whole training loop) in the execution-mode

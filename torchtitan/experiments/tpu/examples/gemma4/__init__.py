@@ -15,7 +15,7 @@ from torchtitan.models.common.config_utils import (
     make_token_dispatcher_config,
 )
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.moe import MoELoadBalanceAuxLoss
+from torchtitan.models.common.moe import MoELoadBalanceAuxLoss, RoutedExperts
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.utils import validate_converter_order
@@ -129,11 +129,14 @@ def _make_moe_config(
             ),
             param_init=param_init["router"],
         ),
-        experts=TpuGroupedExperts.Config(
-            activation="gelu_tanh",
-            dim=dim,
-            hidden_dim=hidden_dim,
-            num_experts=num_experts,
+        routed_experts=RoutedExperts.Config(
+            inner_experts=TpuGroupedExperts.Config(
+                activation="gelu_tanh",
+                dim=dim,
+                hidden_dim=hidden_dim,
+                num_experts=num_experts,
+                param_init=param_init["experts"],
+            ),
             token_dispatcher=make_token_dispatcher_config(
                 num_experts=num_experts,
                 top_k=top_k,
@@ -141,7 +144,6 @@ def _make_moe_config(
                 non_blocking_capacity_factor=non_blocking_capacity_factor,
                 hidden_dim=dim,
             ),
-            param_init=param_init["experts"],
         ),
     )
 
@@ -260,7 +262,7 @@ def _build_gemma4_layers(
                     inner_attention=get_attention_config(attn_backend),
                     rope=Gemma4RoPE.Config(
                         dim=layer_head_dim,
-                        max_seq_len=max_seq_len,
+                        max_context_length=max_seq_len,
                         theta=layer_rope_theta,
                         partial_rotary_factor=layer_partial_rotary,
                     ),
@@ -618,10 +620,12 @@ def model_registry(
         converters=converters,
         enable_weight_tying=enable_weight_tying,
     )
+    assert config.layers[0].attention.rope is not None
     return ModelSpec(
         name="gemma4",
         flavor=flavor,
         model=config,
+        max_context_length=config.layers[0].attention.rope.max_context_length,
         parallelize_fn=parallelize_gemma4,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=register_moe_load_balancing_hook,

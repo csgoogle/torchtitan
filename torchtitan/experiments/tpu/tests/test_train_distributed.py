@@ -243,10 +243,15 @@ class TrainDistributedTest(
           config="llama3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+          # seq_len -> max_context_length. The token budget has to be
+          # restated too: default_args sizes it for a 128-token context, and a
+          # token budget is absolute, so inheriting it here would ask for a
+          # sub-1 microbatch. 4 * 1024 preserves the pre-import 4 sequences.
           args=[
               "--training.dtype=bfloat16",
               "--loss_kernel.use_loss_kernel",
-              "--training.seq_len=1024",
+              "--training.max_context_length=1024",
+              "--training.num_tokens_per_microbatch_per_dp_rank=4096",
               "--loss_kernel.loss_b_block_size=128",
               "--loss_kernel.loss_h_block_size=128",
               "--loss_kernel.loss_v_block_size=128",
@@ -325,10 +330,15 @@ class TrainDistributedTest(
           config="qwen3_debugmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
+          # seq_len -> max_context_length. The token budget has to be
+          # restated too: default_args sizes it for a 128-token context, and a
+          # token budget is absolute, so inheriting it here would ask for a
+          # sub-1 microbatch. 4 * 1024 preserves the pre-import 4 sequences.
           args=[
               "--training.dtype=bfloat16",
               "--loss_kernel.use_loss_kernel",
-              "--training.seq_len=1024",
+              "--training.max_context_length=1024",
+              "--training.num_tokens_per_microbatch_per_dp_rank=4096",
               "--loss_kernel.loss_b_block_size=128",
               "--loss_kernel.loss_h_block_size=128",
               "--loss_kernel.loss_v_block_size=128",
@@ -435,6 +445,9 @@ class TrainDistributedTest(
       dataset="c4_test",
       args: list[str] | None = None,
   ):
+    # Upstream replaced seq_len/local_batch_size with a token budget:
+    # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len, with
+    # seq_len = 128 here, so 1 * 128 for flux and 4 * 128 otherwise.
     default_args = [
         f"--module={module}",
         f"--config={config}",
@@ -442,11 +455,14 @@ class TrainDistributedTest(
         f"--dataloader.dataset_path={dataset_path}",
         f"--dataloader.dataset={dataset}",
         "--hf_assets_path=tests/assets/tokenizer",
-        "--training.seq_len=128",
+        "--training.max_context_length=128",
         "--training.steps=3",
         "--training.mixed_precision_param=float32",
         "--training.mixed_precision_reduce=float32",
-        f"--training.local_batch_size={1 if module == 'flux' else 4}",
+        (
+            "--training.num_tokens_per_microbatch_per_dp_rank="
+            f"{128 if module == 'flux' else 512}"
+        ),
     ]
     if not args:
       args = []

@@ -36,7 +36,11 @@ class PrecomputedDataloader:
                 if step >= self.max_steps:
                     break
                 data = torch.load(file_path, weights_only=False)
-                yield data, data["img_encodings"]
+                # FluxTrainer expects a single TrainerBatch dict keyed by "labels".
+                yield {**data, "labels": data["img_encodings"]}
                 step += 1
             if step >= self.max_steps:
                 raise RuntimeError(f"Reached max_steps={self.max_steps} while iterating through precomputed batches. Please ensure that the number of precomputed batches is at least max_steps.")
+
+    def close(self) -> None:
+        """No-op; called by Trainer.close()."""

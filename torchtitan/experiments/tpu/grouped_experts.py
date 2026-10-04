@@ -17,7 +17,7 @@ from torchtitan.experiments.tpu.kernels.paired_segment_matmul import (
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.model import ModelConfigConverter
-from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
+from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.logging import logger
 
 
@@ -28,8 +28,23 @@ _CANONICAL_TO_NATIVE_WEIGHT = {
 }
 
 
-def _transpose_last_two_dims(layout: SpmdLayout, *, ndim: int = 3) -> SpmdLayout:
-    """Transpose tensor-dimension references in an SPMD layout."""
+def _transpose_last_two_dims(
+    layout: spmd.SpmdType, *, ndim: int = 3
+) -> spmd.SpmdType:
+    """Transpose tensor-dimension references in an SPMD layout.
+
+    Upstream d771abb0 deleted `torchtitan.protocols.sharding.SpmdLayout` in
+    favour of `spmd_types.SpmdType`, renaming the per-axis field
+    `axis_types` -> `local_type`.
+
+    This reads the RAW fields rather than upstream's `_per_axis_types()`
+    helper. That helper flattens `partition_spec` entries into `S(dim)`
+    per-axis types, which is fine for inspection but cannot be fed back into
+    `local_type`: `SpmdType.__post_init__` rejects a value that carries both
+    `S(i)` entries and an explicit `PartitionSpec`. Permuting the raw fields
+    independently keeps the two representations mutually exclusive, exactly as
+    they arrived.
+    """
 
     if ndim < 2:
         raise ValueError(f"Expected rank of at least 2, got {ndim}")
@@ -37,15 +52,15 @@ def _transpose_last_two_dims(layout: SpmdLayout, *, ndim: int = 3) -> SpmdLayout
     permutation = list(range(ndim))
     permutation[-2], permutation[-1] = permutation[-1], permutation[-2]
 
-    axis_types = {}
-    for axis, axis_type in layout.axis_types.items():
+    local_type = {}
+    for axis, axis_type in layout.local_type.items():
         if isinstance(axis_type, spmd.Shard):
             if not 0 <= axis_type.dim < ndim:
                 raise ValueError(
                     f"Tensor dimension {axis_type.dim} is invalid for rank {ndim}"
                 )
             axis_type = spmd.S(permutation[axis_type.dim])
-        axis_types[axis] = axis_type
+        local_type[axis] = axis_type
 
     partition_spec = layout.partition_spec
     if partition_spec is not None:
@@ -56,7 +71,7 @@ def _transpose_last_two_dims(layout: SpmdLayout, *, ndim: int = 3) -> SpmdLayout
         partition_spec = tuple(partition_spec[dim] for dim in permutation)
     return replace(
         layout,
-        axis_types=axis_types,
+        local_type=local_type,
         partition_spec=partition_spec,
     )
 
@@ -86,8 +101,11 @@ class TpuGroupedExperts(GroupedExperts):
 
     The paired path changes only W1/W3 execution: their parameters, FSDP
     collectives, checkpoint keys, and the W2 projection remain independent.
-    The unpaired dWeight kernel retains FP32 accumulation and stores in the
-    final FSDP reduction dtype selected by the parallelizer.
+    W2's dWeight may tile differently from W1/W3's: a dWeight is tiled along
+    ``K``, the weight's input dimension, which is ``F`` for W2 and ``D`` for
+    W1/W3, so one K tile cannot suit both.
+    The dWeight kernels accumulate in FP32 and store in the BF16 dtype of the
+    weights they are given, whatever the param and reduce dtypes are.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -100,6 +118,10 @@ class TpuGroupedExperts(GroupedExperts):
         pallas_grouped_mm_tile_k: int = 0
         pallas_grouped_mm_tile_n: int = 0
         pallas_grouped_mm_tgmm_tiling: tuple[int, int, int] = (128, 128, 128)
+        # TGMM tiling for the W2 (down-projection) dWeight. ``None`` follows
+        # ``pallas_grouped_mm_tgmm_tiling``. Set it when W1/W3 want a K tile
+        # that W2's shorter K axis cannot hold.
+        pallas_grouped_mm_w2_tgmm_tiling: tuple[int, int, int] | None = None
         use_kernel_native_weight_layout: bool = False
 
     def __init__(self, config: Config):
@@ -123,7 +145,8 @@ class TpuGroupedExperts(GroupedExperts):
             self.w3_EDF = torch.nn.Parameter(
                 torch.empty(config.num_experts, config.dim, config.hidden_dim)
             )
-            self.token_dispatcher = config.token_dispatcher.build()
+            # `token_dispatcher` moved to the enclosing `RoutedExperts` in
+            # upstream d771abb0; `GroupedExperts` is now dispatch-free.
         else:
             super().__init__(config)
 
@@ -134,10 +157,7 @@ class TpuGroupedExperts(GroupedExperts):
         self.pallas_grouped_mm_tile_k = config.pallas_grouped_mm_tile_k
         self.pallas_grouped_mm_tile_n = config.pallas_grouped_mm_tile_n
         self.pallas_grouped_mm_tgmm_tiling = config.pallas_grouped_mm_tgmm_tiling
-        # Standalone modules preserve the historical FP32 result. Qwen's
-        # parallelizer replaces this with the final, post-CLI FSDP reduction
-        # dtype before tracing or sharding.
-        self._unpaired_dweight_output_dtype = torch.float32
+        self.pallas_grouped_mm_w2_tgmm_tiling = config.pallas_grouped_mm_w2_tgmm_tiling
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
         self._native_sharding_applied = False
 
@@ -153,15 +173,6 @@ class TpuGroupedExperts(GroupedExperts):
             return
         self.register_state_dict_post_hook(self._canonical_weights_on_save)
         self.register_load_state_dict_pre_hook(self._native_weights_on_load)
-
-    def configure_dweight_output_dtype(self, reduce_dtype: torch.dtype) -> None:
-        """Match unpaired expert dWeight stores to the FSDP reduction dtype."""
-        if reduce_dtype not in (torch.float32, torch.bfloat16):
-            raise ValueError(
-                "Expert dWeight output supports only "
-                f"float32 or bfloat16 reductions, got {reduce_dtype}"
-            )
-        self._unpaired_dweight_output_dtype = reduce_dtype
 
     def _init_param(self, name: str, param: torch.nn.Parameter) -> None:
         """Initialize native storage through a canonical contiguous tensor."""
@@ -227,9 +238,9 @@ class TpuGroupedExperts(GroupedExperts):
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
     ) -> torch.Tensor:
-        """``GroupedExperts._experts_forward`` with a configurable activation.
+        """``GroupedExperts.forward`` with a configurable activation.
 
-        Mirrors ``GroupedExperts._experts_forward`` in
+        Mirrors ``GroupedExperts.forward`` in
         ``torchtitan/models/common/moe.py`` (keep in sync); upstream hard-codes
         silu.
         """
@@ -266,7 +277,7 @@ class TpuGroupedExperts(GroupedExperts):
             return F.gelu(gate_RF, approximate="tanh")
         return F.silu(gate_RF)
 
-    def _experts_forward(
+    def forward(
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
@@ -295,10 +306,11 @@ class TpuGroupedExperts(GroupedExperts):
         tile_k = self.pallas_grouped_mm_tile_k
         tile_n = self.pallas_grouped_mm_tile_n
         tgmm_tiling = self.pallas_grouped_mm_tgmm_tiling
+        w2_tgmm_tiling = self.pallas_grouped_mm_w2_tgmm_tiling or tgmm_tiling
         if self.use_pallas_paired_grouped_mm:
-            # Paired W1/W3 always return BF16 dWeights: two full FP32 output
-            # tiles exceed TPU scoped VMEM. FP32 FSDP reductions widen those
-            # gradients after the kernel; BF16 reductions consume them as-is.
+            # Every expert kernel gets BF16 weights and returns BF16 dWeights.
+            # FP32 FSDP reductions widen those gradients after the kernel; BF16
+            # reductions consume them as-is.
             gate_RF, up_RF = paired_segment_matmul_pallas_2d(
                 x_bf16,
                 w1_EKN.bfloat16(),
@@ -317,7 +329,6 @@ class TpuGroupedExperts(GroupedExperts):
                 tile_k=tile_k,
                 tile_n=tile_n,
                 tgmm_tiling=tgmm_tiling,
-                dweight_output_dtype=self._unpaired_dweight_output_dtype,
             )
             up_RF = segment_matmul_pallas_2d(
                 x_bf16,
@@ -327,7 +338,6 @@ class TpuGroupedExperts(GroupedExperts):
                 tile_k=tile_k,
                 tile_n=tile_n,
                 tgmm_tiling=tgmm_tiling,
-                dweight_output_dtype=self._unpaired_dweight_output_dtype,
             )
         hidden_RF = self._activation_fn(gate_RF) * up_RF
         return segment_matmul_pallas_2d(
@@ -337,18 +347,8 @@ class TpuGroupedExperts(GroupedExperts):
             tile_m=tile_m,
             tile_k=tile_k,
             tile_n=tile_n,
-            tgmm_tiling=tgmm_tiling,
-            dweight_output_dtype=self._unpaired_dweight_output_dtype,
+            tgmm_tiling=w2_tgmm_tiling,
         ).type_as(x_RD)
-
-
-def configure_expert_dweight_output_dtype(
-    model: torch.nn.Module, reduce_dtype: torch.dtype
-) -> None:
-    """Resolve unpaired dWeight stores before FSDP and graph tracing."""
-    for module in model.modules():
-        if isinstance(module, TpuGroupedExperts):
-            module.configure_dweight_output_dtype(reduce_dtype)
 
 
 class TpuGroupedExpertsConverter(ModelConfigConverter):

@@ -150,12 +150,18 @@ class TrainerMinimal:
         job_config.tokenizer.build(tokenizer_path=job_config.hf_assets_path)
     )
 
+    # Upstream d771abb0 renamed training.seq_len -> training.max_context_length
+    # and replaced training.local_batch_size with the token-based
+    # training.num_tokens_per_microbatch_per_dp_rank; the dataloader is now
+    # components.data.GrainDataLoader, which takes max_context_length /
+    # num_tokens_per_batch instead of seq_len / local_batch_size.
     self.dataloader = job_config.dataloader.build(
         dp_world_size=batch_degree,
         dp_rank=batch_rank,
         tokenizer=self.tokenizer,
-        seq_len=job_config.training.seq_len,
-        local_batch_size=job_config.training.local_batch_size,
+        max_context_length=job_config.training.max_context_length,
+        num_tokens_per_batch=(
+            job_config.training.num_tokens_per_microbatch_per_dp_rank),
     )
 
     model_config = self.model_spec.model
@@ -187,10 +193,13 @@ class TrainerMinimal:
       model = model_config.build()
 
     # calculate model size and flops per token
+    # Upstream d771abb0 renamed training.seq_len -> training.max_context_length.
     (
         model_param_count,
         _,
-    ) = model_config.get_nparams_and_flops(model, job_config.training.seq_len)
+    ) = model_config.get_nparams_and_flops(
+        model, job_config.training.max_context_length
+    )
 
     logger.info(
         f"Model {self.model_spec.name} {self.model_spec.flavor} "
@@ -246,25 +255,45 @@ class TrainerMinimal:
 
   def train(self):
     """Runs a simple training loop on the specified device."""
+    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
+    from torchtitan.models.common.decoder import Decoder  # pylint: disable=g-import-not-at-top
 
     data_iterator = iter(self.dataloader)
+    seq_len = self.job_config.training.max_context_length
 
     try:
 
       def get_batch():
         batch = next(data_iterator)
-        tokens = batch[0]["input"].to(self.device)
-        labels = batch[1].to(self.device)
-        return tokens, labels
+        if isinstance(batch, tuple):
+          input_dict, labels_raw = batch
+        else:
+          input_dict = batch
+          labels_raw = batch["labels"]
+        tokens = input_dict["input"].to(self.device)
+        labels = labels_raw.to(self.device)
+        positions = input_dict.get("positions")
+        if positions is not None:
+          positions = positions.to(self.device)
+        if not isinstance(self.model, Decoder) and tokens.ndim == 1:
+          tokens = tokens.reshape(-1, seq_len)
+          labels = labels.reshape(-1, seq_len)
+        return tokens, labels, positions
 
       def _get_dummy_batch():
         vocab_size = getattr(self.model_config, "vocab_size", 32000)
+        # Upstream d771abb0 renamed training.seq_len ->
+        # training.max_context_length and replaced training.local_batch_size
+        # with the token-based training.num_tokens_per_microbatch_per_dp_rank.
+        local_batch_size = (
+            self.job_config.training.num_tokens_per_microbatch_per_dp_rank
+            // seq_len)
         tokens = torch.randint(
             0,
             vocab_size,
             (
-                self.job_config.training.local_batch_size,
-                self.job_config.training.seq_len,
+                local_batch_size,
+                seq_len,
             ),
             device=self.device,
         )
@@ -272,8 +301,8 @@ class TrainerMinimal:
             0,
             vocab_size,
             (
-                self.job_config.training.local_batch_size,
-                self.job_config.training.seq_len,
+                local_batch_size,
+                seq_len,
             ),
             device=self.device,
         )
@@ -282,15 +311,18 @@ class TrainerMinimal:
       total_tokens = 0
       total_time = 0.0
 
-      with torchtitan_profiler.Profiler(
-          self.job_config.profiler,
-          global_step=0,
-          base_folder=self.job_config.dump_folder,
-      ) as profiler:
+      with (
+          set_unflatten_seq_len(seq_len),
+          torchtitan_profiler.Profiler(
+              self.job_config.profiler,
+              global_step=0,
+              base_folder=self.job_config.dump_folder,
+          ) as profiler,
+      ):
         for step in range(self.job_config.training.steps):
           step_start_time = time.time()
           self.optimizers.zero_grad()
-          tokens, labels = get_batch()
+          tokens, labels, positions = get_batch()
           # In distributed settings, we sum locally calculated valid tokens
           # across all data-parallel ranks to get the global token count,
           # which is used to scale the loss and gradients.
@@ -310,7 +342,10 @@ class TrainerMinimal:
           # train_context would take care of converting labels to DTensors using
           # https://docs.pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.loss_parallel
           with self.train_context():  # pytype: disable=not-callable
-            pred = self.model(tokens)
+            if isinstance(self.model, Decoder) and positions is not None:
+              pred = self.model(tokens, positions=positions)
+            else:
+              pred = self.model(tokens)
             loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
             # need to free pred before bwd to avoid peaking memory
             del pred
@@ -328,15 +363,17 @@ class TrainerMinimal:
               gathered_labels = _gather_along_first_dim(labels, dp_group)
             self.step_callback(step, self.model, loss, gathered_tokens, gathered_labels)
 
+          # Upstream d771abb0 replaced training.local_batch_size *
+          # training.seq_len with the single token-based
+          # training.num_tokens_per_microbatch_per_dp_rank.
+          num_tokens_per_step = (
+              self.job_config.training.num_tokens_per_microbatch_per_dp_rank)
+
           if step >= self.job_config.lr_scheduler.warmup_steps:
-            total_tokens += (
-                self.job_config.training.local_batch_size *
-                self.job_config.training.seq_len)
+            total_tokens += num_tokens_per_step
             total_time += step_time
 
-          tokens_per_sec = (
-              self.job_config.training.local_batch_size *
-              self.job_config.training.seq_len) / step_time
+          tokens_per_sec = num_tokens_per_step / step_time
 
           logger.info(
               "Step %d/%d | Loss: %.4f | Step time: %.2f sec | "
@@ -396,7 +433,12 @@ def start_trainer(config: JobConfig):
           "Training with config: %s",
           json.dumps(config.to_dict(), indent=2)
       )
-    trainer.train()
+    # TT-UNFLATTEN-SHIM:
+    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    # Upstream d771abb0 renamed training.seq_len ->
+    # training.max_context_length.
+    with set_unflatten_seq_len(config.training.max_context_length):
+      trainer.train()
   finally:
     if torch.distributed.is_initialized():
       torch.distributed.barrier()

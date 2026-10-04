@@ -15,14 +15,18 @@ This file replaces `torch.flip` and `scan_op` for the duration of one
 `call_backward`:
 
   1. `torch.flip` returns the stack unchanged
-  2. `scan_op` scans over a descending index instead; each step reads its own
-     row with `index_select` and writes its gradient back with `index_copy`
+  2. `scan_op` runs a reverse loop over an ascending index instead (torch_tpu
+     honours the request); each step reads its own row with `index_select` and
+     returns its gradient row, which the reverse loop writes in final position
   3. `torch.flip` returns the gradients unchanged -- step 2 already wrote every
      row in its final position
 
 Same rows in the same order, no copy. The rest of `call_backward` is torch's
 code running unmodified, so most torch updates need nothing here. One that
 changes how the backward reverses raises instead of falling back to copying.
+
+Off TPU (CPU tests, meta-device traces) step 2 runs forwards over a descending
+index and flips its gradient stacks once: correct, just not copy-free.
 
 Assumes one thread per process: the two replacements are module-level globals
 in torch's `scan.py`, so a concurrent `call_backward` would see them.
@@ -37,7 +41,8 @@ import sys
 import torch
 from torch._higher_order_ops.scan import ScanAutogradImpl, scan_op
 from torch._higher_order_ops.utils import first_slice_copy, materialize_as_graph
-import torch.utils._pytree as pytree
+from torch.fx.traceback import annotate
+from torch_tpu._internal.compile.scan import SCAN_REVERSE_ANNOTATION
 
 from torchtitan.tools.logging import logger
 
@@ -246,18 +251,34 @@ class _ScanOpWithOneCallRewritten(type(scan_op)):
 # --- The scan that replaces the flipped one --------------------------------
 
 
+# The only device whose backend honours `SCAN_REVERSE_ANNOTATION`.
+_REVERSE_SCAN_DEVICE_TYPE = "tpu"
+
+
 def _scan_over_descending_index(combine_gm, init, xs, additional_inputs):
-    """`scan(combine_gm, init, xs, reverse=True)` without reversing anything.
+    """`scan(combine_gm, init, xs, reverse=True)` without reversing the inputs.
 
     The stacks move to `additional_inputs`, which scan passes through whole,
-    and the thing scanned over becomes `scan_length` int64s counting down. Each
-    step picks its own row out of the stacks, so the loop runs backwards over
-    the data while running forwards over the index.
+    and the thing scanned over becomes `scan_length` int64s counting up. The
+    step body is annotated so torch_tpu runs the loop in reverse: step i reads
+    and writes row `len - 1 - i`. Each step picks its own row out of the stacks
+    with that index, so the loop visits the data backwards without a flip.
 
-    `combine_gm` returns one row of gradient per step, in iteration order --
-    which is backwards. So the output stacks are carried as buffers and each
-    step writes its own row in place; they come out already in order.
+    `combine_gm` returns one row of gradient per step. They come out as scan
+    outputs, and the reverse loop writes each at `len - 1 - i` with a plain
+    dynamic-update-slice -- so the gradient stacks come out already in order,
+    with neither an `index_copy` (a scatter that XLA's collective pipeliner
+    cannot move collectives through) nor a flip after the loop.
+
+    Only torch_tpu honours the reverse request. Anywhere else -- a CPU test, a
+    meta-device trace -- the loop runs forwards over a descending index
+    instead, unannotated, and the gradient stacks come out in iteration order,
+    backwards, so they are flipped once at the end. That flip is the copy the
+    TPU path avoids, but off TPU it costs nothing that matters.
     """
+    device = xs[0].device
+    backend_reverses = device.type == _REVERSE_SCAN_DEVICE_TYPE
+
     n_init = len(init)
     n_additional = len(additional_inputs)
     scan_length = xs[0].shape[0]
@@ -268,46 +289,37 @@ def _scan_over_descending_index(combine_gm, init, xs, additional_inputs):
     # alias. Clone the init, one slice, instead of the stacks, the whole history.
     init = [t.clone() if isinstance(t, torch.Tensor) else t for t in init]
 
-    buffers = [
-        torch.zeros(
-            (scan_length, *meta.shape), dtype=meta.dtype, device=meta.device
+    if backend_reverses:
+        index = torch.arange(scan_length, dtype=torch.int64, device=device)
+    else:
+        index = torch.arange(
+            scan_length - 1, -1, -1, dtype=torch.int64, device=device
         )
-        for meta in _output_metas(combine_gm)[n_init:]
-    ]
-    n_buffers = len(buffers)
 
     def step(*args):
         carry = args[:n_init]
-        bufs = args[n_init : n_init + n_buffers]
-        row = args[n_init + n_buffers].reshape(1)
-        rest = args[n_init + n_buffers + 1 :]
+        row = args[n_init].reshape(1)
+        rest = args[n_init + 1 :]
         additional, stacks = rest[:n_additional], rest[n_additional:]
         # `index_select` rather than `select` because the index is a traced
         # value, not a Python int; it lowers to a dynamic-slice.
         rows = [torch.index_select(s, 0, row).squeeze(0) for s in stacks]
-        out = combine_gm(*carry, *rows, *additional)
-        return [
-            *out[:n_init],
-            *[
-                buf.index_copy(0, row, grad.unsqueeze(0))
-                for buf, grad in zip(bufs, out[n_init:])
-            ],
-        ]
+        return list(combine_gm(*carry, *rows, *additional))
 
-    descending = torch.arange(
-        scan_length - 1, -1, -1, dtype=torch.int64, device=xs[0].device
-    )
-    scan_init = [*init, *buffers]
-    step_gm = materialize_as_graph(
-        step,
-        (*scan_init, first_slice_copy(descending), *additional_inputs, *xs),
-    )
-    # All carry, no ys, so the result is already `(*carry, *stacked_grad_xs)`:
-    # the same flat layout upstream's own `scan_op` call returns.
-    return scan_op(step_gm, scan_init, [descending], (*additional_inputs, *xs))
-
-
-def _output_metas(gm: torch.fx.GraphModule) -> list[torch.Tensor]:
-    """The fake vals a graph returns, flat, so buffers can be sized from them."""
-    (output_node,) = gm.graph.find_nodes(op="output")
-    return [node.meta["val"] for node in pytree.tree_leaves(output_node.args[0])]
+    # On the nodes, not the graph module: scan re-traces the body into a new
+    # module, which keeps node metadata and drops attributes.
+    with (
+        annotate({SCAN_REVERSE_ANNOTATION: True})
+        if backend_reverses
+        else contextlib.nullcontext()
+    ):
+        step_gm = materialize_as_graph(
+            step,
+            (*init, first_slice_copy(index), *additional_inputs, *xs),
+        )
+        # `(*carry, *stacked_grad_xs)`: the same flat layout upstream's own
+        # `scan_op` call returns.
+        out = scan_op(step_gm, init, [index], (*additional_inputs, *xs))
+    if backend_reverses:
+        return out  # The reverse loop wrote the stacks in final order.
+    return [*out[:n_init], *(torch.flip(g, (0,)) for g in out[n_init:])]

@@ -4,8 +4,11 @@ from unittest.mock import patch
 import jax
 import jax.numpy as jnp
 import pytest
+# With torch_tpu, torch must be imported before spmd_types to avoid a circular
+# import error. Import of torch autoloads torch_tpu which imports
+# torch.distributed.fsdp which imports spmd_types still initializing.
+import torch  # isort: skip
 import spmd_types as spmd
-import torch
 
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.experiments.tpu.grouped_experts import (
@@ -22,8 +25,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
 )
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.models.common.moe_sharding import expert_param_placement_dense
-from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
-from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
+from torchtitan.protocols.sharding import ShardingConfig
 
 
 def _build_experts(
@@ -45,10 +47,6 @@ def _build_experts(
         ),
         use_kernel_native_weight_layout=use_kernel_native_weight_layout,
         param_init=param_init,
-        token_dispatcher=LocalTokenDispatcher.Config(
-            num_experts=num_experts,
-            top_k=1,
-        ),
     )
     experts = config.build()
     if param_init is None:
@@ -64,10 +62,6 @@ def test_model_converter_preserves_config_fields():
                 dim=16,
                 hidden_dim=24,
                 num_experts=8,
-                token_dispatcher=LocalTokenDispatcher.Config(
-                    num_experts=8,
-                    top_k=2,
-                ),
             )
 
         def traverse(self, config_type):
@@ -84,7 +78,6 @@ def test_model_converter_preserves_config_fields():
     assert root.experts.dim == original.dim
     assert root.experts.hidden_dim == original.hidden_dim
     assert root.experts.num_experts == original.num_experts
-    assert root.experts.token_dispatcher == original.token_dispatcher
     assert not root.experts.use_pallas_paired_grouped_mm
     assert root.experts.pallas_grouped_mm_tile_k == 0
     assert root.experts.pallas_grouped_mm_tile_n == 0
@@ -122,21 +115,13 @@ def test_fsdp_recipe_preserves_global_aux_contract_and_selects_tpu_experts():
     assert benchmark.tpu_config.mfu_benchmark_start_step == 10
 
 
-@pytest.mark.parametrize(
-    ("weight_dtype", "output_is_bfloat16", "expected_dweight_dtype"),
-    [
-        (jnp.bfloat16, False, jnp.float32),
-        (jnp.bfloat16, True, jnp.bfloat16),
-    ],
-)
-def test_pallas_dweight_output_dtype_contract(
-    weight_dtype, output_is_bfloat16, expected_dweight_dtype
-):
+@pytest.mark.parametrize("weight_dtype", [jnp.bfloat16, jnp.float32])
+def test_pallas_dweight_is_stored_in_the_weight_dtype(weight_dtype):
     backward = expert_segment_matmul._grouped_mm_bwd._init_fn.jit_fn
     grad_lhs, grad_rhs = jax.eval_shape(
         backward,
-        jax.ShapeDtypeStruct((128, 64), jnp.bfloat16),
-        jax.ShapeDtypeStruct((128, 32), jnp.bfloat16),
+        jax.ShapeDtypeStruct((128, 64), weight_dtype),
+        jax.ShapeDtypeStruct((128, 32), weight_dtype),
         jax.ShapeDtypeStruct((2, 32, 64), weight_dtype),
         jax.ShapeDtypeStruct((2,), jnp.int32),
         128,
@@ -145,43 +130,55 @@ def test_pallas_dweight_output_dtype_contract(
         128,
         32,
         64,
-        output_is_bfloat16,
     )
 
     assert grad_lhs.shape == (128, 32)
-    assert grad_lhs.dtype == jnp.bfloat16
+    assert grad_lhs.dtype == weight_dtype
     assert grad_rhs.shape == (2, 32, 64)
-    assert grad_rhs.dtype == expected_dweight_dtype
+    assert grad_rhs.dtype == weight_dtype
 
 
-@pytest.mark.parametrize(
-    ("reduce_dtype", "expected_dtype"),
-    [
-        (torch.float32, torch.float32),
-        (torch.bfloat16, torch.bfloat16),
-    ],
-)
-def test_unpaired_dweight_output_matches_fsdp_dtype(reduce_dtype, expected_dtype):
-    experts = _build_experts(use_pallas_grouped_mm=True)
+@pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float32])
+def test_unpaired_kernels_get_bf16_weights_whatever_the_param_dtype(param_dtype):
+    """The dWeight store follows the kernel's weight dtype, which is always BF16.
 
-    experts.configure_dweight_output_dtype(reduce_dtype)
+    Neither ``mixed_precision_param`` nor ``mixed_precision_reduce`` reaches the
+    kernel: the experts cast to BF16 themselves, so the gradient autograd wants
+    is BF16 in every configuration.
+    """
+    experts = _build_experts(num_experts=2, use_pallas_grouped_mm=True).to(
+        param_dtype
+    )
+    counts = torch.tensor([3, 5], dtype=torch.int32)
+    x = torch.randn(8, experts.w1_EFD.shape[-1], dtype=param_dtype)
 
-    assert experts._unpaired_dweight_output_dtype == expected_dtype
+    def grouped_mm(x, weight, counts, **kwargs):
+        del kwargs
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        return torch._grouped_mm(x, weight, offs=offsets)
+
+    with patch(
+        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
+        side_effect=grouped_mm,
+    ) as unpaired:
+        out = experts.forward(x, counts)
+
+    assert out.dtype == param_dtype
+    assert unpaired.call_count == 3
+    for call in unpaired.call_args_list:
+        assert call.args[0].dtype == torch.bfloat16
+        assert call.args[1].dtype == torch.bfloat16
+        assert "dweight_output_dtype" not in call.kwargs
 
 
-def test_expert_dweight_output_rejects_unsupported_dtype():
-    experts = _build_experts(use_pallas_grouped_mm=True)
-
-    with pytest.raises(ValueError, match="supports only float32 or bfloat16"):
-        experts.configure_dweight_output_dtype(torch.float16)
-
-
-def test_graph_trainer_parallelize_configures_dweight_output_dtype():
+def test_graph_trainer_parallelize_forwards_to_the_graph_trainer():
     experts = _build_experts(
         use_pallas_grouped_mm=True,
     )
     model = torch.nn.Sequential(experts)
-    training = SimpleNamespace(mixed_precision_reduce="bfloat16")
+    training = SimpleNamespace(
+        mixed_precision_param="bfloat16", mixed_precision_reduce="float32"
+    )
     parallel_dims = SimpleNamespace(dp_shard=1, cp=1, ep_enabled=False)
 
     with patch.object(
@@ -197,7 +194,6 @@ def test_graph_trainer_parallelize_configures_dweight_output_dtype():
         )
 
     assert result is model
-    assert experts._unpaired_dweight_output_dtype == torch.bfloat16
     delegate.assert_called_once_with(
         model,
         training=training,
@@ -221,7 +217,6 @@ def test_paired_grouped_mm_validates_supported_configuration():
         num_experts=1,
         use_pallas_grouped_mm=True,
         use_pallas_paired_grouped_mm=True,
-        token_dispatcher=LocalTokenDispatcher.Config(num_experts=1, top_k=1),
     )
     with pytest.raises(ValueError, match="requires a full N TGMM tile"):
         config.build()
@@ -234,7 +229,6 @@ def test_paired_grouped_mm_validates_supported_configuration():
         use_pallas_grouped_mm=True,
         use_pallas_paired_grouped_mm=True,
         pallas_grouped_mm_tgmm_tiling=(128, 128, 0),
-        token_dispatcher=LocalTokenDispatcher.Config(num_experts=1, top_k=1),
     ).build()
 
     experts = _build_experts(
@@ -265,7 +259,6 @@ def test_paired_grouped_mm_forwards_tgmm_tile_k():
         use_pallas_grouped_mm=True,
         use_pallas_paired_grouped_mm=True,
         pallas_grouped_mm_tgmm_tiling=(128, 8, 0),
-        token_dispatcher=LocalTokenDispatcher.Config(num_experts=2, top_k=1),
     ).build()
     for param in experts.parameters():
         torch.nn.init.normal_(param, std=0.02)
@@ -288,7 +281,7 @@ def test_paired_grouped_mm_forwards_tgmm_tile_k():
         "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
         side_effect=paired_grouped_mm,
     ) as paired:
-        experts._experts_forward(x, counts)
+        experts.forward(x, counts)
 
     paired.assert_called_once()
     assert paired.call_args.kwargs["tgmm_tile_m"] == 128
@@ -296,6 +289,60 @@ def test_paired_grouped_mm_forwards_tgmm_tile_k():
     # The down projection stays on the unpaired kernel and gets the full tuple.
     unpaired.assert_called_once()
     assert unpaired.call_args.kwargs["tgmm_tiling"] == (128, 8, 0)
+
+
+@pytest.mark.parametrize("paired", [True, False])
+def test_w2_tgmm_tiling_reaches_only_the_w2_dweight(paired):
+    """``pallas_grouped_mm_w2_tgmm_tiling`` tiles W2 and nothing else.
+
+    Its N tile is non-zero here: the full-N rule is the paired kernel's, and W2
+    is never paired.
+    """
+    shared, w2_own = (128, 8, 0), (64, 4, 4)
+    experts = TpuGroupedExperts.Config(
+        dim=16,
+        hidden_dim=24,
+        num_experts=2,
+        use_pallas_grouped_mm=True,
+        use_pallas_paired_grouped_mm=paired,
+        pallas_grouped_mm_tgmm_tiling=shared,
+        pallas_grouped_mm_w2_tgmm_tiling=w2_own,
+    ).build()
+    for param in experts.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    x = torch.randn(7, 16)
+    counts = torch.tensor([3, 4], dtype=torch.int32)
+
+    def grouped_mm(x, weight, counts, **kwargs):
+        del kwargs
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        return torch._grouped_mm(x, weight, offs=offsets)
+
+    def paired_grouped_mm(x, w1, w3, counts, **kwargs):
+        del kwargs
+        return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
+
+    with patch(
+        "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
+        side_effect=grouped_mm,
+    ) as unpaired, patch(
+        "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
+        side_effect=paired_grouped_mm,
+    ) as paired_kernel:
+        experts.forward(x, counts)
+
+    if paired:
+        paired_kernel.assert_called_once()
+        assert paired_kernel.call_args.kwargs["tgmm_tile_m"] == shared[0]
+        assert paired_kernel.call_args.kwargs["tgmm_tile_k"] == shared[1]
+        unpaired.assert_called_once()
+    else:
+        paired_kernel.assert_not_called()
+        gate, up, _ = unpaired.call_args_list
+        assert gate.kwargs["tgmm_tiling"] == shared
+        assert up.kwargs["tgmm_tiling"] == shared
+    # W2 is always the last unpaired call.
+    assert unpaired.call_args_list[-1].kwargs["tgmm_tiling"] == w2_own
 
 
 def test_kernel_native_layout_preserves_initialization_and_state_dict():
@@ -394,7 +441,7 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
     def paired_grouped_mm(x, w1, w3, counts, **kwargs):
         return grouped_mm(x, w1, counts), grouped_mm(x, w3, counts)
 
-    expected = stock._experts_forward(x, counts)
+    expected = stock.forward(x, counts)
     with patch(
         "torchtitan.experiments.tpu.grouped_experts.segment_matmul_pallas_2d",
         side_effect=grouped_mm,
@@ -402,7 +449,7 @@ def test_kernel_native_layout_pallas_forward_and_backward(use_pair):
         "torchtitan.experiments.tpu.grouped_experts.paired_segment_matmul_pallas_2d",
         side_effect=paired_grouped_mm,
     ):
-        actual = native._experts_forward(x_native, counts)
+        actual = native.forward(x_native, counts)
     torch.testing.assert_close(actual, expected)
 
     actual.float().square().sum().backward()
@@ -427,13 +474,16 @@ def test_kernel_native_layout_transposes_tp_sharding_axes():
     )
     native = _native_weight_sharding(config)
     assert set(native.state_shardings) == {"w1_EDF", "w2_EFD", "w3_EDF"}
-    assert native.state_shardings["w1_EDF"].axis_types[MeshAxisName.TP] == spmd.S(2)
-    assert native.state_shardings["w2_EFD"].axis_types[MeshAxisName.TP] == spmd.S(1)
-    assert native.state_shardings["w3_EDF"].axis_types[MeshAxisName.TP] == spmd.S(2)
+    assert native.state_shardings["w1_EDF"].local_type[MeshAxisName.TP] == spmd.S(2)
+    assert native.state_shardings["w2_EFD"].local_type[MeshAxisName.TP] == spmd.S(1)
+    assert native.state_shardings["w3_EDF"].local_type[MeshAxisName.TP] == spmd.S(2)
 
 
 def test_kernel_native_layout_transposes_rank_aware_partition_spec():
-    layout = SpmdLayout(
+    # Upstream d771abb0 deleted `protocols.sharding.SpmdLayout` in favour of
+    # `spmd_types.SpmdType`, renaming the per-axis field `axis_types` ->
+    # `local_type`.
+    layout = spmd.SpmdType(
         {
             MeshAxisName.DP_SHARD: spmd.V,
             MeshAxisName.TP: spmd.V,

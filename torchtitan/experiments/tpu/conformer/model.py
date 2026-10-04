@@ -27,7 +27,9 @@ class ConformerModelArgs(BaseModel.Config):
   def update_from_config(self, train_config, **kwargs):
     # Update from train_config if needed
     if hasattr(train_config, "training"):
-      self.max_seq_len = train_config.training.seq_len
+      # Upstream d771abb0 renamed training.seq_len ->
+      # training.max_context_length.
+      self.max_seq_len = train_config.training.max_context_length
     if isinstance(train_config, TPUTrainerConfig):
       self.use_splash = (
           train_config.splash_attention_kernel.use_splash_attention_kernel
