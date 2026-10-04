@@ -285,13 +285,24 @@ def bld_skip_reason(parallelism, tpu_config) -> str | None:
   )
   if graph_trainer and (
       tpu_config.use_graph_split
-      or "offload" in tpu_config.graph_trainer_memory_policy
+      or _uses_generic_cpu_offload(tpu_config.graph_trainer_memory_policy)
   ):
-    # GraphTrainer's CPU offload refuses views and graph_split assigns nodes
-    # by layer; the [B, L] views at block boundaries break both. Outside
+    # GraphTrainer's generic CPU offload refuses views and graph_split assigns
+    # nodes by layer; the [B, L] views at block boundaries break both. Outside
     # GraphTrainer, `use_graph_split` is only an eager fwd/bwd sync point.
     return "graph-trainer CPU offload / graph_split do not handle its views yet"
   return None
+
+
+def _uses_generic_cpu_offload(memory_policy: str) -> bool:
+  """Whether ``memory_policy`` runs GraphTrainer's generic CPU-offload pass.
+
+  ``full_and_scan_offload`` is excluded: it offloads the stacked scan carries
+  rather than individual graph nodes, so the [B, L] views at block boundaries
+  never reach the offload pass. On qwen3-235B scan (TPU7x 4x4x4, FSDP 128)
+  enabling [B, L] under it brought steps from 31.6 s back to 29.2 s.
+  """
+  return "offload" in memory_policy and memory_policy != "full_and_scan_offload"
 
 
 def apply_bld_layout(
