@@ -257,6 +257,10 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           enable_compile=True,
+          # TODO: Same TPU7x-only XLA fusion_emitter.cc CHECK failure
+          # ("Scaled window bound is not a power of 2") as qwen3_tp_compile.
+          # b/568843473
+          skip_on_tpu7x=True,
       ),
   ])
   def test_model_distributed(
