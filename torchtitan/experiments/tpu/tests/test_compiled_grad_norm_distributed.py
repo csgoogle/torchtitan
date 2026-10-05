@@ -54,6 +54,20 @@ class CompiledGradNormUnitTest(absltest.TestCase):
             1.0,
         )
 
+  def test_mismatched_compiled_norm_falls_back_to_eager(self) -> None:
+    model = torch.nn.Linear(4, 3, bias=False)
+    model.weight.grad = torch.full_like(model.weight, 2.0)
+    params = list(model.parameters())
+    eager = grad_norm.global_grad_norm([model.weight.grad])
+    norm = grad_norm.CompiledGradNorm()
+    norm._runner = lambda grads: eager * 0.75  # pylint: disable=protected-access
+    norm._signature = grad_norm._grad_signature([model.weight.grad])  # pylint: disable=protected-access
+
+    for _ in range(2):
+      model.weight.grad = torch.full_like(model.weight, 2.0)
+      torch.testing.assert_close(norm.clip_grad_norm_(params, max_norm=1e6), eager)
+    self.assertTrue(norm._use_eager)  # pylint: disable=protected-access
+
   def test_recipes_enable_compiled_grad_norm(self) -> None:
     for recipe in (
         reg_trainer_qwen3_8b,
