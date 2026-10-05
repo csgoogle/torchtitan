@@ -68,6 +68,14 @@ class CompiledGradNormUnitTest(absltest.TestCase):
       torch.testing.assert_close(norm.clip_grad_norm_(params, max_norm=1e6), eager)
     self.assertTrue(norm._use_eager)  # pylint: disable=protected-access
 
+  def test_offset_views_are_copied_before_the_compiled_norm(self) -> None:
+    base = torch.arange(12.0)
+    view, plain = base[4:8], torch.ones(3)
+    out = grad_norm._without_offset_views([view, plain])  # pylint: disable=protected-access
+    self.assertEqual(out[0].storage_offset(), 0)
+    torch.testing.assert_close(out[0], view)
+    self.assertIs(out[1], plain)
+
   def test_recipes_enable_compiled_grad_norm(self) -> None:
     for recipe in (
         reg_trainer_qwen3_8b,

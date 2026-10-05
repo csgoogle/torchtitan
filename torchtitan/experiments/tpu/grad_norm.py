@@ -34,6 +34,23 @@ GradSignature = tuple[
 ]
 
 
+def _without_offset_views(grads: list[torch.Tensor]) -> list[torch.Tensor]:
+  """Replace gradients whose local shard is an offset view with copies.
+
+  Fused parameters (packed QKV, paired W1/W3) leave gradients that are
+  contiguous views at a non-zero, rank-dependent storage offset. TorchTPU
+  710e117f compiles the norm graph with one rank's offsets, so other ranks read
+  the wrong memory: Qwen3-30B-A3B's step-1 norm came out 16.69 instead of 19.09.
+  A copy starts at offset 0 on every rank. Remove once TorchTPU is fixed.
+  """
+  return [
+      grad.clone()
+      if (grad.to_local() if isinstance(grad, DTensor) else grad).storage_offset()
+      else grad
+      for grad in grads
+  ]
+
+
 def _grad_signature(grads: list[torch.Tensor]) -> GradSignature:
   return tuple(
       (grad.shape, grad.dtype, grad.device_mesh, grad.placements)
@@ -97,7 +114,7 @@ class CompiledGradNorm:
           "[compiled_grad_norm] compiling global norm for %d gradients",
           len(grads),
       )
-      traced = minimal_fx_tracer(global_grad_norm)(grads)
+      traced = minimal_fx_tracer(global_grad_norm)(_without_offset_views(grads))
       # This is a standalone graph; is_fwd avoids backward-only AC marking and
       # selects the forward debug-dump bucket.
       traced.gm = tpu_backend_compile_pass(
@@ -113,7 +130,7 @@ class CompiledGradNorm:
           f"trace-time {self._signature}, runtime {signature}"
       )
     # Do not retrace a collective independently on ranks that might diverge.
-    total_norm = self._runner(grads)
+    total_norm = self._runner(_without_offset_views(grads))
     if not self._validated:
       self._validated = True
       # A miscompiled reduction is silent: training runs, but clipping uses
