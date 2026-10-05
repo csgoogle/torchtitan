@@ -179,8 +179,9 @@ def _tpu_hf_config(
           local_batch_size=local_batch_size, seq_len=seq_len, steps=steps
       ),
       # SimpleFSDP is the data-parallel implementation on this lane; see
-      # parallelize.py for why it is not FSDP2.
-      parallelism=ParallelismConfig(use_simple_fsdp=True),
+      # parallelize.py for why it is not FSDP2. The shared backend requires
+      # spmd_types, which this fork does not default to.
+      parallelism=ParallelismConfig(use_simple_fsdp=True, spmd_backend="spmd_types"),
       # "layer" compiles each decoder block on its own. Compiling is what makes
       # the SimpleFSDP choice pay off: its all-gather sits on the .weight
       # access path, so the graph break lands before the layer body and the
