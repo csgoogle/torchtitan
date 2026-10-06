@@ -1,8 +1,8 @@
 # Recipe for training Conformer model on 8 TPU trillium cluster (v6e-8)
 
-These are instructions for deploying Conformer training to an 8 chip v6e cluster using `xpk`.
+These are instructions for deploying Conformer training to an 8 chip v6e cluster using Cluster Toolkit (`gcluster`).
 
-For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
 
 After setting up your cluster, the following variables should be set:
 
@@ -10,7 +10,7 @@ After setting up your cluster, the following variables should be set:
 export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
-export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
+export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 ```
 
 ## Notes as of 5/21/26
@@ -22,16 +22,17 @@ export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 
-xpk workload create \
---workload=$WORKLOAD_NAME \
---cluster=$CLUSTER_NAME \
---zone=$ZONE \
---project=$PROJECT_ID \
---tpu-type="v6e-8" \
---num-slices=1 \
---docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
---env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
---command "
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type ct6e-standard-4t \
+  --topology 2x4 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "$WORKLOAD_IMAGE" \
+  --env=WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
+  --command "
     torchrun \
     --nnodes=2 \
     --nproc_per_node=4 \
@@ -58,11 +59,11 @@ xpk workload create \
 "
 ```
 
-**5/21/26: With this configuration you should observe approximately the following metrics**
+**9/30/26: With this configuration you should observe approximately the following metrics**
 
-- Average TPS/chip: **89,000**
-- Average MFU: **6.00%**
-- Total TPS (8 chips): **712,100**
+- Average TPS/chip: **87,181**
+- Average MFU: **6.37%**
+- Total TPS (8 chips): **697,448**
 
 
 
@@ -71,16 +72,17 @@ xpk workload create \
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 
-xpk workload create \
---workload=$WORKLOAD_NAME \
---cluster=$CLUSTER_NAME \
---zone=$ZONE \
---project=$PROJECT_ID \
---tpu-type="v6e-8" \
---num-slices=1 \
---docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
---env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
---command "
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type ct6e-standard-4t \
+  --topology 2x4 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "$WORKLOAD_IMAGE" \
+  --env=WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
+  --command "
     torchrun \
     --nnodes=2 \
     --nproc_per_node=4 \
@@ -106,9 +108,9 @@ xpk workload create \
 "
 ```
 
-**5/21/26: With this configuration you should observe approximately the following metrics**
+**9/30/26: With this configuration you should observe approximately the following metrics**
 
-- Average TPS/chip: **59,000**
-- Average MFU: **3.98%**
-- Total TPS (8 chips): **472,000**
+- Average TPS/chip: **88,664**
+- Average MFU: **6.48%**
+- Total TPS (8 chips): **709,312**
 

@@ -1,8 +1,8 @@
 # Recipe for training Llama3-70B model on a 32 device (16 chip) TPU ironwood cluster (tpu7x-32)
 
-These are instructions for deploying Llama3-70B training to a 32 device (16 chip) tpu7x cluster using `xpk`.
+These are instructions for deploying Llama3-70B training to a 32 device (16 chip) tpu7x cluster using Cluster Toolkit (`gcluster`).
 
-For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
 
 After setting up your cluster, the following variables should be set:
 
@@ -10,8 +10,7 @@ After setting up your cluster, the following variables should be set:
 export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
-export REPOSITORY=YOUR_REPOSITORY # Artifact Registry repo holding torchtitan-container
-export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
+export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 ```
 
 ## Notes
@@ -47,20 +46,21 @@ Overridden on the command line:
 ## Training Command
 
 ```bash
-export WORKLOAD_NAME="llama3-70b-tpu7x32-$(date +%Y%m%d-%H%M%S)"
+export WORKLOAD_NAME="llama3-70b-tpu7x32-$(date +%H%M%S)"
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --tpu-type="tpu7x-2x2x4" \
-  --project="$PROJECT_ID" \
-  --zone="$ZONE" \
-  --no-use-parallel-containers \
-  --base-docker-image="us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest" \
-  --script-dir="$SCRIPT_DIR" \
-  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type tpu7x \
+  --topology 2x2x4 \
+  --num-slices 1 \
+  --project "$PROJECT_ID" \
+  --location "$ZONE" \
+  --gke-disable-parallel-containers \
+  --image "$WORKLOAD_IMAGE" \
+  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-main-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
-  --command="torchrun \
+  --command "torchrun \
     --nnodes=4 \
     --nproc_per_node=8 \
     --rdzv_backend=static \
@@ -79,8 +79,8 @@ xpk workload create \
 
 ## Expected Metrics
 
-With this configuration you should observe the following metrics at step 15:
+With this configuration you should observe the following metrics (as of 9/28/26):
 
-- TPS/device: **1,067**
-- MFU: **44.54%**
-- Total TPS (32 devices / 16 chips): 34,144
+- TPS/device: **1,138**
+- MFU: **47.51%**
+- Total TPS (32 devices / 16 chips): 36,426
