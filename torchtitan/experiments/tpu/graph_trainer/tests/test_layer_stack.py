@@ -663,6 +663,7 @@ class TestQwen3(unittest.TestCase):
                     type="batch_wise", coeff=coeff, top_k=layer.moe.router.top_k
                 )
                 aux_loss.global_batch_size = TOKENS // SEQ_LEN
+                aux_loss.seq_len = SEQ_LEN
                 layer.moe.router.aux_loss = aux_loss
         # As in the 235B scan recipe: no `tokens_per_expert_E` write either.
         apply_overrides(

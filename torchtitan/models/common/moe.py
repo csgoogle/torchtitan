@@ -174,49 +174,6 @@ def _all_reduce_expert_counts(
     return counts
 
 
-def _unflatten_router_outputs(
-    scores_TE: torch.Tensor,
-    routing_map_TE: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reshape the router's ``[T, E]`` outputs to ``[B, L, E]``."""
-    # TT-UNFLATTEN-SHIM: Upstream flattened sequence compatibility.
-    # Scores and the routing map are [T, E] under upstream's Native [T] Token
-    # Streams. The DeepSeekv3 patch load-balance losses expect [B, L, E].
-    # We recover L via a lazy import of the temporary TPU shim to avoid a BUILD
-    # dependency cycle (core torchtitan depending on experiments/tpu).
-    # TODO: remove with the shim when upstream's global batch-wise loss
-    # (pytorch/torchtitan#4772) replaces MoELoadBalanceAuxLoss.
-    if scores_TE.ndim != 2:
-        return scores_TE, routing_map_TE
-    L = None
-    try:
-        from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
-        L = get_unflatten_seq_len()
-    except ImportError:
-        pass
-    if L is None:
-        raise ValueError(
-            "TT-UNFLATTEN-SHIM: `scores_TE` is 2-dimensional ([T, E]) but "
-            "the TPU unflatten shim context is inactive (no seq_len). "
-            "The current 0005 DeepSeek patch statically requires [B, L, E]. "
-            "Please migrate the MoE loss logic to support native [T, E]!"
-        )
-    num_tokens, num_experts = scores_TE.shape
-    if num_tokens % L != 0:
-        raise ValueError(
-            f"TT-UNFLATTEN-SHIM: the router's local token count ({num_tokens}) "
-            f"is not a multiple of seq_len ({L}), so it cannot be regrouped "
-            "into whole sequences."
-        )
-    B = num_tokens // L
-    return (
-        scores_TE.reshape(B, L, num_experts),
-        routing_map_TE.reshape(B, L, num_experts)
-        if routing_map_TE is not None
-        else None,
-    )
-
-
 class MoELoadBalanceAuxLoss(AuxLoss):
     """MoE auxiliary load-balance loss, configured on the router.
 
@@ -259,6 +216,11 @@ class MoELoadBalanceAuxLoss(AuxLoss):
         Torchtitan generally uses sum aggregation & global_bs division.
         Because batch_wise aux loss doesn't commute over microbatches, we ban
         batch_wise + PP usage in any case."""
+        seq_len: int | None = None
+        """Tokens per sequence (``training.max_context_length``). Converts the
+        router's ``[T, E]`` token count to samples for the ``global_batch_size``
+        weight, and regroups tokens into sequences for ``sequence_wise``. Set
+        by ``update_moe_aux_loss_configs``."""
 
     def __init__(self, config: Config):
         if config.coeff <= 0:
@@ -282,6 +244,7 @@ class MoELoadBalanceAuxLoss(AuxLoss):
         del self.instance_acc
         self.type = config.type
         self.global_batch_size = config.global_batch_size
+        self.seq_len = config.seq_len
         self.top_k = config.top_k
         self.dp_mesh: DeviceMesh | None = None
         self.cp_mesh: DeviceMesh | None = None
@@ -330,26 +293,15 @@ class MoELoadBalanceAuxLoss(AuxLoss):
         # ``configure_moe_aux_loss_reduction``, so the loss works on this
         # rank's local tokens. ``to_local`` keeps the gradient placement of the
         # router output.
-        scores_BLE = (
+        scores_TE = (
             scores_TE.to_local() if isinstance(scores_TE, DTensor) else scores_TE
         )
-        routing_map_BLE = (
+        routing_map_TE = (
             routing_map_TE.to_local()
             if isinstance(routing_map_TE, DTensor)
             else routing_map_TE
         )
-        scores_BLE, routing_map_BLE = _unflatten_router_outputs(
-            scores_BLE, routing_map_BLE
-        )
-        local_counts_E = None
-        if routing_map_BLE is None:
-            ids_TK = (
-                expert_ids_TK.to_local()
-                if isinstance(expert_ids_TK, DTensor)
-                else expert_ids_TK
-            )
-            local_counts_E = _tokens_per_expert(ids_TK, scores_BLE.size(-1))
-        B = scores_BLE.size(0)
+        num_experts = scores_TE.size(-1)
         if self.global_batch_size is None:
             # Falling back to B would drop the 1 / dp-degree factor, making the
             # aux gradient dp-times too large after the DP gradient sum.
@@ -359,20 +311,55 @@ class MoELoadBalanceAuxLoss(AuxLoss):
                 "update_from_config, which also validates PP and gradient "
                 "accumulation."
             )
-        scaled_coeff = self.coeff * B / self.global_batch_size
+        # [B, L, E] inputs carry their own sequence length; the router's
+        # [T, E] outputs need the configured one.
+        seq_len = scores_TE.size(1) if scores_TE.ndim == 3 else self.seq_len
+        if seq_len is None:
+            raise ValueError(
+                "MoELoadBalanceAuxLoss.seq_len is not set. Call "
+                "update_moe_aux_loss_configs from the model's "
+                "update_from_config."
+            )
+        local_counts_E = None
+        if routing_map_TE is None:
+            ids_TK = (
+                expert_ids_TK.to_local()
+                if isinstance(expert_ids_TK, DTensor)
+                else expert_ids_TK
+            )
+            local_counts_E = _tokens_per_expert(ids_TK, num_experts)
+        # This rank's share of the global batch, B / global_batch_size, counted
+        # in tokens so the batch-wise loss never regroups tokens into sequences.
+        num_local_tokens = scores_TE.numel() // num_experts
+        scaled_coeff = (
+            self.coeff * num_local_tokens / (self.global_batch_size * seq_len)
+        )
         if self.type == "sequence_wise":
+            # Per-sequence expert frequencies need the sequence boundaries.
+            if num_local_tokens % seq_len != 0:
+                raise ValueError(
+                    f"The router's local token count ({num_local_tokens}) is "
+                    f"not a multiple of seq_len ({seq_len}), so it cannot be "
+                    "regrouped into whole sequences."
+                )
             aux_loss = _sequence_wise_load_balance_loss(
-                scores_BLE,
-                routing_map_BLE,
+                scores_TE.reshape(-1, seq_len, num_experts),
+                routing_map_TE.reshape(-1, seq_len, num_experts),
                 self.top_k,
                 scaled_coeff,
                 cp_mesh=self.cp_mesh,
                 tp_mesh=self.tp_mesh,
             )
         else:
+            # The batch-wise loss only sums over tokens, so a single
+            # [1, T, E] "sequence" gives the same result as any [B, L, E]
+            # grouping of the same tokens.
+            scores_1TE = scores_TE.reshape(1, -1, num_experts)
             aux_loss = _batch_wise_load_balance_loss(
-                scores_BLE,
-                routing_map_BLE,
+                scores_1TE,
+                routing_map_TE.reshape(1, -1, num_experts)
+                if routing_map_TE is not None
+                else None,
                 self.top_k,
                 scaled_coeff,
                 dp_mesh=self.dp_mesh,
@@ -390,7 +377,7 @@ class MoELoadBalanceAuxLoss(AuxLoss):
             self._last_local_tokens_per_expert_E = (
                 local_counts_E
                 if local_counts_E is not None
-                else routing_map_BLE.reshape(-1, routing_map_BLE.size(-1)).sum(dim=0)
+                else routing_map_TE.reshape(-1, num_experts).sum(dim=0)
             ).detach().float()
         return _AuxLossInjection.apply(carrier, aux_loss)
 
@@ -420,8 +407,9 @@ def configure_moe_aux_loss_reduction(model: nn.Module, parallel_dims) -> None:
         m for m in model.modules() if isinstance(m, MoELoadBalanceAuxLoss)
     ]
     if aux_losses and (cp_mesh is not None or tp_mesh is not None):
-        # The loss regroups the router's rank-local tokens into sequences of the
-        # global seq_len, which is wrong once CP, or TP with EP, splits them.
+        # The loss treats the router's rank-local tokens as whole sequences of
+        # the global seq_len (its share of the batch, and sequence_wise's
+        # grouping), which is wrong once CP, or TP with EP, splits them.
         raise NotImplementedError(
             "MoELoadBalanceAuxLoss does not support context parallelism or "
             "tensor parallelism with expert parallelism: it would group the "

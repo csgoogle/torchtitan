@@ -25,7 +25,6 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     run_traced,
 )
 from torchtitan.experiments.graph_trainer.trainer import make_fwd_bwd_step
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common import moe as moe_module
 from torchtitan.models.common.aux_loss import _AuxLossInjection, AuxLoss
 from torchtitan.models.common.config_utils import (
@@ -141,6 +140,7 @@ def test_batch_wise_aux_loss_rejects_gradient_accumulation():
         pp_enabled=False,
         local_global_batch_size=16,
         global_batch_size=16,
+        seq_len=8,
     )
     assert aux_loss.global_batch_size == 16
 
@@ -150,6 +150,7 @@ def test_batch_wise_aux_loss_rejects_gradient_accumulation():
             pp_enabled=False,
             local_global_batch_size=16,
             global_batch_size=32,
+            seq_len=8,
         )
 
 
@@ -169,6 +170,7 @@ def test_batch_wise_aux_loss_rejects_pipeline_parallelism():
             pp_enabled=True,
             local_global_batch_size=16,
             global_batch_size=16,
+            seq_len=8,
         )
 
 
@@ -217,11 +219,73 @@ def test_aux_loss_reduction_allows_tp_without_ep():
     assert model["aux"].tp_mesh is None
 
 
-def test_unflatten_rejects_partial_sequences():
+def test_sequence_wise_rejects_partial_sequences():
     scores_TE = torch.rand(_L + 1, _E)
-    with set_unflatten_seq_len(_L):
-        with pytest.raises(ValueError, match="not a multiple of seq_len"):
-            moe_module._unflatten_router_outputs(scores_TE, scores_TE)
+    expert_ids_TK = scores_TE.topk(k=_K, dim=-1).indices
+    aux_loss = MoELoadBalanceAuxLoss.Config(
+        type="sequence_wise", coeff=1e-3, top_k=_K, global_batch_size=1, seq_len=_L
+    ).build()
+    with pytest.raises(ValueError, match="not a multiple of seq_len"):
+        aux_loss(
+            scores_TE,
+            _routing_map(expert_ids_TK, _E),
+            carrier=scores_TE.gather(-1, expert_ids_TK),
+        )
+
+
+def test_aux_loss_requires_seq_len_for_flat_tokens():
+    scores_TE = torch.rand(_B * _L, _E)
+    expert_ids_TK = scores_TE.topk(k=_K, dim=-1).indices
+    aux_loss = MoELoadBalanceAuxLoss.Config(
+        type="batch_wise", coeff=1e-3, top_k=_K, global_batch_size=_B
+    ).build()
+    with pytest.raises(ValueError, match="seq_len is not set"):
+        aux_loss(
+            scores_TE,
+            _routing_map(expert_ids_TK, _E),
+            carrier=scores_TE.gather(-1, expert_ids_TK),
+        )
+
+
+@pytest.mark.parametrize("loss_type", ["batch_wise", "sequence_wise"])
+@pytest.mark.parametrize("use_routing_map", [True, False], ids=["map", "histc"])
+def test_flat_tokens_match_batched_sequences(loss_type, use_routing_map):
+    """The router's [T, E] outputs give the [B, L, E] loss and gradient.
+
+    No unflatten-shim context is active, as on non-TPU trainers.
+    """
+    if loss_type == "sequence_wise" and not use_routing_map:
+        pytest.skip("sequence_wise always consumes the routing map")
+    torch.manual_seed(0)
+    global_batch_size = 2 * _B
+    scores_BLE = torch.rand(_B, _L, _E, dtype=torch.double)
+    expert_ids_BLK = scores_BLE.topk(k=_K, dim=-1).indices
+    routing_map_BLE = _routing_map(expert_ids_BLK, _E)
+    grads = []
+    for flat in (False, True):
+        scores = scores_BLE.clone().requires_grad_(True)
+        aux_loss = MoELoadBalanceAuxLoss.Config(
+            type=loss_type,
+            coeff=1e-2,
+            top_k=_K,
+            global_batch_size=global_batch_size,
+            seq_len=_L,
+        ).build()
+        if flat:
+            scores_in = scores.reshape(-1, _E)
+            map_in = routing_map_BLE.reshape(-1, _E) if use_routing_map else None
+            ids = expert_ids_BLK.reshape(-1, _K)
+        else:
+            scores_in, map_in, ids = scores, routing_map_BLE, expert_ids_BLK
+        out = aux_loss(
+            scores_in,
+            map_in,
+            carrier=scores_in.gather(-1, ids),
+            expert_ids_TK=ids if flat else None,
+        )
+        out.sum().backward()
+        grads.append(scores.grad)
+    torch.testing.assert_close(grads[0], grads[1], rtol=1e-12, atol=1e-12)
 
 
 def test_aux_loss_metric_capture_does_not_change_output_or_gradient():
@@ -443,6 +507,7 @@ def _router_config(aux_loss=None):
 def _global_aux_loss_config(global_batch_size=_B):
     config = make_aux_loss_config(type="batch_wise", coeff=1e-2, top_k=_K)
     config.global_batch_size = global_batch_size
+    config.seq_len = _L
     return config
 
 
@@ -480,13 +545,12 @@ def test_router_calls_global_batch_aux_loss_only_in_training():
     router.aux_loss.register_forward_hook(lambda *_: calls.append(1))
     x_TD = torch.randn(_B * _L, _D)
 
-    with set_unflatten_seq_len(_L):
-        router.train()
-        router(x_TD)
-        assert len(calls) == 1
-        router.eval()
-        router(x_TD)
-        assert len(calls) == 1
+    router.train()
+    router(x_TD)
+    assert len(calls) == 1
+    router.eval()
+    router(x_TD)
+    assert len(calls) == 1
 
 
 def test_router_injects_global_batch_aux_loss_gradient():
@@ -498,8 +562,7 @@ def test_router_injects_global_batch_aux_loss_gradient():
     router = _init_normal(
         _router_config(_global_aux_loss_config(global_batch_size)).build()
     )
-    with set_unflatten_seq_len(_L):
-        topk_scores_TK, topk_expert_ids_TK, _ = router(x_TD)
+    topk_scores_TK, topk_expert_ids_TK, _ = router(x_TD)
     topk_scores_TK.sum().backward()
 
     reference = _init_normal(_router_config().build())
@@ -579,8 +642,7 @@ def test_moe_forward_produces_routing_metrics():
     moe = model_part.layers["0"].moe
     assert configure_moe_routing_metrics([model_part], enabled=True)
     x_TD = torch.randn(_B * _L, _D)
-    with set_unflatten_seq_len(_L):
-        moe(x_TD)
+    moe(x_TD)
 
     metrics = get_moe_load_balancing_metrics([model_part])
 

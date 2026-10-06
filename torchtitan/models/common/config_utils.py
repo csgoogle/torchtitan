@@ -481,12 +481,14 @@ def update_moe_aux_loss_configs(
     pp_enabled: bool,
     local_global_batch_size: int,
     global_batch_size: int,
+    seq_len: int,
 ) -> None:
     """Update aux loss configs for all MoE layers from trainer config.
 
     Call this from each model's ``update_from_config`` to set
     ``global_batch_size`` for gradient normalization across PP microbatches,
-    gradient accumulation steps, and DP ranks (FSDP sum). Also validates
+    gradient accumulation steps, and DP ranks (FSDP sum), and ``seq_len`` so
+    the loss can work on the router's flat ``[T, E]`` outputs. Also validates
     that batch-wise aux loss is not used with PP or gradient accumulation.
     """
     for aux_loss in moe_load_balance_aux_loss_configs(layers):
@@ -497,9 +499,12 @@ def update_moe_aux_loss_configs(
             )
         if aux_loss.type == "batch_wise" and global_batch_size != local_global_batch_size:
             raise ValueError(
-                "batch_wise MoE aux loss is incompatible with gradient "
-                "accumulation. Use sequence_wise instead or set "
-                "training.global_batch_size to local_batch_size * data-parallel degree."
+                "batch_wise MoE aux loss is incompatible with gradient accumulation: "
+                f"global batch is {global_batch_size} sequences but one step covers "
+                f"{local_global_batch_size} (per-rank microbatch x DP degree). Use "
+                "sequence_wise, or set training.num_tokens_per_train_step to "
+                "training.num_tokens_per_microbatch_per_dp_rank * data-parallel degree."
             )
         aux_loss.global_batch_size = global_batch_size
+        aux_loss.seq_len = seq_len
 

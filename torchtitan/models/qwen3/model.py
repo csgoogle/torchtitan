@@ -117,6 +117,7 @@ class Qwen3Model(Decoder):
                     pp_enabled=parallelism.pipeline_parallel_degree > 1,
                     local_global_batch_size=kwargs["local_global_batch_size"],
                     global_batch_size=kwargs["global_batch_size"],
+                    seq_len=config.training.max_context_length,
                 )
 
             from torchtitan.models.qwen3.sharding import set_qwen3_sharding_config
