@@ -1,6 +1,10 @@
 ARG PYTHON_VERSION=3.14
 FROM python:${PYTHON_VERSION}
 
+# Install tcmalloc (enabled via LD_PRELOAD at the end of this file)
+RUN apt-get update && apt-get install -y --no-install-recommends libgoogle-perftools-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 ARG CACHE_BUSTER=1
 
 # Install PyTorch CPU nightly first so downstream packages do not pull CUDA wheels
@@ -29,3 +33,6 @@ COPY assets /torchtitan/assets
 COPY tests /torchtitan/tests
 
 WORKDIR /torchtitan
+
+# Enable tcmalloc at runtime (set after all RUN steps so build steps are unaffected)
+ENV LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
