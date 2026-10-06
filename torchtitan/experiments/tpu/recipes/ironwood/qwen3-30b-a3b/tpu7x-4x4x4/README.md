@@ -1,7 +1,7 @@
 # Qwen3-30B-A3B on TPU7x 4x4x4
 
 This recipe runs the FSDP-only Qwen3-30B-A3B benchmark on 128 TPU cores.
-See the TPU [README](../../../../README.md) for XPK installation and cluster
+See the TPU [README](../../../../README.md) for Cluster Toolkit (`gcluster`) installation and cluster
 setup.
 
 The libtpu init flags this recipe needs ride on the torchtitan config
@@ -33,16 +33,18 @@ xla_tpu_enable_sparse_core_hierarchical_reduce_scatter=true \
 xla_tpu_dvfs_p_state=7 \
 xla_tpu_enable_diagnostic_coordinator=false"
 
-xpk workload create \
---workload="$WORKLOAD_NAME" \
---cluster="$CLUSTER_NAME" \
---zone="$ZONE" \
---project="$PROJECT_ID" \
---tpu-type=tpu7x-4x4x4 \
---num-slices=1 \
---docker-image="$WORKLOAD_IMAGE" \
---env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
---command "\
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --compute-type tpu7x \
+  --topology 4x4x4 \
+  --num-slices 1 \
+  --image "$WORKLOAD_IMAGE" \
+  --gke-disable-parallel-containers \
+  --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
+  --command "\
     torchrun \
     --nnodes=16 \
     --nproc_per_node=8 \
@@ -53,6 +55,8 @@ xpk workload create \
     --module=torchtitan.experiments.tpu.qwen3 \
     --config=qwen3_moe_30b_fsdp_only_full_ac_benchmark \
     --hf_assets_path=tests/assets/tokenizer \
+    --dataloader.dataset=c4_test \
+    --dataloader.dataset_path=tests/assets/c4_test \
     --libtpu-init-flags='$LIBTPU_INIT_FLAGS'"
 ```
 
@@ -71,9 +75,9 @@ by another 1.09% and raised ring-equivalent reduce-scatter bus bandwidth from
 351.29 to 364.57 GB/s.
 
 ## Benchmark Results
-Run Date: 9/23/2026
-* **MFU:** 15.00%
-* **TPS (Tokens Per Second):** 8,374
-* **TFLOPS:** 173.05
-* **Memory Usage:** 65.12 GiB (67.83%)
-* **Step Time (end-to-end):** 1.467s
+Run Date: 9/28/2026
+* **MFU:** 13.42%
+* **TPS (Tokens Per Second):** 7,490
+* **TFLOPS:** 154.78
+* **Memory Usage:** 65.48 GiB (68.21%)
+* **Step Time (end-to-end):** 1.700s

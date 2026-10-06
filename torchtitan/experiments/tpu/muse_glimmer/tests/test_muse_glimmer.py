@@ -3,7 +3,8 @@
 This file contains tests to ensure parity between CPU and GPU/TPU device
 implementations of various Muse Glimmer model layers (sliding-window SDPA,
 Attention, EmbeddingWithNorm, SoftCappedLinear output head and
-TransformerBlock) and full model training.
+TransformerBlock) and full model training, plus TPU-only checks that the Splash
+and tokamax attention patches match the SDPA reference on packed documents.
 
 CPU-only config / registry checks live in test_muse_glimmer_config.py.
 """
@@ -17,8 +18,10 @@ import torch
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu import workarounds
 import torchtitan.experiments.tpu.muse_glimmer as muse_glimmer_tpu
 from torchtitan.experiments.tpu.muse_glimmer import attention as tpu_attention
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.attention import segment_ids_from_positions
 from torchtitan.models.muse_glimmer.model import MuseGlimmerModel
@@ -76,6 +79,19 @@ SDPA_TEST_CONFIGS = [
 LAYER_TEST_CONFIGS = [
     dict(testcase_name="_SWA_ROPE", layer_id=0),
     dict(testcase_name="_GLOBAL_NOPE", layer_id=3),
+]
+
+# Splash / tokamax attention patches vs. SDPA, on the debugmodel's attention
+# (head_dim 64, window 128): layer 0 is sliding-window + RoPE (Splash
+# LocalMask), layer 3 global + NoPE (CausalMask).
+SPLASH_TEST_CONFIGS = [
+    dict(
+        testcase_name=f"_{kernel}_{layer_name}",
+        kernel=kernel,
+        layer_id=layer_id,
+    )
+    for kernel in ("splash", "splash_batch_native", "tokamax")
+    for layer_name, layer_id in (("SWA_ROPE", 0), ("GLOBAL_NOPE", 3))
 ]
 
 FULL_MODEL_TEST_CONFIGS = [
@@ -501,6 +517,93 @@ class MuseGlimmerTest(base_device_test.BaseAcceleratorDeviceTest):
                 rtol=tol,
                 check_name=check_name,
             )
+
+  @parameterized.named_parameters(*SPLASH_TEST_CONFIGS)
+  def test_muse_glimmer_splash_attention_matches_sdpa(self, kernel, layer_id):
+    """Tests a Splash-patched Attention against the SDPA one on packed docs.
+
+    Covers the Muse window ``W`` -> Splash ``LocalMask`` ``W - 1`` conversion at
+    a context longer than the window, and packed-document masking through the
+    ``positions`` that ``TpuMuseGlimmerAttention`` passes to the kernel. The
+    reference is the unpatched module on CPU (window + document mask in SDPA).
+
+    Args:
+      kernel: ``splash`` (document-aware block skipping),
+        ``splash_batch_native`` (batch-native masking) or ``tokamax``.
+      layer_id: Debugmodel layer whose attention config is used.
+    """
+    if not self._is_tpu():
+      self.skipTest("Splash and tokamax attention are TPU-only Pallas kernels.")
+    config = _get_model_config("debugmodel")
+    window_size = config.layers[layer_id].attention.window_size
+    batch, seq_len = 2, 512
+    self.assertTrue(window_size is None or window_size < seq_len)
+
+    attention_cpu, attention_device = (
+        self._setup_module_cpu_device_from_config(
+            config.layers[layer_id].attention
+        )
+    )
+    sa_config = SplashAttentionKernelConfig(
+        sa_use_document_aware_block_skipping=(kernel == "splash")
+    )
+    if kernel == "tokamax":
+      workarounds.use_tokamax_splash_attention_patch(
+          attention_device, sa_config
+      )
+    elif kernel in ("splash", "splash_batch_native"):
+      workarounds.use_splash_attention_patch(attention_device, sa_config)
+    else:
+      raise ValueError(f"Unexpected kernel: {kernel!r}")
+
+    x_cpu, x_device = self._create_input_tensor_cpu_device(
+        (batch * seq_len, config.dim), requires_grad=True
+    )
+    # Row 0 packs documents of lengths 200, 180 and 132, so boundaries fall
+    # inside the window; row 1 is a single document.
+    positions_cpu = torch.cat([
+        torch.arange(200),
+        torch.arange(180),
+        torch.arange(seq_len - 380),
+        torch.arange(seq_len),
+    ])
+    positions_device = positions_cpu.to(self.accelerator_device)
+
+    with set_unflatten_seq_len(seq_len):
+      out_cpu = attention_cpu(x_cpu, None, positions_cpu)
+      out_device = attention_device(x_device, None, positions_device)
+      # Sensitivity: without the document mask the reference moves by far more
+      # than the tolerance, so a kernel ignoring documents would fail below.
+      with torch.no_grad():
+        out_cpu_unpacked = attention_cpu(
+            x_cpu, None, torch.arange(seq_len).repeat(batch)
+        )
+    unpacked_rel_diff = (
+        torch.linalg.vector_norm(out_cpu_unpacked - out_cpu)
+        / torch.linalg.vector_norm(out_cpu)
+    ).item()
+    self.assertGreater(unpacked_rel_diff, 0.1)
+    self._check_relative_l2(
+        out_device, out_cpu, 1e-2, check_name=f"{kernel} Attention Forward"
+    )
+
+    grad_out = torch.randn(
+        out_cpu.shape, generator=torch.Generator().manual_seed(0)
+    )
+    out_cpu.backward(grad_out)
+    out_device.backward(grad_out.to(self.accelerator_device))
+    self._check_relative_l2(
+        x_device.grad, x_cpu.grad, 2.5e-2, check_name=f"{kernel} Input Grad"
+    )
+    for (name, p_cpu), p_device in zip(
+        attention_cpu.named_parameters(), attention_device.parameters()
+    ):
+      self._check_relative_l2(
+          p_device.grad,
+          p_cpu.grad,
+          2.5e-2,
+          check_name=f"{kernel} Param Grad: {name}",
+      )
 
   @parameterized.named_parameters(*FULL_MODEL_TEST_CONFIGS)
   def test_muse_glimmer_full_model_training_steps_cpu_device_parity(

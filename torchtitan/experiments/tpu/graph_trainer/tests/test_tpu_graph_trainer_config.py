@@ -808,6 +808,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         },
         tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
     )
+    self.assertEqual(
+        config.libtpu_init_flags[
+            "xla_tpu_layer_scheduler_min_compute_latency_for_backward_pass"
+        ],
+        "25000000",
+    )
 
   def test_235b_proxy_keeps_the_layer_shape_and_drops_the_count(self) -> None:
     proxy = qwen3_moe_235b_scan_proxy()

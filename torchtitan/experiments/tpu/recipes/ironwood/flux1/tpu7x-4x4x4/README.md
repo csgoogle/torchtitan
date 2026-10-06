@@ -1,9 +1,9 @@
 # Recipe for training FLUX.1-dev model on 64 TPU ironwood cluster (v7x-64)
 
-These are instructions for deploying FLUX.1-dev training (all 12B parameters trained) to an 64 chip v7x cluster using `xpk`.
+These are instructions for deploying FLUX.1-dev training (all 12B parameters trained) to an 64 chip v7x cluster using Cluster Toolkit (`gcluster`).
 
 <!-- disableFinding(LINK_RELATIVE_G3DOC) -->
-For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
 
 After setting up your cluster, the following variables should be set:
 
@@ -11,7 +11,7 @@ After setting up your cluster, the following variables should be set:
 export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
-export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
+export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 ```
 
 ## SimpleFSDP + SplashAttention + torch.compile
@@ -21,15 +21,17 @@ export REPOSITORY=YOUR_REPOSITORY # Repository containing docker image
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --zone="$ZONE" \
-  --project="$PROJECT_ID" \
-  --tpu-type="tpu7x-4x4x4" \
-  --num-slices=1 \
-  --docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
-  --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --compute-type tpu7x \
+  --topology 4x4x4 \
+  --num-slices 1 \
+  --image "$WORKLOAD_IMAGE" \
+  --gke-disable-parallel-containers \
+  --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
   --command "\
     torchrun \
     --nnodes=16 \
@@ -57,26 +59,28 @@ xpk workload create \
     --activation-checkpoint.no-preserve-rng-state"
 ```
 
-**6/11/26: With this configuration you should observe the following metrics**
+**9/28/26: With this configuration you should observe the following metrics**
 
-- Average Step time: **2.50s**
-- Average Step time / PDB: **0.83s**
-- Average MFU: **21.01%**
+- Average Step time: **2.57s**
+- Average Step time / PDB: **0.86s**
+- Average MFU: **20.47%**
 
 ### bfloat16
 
 ```bash
 export WORKLOAD_NAME=YOUR_WORKLOAD_NAME
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --zone="$ZONE" \
-  --project="$PROJECT_ID" \
-  --tpu-type="tpu7x-4x4x4" \
-  --num-slices=1 \
-  --docker-image=us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest \
-  --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --compute-type tpu7x \
+  --topology 4x4x4 \
+  --num-slices 1 \
+  --image "$WORKLOAD_IMAGE" \
+  --gke-disable-parallel-containers \
+  --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
   --command "\
     torchrun \
     --nnodes=16 \
@@ -104,8 +108,8 @@ xpk workload create \
     --activation-checkpoint.no-preserve-rng-state"
 ```
 
-**6/11/26: With this configuration you should observe the following metrics**
+**9/30/26: With this configuration you should observe the following metrics**
 
-- Average Step time: **4.00s**
-- Average Step time / PDB: **0.80s**
-- Average MFU: **21.80%**
+- Average Step time: **4.04s**
+- Average Step time / PDB: **0.81s**
+- Average MFU: **21.64%**

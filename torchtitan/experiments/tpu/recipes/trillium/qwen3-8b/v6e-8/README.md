@@ -2,9 +2,9 @@
 
 > **Note (8/30/2026):** This recipe uses the Regular Trainer configuration for Qwen3-8B. The Graph Trainer currently still encounters Out Of Memory (OOM) errors on v6e.
 
-These are instructions for deploying Qwen3-8B training using the regular trainer to an 8 chip v6e cluster using `xpk`.
+These are instructions for deploying Qwen3-8B training using the regular trainer to an 8 chip v6e cluster using Cluster Toolkit (`gcluster`).
 
-For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
 
 After setting up your cluster, the following variables should be set:
 
@@ -12,7 +12,7 @@ After setting up your cluster, the following variables should be set:
 export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
-export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
+export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 ```
 
 ## Notes
@@ -38,20 +38,21 @@ We are running with the following key optimizations built into the configuration
 
 ## Training Command
 ```bash
-export WORKLOAD_NAME="qwen3-8b-v6e8-$(date +%Y%m%d-%H%M%S)"
+export WORKLOAD_NAME="qwen3-8b-v6e8-$(date +%H%M%S)"
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --tpu-type="v6e-8" \
-  --project="$PROJECT_ID" \
-  --zone="$ZONE" \
-  --base-docker-image="us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest" \
-  --script-dir="$SCRIPT_DIR" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type ct6e-standard-4t \
+  --topology 2x4 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "$WORKLOAD_IMAGE" \
   --env="PYTHONUNBUFFERED=1" \
-  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
+  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-main-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
-  --command="export PYTHONPATH=/app:\$PYTHONPATH && cd /app && WORKERS=(${TPU_WORKER_HOSTNAMES//,/ }) && MASTER_ADDR=\$WORKERS_0_HOSTNAME && torchrun \
+  --command "export PYTHONPATH=/torchtitan:\$PYTHONPATH && cd /torchtitan && torchrun \
     --nnodes=2 \
     --nproc_per_node=4 \
     --rdzv_backend=static \
@@ -85,12 +86,13 @@ xpk workload create \
 
 ## Expected Metrics
 
-With this configuration, we observe the following at step 15 (run from 8/31/2026):
+With this configuration, we observe the following (run from 10/4/2026;
+throughput metrics averaged over steps 2-15, loss/grad norm/memory at step 15):
 
-- **TPS (Tokens per second)**: 5,642
-- **TFLOPS**: 276.65
-- **MFU**: 30.14%
-- **Step Time (time_end_to_end)**: 2.18s
-- **Loss**: 7.82703
-- **Grad Norm**: 31.0801
-- **Memory**: 2.01GiB (6.28%)
+- **TPS (Tokens per second)**: 5,753
+- **TFLOPS**: 271.65
+- **MFU**: 29.59%
+- **Step Time (time_end_to_end)**: 2.14s
+- **Loss**: 7.69447
+- **Grad Norm**: 36.6285
+- **Memory**: 3.67GiB (11.45%)

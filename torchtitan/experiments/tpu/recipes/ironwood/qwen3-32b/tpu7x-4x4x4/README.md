@@ -1,8 +1,8 @@
 # Recipe for training Qwen3-32B model on a 128 device TPU ironwood cluster (tpu7x-4x4x4)
 
-These are instructions for deploying Qwen3-32B training to a 128 device (64 chip) tpu7x cluster using `xpk`.
+These are instructions for deploying Qwen3-32B training to a 128 device (64 chip) tpu7x cluster using Cluster Toolkit (`gcluster`).
 
-For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
 
 After setting up your cluster, the following variables should be set:
 
@@ -10,8 +10,7 @@ After setting up your cluster, the following variables should be set:
 export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
-export TORCHTITAN_IMAGE=YOUR_TORCHTITAN_IMAGE # Artifact Registry repo holding torchtitan-container
-export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
+export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 ```
 
 ## Notes
@@ -37,21 +36,22 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ## Training Command
 
 ```bash
-export WORKLOAD_NAME="qwen3-32b-tpu7x-4x4x4-$(date +%Y%m%d-%H%M%S)"
+export WORKLOAD_NAME="qwen3-32b-tpu7x-4x4x4-$(date +%H%M%S)"
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --tpu-type="tpu7x-4x4x4" \
-  --num-slices=1 \
-  --zone="$ZONE" \
-  --project="$PROJECT_ID" \
-  --base-docker-image="$TORCHTITAN_IMAGE" \
-  --script-dir="$SCRIPT_DIR" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type tpu7x \
+  --topology 4x4x4 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "$WORKLOAD_IMAGE" \
+  --gke-disable-parallel-containers \
   --env="PYTHONUNBUFFERED=1" \
-  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
+  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-main-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
-  --command="torchrun \
+  --command "torchrun \
     --nnodes=16 \
     --nproc_per_node=8 \
     --rdzv_backend=static \
@@ -67,13 +67,18 @@ xpk workload create \
 
 With this configuration (local batch 8, global batch 1024, sequence 4096), you
 should observe the following per-device metrics averaged over steps 10-30 (as
-of 9/25/2026, measured on streamed C4 via `--dataloader.dataset=c4`):
+of 10/4/2026, measured with the command above, i.e. on the default `c4_test`
+dataset and test tokenizer):
 
-- **TPS (Tokens per second)**: ~2,742
-- **TFLOPS**: ~561.5
-- **MFU**: ~48.7%
-- **Step Time (time_end_to_end)**: ~11.95s
-- **Physical peak HBM**: 36.46GiB
+- **TPS (Tokens per second)**: ~2,618
+- **TFLOPS**: ~536.1
+- **MFU**: ~46.5%
+- **Step Time (time_end_to_end)**: ~12.52s
+- **Physical peak HBM**: 35.66GiB (37.14%)
+
+On 9/25/2026, measured on streamed C4 (`--dataloader.dataset=c4`), the same
+configuration gave ~2,742 TPS, ~561.5 TFLOPS, ~48.7% MFU, ~11.95s per step and
+36.46GiB peak HBM.
 
 `grad_norm` is logged as 0.0 because the optimizer runs inside the compiled
 graph; gradient clipping is still applied there.
@@ -85,7 +90,7 @@ graph; gradient clipping is still applied there.
 | `qwen3_32b_maxtext_parity` | MaxText policy comparison | BF16 FSDP reductions and BF16 RoPE |
 
 `qwen3_32b_maxtext_parity` measured ~11.83s per step, ~49.2% MFU and
-35.10GiB peak HBM under the same command.
+35.10GiB peak HBM in the 9/25/2026 streamed-C4 measurement.
 
 Keep canonical FP32-reduction results separate from MaxText-policy results.
 The latter deliberately changes reduction precision and RoPE arithmetic.

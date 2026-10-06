@@ -194,17 +194,17 @@ To train larger models, use a multi-host configuration on Google Kubernetes Engi
 To provision Cloud TPUs, use one of the following methods:
 
 * **GKE:** Use GKE to provision and manage Cloud TPUs as a pool of accelerators for containerized machine learning workloads. Use the gcloud CLI to create GKE cluster instances manually for precise customization or to expand existing production GKE environments. For more information, see [TPUs in GKE](https://cloud.google.com/kubernetes-engine/docs/concepts/tpus).
-* **GKE and XPK:** The Accelerated Processing Kit (XPK) is a command-line tool that simplifies cluster creation and workload execution on GKE. It is designed for ML practitioners to provision Cloud TPUs and run training jobs without requiring deep Kubernetes expertise. Use XPK to quickly create GKE clusters and run workloads for proof-of-concept testing. For more information, see the [XPK GitHub repository](https://github.com/google/xpk).
+* **GKE and Cluster Toolkit:** Cluster Toolkit is an open-source tool that simplifies cluster creation and workload execution on GKE. It is designed for ML practitioners to provision Cloud TPUs and run training jobs without requiring deep Kubernetes expertise. Use Cluster Toolkit blueprints to create GKE clusters, and use its `gcluster` CLI to submit workloads. For more information, see the [Cluster Toolkit overview](https://docs.cloud.google.com/cluster-toolkit/docs/overview) and the [Cluster Toolkit GitHub repository](https://github.com/GoogleCloudPlatform/cluster-toolkit).
 * **GKE and TPU Cluster Director:** TPU Cluster Director is available through an All Capacity mode reservation, providing full access to reserved capacity without hold-backs. This mode offers full visibility into TPU hardware topology, utilization, and health status. For more information, see the [All Capacity mode overview](https://www.google.com/search?q=https://docs.cloud.google.com/tpu/docs/all-capacity-mode-overview).
 
-In this document, you use GKE managed by XPK. XPK is a command-line tool designed to simplify provisioning, managing, and running machine learning workloads.
+In this document, you use GKE managed by Cluster Toolkit. Cluster Toolkit's `gcluster` command-line tool is designed to simplify provisioning, managing, and running machine learning workloads.
 
-### Install XPK and its dependencies
+### Install Cluster Toolkit and its dependencies
 
-1. **Install XPK:** Follow the installation instructions in the [XPK GitHub repository](https://github.com/google/xpk).
+1. **Install Cluster Toolkit:** Follow the [Cluster Toolkit installation guide](https://docs.cloud.google.com/cluster-toolkit/docs/setup/configure-environment) to install the `gcluster` CLI, and make sure `gcluster` is on your `PATH`. Verify the installation:
 
 ```bash
-pip install xpk
+gcluster --version
 
 ```
 
@@ -222,9 +222,12 @@ docker run hello-world # Verify the Docker installation.
 
 ```bash
 export PROJECT_ID=YOUR_PROJECT_ID
+export REGION=YOUR_REGION
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
-export ACCELERATOR_TYPE=YOUR_ACCELERATOR_TYPE
+export COMPUTE_TYPE=YOUR_COMPUTE_TYPE
+export TOPOLOGY=YOUR_TOPOLOGY
+export AUTHORIZED_CIDR=YOUR_AUTHORIZED_CIDR
 export BUCKET_NAME="gs://YOUR_BUCKET_NAME"
 export REPOSITORY=YOUR_REPOSITORY
 
@@ -233,9 +236,12 @@ export REPOSITORY=YOUR_REPOSITORY
 Replace the following placeholders:
 
 * `YOUR_PROJECT_ID`: Your Google Cloud project ID.
-* `YOUR_ZONE`: The zone where the cluster will be created. For TPU availability, see [Cloud TPU regions and zones](https://docs.cloud.google.com/tpu/docs/regions-zones) and your project's **Quotas** page.
-* `YOUR_CLUSTER_NAME`: The name of the new GKE cluster.
-* `YOUR_ACCELERATOR_TYPE`: The TPU version and topology (for example, `v6e-32`).
+* `YOUR_REGION`: The region that contains `YOUR_ZONE` (for example, `us-east5`).
+* `YOUR_ZONE`: The zone where the cluster's TPU nodes will be created. For TPU availability, see [Cloud TPU regions and zones](https://docs.cloud.google.com/tpu/docs/regions-zones) and your project's **Quotas** page.
+* `YOUR_CLUSTER_NAME`: The name of the new GKE cluster. Cluster Toolkit also uses this name as the deployment name.
+* `YOUR_COMPUTE_TYPE`: The TPU machine type (for example, `ct6e-standard-4t` for TPU v6e).
+* `YOUR_TOPOLOGY`: The TPU slice topology (for example, `4x8` for a `v6e-32` slice).
+* `YOUR_AUTHORIZED_CIDR`: The CIDR block that can access the cluster's control plane. It must contain the IP address of the machine where you run `gcluster`. To allow only your IP address, use your IP address followed by `/32`. To allow all IP addresses, use `0.0.0.0/0`; Identity and Access Management (IAM) restrictions are still enforced.
 * `YOUR_BUCKET_NAME`: The name of your Cloud Storage bucket for output.
 * `YOUR_REPOSITORY`: The name of your Artifact Registry repository (for example, `test`).
 
@@ -250,66 +256,36 @@ gcloud storage buckets create ${REPOSITORY} \
 
 ```
 
-### Create a single-NIC, single-slice cluster
+### Create a single-slice cluster
 
-We recommend using a custom network with an MTU of 8,896 for optimal performance.
+Create the cluster with the Cluster Toolkit [GKE TPU v6e blueprint](https://github.com/GoogleCloudPlatform/cluster-toolkit/blob/main/examples/gke-tpu-v6e/gke-tpu-v6e.yaml). The blueprint creates a VPC network with an MTU of 8,896 for optimal performance and a firewall rule for traffic between nodes, a GKE cluster, and a TPU node pool for one slice. It also installs Kueue and JobSet, which `gcluster job submit` uses to run workloads. For more information, see [Deploy a GKE TPU v6e cluster](https://docs.cloud.google.com/cluster-toolkit/docs/deploy/gke/gke-tpu-v6e).
 
-#### Option 1: Custom network (Recommended)
-
-1. Set the network environment variables:
+1. Generate Application Default Credentials so that Cluster Toolkit can provision resources with Terraform:
 
 ```bash
-export NETWORK_NAME=YOUR_NETWORK_NAME
-export NETWORK_FW_NAME=YOUR_FIREWALL_NAME
+gcloud auth application-default login
 
 ```
 
-2. Create the network and firewall rule:
+2. From the directory where you extracted the Cluster Toolkit bundle (for example, `~/cluster-toolkit`), create the cluster:
 
 ```bash
-gcloud compute networks create ${NETWORK_NAME} \
-    --mtu=8896 \
-    --project=${PROJECT_ID} \
-    --subnet-mode=auto \
-    --bgp-routing-mode=regional
-
-gcloud compute firewall-rules create ${NETWORK_FW_NAME} \
-    --network=${NETWORK_NAME} \
-    --allow tcp,icmp,udp \
-    --project=${PROJECT_ID}
+gcluster deploy examples/gke-tpu-v6e/gke-tpu-v6e.yaml \
+    --vars project_id=${PROJECT_ID},deployment_name=${CLUSTER_NAME} \
+    --vars region=${REGION},zone=${ZONE} \
+    --vars machine_type=${COMPUTE_TYPE},tpu_topology=${TOPOLOGY},num_slices=1 \
+    --vars authorized_cidr=${AUTHORIZED_CIDR},enable_gcsfuse_csi=true
 
 ```
 
-3. Create the cluster with optimized network settings:
+`gcluster` displays a Terraform plan; type `a` and press Enter to apply it. Provisioning can take 10 to 20 minutes or more.
 
-```bash
-export CLUSTER_ARGUMENTS="--network=${NETWORK_NAME} --subnetwork=${NETWORK_NAME}"
+**Notes:**
 
-xpk cluster create --cluster=${CLUSTER_NAME} \
-    --cluster-cpu-machine-type=n1-standard-8 \
-    --num-slices=1 \
-    --tpu-type=${ACCELERATOR_TYPE} \
-    --zone=${ZONE} \
-    --project=${PROJECT_ID} \
-    --on-demand \
-    --custom-cluster-arguments="${CLUSTER_ARGUMENTS}"
-
-```
-
-#### Option 2: Default network
-
-Create the cluster using default network settings:
-
-```bash
-xpk cluster create --cluster=${CLUSTER_NAME} \
-    --cluster-cpu-machine-type=n1-standard-8 \
-    --num-slices=1 \
-    --tpu-type=${ACCELERATOR_TYPE} \
-    --zone=${ZONE} \
-    --project=${PROJECT_ID} \
-    --on-demand
-
-```
+* The blueprint creates a regional cluster in `${REGION}` and places the TPU node pool in `${ZONE}`.
+* `enable_gcsfuse_csi=true` enables the Cloud Storage FUSE CSI driver, which you need to mount a Cloud Storage bucket in your workload.
+* The blueprint provisions on-demand TPUs. To use a reservation, Spot VMs, or flex-start instead, see the consumption options in [`gke-tpu-v6e-deployment.yaml`](https://github.com/GoogleCloudPlatform/cluster-toolkit/blob/main/examples/gke-tpu-v6e/gke-tpu-v6e-deployment.yaml).
+* `gcluster deploy` creates a deployment directory named `${CLUSTER_NAME}` in the current directory. It contains the Terraform configuration and state for the cluster. Keep this directory, because you need it to delete the cluster.
 
 ### Build the TorchTitan TPU-enabled Docker image
 
@@ -370,45 +346,41 @@ docker push us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-co
 
 ```
 
-#### Optional: Attach Cloud Storage FUSE storage
+#### Optional: Mount a Cloud Storage bucket with Cloud Storage FUSE
 
-To make data in Cloud Storage accessible to TorchTitan and to export logs and profiles, you can mount a bucket using Cloud Storage FUSE. This allows the bucket to appear as a local directory. For more information, see [XPK storage usage](https://github.com/AI-Hypercomputer/xpk/blob/main/docs/usage/storage.md).
+To make data in Cloud Storage accessible to TorchTitan and to export logs and profiles, you can mount a bucket using Cloud Storage FUSE. This allows the bucket to appear as a local directory.
 
-```bash
-xpk storage attach my-gcsfuse-storage \
-  --type=gcsfuse \
-  --project=${PROJECT_ID} \
-  --cluster=${CLUSTER_NAME} \
-  --zone=${ZONE} \
-  --mount-point=/data \
-  --readonly=false \
-  --bucket=${BUCKET_NAME} \
-  --size=1 \
-  --auto-mount=false
+With Cluster Toolkit, you don't attach storage to the cluster in a separate step. Instead, you mount the bucket when you submit the workload, by passing the following flags to `gcluster job submit` (as shown in the next section):
 
-```
+* `--mount "$BUCKET_NAME;/data;rw"`: Mounts the bucket at `/data` in read-write mode. This requires the Cloud Storage FUSE CSI driver, which the cluster creation command enables with `enable_gcsfuse_csi=true`.
+* `--service-account workload-identity-k8s-sa`: Runs the workload as the Kubernetes service account that the blueprint creates. This service account uses Workload Identity Federation for GKE to access the Cloud Storage buckets in your project.
+
+For more information, see [Submit Job with Persistent Storage](https://github.com/GoogleCloudPlatform/cluster-toolkit/blob/main/docs/gcluster_job_guide.md#44-example-submit-job-with-persistent-storage).
 
 #### Deploy the training workload
 
 The following sample demonstrates Llama 8B training on a `v6e-32` using FSDP:
 
 ```bash
-export WORKLOAD_NAME=torchtitan-llama3-8b-xpk
+export WORKLOAD_NAME=torchtitan-llama3-8b
 
 # if using GCSFUSE, set the following parameters:
 # --dump_folder="/data/assets/hf/Llama-3.1-8B"
 # --dataloader.dataset_path="/data/assets/hf/Llama-3.1-8B"
 # --hf_assets_path="/data/assets/hf/Llama-3.1-8B"
-xpk workload create \
-    --workload=$WORKLOAD_NAME \
-    --cluster=$CLUSTER_NAME \
-    --zone=$ZONE \
-    --project=$PROJECT_ID \
-    --tpu-type=$ACCELERATOR_TYPE \
-    --num-slices=1 \
-    --docker-image="us-central1-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/torchtitan-container:latest" \
-    --storage=my-gcsfuse-storage \
-    --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-slice-job-0-0.$WORKLOAD_NAME" \
+# if not using GCSFUSE, remove the --service-account and --mount flags.
+gcluster job submit \
+    --name $WORKLOAD_NAME \
+    --cluster $CLUSTER_NAME \
+    --location $REGION \
+    --project $PROJECT_ID \
+    --compute-type $COMPUTE_TYPE \
+    --topology $TOPOLOGY \
+    --num-slices 1 \
+    --image "us-central1-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/torchtitan-container:latest" \
+    --service-account workload-identity-k8s-sa \
+    --mount "$BUCKET_NAME;/data;rw" \
+    --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
     --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
     --command 'torchrun \
         --nnodes=8 \
@@ -532,7 +504,7 @@ pip install xprof
 To view the profile captured for your TorchTitan training job, run:
 
 ```bash
-tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-llama3-8b-xpk/rank_0
+tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-llama3-8b/rank_0
 
 ```
 
@@ -541,10 +513,17 @@ tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-llama3-8b-xpk/rank_0
 To avoid incurring unnecessary charges, delete your resources when you are finished:
 
 ```bash
-# Delete the XPK workload.
-xpk workload delete --workload torchtitan-llama3-8b-xpk --cluster ${CLUSTER_NAME}
+# Cancel the workload.
+gcluster job cancel torchtitan-llama3-8b \
+    --cluster ${CLUSTER_NAME} \
+    --location ${REGION} \
+    --project ${PROJECT_ID}
 
-# Delete the GKE cluster.
-xpk cluster delete --cluster ${CLUSTER_NAME}
+# Delete the GKE cluster and the VPC network that Cluster Toolkit created.
+# Run this command from the directory where you ran gcluster deploy, and
+# confirm when prompted.
+gcluster destroy ${CLUSTER_NAME}
 
 ```
+
+For more information, see [`gcluster job cancel`](https://docs.cloud.google.com/cluster-toolkit/docs/reference/gcluster-job-cancel) and [`gcluster destroy`](https://docs.cloud.google.com/cluster-toolkit/docs/reference/gcluster-destroy).

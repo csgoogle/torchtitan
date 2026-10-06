@@ -429,8 +429,8 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           checkpoint_enabled=True,
       ),
-      # muse_glimmer (text-only). No TP case: the debugmodel has 2 KV heads,
-      # which TP=8 (tpu_4x2x1) cannot divide.
+      # muse_glimmer (text-only). TP is capped at 2: the debugmodel has 2 KV
+      # heads (see muse_glimmer_fsdp_tp2).
       dict(
           testcase_name="muse_glimmer_fsdp",
           module="torchtitan.experiments.tpu.muse_glimmer",
@@ -456,6 +456,45 @@ class TrainDistributedTest(
               "--parallelism.use_simple_fsdp",
               "--training.max_context_length=256",
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      # Splash / tokamax on the sliding-window (LocalMask) and global layers.
+      # Context 512 (one 512 splash block) is 4x the 128-token window, and the
+      # packed C4 batches exercise document masking.
+      dict(
+          testcase_name="muse_glimmer_simplefsdp_use_splash_attention_kernel",
+          module="torchtitan.experiments.tpu.muse_glimmer",
+          config="muse_glimmer_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=2048",
+              "--splash_attention_kernel.use_splash_attention_kernel",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
+          testcase_name=(
+              "muse_glimmer_simplefsdp_use_tokamax_splash_attention_kernel"
+          ),
+          module="torchtitan.experiments.tpu.muse_glimmer",
+          config="muse_glimmer_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=2048",
+              "--splash_attention_kernel.use_tokamax_splash_attention_kernel",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
       dict(

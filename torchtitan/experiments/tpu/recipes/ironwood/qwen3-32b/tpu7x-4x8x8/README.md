@@ -1,8 +1,8 @@
 # Recipe for training Qwen3-32B model on a 512 device TPU ironwood cluster (tpu7x-4x8x8)
 
-These are instructions for deploying Qwen3-32B training to a 512 device (256 chip) tpu7x cluster using `xpk`.
+These are instructions for deploying Qwen3-32B training to a 512 device (256 chip) tpu7x cluster using Cluster Toolkit (`gcluster`).
 
-For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
 
 After setting up your cluster, the following variables should be set:
 
@@ -10,8 +10,7 @@ After setting up your cluster, the following variables should be set:
 export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
-export TORCHTITAN_IMAGE=YOUR_TORCHTITAN_IMAGE # Artifact Registry repo holding torchtitan-container
-export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
+export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 ```
 
 ## Notes
@@ -35,21 +34,22 @@ export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
 ## Training Command
 
 ```bash
-export WORKLOAD_NAME="qwen3-32b-tpu7x-4x8x8-$(date +%Y%m%d-%H%M%S)"
+export WORKLOAD_NAME="qwen3-32b-tpu7x-4x8x8-$(date +%H%M%S)"
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --tpu-type="tpu7x-4x8x8" \
-  --num-slices=1 \
-  --zone="$ZONE" \
-  --project="$PROJECT_ID" \
-  --base-docker-image="$TORCHTITAN_IMAGE" \
-  --script-dir="$SCRIPT_DIR" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type tpu7x \
+  --topology 4x8x8 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "$WORKLOAD_IMAGE" \
+  --gke-disable-parallel-containers \
   --env="PYTHONUNBUFFERED=1" \
-  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
+  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-main-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
-  --command="torchrun \
+  --command "torchrun \
     --nnodes=64 \
     --nproc_per_node=8 \
     --rdzv_backend=static \
@@ -65,7 +65,9 @@ xpk workload create \
 
 With this configuration (local batch 8, global batch 4096, sequence 4096), you
 should observe the following per-device metrics averaged over steps 10-30 (as
-of 9/25/2026, measured on streamed C4 via `--dataloader.dataset=c4`):
+of 9/25/2026, measured with the original `xpk` launch on streamed C4 via
+`--dataloader.dataset=c4`; not yet re-measured with the `gcluster` command
+above):
 
 - **TPS (Tokens per second)**: ~2,656
 - **TFLOPS**: ~544.0

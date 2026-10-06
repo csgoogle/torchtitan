@@ -1,8 +1,8 @@
 # Recipe for training Llama3-8B model on 8 TPU trillium cluster (v6e-8)
 
-These are instructions for deploying Llama3-8B training to an 8 chip v6e cluster using `xpk`.
+These are instructions for deploying Llama3-8B training to an 8 chip v6e cluster using Cluster Toolkit (`gcluster`).
 
-For `xpk` installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image build, and (optionally) attaching GCS bucket to save profiler traces please consult the main [README.md](../../../../README.md) for multi-host set up instructions.
 
 After setting up your cluster, the following variables should be set:
 
@@ -10,7 +10,7 @@ After setting up your cluster, the following variables should be set:
 export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
-export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
+export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 ```
 
 ## Notes
@@ -39,19 +39,20 @@ We are running with the following key configurations (explicitly passed as flags
 ## Training Command
 
 ```bash
-export WORKLOAD_NAME="llama3-8b-v6e8-$(date +%Y%m%d-%H%M%S)"
+export WORKLOAD_NAME="llama3-8b-v6e8-$(date +%H%M%S)"
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --tpu-type="v6e-8" \
-  --project="$PROJECT_ID" \
-  --zone="$ZONE" \
-  --base-docker-image="us-west1-docker.pkg.dev/tpu-pytorch/torchtitan-images/torchtitan-container:latest" \
-  --script-dir="$SCRIPT_DIR" \
-  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type ct6e-standard-4t \
+  --topology 2x4 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "$WORKLOAD_IMAGE" \
+  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-main-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
-  --command="torchrun \
+  --command "torchrun \
     --nnodes=2 \
     --nproc_per_node=4 \
     --rdzv_backend=static \
@@ -75,8 +76,8 @@ xpk workload create \
 
 ## Expected Metrics
 
-With this configuration you should observe the following metrics at step 15:
+With this configuration you should observe the following metrics (as of 9/29/26):
 
-- TPS/chip: **6,139**
-- MFU: **38.73%**
-- Total TPS (8 chips): 49,112
+- TPS/chip: **5,383**
+- MFU: **33.96%**
+- Total TPS (8 chips): 43,068

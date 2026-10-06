@@ -4,10 +4,10 @@ import torch
 from torchtitan.tools.logging import logger
 
 try:
-  from torch_tpu._internal.distributed.spmd_util import spmd_safe  # pylint: disable=g-import-not-at-top
-except ImportError as e:
+  spmd_safe = torch.tpu.distributed.spmd_safe
+except AttributeError as e:
   logger.warning(
-      "Unable to import spmd_safe decorator from torch_tpu. Compiled modules "
+      "Unable to find spmd_safe decorator in torch.tpu. Compiled modules "
       f"will fall back to skinny collective behavior.\nDetails: {e}"
   )
   def spmd_safe(func):

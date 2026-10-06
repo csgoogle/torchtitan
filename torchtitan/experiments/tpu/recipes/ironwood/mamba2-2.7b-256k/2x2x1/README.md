@@ -3,11 +3,13 @@
 These are instructions for deploying long-context Mamba-2 2.7B (3,280,906,240
 parameters) training with **256K sequence length** (S = 262,144), **head
 dimension of 64** (D = 64), and **batch size of 8** on a Google Cloud TPU
-Ironwood cluster (`2x2x1` topology, 8 TensorCores) using `xpk`.
+Ironwood cluster (`2x2x1` topology, 8 TensorCores) using Cluster Toolkit
+(`gcluster`).
 
 <!-- disableFinding(LINK_RELATIVE_G3DOC) -->
-For `xpk` installation, cluster set up, docker image build, and multi-host
-setup instructions please consult the main [README.md](../../../../README.md).
+For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image
+build, and multi-host setup instructions please consult the main
+[README.md](../../../../README.md).
 
 After setting up your cluster, set the following environment variables:
 
@@ -15,7 +17,7 @@ After setting up your cluster, set the following environment variables:
 export PROJECT_ID=YOUR_PROJECT_ID
 export ZONE=YOUR_ZONE
 export CLUSTER_NAME=YOUR_CLUSTER_NAME
-export SCRIPT_DIR=YOUR_SCRIPT_DIR # Path to your torchtitan directory
+export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 ```
 
 ## Software Environment & Dependencies
@@ -75,22 +77,25 @@ safely and avoiding OOMs.
 ### Option A: Local Batch Size 8 (High Throughput & High Memory Utilization, Global Batch 64)
 
 ```bash
-export WORKLOAD_NAME="mamba2-27b-256k-b8-$(date +%Y%m%d-%H%M%S)"
+export WORKLOAD_NAME="mamba2-27b-256k-b8-$(date +%H%M%S)"
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --tpu-type="tpu7x-2x2x1" \
-  --project="$PROJECT_ID" \
-  --zone="$ZONE" \
-  --docker-image="us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest" \
-  --no-use-parallel-containers \
-  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type tpu7x \
+  --topology 2x2x1 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "$WORKLOAD_IMAGE" \
+  --gke-disable-parallel-containers \
+  --env="PYTHONUNBUFFERED=1" \
+  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-main-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
-  --command="torchrun \
+  --command "torchrun \
     --nnodes=1 \
     --nproc_per_node=8 \
-    --rdzv_backend=c10d \
+    --rdzv_backend=static \
     --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
@@ -107,22 +112,25 @@ xpk workload create \
 ### Option B: Global Batch Size 8 (Local Batch Size 1 across 8 TPU cores)
 
 ```bash
-export WORKLOAD_NAME="mamba2-27b-256k-gb8-$(date +%Y%m%d-%H%M%S)"
+export WORKLOAD_NAME="mamba2-27b-256k-gb8-$(date +%H%M%S)"
 
-xpk workload create \
-  --workload="$WORKLOAD_NAME" \
-  --cluster="$CLUSTER_NAME" \
-  --tpu-type="tpu7x-2x2x1" \
-  --project="$PROJECT_ID" \
-  --zone="$ZONE" \
-  --docker-image="us-central1-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/torchtitan-container:latest" \
-  --no-use-parallel-containers \
-  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-slice-job-0-0.${WORKLOAD_NAME}" \
+gcluster job submit \
+  --name "$WORKLOAD_NAME" \
+  --cluster "$CLUSTER_NAME" \
+  --compute-type tpu7x \
+  --topology 2x2x1 \
+  --num-slices 1 \
+  --location "$ZONE" \
+  --project "$PROJECT_ID" \
+  --image "$WORKLOAD_IMAGE" \
+  --gke-disable-parallel-containers \
+  --env="PYTHONUNBUFFERED=1" \
+  --env="WORKERS_0_HOSTNAME=${WORKLOAD_NAME}-main-job-0-0.${WORKLOAD_NAME}" \
   --env="WORKLOAD_NAME=$WORKLOAD_NAME" \
-  --command="torchrun \
+  --command "torchrun \
     --nnodes=1 \
     --nproc_per_node=8 \
-    --rdzv_backend=c10d \
+    --rdzv_backend=static \
     --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \

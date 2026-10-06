@@ -992,6 +992,14 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
       tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
       # As the splitter does: it halves the expert-weight all-gather wait.
       tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+      {
+          # Raise the backward layer scheduler compute threshold so expert
+          # gradient reduce-scatters overlap with the expert matmul (otherwise
+          # the smaller SwiGLU backward fusion gets chosen for overlap).
+          "xla_tpu_layer_scheduler_min_compute_latency_for_backward_pass": (
+              25000000
+          ),
+      },
   )
   return cfg
 
