@@ -88,11 +88,76 @@ def _patch_cpu_device_module(device_module: ModuleType) -> None:
     setattr(device_module, "memory_stats", memory_stats)
 
 
-def _patch_tpu_device_module(device_module: ModuleType) -> None:
+class _TpuDeviceModule(ModuleType):
+    """``torch.tpu`` as torchtitan calls it, with torch.accelerator-backed APIs.
+
+    torch_tpu marks the ``torch.tpu`` APIs that have a ``torch.accelerator``
+    equivalent as internal (PyTorch >= 2.11): calling them from outside the
+    torch / torch_tpu packages emits a one-time ``InternalApi`` warning naming
+    the replacement. torchtitan reaches them through ``device_module``, so this
+    view routes them to ``torch.accelerator`` and forwards every other attribute
+    to ``torch.tpu`` untouched. It is a separate object rather than a patch on
+    ``torch.tpu`` because torch_tpu calls these same functions on ``torch.tpu``
+    internally (e.g. ``set_device`` from device guards, ``device_count`` from
+    ``is_available``), and their pre-initialization behavior must not change.
+    """
+
+    def __init__(self, tpu_module: ModuleType) -> None:
+        super().__init__(tpu_module.__name__, tpu_module.__doc__)
+        self._tpu_module = tpu_module
+
+    def __getattr__(self, name: str):
+        return getattr(self._tpu_module, name)
+
+    @staticmethod
+    def is_available() -> bool:
+        return torch.accelerator.is_available()
+
+    @staticmethod
+    def device_count() -> int:
+        return torch.accelerator.device_count()
+
+    @staticmethod
+    def current_device() -> int:
+        return torch.accelerator.current_device_index()
+
+    @staticmethod
+    def set_device(device: int | str | torch.device) -> None:
+        # torch.tpu.set_device accepted an index-free "tpu" / torch.device("tpu")
+        # as "this process's device" (a TPU process owns one chip, see
+        # get_local_device). torch.accelerator.set_device_index rejects a
+        # device without an index, so resolve it to the current index first.
+        if isinstance(device, str):
+            device = torch.device(device)
+        if isinstance(device, torch.device) and device.index is None:
+            if device.type != "tpu":
+                raise ValueError(f"Invalid device type {device.type}")
+            device = torch.accelerator.current_device_index()
+        torch.accelerator.set_device_index(device)
+
+    @staticmethod
+    def synchronize(device: int | str | torch.device | None = None) -> None:
+        torch.accelerator.synchronize(device)
+
+    @staticmethod
+    def current_stream(device: int | str | torch.device | None = None):
+        return torch.accelerator.current_stream(device)
+
+    @staticmethod
+    def set_stream(stream) -> None:
+        torch.accelerator.set_stream(stream)
+
+
+def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
     """Adds the device-module functions torch_tpu does not provide.
 
-    torch_tpu natively provides get_device_name, get_device_properties,
-    set_device, current_device, device_count and synchronize; it gained
+    Returns the module torchtitan should use as ``device_module``: a
+    ``_TpuDeviceModule`` view of ``torch.tpu`` that calls the
+    ``torch.accelerator`` equivalents of torch_tpu's internal device APIs.
+
+    torch_tpu natively provides get_device_name and get_device_properties
+    (set_device, current_device, device_count and synchronize come from
+    torch.accelerator through _TpuDeviceModule); it gained
     is_triton_capable on 2026-08-11, so that one is only back-filled for older
     builds. Drop these once torch_tpu exposes the memory-management trio.
     """
@@ -117,6 +182,7 @@ def _patch_tpu_device_module(device_module: ModuleType) -> None:
     setattr(device_module, "memory_stats", memory_stats)
     if not hasattr(device_module, "is_triton_capable"):
         setattr(device_module, "is_triton_capable", is_triton_capable)
+    return _TpuDeviceModule(device_module)
 
 
 def get_device_info() -> tuple[str, ModuleType]:
@@ -128,7 +194,7 @@ def get_device_info() -> tuple[str, ModuleType]:
     if device_type == "cpu":
         _patch_cpu_device_module(device_module)
     elif device_type == "tpu":
-        _patch_tpu_device_module(device_module)
+        device_module = _patch_tpu_device_module(device_module)
     return device_type, device_module
 
 
