@@ -88,50 +88,16 @@ def _patch_cpu_device_module(device_module: ModuleType) -> None:
     setattr(device_module, "memory_stats", memory_stats)
 
 
-def _torch_version_tuple() -> tuple[int, ...]:
-    """Leading numeric components of torch.__version__, e.g. (2, 11, 0).
-
-    Matches how torch_tpu reads the version, so "2.11.0.dev20260101" counts as
-    2.11 (packaging's ordering would put a dev build before the release).
-    """
-    parts = []
-    for part in torch.__version__.split("."):
-        digits = ""
-        for ch in part:
-            if not ch.isdigit():
-                break
-            digits += ch
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts)
-
-
-# torch.accelerator functions _TpuDeviceModule routes to.
-_ACCELERATOR_DEVICE_APIS = (
-    "is_available",
-    "device_count",
-    "current_device_index",
-    "set_device_index",
-    "synchronize",
-    "current_stream",
-    "set_stream",
-)
-
-
 def _use_accelerator_device_apis() -> bool:
-    """Whether to call torch.accelerator instead of torch.tpu's device APIs.
+    """Whether torch.accelerator provides the device APIs _TpuDeviceModule calls.
 
-    torch_tpu makes these torch.tpu APIs internal only on PyTorch >= 2.11; on
-    older PyTorch they stay experimental, and torch.accelerator (or some of the
-    functions above) may be missing, so torch.tpu is used directly.
+    torch.accelerator first shipped in PyTorch 2.6 with all of them
+    (is_available, device_count, current_device_index, set_device_index,
+    synchronize, current_stream, set_stream), so one of them stands for all.
+    They are correct on any version that has them: torch_tpu's own torch.tpu
+    device APIs are built on torch.accelerator.
     """
-    accelerator = getattr(torch, "accelerator", None)
-    return (
-        _torch_version_tuple() >= (2, 11)
-        and accelerator is not None
-        and all(hasattr(accelerator, name) for name in _ACCELERATOR_DEVICE_APIS)
-    )
+    return hasattr(getattr(torch, "accelerator", None), "set_device_index")
 
 
 class _TpuDeviceModule(ModuleType):
@@ -198,10 +164,10 @@ class _TpuDeviceModule(ModuleType):
 def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
     """Adds the device-module functions torch_tpu does not provide.
 
-    Returns the module torchtitan should use as ``device_module``: on
-    PyTorch >= 2.11 with torch.accelerator, a ``_TpuDeviceModule`` view of
-    ``torch.tpu`` that calls the ``torch.accelerator`` equivalents of
-    torch_tpu's internal device APIs; otherwise ``torch.tpu`` itself.
+    Returns the module torchtitan should use as ``device_module``: a
+    ``_TpuDeviceModule`` view of ``torch.tpu`` that calls the
+    ``torch.accelerator`` equivalents of torch_tpu's internal device APIs, or
+    ``torch.tpu`` itself when torch.accelerator lacks any of them.
 
     torch_tpu natively provides get_device_name, get_device_properties,
     set_device, current_device, device_count and synchronize (routed through

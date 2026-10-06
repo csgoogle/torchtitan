@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from torchtitan.tools.utils import (
-    _ACCELERATOR_DEVICE_APIS,
     _patch_tpu_device_module,
     _TpuDeviceModule,
     GarbageCollection,
@@ -121,6 +120,17 @@ def _fake_tpu_module() -> ModuleType:
     return module
 
 
+_ACCELERATOR_DEVICE_APIS = (
+    "is_available",
+    "device_count",
+    "current_device_index",
+    "set_device_index",
+    "synchronize",
+    "current_stream",
+    "set_stream",
+)
+
+
 def _fake_accelerator(**overrides) -> SimpleNamespace:
     apis = {
         name: Mock(name=f"torch.accelerator.{name}")
@@ -135,8 +145,7 @@ def _fake_accelerator(**overrides) -> SimpleNamespace:
 def test_tpu_device_module_without_torch_accelerator_uses_torch_tpu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # PyTorch 2.10 builds without torch.accelerator: keep torch.tpu as is.
-    monkeypatch.setattr(torch, "__version__", "2.10.0")
+    # e.g. a PyTorch build without torch.accelerator: keep torch.tpu as is.
     monkeypatch.delattr(torch, "accelerator", raising=False)
     tpu = _fake_tpu_module()
 
@@ -148,27 +157,9 @@ def test_tpu_device_module_without_torch_accelerator_uses_torch_tpu(
     assert device_module.memory_stats() == {}
 
 
-def test_tpu_device_module_before_2_11_uses_torch_tpu(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # torch_tpu keeps these APIs experimental (not internal) before 2.11.
-    monkeypatch.setattr(torch, "__version__", "2.10.0+cpu")
-    accelerator = _fake_accelerator()
-    monkeypatch.setattr(torch, "accelerator", accelerator)
-    tpu = _fake_tpu_module()
-
-    device_module = _patch_tpu_device_module(tpu)
-
-    assert device_module is tpu
-    assert device_module.memory_stats() == {"allocated_bytes.all.current": 1}
-    accelerator.set_device_index.assert_not_called()
-
-
 def test_tpu_device_module_routes_internal_apis_to_torch_accelerator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A dev build of 2.11 counts as 2.11, as in torch_tpu.
-    monkeypatch.setattr(torch, "__version__", "2.11.0.dev20260101+cpu")
     accelerator = _fake_accelerator()
     monkeypatch.setattr(torch, "accelerator", accelerator)
     tpu = _fake_tpu_module()
@@ -188,12 +179,12 @@ def test_tpu_device_module_routes_internal_apis_to_torch_accelerator(
     assert device_module.memory_stats() == {"allocated_bytes.all.current": 1}
 
 
-def test_tpu_device_module_with_incomplete_torch_accelerator_uses_torch_tpu(
+def test_tpu_device_module_without_set_device_index_uses_torch_tpu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(torch, "__version__", "2.11.0")
+    # A torch.accelerator namespace without the device APIs (e.g. a stub).
     accelerator = _fake_accelerator()
-    del accelerator.set_stream
+    del accelerator.set_device_index
     monkeypatch.setattr(torch, "accelerator", accelerator)
     tpu = _fake_tpu_module()
 
@@ -207,7 +198,6 @@ def test_tpu_device_module_with_incomplete_torch_accelerator_uses_torch_tpu(
 def test_tpu_device_module_set_device_accepts_index_free_tpu_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(torch, "__version__", "2.11.0")
     accelerator = _fake_accelerator()
     accelerator.current_device_index.return_value = 3
     monkeypatch.setattr(torch, "accelerator", accelerator)
