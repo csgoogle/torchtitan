@@ -171,9 +171,7 @@ def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
 
     torch_tpu natively provides get_device_name, get_device_properties,
     set_device, current_device, device_count and synchronize (routed through
-    torch.accelerator by _TpuDeviceModule where available); it gained
-    is_triton_capable on 2026-08-11, so that one is only back-filled for older
-    builds. Drop these once torch_tpu exposes the memory-management trio.
+    torch.accelerator by _TpuDeviceModule where available).
     """
 
     def reset_peak_memory_stats(device=None):
