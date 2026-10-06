@@ -23,6 +23,7 @@ from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe import (
+    _tokens_per_expert,
     MoE,
     TokenChoiceTopKRouter,
 )
@@ -323,14 +324,16 @@ class Gemma4Router(TokenChoiceTopKRouter):
         x_TD: torch.Tensor,
         expert_bias_E: torch.Tensor | None = None,
         **router_kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         x_normed = self.norm(x_TD) * self.root_size * self.scale.to(x_TD.dtype)
         topk_scores_TK, topk_expert_ids_TK, routing_map_TE = super().forward(
             x_normed, expert_bias_E, **router_kwargs
         )
         expert_scales_TK = (
-            routing_map_TE.new_zeros(
-                routing_map_TE.shape, dtype=topk_scores_TK.dtype
+            topk_scores_TK.new_zeros(
+                topk_scores_TK.shape[0],
+                self.per_expert_scale.shape[0],
+                dtype=topk_scores_TK.dtype,
             )
             + self.per_expert_scale.to(topk_scores_TK.dtype)
         ).gather(dim=-1, index=topk_expert_ids_TK)
@@ -360,7 +363,13 @@ class Gemma4MoE(MoE):
             topk_expert_ids_TK,
             routing_map_TE,
         ) = self.router(x_TD, self.expert_bias_E, **router_kwargs)
-        num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
+        num_local_tokens_per_expert_E = (
+            routing_map_TE.sum(dim=0)
+            if routing_map_TE is not None
+            else _tokens_per_expert(
+                topk_expert_ids_TK, self.tokens_per_expert_E.numel()
+            )
+        )
 
         if self.training:
             with torch.no_grad():
