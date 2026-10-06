@@ -88,6 +88,52 @@ def _patch_cpu_device_module(device_module: ModuleType) -> None:
     setattr(device_module, "memory_stats", memory_stats)
 
 
+def _torch_version_tuple() -> tuple[int, ...]:
+    """Leading numeric components of torch.__version__, e.g. (2, 11, 0).
+
+    Matches how torch_tpu reads the version, so "2.11.0.dev20260101" counts as
+    2.11 (packaging's ordering would put a dev build before the release).
+    """
+    parts = []
+    for part in torch.__version__.split("."):
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+# torch.accelerator functions _TpuDeviceModule routes to.
+_ACCELERATOR_DEVICE_APIS = (
+    "is_available",
+    "device_count",
+    "current_device_index",
+    "set_device_index",
+    "synchronize",
+    "current_stream",
+    "set_stream",
+)
+
+
+def _use_accelerator_device_apis() -> bool:
+    """Whether to call torch.accelerator instead of torch.tpu's device APIs.
+
+    torch_tpu makes these torch.tpu APIs internal only on PyTorch >= 2.11; on
+    older PyTorch they stay experimental, and torch.accelerator (or some of the
+    functions above) may be missing, so torch.tpu is used directly.
+    """
+    accelerator = getattr(torch, "accelerator", None)
+    return (
+        _torch_version_tuple() >= (2, 11)
+        and accelerator is not None
+        and all(hasattr(accelerator, name) for name in _ACCELERATOR_DEVICE_APIS)
+    )
+
+
 class _TpuDeviceModule(ModuleType):
     """``torch.tpu`` as torchtitan calls it, with torch.accelerator-backed APIs.
 
@@ -100,6 +146,7 @@ class _TpuDeviceModule(ModuleType):
     ``torch.tpu`` because torch_tpu calls these same functions on ``torch.tpu``
     internally (e.g. ``set_device`` from device guards, ``device_count`` from
     ``is_available``), and their pre-initialization behavior must not change.
+    Only used when ``_use_accelerator_device_apis()`` holds.
     """
 
     def __init__(self, tpu_module: ModuleType) -> None:
@@ -151,13 +198,14 @@ class _TpuDeviceModule(ModuleType):
 def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
     """Adds the device-module functions torch_tpu does not provide.
 
-    Returns the module torchtitan should use as ``device_module``: a
-    ``_TpuDeviceModule`` view of ``torch.tpu`` that calls the
-    ``torch.accelerator`` equivalents of torch_tpu's internal device APIs.
+    Returns the module torchtitan should use as ``device_module``: on
+    PyTorch >= 2.11 with torch.accelerator, a ``_TpuDeviceModule`` view of
+    ``torch.tpu`` that calls the ``torch.accelerator`` equivalents of
+    torch_tpu's internal device APIs; otherwise ``torch.tpu`` itself.
 
-    torch_tpu natively provides get_device_name and get_device_properties
-    (set_device, current_device, device_count and synchronize come from
-    torch.accelerator through _TpuDeviceModule); it gained
+    torch_tpu natively provides get_device_name, get_device_properties,
+    set_device, current_device, device_count and synchronize (routed through
+    torch.accelerator by _TpuDeviceModule where available); it gained
     is_triton_capable on 2026-08-11, so that one is only back-filled for older
     builds. Drop these once torch_tpu exposes the memory-management trio.
     """
@@ -171,8 +219,12 @@ def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
     def memory_stats(device=None):
         # torch_tpu exposes memory stats through the modern torch.accelerator
         # namespace, but torchtitan expects them on the legacy device-module
-        # namespace (torch.tpu). Route them across.
-        return torch.accelerator.memory_stats()
+        # namespace (torch.tpu). Route them across when that namespace has
+        # them; an older PyTorch without torch.accelerator reports no stats.
+        accelerator = getattr(torch, "accelerator", None)
+        if accelerator is None or not hasattr(accelerator, "memory_stats"):
+            return {}
+        return accelerator.memory_stats()
 
     def is_triton_capable(*args, **kwargs):
         return False
@@ -182,7 +234,9 @@ def _patch_tpu_device_module(device_module: ModuleType) -> ModuleType:
     setattr(device_module, "memory_stats", memory_stats)
     if not hasattr(device_module, "is_triton_capable"):
         setattr(device_module, "is_triton_capable", is_triton_capable)
-    return _TpuDeviceModule(device_module)
+    if _use_accelerator_device_apis():
+        return _TpuDeviceModule(device_module)
+    return device_module
 
 
 def get_device_info() -> tuple[str, ModuleType]:
