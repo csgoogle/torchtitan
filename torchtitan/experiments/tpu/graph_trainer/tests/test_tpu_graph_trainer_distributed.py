@@ -132,6 +132,23 @@ class TpuGraphTrainerDistributedTest(
               "--tpu_config.use_scan_layers",
           ],
       ),
+      # Muse Glimmer (text-only). Context 256 exceeds the debugmodel's
+      # 128-token sliding window, so the SWA layers actually mask; the token
+      # budget keeps 4 sequences per rank. No scan case: the SWA/RoPE and
+      # global/NoPE layers differ, so they cannot be stacked. No TP case:
+      # b/567185409.
+      dict(
+          testcase_name="muse_glimmer_simple_fsdp",
+          module="torchtitan.experiments.tpu.muse_glimmer",
+          config="muse_glimmer_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--tpu_config.use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
   ])
   def test_graph_trainer_distributed(
       self,

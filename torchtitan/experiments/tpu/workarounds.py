@@ -489,6 +489,33 @@ class PallasLossLinear(nn.Module):
     return x, self.weight.t()
 
 
+def _check_lm_head_is_plain_projection(lm_head: nn.Linear) -> None:
+  """Raises if the fused loss would skip work done in ``lm_head.forward``.
+
+  ``PallasLossLinear`` returns ``(x, weight.T)`` and never calls the head's
+  ``forward``, so the fused loss computes plain linear cross-entropy. That is
+  only correct for a head whose ``forward`` is ``nn.Linear``'s (or one that
+  already returns those operands). E.g. Muse Glimmer's ``SoftCappedLinear``
+  applies an output multiplier and tanh soft-cap in ``forward``; wrapping it
+  would silently change the loss and gradients.
+
+  Args:
+    lm_head: The output projection about to be wrapped.
+
+  Raises:
+    ValueError: If ``lm_head`` overrides ``forward`` with extra computation.
+  """
+  if getattr(lm_head, "returns_loss_operands", False):
+    return  # E.g. FusedLossLinearWrapper: already returns (x, weight.T).
+  if type(lm_head).forward is not nn.Linear.forward:
+    raise ValueError(
+        "--loss_kernel.use_loss_kernel cannot be used with"
+        f" {type(lm_head).__name__} as lm_head: it overrides forward (e.g. an"
+        " output multiplier or logit soft-cap), which the fused Pallas loss"
+        " would silently skip. Disable the loss kernel for this model."
+    )
+
+
 def use_output_projection_patch(
     model: nn.Module,
 ) -> None:
@@ -504,6 +531,7 @@ def use_output_projection_patch(
     )
   elif hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Linear):
     # Original torchtitan models (e.g. Llama) use lm_head for output projection
+    _check_lm_head_is_plain_projection(model.lm_head)
     model.lm_head = PallasLossLinear(model.lm_head)
     logger.info("Patched model.lm_head to return (x, weight) for Pallas loss")
   else:

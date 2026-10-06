@@ -801,6 +801,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         config.tpu_config.graph_trainer_memory_policy, "full_and_scan_offload"
     )
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
+            for name in tpu_flags.SELECTIVE_ICI_RS_PIPELINING
+        },
+        tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
+    )
 
   def test_235b_proxy_keeps_the_layer_shape_and_drops_the_count(self) -> None:
     proxy = qwen3_moe_235b_scan_proxy()
@@ -903,6 +910,34 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         config.tpu_config.graph_trainer_memory_policy, "full_and_scan_offload"
     )
     self.assertEqual(config.optimizer.implementation, "fused_opt_states_bf16")
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
+            for name in tpu_flags.SELECTIVE_ICI_RS_PIPELINING
+        },
+        tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
+    )
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
+            for name in tpu_flags.HIERARCHICAL_REDUCE_SCATTER
+        },
+        tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+    )
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
+            for name in tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER
+        },
+        tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    )
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
+            for name in tpu_flags.CONVOLUTION_UNFUSING
+        },
+        tpu_flags.CONVOLUTION_UNFUSING,
+    )
 
   @parameterized.parameters(
       llama3_8b,

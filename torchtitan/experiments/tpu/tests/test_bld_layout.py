@@ -2,12 +2,14 @@
 
 import copy
 import pickle
+import types
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 
 from torchtitan.experiments.tpu.bld_layout import apply_bld_layout
+from torchtitan.experiments.tpu.bld_layout import bld_skip_reason
 from torchtitan.experiments.tpu.bld_layout import cossin_rotate
 from torchtitan.experiments.tpu.overrides.bf16_rope import tpu_activation_dtype_cossin_rope
 from torchtitan.experiments.tpu.overrides.real_rope import tpu_real_arithmetic_complex_rope
@@ -194,6 +196,53 @@ class BLDLayoutTest(parameterized.TestCase):
     # generated ones to resolve.
     for cls in (type(bld), type(bld.attention)):
       self.assertIs(pickle.loads(pickle.dumps(cls)), cls)
+
+
+class BLDSkipReasonTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ("default_policy", {}, {}, False),
+      (
+          "scan_offload",
+          {},
+          {"graph_trainer_memory_policy": "full_and_scan_offload"},
+          False,
+      ),
+      (
+          "generic_offload_outside_graph_trainer",
+          {},
+          {
+              "use_graph_trainer": False,
+              "graph_trainer_memory_policy": "full_and_offload",
+          },
+          False,
+      ),
+      (
+          "generic_offload",
+          {},
+          {"graph_trainer_memory_policy": "full_and_offload"},
+          True,
+      ),
+      ("graph_split", {}, {"use_graph_split": True}, True),
+      ("context_parallel", {"context_parallel_degree": 2}, {}, True),
+      ("tensor_parallel", {"tensor_parallel_degree": 2}, {}, True),
+  )
+  def test_skip_reason(self, parallelism_overrides, tpu_overrides, skipped):
+    parallelism = types.SimpleNamespace(
+        context_parallel_degree=1, tensor_parallel_degree=1
+    )
+    vars(parallelism).update(parallelism_overrides)
+    tpu_config = types.SimpleNamespace(
+        use_graph_trainer=True,
+        compile_mode="layer",
+        use_graph_split=False,
+        graph_trainer_memory_policy="full",
+    )
+    vars(tpu_config).update(tpu_overrides)
+
+    reason = bld_skip_reason(parallelism, tpu_config)
+
+    self.assertEqual(reason is not None, skipped, reason)
 
 
 if __name__ == "__main__":

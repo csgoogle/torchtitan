@@ -33,6 +33,7 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_applied
 import torchtitan.experiments.tpu.llama3  # trigger model registration
+import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools.logging import init_logger, logger
@@ -271,6 +272,10 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
       from torchtitan.experiments.graph_trainer.llama3 import model_registry as gt_registry
     elif model_name == "deepseek_v3":
       from torchtitan.experiments.graph_trainer.deepseek_v3 import model_registry as gt_registry
+    elif model_name == "muse_glimmer":
+      from torchtitan.experiments.tpu.graph_trainer.muse_glimmer import (
+          model_registry as gt_registry,
+      )
     else:
       raise ValueError(
           f"Model {model_name} is not currently supported with GraphTrainer."
@@ -387,7 +392,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
 
     workarounds.apply_patches(model, train_config)
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
-      if model_spec.name in ("llama3", "qwen3", "gemma4"):
+      if model_spec.name in ("llama3", "muse_glimmer", "qwen3", "gemma4"):
         if (
             train_config.tpu_config.use_graph_trainer
             or train_config.tpu_config.compile_mode == "aot_fx_trace"

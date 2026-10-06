@@ -429,6 +429,49 @@ class TrainDistributedTest(
           tensor_parallel_degree=1,
           checkpoint_enabled=True,
       ),
+      # muse_glimmer (text-only). No TP case: the debugmodel has 2 KV heads,
+      # which TP=8 (tpu_4x2x1) cannot divide.
+      dict(
+          testcase_name="muse_glimmer_fsdp",
+          module="torchtitan.experiments.tpu.muse_glimmer",
+          config="muse_glimmer_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          # The debugmodel config defaults to SimpleFSDP; use FSDP2 here.
+          # Context 256 > the debugmodel's 128-token sliding window, so SWA
+          # layers actually mask. The token budget keeps 4 sequences per rank.
+          args=[
+              "--parallelism.no-use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      dict(
+          testcase_name="muse_glimmer_simplefsdp",
+          module="torchtitan.experiments.tpu.muse_glimmer",
+          config="muse_glimmer_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
+      dict(
+          # TP=2 divides the debugmodel's 2 KV heads. dp_shard is inferred:
+          # 1 with 2 ranks (CPU/GPU), 4 on tpu_4x2x1.
+          testcase_name="muse_glimmer_fsdp_tp2",
+          module="torchtitan.experiments.tpu.muse_glimmer",
+          config="muse_glimmer_debugmodel",
+          data_parallel_shard_degree=None,
+          tensor_parallel_degree=2,
+          args=[
+              "--parallelism.no-use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
   ])
   def test_train_distributed(
       self,

@@ -27,6 +27,10 @@ class FusedLossLinearWrapper(Linear):
   initialization, sharding, optimizer ownership, and checkpoint key.
   """
 
+  # Tells workarounds.use_output_projection_patch that forward already returns
+  # the fused-loss operands, so the overridden forward is safe to bypass.
+  returns_loss_operands = True
+
   @dataclass(kw_only=True, slots=True)
   class Config(Linear.Config):
     pass

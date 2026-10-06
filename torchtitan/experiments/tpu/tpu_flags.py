@@ -172,6 +172,20 @@ HIERARCHICAL_REDUCE_SCATTER: FlagMap = {
     "xla_tpu_enable_sparse_core_hierarchical_reduce_scatter": "true",
 }
 
+# Pipeline small (<= 1024 KiB per shard) reduce-scatters across the scan
+# backward while-loop back-edge while keeping multi-MiB weight reductions
+# inside their own iteration to avoid double-buffering in VMEM/HBM.
+SELECTIVE_ICI_RS_PIPELINING: FlagMap = {
+    "xla_tpu_enable_ici_rs_pipelining": "true",
+    "xla_tpu_ici_rs_pipelining_threshold_kib": "1024",
+}
+
+# Unfuse elementwise ops from MXU matmuls when fusing degrades tile selection
+# (e.g. restores the 416x8 FFN backward tile on Llama3-405B scan).
+CONVOLUTION_UNFUSING: FlagMap = {
+    "xla_tpu_enable_convolution_unfusing": "true",
+}
+
 # Offload FSDP all-gather and reduce-scatter onto the SparseCores, queued by the
 # latency-hiding scheduler. Broader than
 # SPARSECORE_LATENCY_HIDING_SCHEDULER: this moves the collectives themselves off
