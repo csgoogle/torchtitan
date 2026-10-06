@@ -19,6 +19,7 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
@@ -52,6 +53,18 @@ _FUSED_LOSS_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
 )
 
+_LLAMA3_SCAN_FLAGS = tpu_flags.merge_flags(
+    tpu_flags.TPU7X_THROUGHPUT_P_STATE,
+    {
+        "xla_tpu_scoped_vmem_limit_kib": 131072,
+        "xla_tpu_enable_offloading_copy_to_sparsecore": False,
+    },
+    tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+    tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
+    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    tpu_flags.CONVOLUTION_UNFUSING,
+)
+
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
   """Select the fused loss and its pre-construction LM-head override together."""
@@ -76,6 +89,10 @@ def _on_scan_lane(config: TPUTrainerConfig) -> TPUTrainerConfig:
   # libtpu 0.0.48; see cl/979992733), which segfaults in
   # mlir::sdy::buildTensorFactorShardings on GraphTrainer.
   config.xla_flags["xla_enable_hlo_sharding_v3"] = "false"
+  config.libtpu_init_flags = tpu_flags.merge_flags(
+      config.libtpu_init_flags,
+      _LLAMA3_SCAN_FLAGS,
+  )
   return config
 
 
