@@ -550,6 +550,12 @@ class TokenChoiceTopKRouter(Module):
         route_norm: bool = False
         route_scale: float = 1.0
         aux_loss: AuxLoss.Config | None = None
+        token_count_impl: Literal["histc", "routing_map"] = "histc"
+        """How routed tokens are counted per expert. ``"routing_map"`` builds
+        upstream's one-hot ``(T, E)`` map with ``zeros_like + scatter_``
+        (pytorch/torchtitan#3450) and sums it; ``"histc"`` counts the top-k ids
+        directly, skipping that scatter, which is slow on TPU. The map is still
+        built when ``aux_loss`` is set, since aux losses consume it."""
         _debug_force_load_balance: bool = False
 
     def __init__(self, config: Config):
@@ -563,6 +569,9 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm = config.route_norm
         self.route_scale = config.route_scale
         self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
+        self.build_routing_map = (
+            config.token_count_impl == "routing_map" or self.aux_loss is not None
+        )
         self._debug_force_load_balance = config._debug_force_load_balance
 
     def _debug_force_load_balance_routing(
@@ -649,7 +658,7 @@ class TokenChoiceTopKRouter(Module):
         x_TD: torch.Tensor,
         expert_bias_E: torch.Tensor | None = None,
         **router_kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Args:
             x_TD: Input ``(T, D)``.
@@ -658,7 +667,8 @@ class TokenChoiceTopKRouter(Module):
         Returns:
             topk_scores_TK: Routing scores ``(T, K)``.
             topk_expert_ids_TK: Expert indices ``(T, K)``.
-            routing_map_TE: One-hot boolean routing map ``(T, E)``.
+            routing_map_TE: One-hot boolean routing map ``(T, E)``, or None
+                with ``token_count_impl="histc"`` (count ``topk_expert_ids_TK``).
         """
         scores_TE = self.gate(x_TD)
 
@@ -699,10 +709,14 @@ class TokenChoiceTopKRouter(Module):
         # token is routed to.  Under TP/SP the router outputs are DTensors
         # sharded on the token dim; scatter_ writes along the (replicated)
         # expert dim, so DTensor runs it as a local op with no redistribution.
-        routing_map_TE = torch.zeros_like(scores_TE, dtype=torch.bool).scatter_(
-            -1,
-            topk_expert_ids_TK,
-            True,
+        routing_map_TE = (
+            torch.zeros_like(scores_TE, dtype=torch.bool).scatter_(
+                -1,
+                topk_expert_ids_TK,
+                True,
+            )
+            if self.build_routing_map
+            else None
         )
 
         # Auxiliary load-balance loss (DeepSeek-V3 Sec 2.1.2 Eqs 17-20).
@@ -937,7 +951,13 @@ class MoE(Module):
             topk_expert_ids_TK,
             routing_map_TE,
         ) = self.router(x_TD, self.expert_bias_E, **router_kwargs)
-        num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
+        num_local_tokens_per_expert_E = (
+            routing_map_TE.sum(dim=0)
+            if routing_map_TE is not None
+            else _tokens_per_expert(
+                topk_expert_ids_TK, self.tokens_per_expert_E.numel()
+            )
+        )
 
         # tokens_per_expert_E will be used to update the expert bias for load balancing,
         # and also to count the expert usage.

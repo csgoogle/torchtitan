@@ -13,7 +13,7 @@ from torch.distributed.tensor import DTensor
 
 from torchtitan.models.common import Linear
 from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.moe import GroupedExperts, MoE
+from torchtitan.models.common.moe import _tokens_per_expert, GroupedExperts, MoE
 from torchtitan.models.common.nn_modules import RMSNorm
 
 # Shape suffixes:
@@ -126,7 +126,11 @@ class KimiLatentMoE(MoE):
         weights_TK, expert_ids_TK, routing_map_TE = self.router(
             x_TD, self.expert_bias_E, **router_kwargs
         )
-        num_tokens_per_expert_E = routing_map_TE.sum(dim=0)
+        num_tokens_per_expert_E = (
+            routing_map_TE.sum(dim=0)
+            if routing_map_TE is not None
+            else _tokens_per_expert(expert_ids_TK, self.tokens_per_expert_E.numel())
+        )
         if self.training:
             with torch.no_grad():
                 self.tokens_per_expert_E.add_(num_tokens_per_expert_E)
