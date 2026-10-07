@@ -22,9 +22,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  PYTHON_VERSION: "3.14"
-
 jobs:
   build-wheel:
     name: Build torch_tpu wheel from source against PyTorch Nightly
@@ -59,10 +56,10 @@ jobs:
           SHA=$(git -C torch_tpu rev-parse --short=7 HEAD)
           echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
 
-      - name: Setup Python ${{ env.PYTHON_VERSION }}
+      - name: Setup Python 3.12
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.12'
 
       - name: Download PyTorch Nightly CPU Wheel
         run: |
@@ -71,7 +68,7 @@ jobs:
           pip download --no-deps --pre torch \
             --index-url https://download.pytorch.org/whl/nightly/cpu \
             --only-binary=:all: \
-            --python-version "${PYTHON_VERSION}" \
+            --python-version 3.12 \
             --implementation cp \
             -d torch_tpu/dist
           TORCH_WHEEL=$(ls $(pwd)/torch_tpu/dist/torch-*.whl | head -n 1)
@@ -84,8 +81,6 @@ jobs:
           bazel build -c opt //ci/wheel:torch_tpu_wheel \
             --config=wheel_common \
             --config=local_torch \
-            --repo_env=HERMETIC_PYTHON_VERSION="${PYTHON_VERSION}" \
-            --define PYTHON_VERSION="${PYTHON_VERSION}" \
             --repo_env=TORCH_SOURCE=$TORCH_SOURCE
 
       - name: Upload compiled torch_tpu wheel artifact
@@ -229,7 +224,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             CACHE_BUSTER=${{ steps.meta.outputs.NIGHTLY_DATE }}
-            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -269,8 +263,8 @@ jobs:
       GAR_JSON_KEY: ${{ secrets.GAR_JSON_KEY }}
 
   promote-latest:
-    name: Promote nightly image to :latest
-    needs: [build-and-push-image]
+    name: Promote validated image to :latest
+    needs: [build-and-push-image, validate-image]
     if: ${{ needs.build-and-push-image.outputs.promote_latest == 'true' && github.event.inputs.push_image != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
