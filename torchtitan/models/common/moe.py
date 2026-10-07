@@ -26,7 +26,7 @@ from torchtitan.distributed.spmd_types import (
     spmd_sparse_mesh,
 )
 from torchtitan.distributed.utils import get_spmd_backend
-from torchtitan.models.common.aux_loss import AuxLoss
+from torchtitan.models.common.aux_loss import _AuxLossInjection, AuxLoss
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import RouterGateLinear
 from torchtitan.protocols.module import Module
@@ -48,10 +48,12 @@ from .token_dispatcher import LocalTokenDispatcher
 
 
 # BEGIN PR3000 cherry-pick from db0c4a456b2fd3377f68a4f0cddef015e83ae10e.
-# Do not edit this block except to refresh it from the upstream PR.
+# Keep the load-balance math in this block in sync with the upstream PR. The
+# module plumbing is adapted to d771abb0, which moved MoE auxiliary losses into
+# the router (``TokenChoiceTopKRouter.Config.aux_loss``).
 def _sequence_wise_load_balance_loss(
     scores_BLE: torch.Tensor,
-    topk_expert_ids_BLK: torch.Tensor,
+    routing_map_BLE: torch.Tensor,
     top_k: int,
     aux_loss_coeff: float,
     *,
@@ -69,41 +71,11 @@ def _sequence_wise_load_balance_loss(
     groups (CP, and TP when EP enables sequence parallelism) to get full-sequence
     expert counts.
     """
-    # TT-UNFLATTEN-SHIM: Upstream flattened sequence compatibility.
-    # Scores and IDs are now [T, E] and [T, K] under upstream's Native [T] Token Streams.
-    # DeepSeekv3 patch sequence_wise_load_balance_loss expects [B, L, E].
-    # We recover L via a lazy import of the temporary TPU shim to avoid a BUILD
-    # dependency cycle (core torchtitan depending on experiments/tpu).
-    L = None
-    try:
-        from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
-        L = get_unflatten_seq_len()
-    except ImportError:
-        pass
-    
-    if scores_BLE.ndim == 2:
-        if L is not None:
-            num_tokens, num_experts = scores_BLE.shape
-            B = num_tokens // L
-            scores_BLE = scores_BLE.reshape(B, L, num_experts)
-            topk_expert_ids_BLK = topk_expert_ids_BLK.reshape(B, L, -1)
-        else:
-            raise ValueError(
-                "TT-UNFLATTEN-SHIM: `scores_BLE` is 2-dimensional ([T, E]) but "
-                "the TPU unflatten shim context is inactive (no seq_len). "
-                "The current 0005 DeepSeek patch statically requires [B, L, E]. "
-                "Please migrate the MoE loss logic to support native [T, E]!"
-            )
-        
     B, L, num_experts = scores_BLE.shape
     denom = scores_BLE.sum(dim=-1, keepdim=True) + 1e-20
     probs_BLE = scores_BLE / denom
     prob_sums_BE = probs_BLE.sum(dim=1)
-    indices_BN = topk_expert_ids_BLK.reshape(B, -1)
-    offset = torch.arange(B, device=indices_BN.device).unsqueeze(1) * num_experts
-    flat_indices = (indices_BN + offset).reshape(-1)
-    counts = torch.bincount(flat_indices.long(), minlength=B * num_experts)
-    counts_BE = counts.reshape(B, num_experts).to(dtype=scores_BLE.dtype)
+    counts_BE = routing_map_BLE.sum(dim=1).to(dtype=scores_BLE.dtype)
 
     counts_BE = _all_reduce_expert_counts(
         counts_BE,
@@ -121,13 +93,14 @@ def _sequence_wise_load_balance_loss(
 
 def _batch_wise_load_balance_loss(
     scores_BLE: torch.Tensor,
-    topk_expert_ids_BLK: torch.Tensor,
+    routing_map_BLE: torch.Tensor,
     top_k: int,
     aux_loss_coeff: float,
     *,
     dp_mesh: DeviceMesh | None = None,
     cp_mesh: DeviceMesh | None = None,
     tp_mesh: DeviceMesh | None = None,
+    num_tokens_per_expert: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Batch-wise auxiliary load-balance loss.
 
@@ -136,39 +109,9 @@ def _batch_wise_load_balance_loss(
     are all-reduced across DP and sequence-shard groups (CP, and TP when EP
     enables sequence parallelism) to get global-batch expert counts.
     """
-    # TT-UNFLATTEN-SHIM: Upstream flattened sequence compatibility.
-    # Scores and IDs are now [T, E] and [T, K] under upstream's Native [T] Token Streams.
-    # DeepSeekv3 patch batch_wise_load_balance_loss expects [B, L, E].
-    # We recover L via a lazy import of the temporary TPU shim to avoid a BUILD
-    # dependency cycle (core torchtitan depending on experiments/tpu).
-    L = None
-    try:
-        from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
-        L = get_unflatten_seq_len()
-    except ImportError:
-        pass
-    
-    if scores_BLE.ndim == 2:
-        if L is not None:
-            num_tokens, num_experts = scores_BLE.shape
-            B = num_tokens // L
-            scores_BLE = scores_BLE.reshape(B, L, num_experts)
-            topk_expert_ids_BLK = topk_expert_ids_BLK.reshape(B, L, -1)
-        else:
-            raise ValueError(
-                "TT-UNFLATTEN-SHIM: `scores_BLE` is 2-dimensional ([T, E]) but "
-                "the TPU unflatten shim context is inactive (no seq_len). "
-                "The current 0005 DeepSeek patch statically requires [B, L, E]. "
-                "Please migrate the MoE loss logic to support native [T, E]!"
-            )
-        
     B, L, num_experts = scores_BLE.shape
-    num_tokens_per_expert = torch.histc(
-        topk_expert_ids_BLK.reshape(-1).float(),
-        bins=num_experts,
-        min=0,
-        max=num_experts,
-    )
+    if num_tokens_per_expert is None:
+        num_tokens_per_expert = routing_map_BLE.sum(dim=(0, 1))
     probs_BLE = scores_BLE / (scores_BLE.sum(dim=-1, keepdim=True) + 1e-20)
     prob_sums_E = probs_BLE.sum(dim=(0, 1))
 
@@ -230,42 +173,42 @@ def _all_reduce_expert_counts(
             )
     return counts
 
-class _AuxLossAutograd(torch.autograd.Function):
-    """Injects an auxiliary loss gradient without changing the forward value."""
 
-    @staticmethod
-    def forward(  # pyrefly: ignore [bad-override]
-        ctx: torch.autograd.function.FunctionCtx,
-        topk_scores_BLK: torch.Tensor,
-        aux_loss: torch.Tensor,
-    ) -> torch.Tensor:
-        ctx.save_for_backward(aux_loss)
-        return topk_scores_BLK
+class MoELoadBalanceAuxLoss(AuxLoss):
+    """MoE auxiliary load-balance loss, configured on the router.
 
-    @staticmethod
-    def backward(  # pyrefly: ignore [bad-override]
-        ctx: torch.autograd.function.FunctionCtx,
-        grad_topk_scores_BLK: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        (aux_loss,) = ctx.saved_tensors
-        return grad_topk_scores_BLK, torch.ones_like(aux_loss)
+    Set as ``TokenChoiceTopKRouter.Config.aux_loss``: the router calls it in
+    training with its scores and routing map, and it injects the loss gradient
+    into the router's top-k scores without changing the model output (PP-safe),
+    through the base class's ``_AuxLossInjection``.
 
+    It does not go through ``AuxLoss.inject``, for two reasons:
 
-class MoELoadBalanceAuxLoss(Module):
-    """MoE auxiliary load-balance loss.
+    - The normalization is this loss's own. ``batch_wise`` is Qwen's
+      global-batch loss: f_i and p_i are taken over the global batch (counts
+      are all-reduced over the meshes set by
+      ``configure_moe_aux_loss_reduction``) and each forward is weighted by
+      ``B / global_batch_size`` (see ``update_moe_aux_loss_configs``), rather
+      than by the step's global valid-token count.
+    - ``inject`` accumulates its logged value into the ``instance_acc`` buffer
+      during the forward, and a scanned layer stack cannot write to a buffer it
+      closed over. The per-layer value is logged by the MoE routing metrics
+      (``moe/global_aux_loss_normalized``) instead, so this loss is not
+      registered with ``collect_aux_loss_metrics``. Because the value is
+      overwritten on each forward rather than accumulated, it is also not
+      double-counted when activation checkpointing replays the forward.
 
-    Injects aux loss gradients into router scores without changing the model
-    output (PP-safe). Call instance with router outputs to apply.
+    Unregistering means adjusting the private ``AuxLoss._group_counts`` after
+    ``super().__init__``; ``test_global_batch_aux_loss_is_not_a_logged_aux_loss_group``
+    fails if upstream changes that bookkeeping.
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
+    class Config(AuxLoss.Config):
         type: Literal["sequence_wise", "batch_wise"]
         """Loss variant. sequence_wise (DeepSeek-V3 Eqs 17-20) computes
-        per-sequence then averages; batch_wise averages over all tokens."""
-        coeff: float
-        """Coefficient for the auxiliary load-balance loss. Set moe.aux_loss to
-        None to disable aux loss entirely."""
+        per-sequence then averages; batch_wise averages over all tokens.
+        Set router.aux_loss to None to disable aux loss entirely."""
         top_k: int
         """Number of experts per token. Must match the router's top_k."""
         global_batch_size: int | None = None
@@ -273,27 +216,44 @@ class MoELoadBalanceAuxLoss(Module):
         Torchtitan generally uses sum aggregation & global_bs division.
         Because batch_wise aux loss doesn't commute over microbatches, we ban
         batch_wise + PP usage in any case."""
+        seq_len: int | None = None
+        """Tokens per sequence (``training.max_context_length``). Converts the
+        router's ``[T, E]`` token count to samples for the ``global_batch_size``
+        weight, and regroups tokens into sequences for ``sequence_wise``. Set
+        by ``update_moe_aux_loss_configs``."""
 
     def __init__(self, config: Config):
-        super().__init__()
         if config.coeff <= 0:
             raise ValueError(
                 f"aux_loss.coeff must be > 0, got {config.coeff}. "
-                "Set moe.aux_loss to None to disable aux loss."
+                "Set router.aux_loss to None to disable aux loss."
             )
         if config.type not in ("sequence_wise", "batch_wise"):
             raise ValueError(
                 f"Unknown aux loss type '{config.type}', "
                 f"expected one of ('sequence_wise', 'batch_wise')"
             )
+        super().__init__(config)
+        # Not reported by ``collect_aux_loss_metrics``; see the class docstring.
+        metric_group = (self.reduce_mesh, self.metric_name)
+        AuxLoss._group_counts[metric_group] -= 1
+        if AuxLoss._group_counts[metric_group] == 0:
+            del AuxLoss._group_counts[metric_group]
+        # Unused: this loss doesn't call inject(), so drop the base class's
+        # metric buffer.
+        del self.instance_acc
         self.type = config.type
-        self.coeff = config.coeff
         self.global_batch_size = config.global_batch_size
+        self.seq_len = config.seq_len
         self.top_k = config.top_k
         self.dp_mesh: DeviceMesh | None = None
         self.cp_mesh: DeviceMesh | None = None
         self.tp_mesh: DeviceMesh | None = None
         self.collect_routing_metrics = False
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        # No buffers: the base class's instance_acc is dropped in __init__.
+        pass
 
     def set_meshes(
         self,
@@ -308,37 +268,118 @@ class MoELoadBalanceAuxLoss(Module):
 
     def forward(
         self,
-        topk_scores_BLK: torch.Tensor,
-        scores_BLE: torch.Tensor,
-        topk_expert_ids_BLK: torch.Tensor,
+        scores_TE: torch.Tensor,
+        routing_map_TE: torch.Tensor | None,
+        *,
+        carrier: torch.Tensor,
+        expert_ids_TK: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        B = scores_BLE.size(0)
-        global_batch_size = self.global_batch_size or B
-        scaled_coeff = self.coeff * B / global_batch_size
+        """Compute the load-balance loss and inject its gradient.
+
+        Args:
+            scores_TE: Router scores ``(T, E)``.
+            routing_map_TE: One-hot routing map ``(T, E)`` for the same tokens,
+                as counted by the router; None for batch-wise with
+                ``token_count_impl="histc"``.
+            carrier: Tensor whose backward path carries the injected gradient
+                (the router's top-k scores).
+            expert_ids_TK: The router's top-k expert ids ``(T, K)``, counted
+                with ``histc`` when ``routing_map_TE`` is None.
+
+        Returns:
+            ``carrier`` unchanged (identity forward).
+        """
+        # The expert counts are all-reduced explicitly over the meshes wired by
+        # ``configure_moe_aux_loss_reduction``, so the loss works on this
+        # rank's local tokens. ``to_local`` keeps the gradient placement of the
+        # router output.
+        scores_TE = (
+            scores_TE.to_local() if isinstance(scores_TE, DTensor) else scores_TE
+        )
+        routing_map_TE = (
+            routing_map_TE.to_local()
+            if isinstance(routing_map_TE, DTensor)
+            else routing_map_TE
+        )
+        num_experts = scores_TE.size(-1)
+        if self.global_batch_size is None:
+            # Falling back to B would drop the 1 / dp-degree factor, making the
+            # aux gradient dp-times too large after the DP gradient sum.
+            raise ValueError(
+                "MoELoadBalanceAuxLoss.global_batch_size is not set. Call "
+                "update_moe_aux_loss_configs from the model's "
+                "update_from_config, which also validates PP and gradient "
+                "accumulation."
+            )
+        # [B, L, E] inputs carry their own sequence length; the router's
+        # [T, E] outputs need the configured one.
+        seq_len = scores_TE.size(1) if scores_TE.ndim == 3 else self.seq_len
+        if seq_len is None:
+            raise ValueError(
+                "MoELoadBalanceAuxLoss.seq_len is not set. Call "
+                "update_moe_aux_loss_configs from the model's "
+                "update_from_config."
+            )
+        local_counts_E = None
+        if routing_map_TE is None:
+            ids_TK = (
+                expert_ids_TK.to_local()
+                if isinstance(expert_ids_TK, DTensor)
+                else expert_ids_TK
+            )
+            local_counts_E = _tokens_per_expert(ids_TK, num_experts)
+        # This rank's share of the global batch, B / global_batch_size, counted
+        # in tokens so the batch-wise loss never regroups tokens into sequences.
+        num_local_tokens = scores_TE.numel() // num_experts
+        scaled_coeff = (
+            self.coeff * num_local_tokens / (self.global_batch_size * seq_len)
+        )
         if self.type == "sequence_wise":
+            # Per-sequence expert frequencies need the sequence boundaries.
+            if num_local_tokens % seq_len != 0:
+                raise ValueError(
+                    f"The router's local token count ({num_local_tokens}) is "
+                    f"not a multiple of seq_len ({seq_len}), so it cannot be "
+                    "regrouped into whole sequences."
+                )
             aux_loss = _sequence_wise_load_balance_loss(
-                scores_BLE,
-                topk_expert_ids_BLK,
+                scores_TE.reshape(-1, seq_len, num_experts),
+                routing_map_TE.reshape(-1, seq_len, num_experts),
                 self.top_k,
                 scaled_coeff,
                 cp_mesh=self.cp_mesh,
                 tp_mesh=self.tp_mesh,
             )
         else:
+            # The batch-wise loss only sums over tokens, so a single
+            # [1, T, E] "sequence" gives the same result as any [B, L, E]
+            # grouping of the same tokens.
+            scores_1TE = scores_TE.reshape(1, -1, num_experts)
             aux_loss = _batch_wise_load_balance_loss(
-                scores_BLE,
-                topk_expert_ids_BLK,
+                scores_1TE,
+                routing_map_TE.reshape(1, -1, num_experts)
+                if routing_map_TE is not None
+                else None,
                 self.top_k,
                 scaled_coeff,
                 dp_mesh=self.dp_mesh,
                 cp_mesh=self.cp_mesh,
                 tp_mesh=self.tp_mesh,
+                num_tokens_per_expert=local_counts_E,
             )
             if self.collect_routing_metrics:
                 self._last_local_normalized_aux_loss = (
                     aux_loss / scaled_coeff
                 ).detach().float()
-        return _AuxLossAutograd.apply(topk_scores_BLK, aux_loss)
+        if self.collect_routing_metrics:
+            # Local routed-token counts for the MoE routing metrics; read by
+            # ``collect_moe_routing_metric_tensors`` right after the forward.
+            self._last_local_tokens_per_expert_E = (
+                local_counts_E
+                if local_counts_E is not None
+                else routing_map_TE.reshape(-1, num_experts).sum(dim=0)
+            ).detach().float()
+        return _AuxLossInjection.apply(carrier, aux_loss)
 
 
 def configure_moe_aux_loss_reduction(model: nn.Module, parallel_dims) -> None:
@@ -354,18 +395,30 @@ def configure_moe_aux_loss_reduction(model: nn.Module, parallel_dims) -> None:
     EP is disabled, router counts are replicated over TP and must not be
     all-reduced on the TP mesh.
     """
+    # TODO: the meshes are wired by hand, assuming TP splits router tokens only
+    # under EP. Upstream's global batch-wise loss (pytorch/torchtitan#4772)
+    # infers this from spmd_types placements; switch when it lands.
     dp_mesh = parallel_dims.get_optional_mesh("batch")
     cp_mesh = parallel_dims.get_optional_mesh("cp")
     tp_mesh = (
         parallel_dims.get_optional_mesh("tp") if parallel_dims.ep_enabled else None
     )
-    for module in model.modules():
-        if isinstance(module, MoE) and module.aux_loss is not None:
-            module.aux_loss.set_meshes(
-                dp_mesh=dp_mesh,
-                cp_mesh=cp_mesh,
-                tp_mesh=tp_mesh,
-            )
+    aux_losses = [
+        m for m in model.modules() if isinstance(m, MoELoadBalanceAuxLoss)
+    ]
+    if aux_losses and (cp_mesh is not None or tp_mesh is not None):
+        # The loss treats the router's rank-local tokens as whole sequences of
+        # the global seq_len (its share of the batch, and sequence_wise's
+        # grouping), which is wrong once CP, or TP with EP, splits them.
+        raise NotImplementedError(
+            "MoELoadBalanceAuxLoss does not support context parallelism or "
+            "tensor parallelism with expert parallelism: it would group the "
+            "rank-local tokens into the wrong batch size without error. Use "
+            "MicrobatchWiseLoadBalanceLoss, or wait for "
+            "pytorch/torchtitan#4772."
+        )
+    for module in aux_losses:
+        module.set_meshes(dp_mesh=dp_mesh, cp_mesh=cp_mesh, tp_mesh=tp_mesh)
 
 
 # END PR3000 cherry-pick.
@@ -555,7 +608,8 @@ class TokenChoiceTopKRouter(Module):
         upstream's one-hot ``(T, E)`` map with ``zeros_like + scatter_``
         (pytorch/torchtitan#3450) and sums it; ``"histc"`` counts the top-k ids
         directly, skipping that scatter, which is slow on TPU. The map is still
-        built when ``aux_loss`` is set, since aux losses consume it."""
+        built when ``aux_loss`` consumes it: any aux loss except the batch-wise
+        MoELoadBalanceAuxLoss, which counts the top-k ids itself."""
         _debug_force_load_balance: bool = False
 
     def __init__(self, config: Config):
@@ -569,8 +623,14 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm = config.route_norm
         self.route_scale = config.route_scale
         self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
+        # MoELoadBalanceAuxLoss's batch-wise form counts the top-k ids itself;
+        # other aux losses consume the map.
+        aux_loss_needs_map = self.aux_loss is not None and not (
+            isinstance(self.aux_loss, MoELoadBalanceAuxLoss)
+            and self.aux_loss.type == "batch_wise"
+        )
         self.build_routing_map = (
-            config.token_count_impl == "routing_map" or self.aux_loss is not None
+            config.token_count_impl == "routing_map" or aux_loss_needs_map
         )
         self._debug_force_load_balance = config._debug_force_load_balance
 
@@ -727,10 +787,16 @@ class TokenChoiceTopKRouter(Module):
         # router counted: once the router masks padding positions out of the
         # map, the loss and its token count follow without further changes.
         if self.training and self.aux_loss is not None:
+            aux_kwargs = (
+                {"expert_ids_TK": topk_expert_ids_TK}
+                if isinstance(self.aux_loss, MoELoadBalanceAuxLoss)
+                else {}
+            )
             topk_scores_TK = self.aux_loss(
                 scores_TE,
                 routing_map_TE,
                 carrier=topk_scores_TK,
+                **aux_kwargs,
             )
 
         return (
@@ -890,7 +956,6 @@ class MoE(Module):
         routed_experts: RoutedExperts.Config
         router: TokenChoiceTopKRouter.Config
         load_balance_coeff: float | None = 1e-3
-        aux_loss: MoELoadBalanceAuxLoss.Config | None = None
         shared_experts: FeedForward.Config | None = None
 
     def __init__(self, config: Config):
@@ -908,9 +973,13 @@ class MoE(Module):
         #       expert_bias_E is updated outside the model in an optimizer step pre hook
         #       to work with gradient accumulation.
         self.load_balance_coeff = config.load_balance_coeff
-        self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
-        if self.load_balance_coeff is not None and self.aux_loss is not None:
-            raise ValueError("load_balance_coeff and aux_loss are mutually exclusive")
+        if self.load_balance_coeff is not None and isinstance(
+            self.router.aux_loss, MoELoadBalanceAuxLoss
+        ):
+            raise ValueError(
+                "load_balance_coeff and router.aux_loss (MoELoadBalanceAuxLoss) "
+                "are mutually exclusive"
+            )
         if self.load_balance_coeff is not None:
             assert self.load_balance_coeff > 0.0
             self.register_buffer(

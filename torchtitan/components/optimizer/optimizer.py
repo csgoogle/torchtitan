@@ -561,19 +561,32 @@ def register_moe_load_balancing_hook(
         )
 
 
+def _moe_routing_metrics_aux_loss(moe: nn.Module) -> Any:
+    """Return the MoE's router aux loss if it produces routing metrics.
+
+    Only ``MoELoadBalanceAuxLoss`` (set as ``router.aux_loss``) produces them;
+    it is duck-typed here because this module cannot import the model code.
+    """
+    aux_loss = getattr(getattr(moe, "router", None), "aux_loss", None)
+    if aux_loss is None or not hasattr(aux_loss, "collect_routing_metrics"):
+        return None
+    return aux_loss
+
+
 def configure_moe_routing_metrics(
     model_parts: list[nn.Module], enabled: bool
 ) -> bool:
     """Enable graph-safe routing metric capture on supported MoE layers."""
     found_supported_layer = False
     for _transformer_block, moe in _iter_moe_layers(model_parts):
-        if moe.aux_loss is None:
+        aux_loss = _moe_routing_metrics_aux_loss(moe)
+        if aux_loss is None:
             continue
-        if enabled and moe.aux_loss.type != "batch_wise":
+        if enabled and aux_loss.type != "batch_wise":
             raise ValueError(
                 "MoE routing metrics currently require batch_wise auxiliary loss"
             )
-        moe.aux_loss.collect_routing_metrics = enabled
+        aux_loss.collect_routing_metrics = enabled
         found_supported_layer = True
     return enabled and found_supported_layer
 
@@ -591,7 +604,7 @@ def collect_moe_routing_metric_tensors(
     local_counts = []
     local_normalized_aux_losses = []
     for _transformer_block, moe in _iter_moe_layers(model_parts):
-        aux_loss = moe.aux_loss
+        aux_loss = _moe_routing_metrics_aux_loss(moe)
         if aux_loss is None or not aux_loss.collect_routing_metrics:
             continue
         if not hasattr(aux_loss, "_last_local_tokens_per_expert_E") or not hasattr(
@@ -627,9 +640,10 @@ def set_moe_routing_metric_tensors(
         )
     local_counts_LE, local_normalized_aux_losses_L = metric_tensors
     aux_loss_modules = [
-        moe.aux_loss
+        aux_loss
         for _transformer_block, moe in _iter_moe_layers(model_parts)
-        if moe.aux_loss is not None and moe.aux_loss.collect_routing_metrics
+        if (aux_loss := _moe_routing_metrics_aux_loss(moe)) is not None
+        and aux_loss.collect_routing_metrics
     ]
     if (
         local_counts_LE.size(0) != len(aux_loss_modules)
@@ -652,9 +666,10 @@ def get_moe_load_balancing_metrics(
 
     local_tokens_per_expert_LE, local_normalized_aux_loss_L = metric_tensors
     aux_loss_modules = [
-        moe.aux_loss
+        aux_loss
         for _transformer_block, moe in _iter_moe_layers(model_parts)
-        if moe.aux_loss is not None and moe.aux_loss.collect_routing_metrics
+        if (aux_loss := _moe_routing_metrics_aux_loss(moe)) is not None
+        and aux_loss.collect_routing_metrics
     ]
     local_sums = torch.cat(
         [local_tokens_per_expert_LE, local_normalized_aux_loss_L.unsqueeze(1)], dim=1

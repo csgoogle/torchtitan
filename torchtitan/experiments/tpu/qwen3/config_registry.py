@@ -116,7 +116,7 @@ def _use_global_batch_aux_loss(config: TPUTrainerConfig) -> None:
   assert config.model_spec is not None
   for _, moe, _, _ in config.model_spec.model.traverse(MoE.Config):
     moe.load_balance_coeff = None
-    moe.aux_loss = make_aux_loss_config(
+    moe.router.aux_loss = make_aux_loss_config(
         type="batch_wise", coeff=1e-3, top_k=moe.router.top_k
     )
 
