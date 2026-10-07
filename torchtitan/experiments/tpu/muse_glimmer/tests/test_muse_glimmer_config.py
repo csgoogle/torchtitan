@@ -357,9 +357,8 @@ class MuseGlimmerConfigTest(absltest.TestCase):
   def test_30b_recipes_share_upstream_model_and_flags(self):
     """Tests the 30B recipes: upstream model/data settings, 4x4x4 flags."""
     for name in (
-        "muse_glimmer_30b",
         "muse_glimmer_30b_full_logits",
-        "reg_trainer_muse_glimmer_30b",
+        "muse_glimmer_30b_fused_ce",
         "reg_trainer_muse_glimmer_30b_fused_ce",
     ):
       with self.subTest(name):
@@ -387,9 +386,8 @@ class MuseGlimmerConfigTest(absltest.TestCase):
   def test_30b_recipe_trainer_and_loss_selection(self):
     """Tests which 30B recipes use GraphTrainer and the fused loss."""
     expected = {
-        "muse_glimmer_30b": (True, True),
         "muse_glimmer_30b_full_logits": (True, False),
-        "reg_trainer_muse_glimmer_30b": (False, False),
+        "muse_glimmer_30b_fused_ce": (True, True),
         "reg_trainer_muse_glimmer_30b_fused_ce": (False, True),
     }
     for name, (graph_trainer, fused) in expected.items():
@@ -402,14 +400,23 @@ class MuseGlimmerConfigTest(absltest.TestCase):
         self.assertEqual(
             _FUSED_LOSS_OVERRIDE_PATH in config.override.imports, fused
         )
-    config = config_registry.muse_glimmer_30b()
-    self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
-    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
-    self.assertNotEqual(config.tpu_config.graph_trainer_fsdp_schedule, "none")
+    for name in (
+        "muse_glimmer_30b_full_logits",
+        "muse_glimmer_30b_fused_ce",
+    ):
+      with self.subTest(name):
+        config = getattr(config_registry, name)()
+        self.assertEqual(
+            config.parallelism.fsdp_reshard_after_forward, "always"
+        )
+        self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
+        self.assertNotEqual(
+            config.tpu_config.graph_trainer_fsdp_schedule, "none"
+        )
 
   def test_30b_fused_ce_recipe_passes_logit_transform_check(self):
     """Tests that the 30B head and loss agree on cap and 0.196 multiplier."""
-    config = config_registry.muse_glimmer_30b()
+    config = config_registry.muse_glimmer_30b_fused_ce()
     self.assertAlmostEqual(config.loss.output_multiplier, 0.19611613513)
     self.assertIsNotNone(config.loss.soft_cap)
     model = self._build_fused_ce_model(config)

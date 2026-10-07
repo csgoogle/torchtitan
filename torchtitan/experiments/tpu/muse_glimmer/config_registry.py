@@ -21,9 +21,8 @@ from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 __all__ = [
     "muse_glimmer_debugmodel",
     "muse_glimmer_debugmodel_fused_ce",
-    "muse_glimmer_30b",
     "muse_glimmer_30b_full_logits",
-    "reg_trainer_muse_glimmer_30b",
+    "muse_glimmer_30b_fused_ce",
     "reg_trainer_muse_glimmer_30b_fused_ce",
 ]
 
@@ -176,10 +175,10 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
           components=["model"],
       ),
       # JAX Pallas Splash (kernels/splash_attention.py): LocalMask for the 39
-      # sliding-window layers, causal for the 13 global ones. Tokamax Splash is
-      # left off: its GQA backward is wrong with segment IDs at head (dk/dv
-      # keep only the last q head of each KV group), and Muse has 32 Q / 2 KV
-      # heads.
+      # sliding-window layers, causal for the 13 global ones. Tokamax Splash
+      # (0.0.14) measured ~5% slower: its wrapper has no document-aware block
+      # skipping, so the global layers compute cross-document blocks of the
+      # packed rows.
       splash_attention_kernel=SplashAttentionKernelConfig(
           use_splash_attention_kernel=True,
           sa_block_q=1024,
@@ -203,7 +202,16 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
 
 
 def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
-  """``muse_glimmer_30b`` without the fused loss (full fp32 logits)."""
+  """Muse Glimmer 30B GraphTrainer recipe for a tpu7x-4x4x4 slice.
+
+  SimpleFSDP Zero-3 over all devices with the prefetch FSDP schedule, full
+  graph rematerialization, JAX Pallas Splash attention and plain cross entropy
+  over the full logits. The 4x4x4 libtpu flags ride on the config.
+
+  At the default 16384 tokens per device this is ~2% faster than
+  ``muse_glimmer_30b_fused_ce`` at the same peak HBM. Switch to the fused
+  variant when raising the tokens per microbatch: the logits grow with it.
+  """
   config = _muse_glimmer_30b_base()
   # Zero-3: Zero-2 would keep all ~60 GiB of gathered BF16 weights resident.
   config.parallelism.fsdp_reshard_after_forward = "always"
@@ -221,24 +229,26 @@ def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
   return config
 
 
-def muse_glimmer_30b() -> TPUTrainerConfig:
-  """Muse Glimmer 30B GraphTrainer recipe for a tpu7x-4x4x4 slice.
+def muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
+  """``muse_glimmer_30b_full_logits`` with the soft-capped fused loss.
 
-  SimpleFSDP Zero-3 over all devices with the prefetch FSDP schedule, full
-  graph rematerialization, JAX Pallas Splash attention and the soft-capped
-  fused cross entropy, so the [tokens, 202048] fp32 logits are never
-  materialized. The 4x4x4 libtpu flags ride on the config.
+  The LM-head matmul, soft cap and cross entropy run as one Pallas kernel, so
+  the [tokens, 202048] fp32 logits are never materialized. At two 16384-token
+  sequences per device peak HBM is ~52 GiB vs ~88 GiB with full logits.
   """
   config = muse_glimmer_30b_full_logits()
   _enable_pallas_cross_entropy(config)
   return config
 
 
-def reg_trainer_muse_glimmer_30b() -> TPUTrainerConfig:
-  """Muse Glimmer 30B on the regular ``TPUTrainer`` (full fp32 logits).
+def reg_trainer_muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
+  """Muse Glimmer 30B on the regular ``TPUTrainer`` with the fused loss.
 
   The per-layer compile, selective AC and graph-split setup tuned on
-  tpu7x-2x2x2, with the same model, data and flags as ``muse_glimmer_30b``.
+  tpu7x-2x2x2, with the same model, data and flags as
+  ``muse_glimmer_30b_full_logits``.
+  The fused loss is required: with full logits this trainer runs out of HBM
+  at step 1 on tpu7x-4x4x4.
   """
   config = _muse_glimmer_30b_base()
   config.tpu_config = TPUConfig(
@@ -247,11 +257,5 @@ def reg_trainer_muse_glimmer_30b() -> TPUTrainerConfig:
       compile_mode="layer",
       compile_grad_norm=True,
   )
-  return config
-
-
-def reg_trainer_muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
-  """``reg_trainer_muse_glimmer_30b`` with the soft-capped fused loss."""
-  config = reg_trainer_muse_glimmer_30b()
   _enable_pallas_cross_entropy(config)
   return config

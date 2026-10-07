@@ -27,18 +27,19 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **GraphTrainer, Zero-3**: SimpleFSDP with parameters resharded after forward,
   full graph rematerialization, the optimizer compiled into the graph, and the
   `prefetch` FSDP schedule. Layers are not scanned (see "Scan" below).
-- **Soft-capped fused cross entropy**: the LM-head matmul, soft cap, and cross
-  entropy run as one Pallas kernel, one vocab tile at a time, so the
-  `[16384, 202048]` logits are never materialized (the TPU counterpart of
-  upstream's `ChunkedLossWrapper`). At local batch 1 on GraphTrainer it is ~2%
-  slower than full logits; it is what lets the regular trainer fit, and it
-  saves ~36 GiB at local batch 2.
+- **Full logits by default**: at local batch 1 the `[16384, 202048]` logits
+  fit, and plain cross entropy is ~2% faster than the fused kernel at the same
+  peak HBM. `muse_glimmer_30b_fused_ce` runs the LM-head matmul, soft cap, and
+  cross entropy as one Pallas kernel, one vocab tile at a time, so the logits
+  are never materialized (the TPU counterpart of upstream's
+  `ChunkedLossWrapper`). Use it when raising tokens per microbatch: at local
+  batch 2 it saves ~36 GiB. The regular trainer needs it to fit.
 - **Attention**: the JAX Pallas Splash Attention kernel
   (`jax.experimental.pallas.ops.tpu.splash_attention`, via
   `kernels/splash_attention.py`) with 1024 tiles: a local mask for the 39
   sliding-window layers and a causal mask for the 13 global ones. The tokamax
-  Splash kernel is not used because tokamax 0.0.14+ computes wrong dK/dV for
-  GQA with segment IDs, and Muse has 32 Q / 2 KV heads.
+  Splash kernel (0.0.14) measured ~5% slower: its wrapper does not yet skip
+  blocks that cross packed-document boundaries.
 - **Config-carried flags**: libtpu init flags (p-state 7, scoped VMEM, SparseCore
   collective offload including hierarchical reduce-scatter) ride on the config
   and are exported before PJRT initialization, so the command below does not
@@ -73,7 +74,7 @@ gcluster job submit \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
     --module=torchtitan.experiments.tpu.muse_glimmer \
-    --config=muse_glimmer_30b \
+    --config=muse_glimmer_30b_full_logits \
     --training.steps=30"
 ```
 
@@ -84,11 +85,11 @@ should observe the following per-device metrics averaged over steps 10-30 (as
 of 10/7/2026, measured with the command above, i.e. on the default `c4_test`
 dataset and test tokenizer):
 
-- **TPS (Tokens per second)**: ~2,851
-- **TFLOPS**: ~494.5
-- **MFU**: ~42.9%
-- **Step Time (time_end_to_end)**: ~5.75s
-- **Physical peak HBM**: 46.12GiB (48.0%)
+- **TPS (Tokens per second)**: ~2,913
+- **TFLOPS**: ~505.3
+- **MFU**: ~43.8%
+- **Step Time (time_end_to_end)**: ~5.62s
+- **Physical peak HBM**: 46.18GiB
 
 Compile and initialization take about 5 minutes before the first step.
 
@@ -97,17 +98,18 @@ graph; gradient clipping is still applied there.
 
 ## Alternative configurations
 
-Measured the same way as above (10/7/2026, steps 10-30, per device):
+Measured the same way as above (10/7/2026, sequence 16384, steps 10-30, per
+device):
 
 | Configuration | Step time | TPS | MFU | HBM | Notes |
 |---|---|---|---|---|---|
-| `muse_glimmer_30b` (this recipe) | ~5.75s | ~2,851 | ~42.9% | 46.12GiB | |
-| `muse_glimmer_30b_full_logits` | ~5.62s | ~2,913 | ~43.8% | 46.18GiB | GraphTrainer, plain cross entropy |
-| `reg_trainer_muse_glimmer_30b_fused_ce` | ~5.67s | ~2,889 | ~43.5% | — | Regular trainer (defer-and-fuse eager, per-layer compile); ~2.5 min startup; logs real `grad_norm` |
-| `reg_trainer_muse_glimmer_30b` | — | — | — | — | Out of HBM at step 1 (6.17 GiB bf16 logits) |
-| `muse_glimmer_30b`, local batch 2 | ~11.92s | ~2,748 | ~41.3% | 51.84GiB | `--training.num_tokens_per_microbatch_per_dp_rank=32768` |
-| `muse_glimmer_30b_full_logits`, local batch 2 | ~11.73s | ~2,794 | ~42.0% | 87.62GiB | |
-| `muse_glimmer_30b`, default libtpu flags only | ~7.35s | ~2,229 | ~33.5% | 88.71GiB | The 4x4x4 flags are worth ~28% |
+| `muse_glimmer_30b_full_logits` (this recipe) | ~5.62s | ~2,913 | ~43.8% | 46.18GiB | GraphTrainer, full logits |
+| `muse_glimmer_30b_fused_ce` | ~5.75s | ~2,851 | ~42.9% | 46.12GiB | GraphTrainer, fused cross entropy |
+| `reg_trainer_muse_glimmer_30b_fused_ce` | ~5.67s | ~2,889 | ~43.5% | — | Regular trainer (defer-and-fuse eager, per-layer compile); ~2.5 min startup; logs real `grad_norm`. Out of HBM at step 1 with full logits |
+| `muse_glimmer_30b_full_logits`, local batch 2 | ~11.73s | ~2,794 | ~42.0% | 87.62GiB | `--training.num_tokens_per_microbatch_per_dp_rank=32768` |
+| `muse_glimmer_30b_fused_ce`, local batch 2 | ~11.92s | ~2,748 | ~41.3% | 51.84GiB | |
+| `muse_glimmer_30b_fused_ce`, tokamax Splash | ~6.05s | ~2,708 | ~40.7% | 46.17GiB | `--splash_attention_kernel.use_tokamax_splash_attention_kernel` |
+| `muse_glimmer_30b_fused_ce`, default libtpu flags only | ~7.35s | ~2,229 | ~33.5% | 88.71GiB | The 4x4x4 flags are worth ~28% |
 
 The regular trainer's memory column uses different accounting and is omitted.
 
