@@ -1,6 +1,7 @@
 """Base class and helper functions for distributed accelerator tests."""
 
 import enum
+import importlib
 import os
 import subprocess
 import tempfile
@@ -503,8 +504,15 @@ def _run_cpu_verification(
     grad_rtol: float,
     param_atol: float,
     param_rtol: float,
+    cpu_config_fn: str | None = None,
 ):
-  """Runs the CPU verification in a separate process."""
+  """Runs the CPU verification in a separate process.
+
+  ``cpu_config_fn`` ("module:function") is applied to the parsed CPU config
+  after the generic single-device overrides, for lanes whose accelerator-only
+  choices are not CLI flags (e.g. the HF backend's attention implementation
+  and fused loss live on the model spec).
+  """
   logging.info("[Child Process] Starting CPU Training (Verifying)...")
 
   # The device is CPU because run_in_subprocess launched this process with a
@@ -539,6 +547,12 @@ def _run_cpu_verification(
   if hasattr(cpu_config, "splash_attention_kernel"):
     cpu_config.splash_attention_kernel.use_splash_attention_kernel = False
     cpu_config.splash_attention_kernel.use_tokamax_splash_attention_kernel = False
+
+  if cpu_config_fn is not None:
+    module_name, function_name = cpu_config_fn.split(":")
+    cpu_config = getattr(importlib.import_module(module_name), function_name)(
+        cpu_config
+    )
 
   # Setup validator callback
   validator = numerical_validation.StateValidatorCallback(
@@ -594,12 +608,10 @@ def _run_cpu_verification(
     mock_dataloader = []
     for step in sorted(recorded_history.keys()):
       if "inputs" in recorded_history[step] and "labels" in recorded_history[step]:
-        mock_dataloader.append(
-            (
-                {"input": recorded_history[step]["inputs"]},
-                recorded_history[step]["labels"],
-            )
-        )
+        input_dict = {"input": recorded_history[step]["inputs"]}
+        if "positions" in recorded_history[step]:
+          input_dict["positions"] = recorded_history[step]["positions"]
+        mock_dataloader.append((input_dict, recorded_history[step]["labels"]))
       else:
         raise RuntimeError(f"Step {step} missing recorded inputs/labels!")
 
@@ -806,6 +818,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
       param_rtol: float = 5e-3,
       enable_compile: bool = False,
       data_parallel_replicate_degree: int | None = None,
+      cpu_config_fn: str | None = None,
   ):
     """Orchestrates a distributed parity test: Record Distributed -> Verify on CPU."""
     if skip_devices and self.accelerator_device_type in skip_devices:
@@ -859,6 +872,7 @@ class BaseDistributedDeviceTest(parameterized.TestCase):
                 param_atol,
                 param_rtol,
             ],
+            kwargs={"cpu_config_fn": cpu_config_fn},
         )
       except subprocess.CalledProcessError as e:
         self.fail(f"Isolated subprocess failed with exit code {e.returncode}.\nstdout:\n{e.stdout}\nstderr:\n{e.stderr}")

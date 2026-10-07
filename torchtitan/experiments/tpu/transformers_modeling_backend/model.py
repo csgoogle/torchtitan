@@ -29,6 +29,7 @@ class's ``Config`` (``as_tpu_model_config``) so ``Config.build`` constructs a
 ``TPUHFTransformerModel``.
 """
 
+import ast
 import contextlib
 import copy
 from dataclasses import dataclass
@@ -36,7 +37,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import AttentionInterface, PreTrainedModel
 
 from torchtitan.experiments.transformers_modeling_backend.model import (
     _ATTN_IMPLEMENTATION as _FLEX_IMPLEMENTATION,
@@ -46,6 +47,12 @@ from torchtitan.experiments.transformers_modeling_backend.model import (
 from torchtitan.tools.logging import logger
 
 from . import _meta_init, _structure
+# Registers ``attn_implementation="splash_tpu"`` with HF's AttentionInterface.
+# Imported here, not only by the config registry: a worker that receives the
+# Config by pickle (the test harness, any custom entry point) imports this
+# module and nothing else from the lane, and an unregistered name would be
+# quietly built as sdpa.
+from . import attention as _attention  # noqa: F401  pylint: disable=unused-import
 
 
 class _Attrs:
@@ -57,6 +64,23 @@ class _Attrs:
   def __getattr__(self, name):
     v = self._d.get(name)
     return _Attrs(v) if isinstance(v, dict) else v
+
+
+def _parse_config_overrides(spec: str) -> dict:
+  """Parse ``"a=1,b=0.5,c=foo"`` into ``{"a": 1, "b": 0.5, "c": "foo"}``.
+
+  Values are Python literals when they parse as one, otherwise strings.
+  """
+  out = {}
+  for item in filter(None, (s.strip() for s in spec.split(","))):
+    if "=" not in item:
+      raise ValueError(f"hf_config_overrides: expected key=value, got {item!r}")
+    key, raw = (x.strip() for x in item.split("=", 1))
+    try:
+      out[key] = ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+      out[key] = raw
+  return out
 
 
 class TPUHFTransformerModel(HFTransformerModel):
@@ -101,6 +125,8 @@ class TPUHFTransformerModel(HFTransformerModel):
         self.head_dim = _structure.derive_head_dim(_Attrs(raw))
 
       HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
+      self._complete_from_hf_config(hf_model_id)
+
 
       # is_moe was decided from the *flavor* in __init__, before --hf-model
       # had been applied, so a MoE checkpoint selected on the command line
@@ -131,13 +157,109 @@ class TPUHFTransformerModel(HFTransformerModel):
       # the patch states its own 1.0 directly.
       self.initializer_range = raw.get("initializer_range", 0.02)
 
+      # Per-run HF config overrides from the job config (``key=value`` pairs,
+      # e.g. zeroing a checkpoint's attention dropout because the splash
+      # kernel has no dropout path), applied last so they win over both the
+      # checkpoint and the flavor. An unknown field is an error, not a no-op.
+      for key, value in _parse_config_overrides(
+          getattr(config, "hf_config_overrides", "")
+      ).items():
+        if not hasattr(self, key):
+          raise ValueError(
+              f"hf_config_overrides: {hf_model_id} config has no field {key!r}"
+          )
+        setattr(self, key, value)
       return self
+
+    def _complete_from_hf_config(self, hf_model_id: str) -> None:
+      """Carry over what the base's attribute copy misses from the HF config.
+
+      The base copies ``vars(hf_config)`` minus underscore keys and the
+      architecture name from the causal-LM mapping. Four things fall through
+      that net, each measured on the 2026-09-30 200-model sweep:
+
+      - a composite checkpoint whose text tower has no causal-LM class
+        (Qwen2-VL's ``qwen2_vl_text``, CLIP's ``clip_text_model``): take the
+        bare model class from the AutoModel mapping; the attached lm_head
+        supplies the vocabulary projection;
+      - HF config *properties* (ModernBERT's ``sliding_window``, Gemma-4's
+        ``layer_types``) exist on the HF config class, not in ``vars``;
+      - private fields the modeling code reads (OPT's
+        ``_remove_final_layer_norm``);
+      - an HF ``attribute_map`` entry that inverts a backend alias
+        (DistilBERT: ``hidden_size -> dim`` vs the backend's
+        ``dim -> hidden_size``) recurses on every read.
+      """
+      import inspect
+
+      from transformers import AutoConfig
+
+      from torchtitan.experiments.transformers_modeling_backend.model import (
+          _REMOTE_CONFIG_DENYLIST,
+      )
+
+      raw, _ = PretrainedConfig.get_config_dict(hf_model_id)
+      top_config = AutoConfig.from_pretrained(
+          hf_model_id,
+          trust_remote_code=raw.get("model_type", "") not in _REMOTE_CONFIG_DENYLIST,
+      )
+      hf_config = getattr(top_config, "text_config", None) or top_config  # the base builds the text tower
+      # model_type is a class attribute on HF configs, so the base's vars()
+      # copy never carries it; the resolution below needs it.
+      if not getattr(self, "model_type", None):
+        self.model_type = hf_config.model_type
+
+      # Break alias cycles between HF's attribute_map and the backend's.
+      tt_to_hf = getattr(self, "_tt_to_hf_attribute_map", {})
+      for hf_name, real in list(getattr(self, "attribute_map", {}).items()):
+        if tt_to_hf.get(real) == hf_name:
+          del self.attribute_map[hf_name]
+          if real in self.__dict__ and hf_name not in self.__dict__:
+            self.__dict__[hf_name] = self.__dict__[real]
+
+      # Class properties and private fields of the HF config class.
+      for name, member in inspect.getmembers(type(hf_config)):
+        if isinstance(member, property) and not hasattr(type(self), name):
+          try:
+            setattr(self, name, getattr(hf_config, name))
+          except Exception:  # a property that needs state we do not carry
+            pass
+      skip = {"_attn_implementation", "_attn_implementation_internal", "_name_or_path",
+              "_commit_hash", "_experts_implementation", "_output_attentions"}
+      for key, value in vars(hf_config).items():
+        if key.startswith("_") and key not in skip and not hasattr(self, key):
+          setattr(self, key, value)
+
+      # A text tower with no causal-LM class: build the bare text model. The
+      # AutoModel mapping knows some (Qwen2-VL's Qwen2VLTextModel); the rest
+      # (SiglipTextModel, BlipTextModel, ClapTextModel, Kosmos2TextModel)
+      # are only reachable as <Prefix>TextModel in the parent's module.
+      if not getattr(self, "architectures", None):
+        import importlib
+
+        from transformers.models.auto.modeling_auto import MODEL_MAPPING_NAMES
+
+        cls_name = MODEL_MAPPING_NAMES.get(hf_config.model_type)
+        if cls_name is None and top_config is not hf_config:
+          try:
+            module = importlib.import_module(
+                f"transformers.models.{top_config.model_type.replace('-', '_')}"
+            )
+            cls_name = next(
+                (n for n in dir(module) if n.endswith("TextModel") and not n.startswith("_")),
+                None,
+            )
+          except ImportError:
+            cls_name = None
+        if cls_name:
+          self.architectures = [cls_name]
 
   def __init__(self, config: Config):
     # Set before the base __init__ runs: its layer conversion goes through
     # the ``layers`` property, and ``norm`` / ``lm_head`` consult these.
     object.__setattr__(self, "_added_norm", None)
     object.__setattr__(self, "_added_lm_head", None)
+    object.__setattr__(self, "_context_length", None)
     super().__init__(config)
 
     self._position_capacity = _structure.position_capacity(self.model)
@@ -247,6 +369,10 @@ class TPUHFTransformerModel(HFTransformerModel):
     # out at 2046 and the last two positions of every batch read out of range
     # -- silently on TPU, where the gather clamps.
     wanted = getattr(config, "max_seq_len", None)
+    # Remembered before the growth below: max_seq_len aliases
+    # max_position_embeddings, so after growing the table it reads the table
+    # size, not the context length forward bounds positions by.
+    self._context_length = wanted or None
     if wanted:
       try:
         with torch.device("meta"):
@@ -292,6 +418,15 @@ class TPUHFTransformerModel(HFTransformerModel):
     slower is not attention that is wrong.
     """
     wanted = getattr(config, "_attn_implementation", None)
+    if wanted == "splash_tpu" and wanted not in AttentionInterface._global_mapping:
+      # Not an architecture limit -- the adapter was never imported in this
+      # process. Falling back here would train on sdpa under a config that
+      # says splash, which is the silent no-op this lane refuses to allow.
+      raise RuntimeError(
+          f"attn_implementation={wanted!r} is not registered with HF's "
+          "AttentionInterface in this process (import "
+          "torchtitan.experiments.tpu.transformers_modeling_backend.attention)."
+      )
     attempts = [wanted] + [a for a in ("sdpa", "eager") if a != wanted]
     last = None
     for attempt in attempts:
@@ -468,7 +603,15 @@ class TPUHFTransformerModel(HFTransformerModel):
     if attention_masks is not None:
       kwargs["attention_mask"] = attention_masks
 
-    self._check_position_capacity(model_args[0].shape[-1])
+    # The trainer folds the batch into one token-major stream, so the stream
+    # is BS x seq_len long while the position table only has to cover one
+    # sample: with per-document ``positions`` (reset at every sample boundary)
+    # the largest index is bounded by the context length, not the stream.
+    # Without them the arange above runs the full stream.
+    if positions is not None and self._context_length:
+      self._check_position_capacity(min(model_args[0].shape[-1], self._context_length))
+    else:
+      self._check_position_capacity(model_args[0].shape[-1])
 
     # An encoder-decoder (T5, BART, Marian, mBART) will not run without
     # something to feed its decoder. Teacher-force the same sequence, which
@@ -559,10 +702,20 @@ class TPUHFTransformerModel(HFTransformerModel):
     saved = self.model.config.initializer_range
     if patched:
       self.model.config.initializer_range = 1.0
+    # Sentinel: every parameter starts as NaN, so one the initializer never
+    # wrote is detectable afterwards instead of training on to_empty garbage.
+    # The base's Llama-like patch is installed on PreTrainedModel itself and
+    # dispatches on Llama's attribute names, so a model that merely shares
+    # the class-name pattern (OPT: out_proj / fc1 / fc2, with biases) gets
+    # part of its weights skipped -- measured as loss nan from step 1.
+    with torch.no_grad():
+      for p in self.model.parameters():
+        p.fill_(float("nan"))
     try:
       super().init_states(buffer_device=buffer_device)
     finally:
       self.model.config.initializer_range = saved
+    self._init_untouched_parameters()
 
     # Titan MoE modules swapped in by moe_replacement initialize themselves at
     # parallelize time (to_empty(cpu) + init_states(cpu)), but the trainer
@@ -580,6 +733,33 @@ class TPUHFTransformerModel(HFTransformerModel):
       self._added_lm_head.weight = self.tok_embeddings.weight
 
     self._reassert_device()
+
+  def _init_untouched_parameters(self) -> None:
+    """Initialize parameters the model's own init never wrote (still NaN).
+
+    Default HF semantics for what the Llama-like patch skips: weights at the
+    config's init std, biases and anything one-dimensional at zero. Logged so
+    a model relying on this is visible rather than silently different.
+    """
+    std = float(getattr(self.model.config, "init_std", None)
+                or getattr(self.model.config, "initializer_range", None) or 0.02)
+    touched_up = []
+    with torch.no_grad():
+      for name, p in self.model.named_parameters():
+        if not torch.isnan(p).any():
+          continue
+        if p.dim() >= 2:
+          nn.init.trunc_normal_(p, mean=0.0, std=std, a=-3 * std, b=3 * std)
+        else:
+          p.zero_()
+        touched_up.append(name)
+    if touched_up:
+      logger.warning(
+          "%d parameter(s) were left uninitialized by %s's init and were set to "
+          "HF defaults (std %.3g / zero): %s%s",
+          len(touched_up), type(self.model).__name__, std,
+          ", ".join(touched_up[:6]), " ..." if len(touched_up) > 6 else "",
+      )
 
   def _init_swapped_native_modules(self) -> None:
     """Re-initialize Titan modules swapped into the HF tree after to_empty().

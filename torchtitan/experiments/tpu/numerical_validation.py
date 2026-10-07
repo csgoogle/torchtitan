@@ -64,6 +64,7 @@ class StateRecorderCallback:
       loss: torch.Tensor,
       inputs: torch.Tensor = None,
       labels: torch.Tensor = None,
+      positions: torch.Tensor = None,
   ):
     """Records the state at the current step."""
     self.history[step] = self.capture_fn(model, loss)
@@ -71,6 +72,10 @@ class StateRecorderCallback:
       self.history[step]["inputs"] = inputs.detach().cpu().clone()
     if labels is not None:
       self.history[step]["labels"] = labels.detach().cpu().clone()
+    # Packed streams carry document boundaries only in positions; a replay
+    # without them reads the whole stream as one sequence.
+    if positions is not None:
+      self.history[step]["positions"] = positions.detach().cpu().clone()
 
   def get_history(self) -> Dict[int, Any]:
     """Returns the recorded state history."""
@@ -136,8 +141,10 @@ class StateValidatorCallback:
       loss: torch.Tensor,
       inputs: torch.Tensor = None,
       labels: torch.Tensor = None,
+      positions: torch.Tensor = None,
   ):
     """Validates the current state against the reference history."""
+    del positions  # Only the recorder needs the batch.
     if not self.in_context:
       raise RuntimeError("on_step can only be called within a 'with' context.")
     if step not in self.recorded_history:
