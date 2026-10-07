@@ -219,9 +219,10 @@ def _get_moe_attr_name(layer: nn.Module) -> str:
     Models use ``mlp``; for layer-level MoE (Gemma4) the Titan MoE
     replaces ``mlp`` too.
     """
-    if hasattr(layer, "mlp"):
-        return "mlp"
-    raise AttributeError(f"Layer {type(layer).__name__} has no 'mlp'")
+    for name in ("mlp", "block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
+        if hasattr(layer, name):
+            return name
+    raise AttributeError(f"Layer {type(layer).__name__} has no MoE block")
 
 
 def _get_moe_block(layer: nn.Module) -> nn.Module:

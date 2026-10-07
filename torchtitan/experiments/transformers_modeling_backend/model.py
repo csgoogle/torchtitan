@@ -157,9 +157,13 @@ _REMOTE_CONFIG_DENYLIST = frozenset({"deepseek_v2", "deepseek_v3"})
 def _get_moe_attr_name(layer: nn.Module) -> str | None:
     """Return the attribute name holding the MoE block on a decoder layer.
 
-    Models use ``mlp``.  Returns ``None`` if not present.
+    Most models use ``mlp``; Mixtral and GraniteMoe use ``block_sparse_moe``.
+    Returns ``None`` if no candidate is present.
     """
-    return "mlp" if hasattr(layer, "mlp") else None
+    for name in ("mlp", "block_sparse_moe", "feed_forward", "moe", "mlp_moe"):
+        if hasattr(layer, name):
+            return name
+    return None
 
 
 # The backend routes attention through flex. The custom impl name is registered
@@ -772,18 +776,18 @@ class HFTransformerModel(BaseModel):
                     "HF model's built-in experts kernel."
                 )
 
-        self.model = model_cls(config=config)
+        self.model = self._build_hf_model(model_cls, config)
         self.max_seq_len = config.max_seq_len
         self.cp_mesh = None
 
         # Convert ModuleList to ModuleDict to preserve original indices
         # This ensures state dict keys match checkpoint keys
-        if isinstance(self.model.model.layers, nn.ModuleList):
-            self.model.model.layers = SliceableModuleDict(
-                {str(i): layer for i, layer in enumerate(self.model.model.layers)}
+        if isinstance(self.layers, nn.ModuleList):
+            self.layers = SliceableModuleDict(
+                {str(i): layer for i, layer in enumerate(self.layers)}
             )
 
-        for layer in self.model.model.layers.values():
+        for layer in self.layers.values():
             # Detect MoE layers by checking for gate/router and experts sub-modules.
             # Gemma4 has router/experts as siblings of the dense MLP at the
             # layer level (not inside ``mlp``).
@@ -808,6 +812,10 @@ class HFTransformerModel(BaseModel):
             from .moe_replacement import prepare_native_moe_configs
 
             prepare_native_moe_configs(self, config)
+
+    def _build_hf_model(self, model_cls, config):
+        """Construct the wrapped HF model; a subclass may prepare or retry."""
+        return model_cls(config=config)
 
     def set_cp_mesh(self, mesh):
         self.cp_mesh = mesh
