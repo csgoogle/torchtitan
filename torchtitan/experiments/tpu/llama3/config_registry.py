@@ -20,6 +20,7 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.experiments.tpu import tpu_flags
+from torchtitan.experiments.tpu.float8_converter import TpuFloat8LinearConverter
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
@@ -467,3 +468,32 @@ def llama3_70b_scan() -> TPUTrainerConfig:
 def llama3_405b_scan() -> TPUTrainerConfig:
   """Llama3 405B on the scan lane. Layerwise does not compile at this size."""
   return _on_scan_lane(llama3_405b())
+
+
+def _with_float8(
+    config: TPUTrainerConfig, flavor: str, recipe_name: str = "rowwise"
+) -> TPUTrainerConfig:
+  """Swaps `config`'s model for one with torchao Float8Linear layers.
+
+  Uses `TpuFloat8LinearConverter`, which builds a TPU-compatible torchao config
+  (see `float8_converter.py` for how it differs from the CUDA converter).
+  """
+  model_spec = model_registry(
+      flavor,
+      attn_backend="sdpa",
+      converters=[
+          TpuFloat8LinearConverter.Config(
+              recipe_name=recipe_name,
+              filter_fqns=["lm_head", "output"],
+          )
+      ],
+  )
+  # model_registry installs the GPU parallelize_fn; restore the TPU one.
+  model_spec.parallelize_fn = config.model_spec.parallelize_fn
+  config.model_spec = model_spec
+  return config
+
+
+def llama3_70b_float8() -> TPUTrainerConfig:
+  """`llama3_70b` with torchao rowwise float8 linears."""
+  return _with_float8(llama3_70b(), "70B")
