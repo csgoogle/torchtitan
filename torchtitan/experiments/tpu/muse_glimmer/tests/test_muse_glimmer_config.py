@@ -381,14 +381,14 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     )
 
   @parameterized.parameters(
-      ("muse_glimmer_30b_full_logits", True, False),
-      ("muse_glimmer_30b_fused_ce", True, True),
-      ("reg_trainer_muse_glimmer_30b_fused_ce", False, True),
+      ("muse_glimmer_30b_full_logits", True, False, "fused"),
+      ("muse_glimmer_30b_fused_ce", True, True, "fused"),
+      ("reg_trainer_muse_glimmer_30b_fused_ce", False, True, "foreach"),
   )
-  def test_30b_recipe_trainer_and_loss_selection(
-      self, name, graph_trainer, fused
+  def test_30b_recipe_trainer_loss_and_optimizer_selection(
+      self, name, graph_trainer, fused, optimizer_implementation
   ):
-    """Tests which 30B recipes use GraphTrainer and the fused loss."""
+    """Tests each 30B recipe's trainer, loss and AdamW implementation."""
     config = getattr(config_registry, name)()
     self.assertEqual(config.tpu_config.use_graph_trainer, graph_trainer)
     self.assertEqual(
@@ -396,6 +396,9 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
     )
     self.assertEqual(
         _FUSED_LOSS_OVERRIDE_PATH in config.override.imports, fused
+    )
+    self.assertEqual(
+        config.optimizer.implementation, optimizer_implementation
     )
 
   @parameterized.parameters(
