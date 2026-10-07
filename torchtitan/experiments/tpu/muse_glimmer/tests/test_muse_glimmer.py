@@ -99,6 +99,9 @@ FULL_MODEL_TEST_CONFIGS = [
         testcase_name="_TESTMODEL",
         model_name="testmodel",
         loss_atol=1e-1,
+        # Adam (lr 0.01) amplifies the bf16-pass attention error, so the step-2
+        # loss drifts further on TPU: 0.33 off on the OSS torch_tpu stack.
+        loss_atol_tpu=5e-1,
         loss_rtol=1e-2,
         grad_atol=2.5,  # Grad noise builds up over multiple steps
         grad_atol_tpu=5.0,  # Plus bf16-pass attention on TPU (see _attn_tol)
@@ -610,6 +613,7 @@ class MuseGlimmerTest(base_device_test.BaseAcceleratorDeviceTest):
       self,
       model_name,
       loss_atol,
+      loss_atol_tpu,
       loss_rtol,
       grad_atol,
       grad_atol_tpu,
@@ -627,7 +631,7 @@ class MuseGlimmerTest(base_device_test.BaseAcceleratorDeviceTest):
 
     self._run_full_model_training_steps_parity_test(
         model_cpu=model_cpu,
-        loss_atol=loss_atol,
+        loss_atol=self._attn_tol(loss_atol, loss_atol_tpu),
         loss_rtol=loss_rtol,
         grad_atol=self._attn_tol(grad_atol, grad_atol_tpu),
         grad_rtol=grad_rtol,
