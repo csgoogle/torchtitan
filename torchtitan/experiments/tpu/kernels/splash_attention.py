@@ -1,7 +1,7 @@
 """Splash Attention integration for torch_tpu via Pallas.
 
 Wraps JAX's splash_attention_kernel for use with PyTorch tensors on TPU.
-Uses torch_tpu._internal.pallas.custom_jax_kernel() to bridge JAX -> PyTorch.
+Uses torch.tpu.pallas.jax_op to bridge JAX -> PyTorch.
 """
 
 import hashlib
@@ -22,9 +22,8 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 
 # torch_tpu Pallas bridge
-from torch_tpu._internal import pallas
-
-custom_jax_kernel = pallas.custom_jax_kernel
+import torch_tpu  # pylint: disable=unused-import
+from torch.tpu import pallas  # pyrefly: ignore[missing-import]
 
 _DEFAULT_MASK_VALUE = splash_attention_kernel.DEFAULT_MASK_VALUE
 
@@ -253,7 +252,12 @@ def _make_splash_attention_fn(
     return out_b, logsumexp_b
 
   @jax.jit
-  def splash_fn(q, k, v, segment_ids=None):
+  def splash_fn(
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      segment_ids: jax.Array | None = None,
+  ) -> tuple[jax.Array, jax.Array]:
     """Forward: returns (out, logsumexp) for the whole batch."""
     head_dim = q.shape[-1]
     scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
@@ -344,7 +348,15 @@ def _make_splash_attention_fn(
     return carry, (dq_scaled_b, dk_b, dv_b)
 
   @jax.jit
-  def splash_bwd_fn(q, k, v, out, logsumexp, g, segment_ids=None):
+  def splash_bwd_fn(
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      out: jax.Array,
+      logsumexp: jax.Array,
+      g: jax.Array,
+      segment_ids: jax.Array | None = None,
+  ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Backward: uses saved (out, logsumexp) — no extra forward pass.
 
     Supports both `jax.vmap` and `jax.lax.scan` over the batch dimension.
@@ -404,21 +416,14 @@ def _get_splash_op_names(**splash_kwargs):
     return _splash_op_name_cache[cache_key]
 
   splash_fn, splash_bwd_fn = _make_splash_attention_fn(**splash_kwargs)
-  torch_fwd_fn = custom_jax_kernel(splash_fn, name="splash_attention")
-  torch_bwd_fn = custom_jax_kernel(splash_bwd_fn, name="splash_attention_bwd")
 
   # Truncate SHA-256 to 16 hex characters (64 bits) for op name readability.
   identifier = hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()[:16]
   op_fwd_name = f"splash_attn_fwd_{identifier}"
   op_bwd_name = f"splash_attn_bwd_{identifier}"
-  torch_fwd_fn = torch.library.custom_op(
+  torch_fwd_fn = pallas.jax_op(
       f"pallas::{op_fwd_name}",
-      torch_fwd_fn,
-      mutates_args=(),
-      schema=(
-          "(Tensor q, Tensor k, Tensor v, Tensor? segment_ids) -> (Tensor,"
-          " Tensor)"
-      ),
+      splash_fn,
   )
   torch_fwd_fn.register_fake(  # pyrefly: ignore[missing-attribute]
       # lse: (batch, num_q_heads, q_seq_len, ??)
@@ -434,14 +439,9 @@ def _get_splash_op_names(**splash_kwargs):
       )
   )
 
-  torch_bwd_fn = torch.library.custom_op(
+  torch_bwd_fn = pallas.jax_op(
       f"pallas::{op_bwd_name}",
-      torch_bwd_fn,
-      mutates_args=(),
-      schema=(
-          "(Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, Tensor"
-          " grad_out, Tensor? segment_ids) -> (Tensor, Tensor, Tensor)"
-      ),
+      splash_bwd_fn,
   )
   torch_bwd_fn.register_fake(  # pyrefly: ignore[missing-attribute]
       lambda q, k, v, out, lse, grad_out, segment_ids=None: (
