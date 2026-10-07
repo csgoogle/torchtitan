@@ -459,6 +459,24 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
+      # Fused Pallas CE with the SoftCappedLinear head's soft-cap applied
+      # in-kernel (1024 tokens per rank = one b_block).
+      dict(
+          testcase_name="muse_glimmer_simplefsdp_fused_ce",
+          module="torchtitan.experiments.tpu.muse_glimmer",
+          config="muse_glimmer_debugmodel_fused_ce",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
       dict(
           # TP=2 divides the debugmodel's 2 KV heads. dp_shard is inferred:
           # 1 with 2 ranks (CPU/GPU), 4 on tpu_4x2x1.

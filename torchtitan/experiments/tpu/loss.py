@@ -23,6 +23,8 @@ def pallas_cross_entropy_loss(
     b_block_size: int = 1024,
     h_block_size: int = 512,
     v_block_size: int = 2048,
+    soft_cap: float | None = None,
+    output_multiplier: float = 1.0,
 ) -> torch.Tensor:
   """Compute sum-reduced linear cross entropy without materializing logits.
 
@@ -32,6 +34,10 @@ def pallas_cross_entropy_loss(
   cross entropy together. It also flattens TorchTitan's batched shapes to the
   token-major shapes required by Tokamax and rejects incompatible Mosaic tiles
   instead of silently switching kernels.
+
+  ``soft_cap`` / ``output_multiplier`` reproduce a ``SoftCappedLinear`` LM head
+  (``logits = cap * tanh(z * mul / cap)``, or ``z * mul`` without a cap) inside
+  the kernel; the defaults are the identity, i.e. a plain ``Linear`` head.
   """
   if not isinstance(pred, tuple) or len(pred) != 2:
     raise ValueError("Pallas loss requires (x, weights) as input")
@@ -61,6 +67,8 @@ def pallas_cross_entropy_loss(
   # the fixed token count required by the kernel, but zero those hidden states
   # and use an in-range label. Each ignored row then contributes exactly
   # log(vocab_size), which is removed from the sum below, with zero gradient.
+  # This still holds with the logit transform: zero hidden states give z = 0
+  # and both tanh(0) and 0 * mul are 0, so the row's logits stay all-zero.
   ignored = labels == components_loss.IGNORE_INDEX
   x = torch.where(ignored.unsqueeze(-1), torch.zeros_like(x), x)
   labels = torch.where(ignored, torch.zeros_like(labels), labels)
@@ -86,6 +94,8 @@ def pallas_cross_entropy_loss(
       b_block_size=b_block_size,
       h_block_size=h_block_size,
       v_block_size=v_block_size,
+      soft_cap=soft_cap,
+      output_multiplier=output_multiplier,
   )
   return loss_sum - ignored.sum().to(loss_sum.dtype) * math.log(weights.shape[-1])
 
@@ -98,6 +108,12 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
   the same component as every other TorchTitan loss. ``BaseLoss`` also applies
   TorchTitan's global-valid-token normalization after the kernel's sum
   reduction.
+
+  ``soft_cap`` / ``output_multiplier`` must mirror the LM head the fused-loss
+  override replaced: the wrapper only hands over ``(hidden, weight.T)``, so the
+  head's elementwise logit transform (Muse Glimmer's ``SoftCappedLinear``) is
+  re-applied here, inside the kernel. Recipes copy the two values from
+  ``model_spec.model.lm_head`` when they select this loss.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -106,6 +122,16 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
     b_block_size: int = 1024
     h_block_size: int = 512
     v_block_size: int = 2048
+    soft_cap: float | None = None
+    """Tanh soft-cap on the logits.
+
+    Mirrors ``SoftCappedLinear.output_soft_cap_temp``.
+    """
+    output_multiplier: float = 1.0
+    """Logit multiplier applied before the cap.
+
+    Mirrors ``SoftCappedLinear.output_multiplier``.
+    """
 
   def __init__(
       self,
@@ -120,11 +146,15 @@ class PallasCrossEntropyLoss(components_loss.BaseLoss):
         b_block_size=config.b_block_size,
         h_block_size=config.h_block_size,
         v_block_size=config.v_block_size,
+        soft_cap=config.soft_cap,
+        output_multiplier=config.output_multiplier,
     )
     self.implementation = config.implementation
     self.b_block_size = config.b_block_size
     self.h_block_size = config.h_block_size
     self.v_block_size = config.v_block_size
+    self.soft_cap = config.soft_cap
+    self.output_multiplier = config.output_multiplier
     self._maybe_compile(compile_config)
 
 

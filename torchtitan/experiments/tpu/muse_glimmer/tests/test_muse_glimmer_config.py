@@ -10,10 +10,15 @@ import dataclasses
 from absl.testing import absltest
 import torch
 from torch.nn.attention import flex_attention
+from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.config.override import apply_overrides
 from torchtitan.experiments.tpu import workarounds
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 import torchtitan.experiments.tpu.muse_glimmer as muse_glimmer_tpu
 from torchtitan.experiments.tpu.muse_glimmer import attention as tpu_attention
+from torchtitan.experiments.tpu.muse_glimmer import config_registry
 from torchtitan.experiments.tpu.muse_glimmer.infra.parallelize import parallelize_muse_glimmer
+from torchtitan.experiments.tpu.overrides import fused_loss
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common import attention as common_attention
 from torchtitan.models.common.attention import segment_ids_from_positions
@@ -272,6 +277,75 @@ class MuseGlimmerConfigTest(absltest.TestCase):
     model.lm_head = torch.nn.Linear(8, 16, bias=False)
     workarounds.use_output_projection_patch(model)
     self.assertIsInstance(model.lm_head, workarounds.PallasLossLinear)
+
+  def test_fused_ce_recipe_carries_soft_cap_into_loss(self):
+    """Tests the *_fused_ce recipe: wrapper head + capped fused loss."""
+    base = config_registry.muse_glimmer_debugmodel()
+    base_head = base.model_spec.model.lm_head
+    self.assertIsInstance(base_head, upstream_model.SoftCappedLinear.Config)
+    self.assertIsNotNone(base_head.output_soft_cap_temp)
+
+    config = config_registry.muse_glimmer_debugmodel_fused_ce()
+    self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
+    self.assertEqual(config.loss.soft_cap, base_head.output_soft_cap_temp)
+    self.assertEqual(
+        config.loss.output_multiplier, base_head.output_multiplier
+    )
+    self.assertIn(
+        "torchtitan.experiments.tpu.overrides.fused_loss."
+        "fused_loss_soft_capped_lm_head",
+        config.override.imports,
+    )
+
+    apply_overrides(config.override, config)
+    head = config.model_spec.model.lm_head
+    self.assertIsInstance(head, fused_loss.FusedLossLinearWrapper.Config)
+    self.assertEqual(head.soft_cap, base_head.output_soft_cap_temp)
+    self.assertEqual(head.output_multiplier, base_head.output_multiplier)
+
+    with torch.device("meta"):
+      model = config.model_spec.model.build()
+    self.assertIsInstance(model.lm_head, fused_loss.FusedLossLinearWrapper)
+    # The checkpoint key is unchanged, so plain-CE checkpoints load.
+    self.assertEqual(
+        [k for k in model.state_dict() if k.endswith("lm_head.weight")],
+        ["lm_head.weight"],
+    )
+
+  def _build_fused_ce_model(self, config):
+    apply_overrides(config.override, config)
+    with torch.device("meta"):
+      return config.model_spec.model.build()
+
+  def test_fused_ce_recipe_passes_logit_transform_check(self):
+    """Tests that the *_fused_ce recipe's head and loss agree."""
+    config = config_registry.muse_glimmer_debugmodel_fused_ce()
+    model = self._build_fused_ce_model(config)
+    workarounds._check_fused_loss_logit_transform(model, config)
+
+  def test_logit_transform_check_rejects_mismatched_multiplier(self):
+    """Tests the flavor-swap trap: the loss keeps a stale multiplier."""
+    config = config_registry.muse_glimmer_debugmodel_fused_ce()
+    model = self._build_fused_ce_model(config)
+    config.loss.output_multiplier = 0.196
+    with self.assertRaisesRegex(ValueError, "logit transform mismatch"):
+      workarounds._check_fused_loss_logit_transform(model, config)
+
+  def test_logit_transform_check_rejects_untransformed_loss(self):
+    """Tests that a default (uncapped) fused loss is rejected for Muse."""
+    config = config_registry.muse_glimmer_debugmodel_fused_ce()
+    model = self._build_fused_ce_model(config)
+    config.loss = PallasCrossEntropyLoss.Config()
+    with self.assertRaisesRegex(ValueError, "logit transform mismatch"):
+      workarounds._check_fused_loss_logit_transform(model, config)
+
+  def test_logit_transform_check_rejects_non_fused_loss(self):
+    """Tests that the wrapper head is rejected without a fused loss."""
+    config = config_registry.muse_glimmer_debugmodel_fused_ce()
+    model = self._build_fused_ce_model(config)
+    config.loss = CrossEntropyLoss.Config()
+    with self.assertRaisesRegex(ValueError, "PallasCrossEntropyLoss"):
+      workarounds._check_fused_loss_logit_transform(model, config)
 
 
 if __name__ == "__main__":
