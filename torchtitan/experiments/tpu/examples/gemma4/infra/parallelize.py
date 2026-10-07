@@ -81,7 +81,11 @@ def _parallelize_gemma4(
     dump_folder: str,
     skip_dp: bool = False,
 ) -> nn.Module:
-  """Apply DTensor/SPMD TP, EP, CP, AC, compile, and FSDP to Gemma4."""
+  """Apply DTensor/SPMD TP, EP, AC, compile, and FSDP to Gemma4."""
+  if parallel_dims.cp_enabled:
+    raise NotImplementedError(
+        "Context parallelism is not supported for Gemma4 on TPU yet."
+    )
   model_compile_enabled = (
       compile_config.enable and "model" in compile_config.components
   )
@@ -152,7 +156,7 @@ def configure_gemma4_simple_fsdp_shard_dims(
     parallel_dims: torchtitan.distributed.ParallelDims,
 ) -> None:
   """Use divisible hidden axes for uneven Gemma4 parameters under SimpleFSDP."""
-  fsdp_degree = parallel_dims.dp_shard * parallel_dims.cp
+  fsdp_degree = parallel_dims.dp_shard
   if fsdp_degree <= 1:
     return
 
@@ -230,6 +234,10 @@ def parallelize_gemma4(
     **kwargs,
 ) -> nn.Module:
   """Parallelizes the Gemma4 model, optionally applying Simple FSDP."""
+  if parallel_dims.cp_enabled:
+    raise NotImplementedError(
+        "Context parallelism is not supported for Gemma4 on TPU yet."
+    )
   compile_mode = tpu_compile_mode
   effective_compile_config = compile_config
   if effective_compile_config.enable and hasattr(model, "layers"):

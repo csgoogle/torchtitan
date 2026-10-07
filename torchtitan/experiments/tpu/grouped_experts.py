@@ -260,17 +260,13 @@ class TpuGroupedExperts(GroupedExperts):
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
-        gate_RF = torch._grouped_mm(
-            x_RD.bfloat16(), w1_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
+        h_RF = self._activation_fn(
+            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E)
         )
-        up_RF = torch._grouped_mm(
-            x_RD.bfloat16(), w3_EFD.bfloat16().transpose(-2, -1), offs=offsets_E
+        h_RF = h_RF * self._grouped_mm(
+            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
         )
-        return torch._grouped_mm(
-            self._activation_fn(gate_RF) * up_RF,
-            w2_EDF.bfloat16().transpose(-2, -1),
-            offs=offsets_E,
-        ).type_as(x_RD)
+        return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(x_RD)
 
     def _activation_fn(self, gate_RF: torch.Tensor) -> torch.Tensor:
         if self.activation == "gelu_tanh":
@@ -286,6 +282,8 @@ class TpuGroupedExperts(GroupedExperts):
         # dWeight is incorrect at M=4096. See
         # https://github.com/google-pytorch/torch_tpu/issues/2668.
         if not self.use_pallas_grouped_mm:
+            if self.activation == "silu":
+                return super().forward(x_RD, num_tokens_per_expert_E)
             return self._native_experts_forward(x_RD, num_tokens_per_expert_E)
         def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor

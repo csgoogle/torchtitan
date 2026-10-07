@@ -131,6 +131,80 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
         untied.tok_embeddings.param_init["weight"], skip_param_init
     )
 
+  def test_silu_delegates_to_super_and_gelu_uses_grouped_mm_seam(self):
+    from unittest import mock
+
+    num_experts, dim, hidden_dim = 4, 16, 32
+    x = torch.randn(8, dim, device=self.accelerator_device, dtype=torch.float32)
+    num_tokens_per_expert = torch.tensor(
+        [2, 2, 2, 2], device=self.accelerator_device, dtype=torch.int32
+    )
+
+    cfg_silu = TpuGroupedExperts.Config(
+        dim=dim,
+        hidden_dim=hidden_dim,
+        num_experts=num_experts,
+        use_pallas_grouped_mm=False,
+        activation="silu",
+        param_init=_EXPERTS_INIT,
+    )
+    experts_silu = cfg_silu.build().to(self.accelerator_device)
+    experts_silu.init_states()
+    with mock.patch.object(
+        experts_silu,
+        "_native_experts_forward",
+        wraps=experts_silu._native_experts_forward,
+    ) as spy_native:
+      _ = experts_silu(x, num_tokens_per_expert)
+      spy_native.assert_not_called()
+
+    cfg_gelu = TpuGroupedExperts.Config(
+        dim=dim,
+        hidden_dim=hidden_dim,
+        num_experts=num_experts,
+        use_pallas_grouped_mm=False,
+        activation="gelu_tanh",
+        param_init=_EXPERTS_INIT,
+    )
+    experts_gelu = cfg_gelu.build().to(self.accelerator_device)
+    experts_gelu.init_states()
+    with mock.patch.object(
+        experts_gelu,
+        "_grouped_mm",
+        wraps=experts_gelu._grouped_mm,
+    ) as spy_grouped_mm:
+      _ = experts_gelu(x, num_tokens_per_expert)
+      self.assertEqual(spy_grouped_mm.call_count, 3)
+
+  def test_context_parallel_rejected(self):
+    from types import SimpleNamespace
+    from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
+        parallelize_gemma4,
+    )
+
+    cfg = gemma4_debugmodel()
+    cfg.parallelism.context_parallel_degree = 2
+    with self.assertRaisesRegex(
+        NotImplementedError, "Context parallelism is not supported"
+    ):
+      cfg.model_spec.model.update_from_config(config=cfg)
+
+    with torch.device("meta"):
+      model = gemma4_debugmodel().model_spec.model.build()
+    pdims = SimpleNamespace(cp_enabled=True, cp=2, dp_shard=1)
+    with self.assertRaisesRegex(
+        NotImplementedError, "Context parallelism is not supported"
+    ):
+      parallelize_gemma4(
+          model,
+          parallel_dims=pdims,
+          training=cfg.training,
+          parallelism=cfg.parallelism,
+          compile_config=cfg.compile,
+          ac_config=None,
+          dump_folder="",
+      )
+
 
 class TestGemma4StateDictAdapter(absltest.TestCase):
   """Tests HF <-> TorchTitan state_dict conversion for Gemma 4."""

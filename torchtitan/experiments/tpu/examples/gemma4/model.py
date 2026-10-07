@@ -515,13 +515,9 @@ class Gemma4Model(Decoder):
                             f"layer {idx} n_heads ({attn.n_heads}) and "
                             f"n_kv_heads ({attn.n_kv_heads})."
                         )
-            if parallelism.context_parallel_degree > 1 and isinstance(
-                self.layers[0].attention.inner_attention,
-                VarlenInnerAttention.Config,
-            ):
+            if parallelism.context_parallel_degree > 1:
                 raise NotImplementedError(
-                    "Context Parallelism is not supported with VarlenInnerAttention "
-                    "in Gemma4."
+                    "Context parallelism is not supported for Gemma4 on TPU yet."
                 )
 
             local_global_batch_size = kwargs.get(
