@@ -867,7 +867,9 @@ def substitute_tpu_experts(model: nn.Module) -> None:
   experts stay replicated and SimpleFSDP shards them, as the qwen3 TPU lane
   does.
   """
-  if not (hasattr(torch, "tpu") and torch.tpu.is_available()):
+  from torchtitan.tools import utils  # pylint: disable=g-import-not-at-top
+
+  if utils.device_type != "tpu":
     return
   from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
 

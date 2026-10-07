@@ -83,7 +83,7 @@ class HFBackendDistributedTest(
       dict(
           testcase_name="llama3_debug_max",
           config="hf_debugmodel_max",
-          hf_model="meta-llama/Llama-3.2-1B-Instruct",
+          hf_model="unsloth/Llama-3.2-1B-Instruct",
           args=["--loss.b_block_size=256"],
           skip_devices=[device_type.AcceleratorDeviceType.CPU],  # splash / fused CE are TPU kernels
           **_KERNEL_TOL,

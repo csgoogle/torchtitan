@@ -170,7 +170,7 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
       dict(testcase_name="qwen3", config="hf_debugmodel_max",
            hf_model="Qwen/Qwen3-0.6B", args=["--loss.b_block_size=256"]),
       dict(testcase_name="llama3", config="hf_debugmodel_max",
-           hf_model="meta-llama/Llama-3.2-1B-Instruct", args=["--loss.b_block_size=256"]),
+           hf_model="unsloth/Llama-3.2-1B-Instruct", args=["--loss.b_block_size=256"]),
       # Encoder at full size: bidirectional splash, native MLM head, learned
       # positions; dropout zeroed so the reference is deterministic.
       dict(testcase_name="bert_base", config="hf_full_splash",
