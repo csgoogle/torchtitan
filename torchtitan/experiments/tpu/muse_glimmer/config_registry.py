@@ -208,9 +208,21 @@ def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
   graph rematerialization, JAX Pallas Splash attention and plain cross entropy
   over the full logits. The 4x4x4 libtpu flags ride on the config.
 
-  At the default 16384 tokens per device this is ~2% faster than
-  ``muse_glimmer_30b_fused_ce`` at the same peak HBM. Switch to the fused
-  variant when raising the tokens per microbatch: the logits grow with it.
+  Full logits vs fused cross entropy, measured on tpu7x-4x4x4 with fp32
+  weights and optimizer state (the default ``training.dtype``) and bf16
+  compute:
+
+  * Why full logits here: with 16384 tokens per device the logits are not
+    what sets peak HBM (46.18 GiB full vs 46.12 GiB fused), so the fused
+    kernel saves nothing, while XLA's plain LM-head matmul + cross entropy
+    runs ~2% faster than the vocab-tiled Pallas kernel (2,913 vs 2,851 TPS,
+    43.8% vs 42.9% MFU).
+  * When to use the fused loss: once the logits dominate memory. They scale
+    with tokens per microbatch, so at 2 x 16384 tokens per device peak HBM is
+    87.62 GiB with full logits vs 51.84 GiB fused. Use it for larger local
+    batches or longer sequences, on the regular trainer (which runs out of
+    HBM at step 1 with full logits), or whenever HBM headroom is needed
+    elsewhere.
   """
   config = _muse_glimmer_30b_base()
   # Zero-3: Zero-2 would keep all ~60 GiB of gathered BF16 weights resident.
@@ -233,8 +245,9 @@ def muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
   """``muse_glimmer_30b_full_logits`` with the soft-capped fused loss.
 
   The LM-head matmul, soft cap and cross entropy run as one Pallas kernel, so
-  the [tokens, 202048] fp32 logits are never materialized. At two 16384-token
-  sequences per device peak HBM is ~52 GiB vs ~88 GiB with full logits.
+  the [tokens, 202048] logits are never materialized. ~2% slower than
+  full logits at 16384 tokens per device, but needed once the logits dominate
+  memory; see ``muse_glimmer_30b_full_logits`` for when to use which.
   """
   config = muse_glimmer_30b_full_logits()
   _enable_pallas_cross_entropy(config)

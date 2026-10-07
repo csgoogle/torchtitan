@@ -27,23 +27,38 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **GraphTrainer, Zero-3**: SimpleFSDP with parameters resharded after forward,
   full graph rematerialization, the optimizer compiled into the graph, and the
   `prefetch` FSDP schedule. Layers are not scanned (see "Scan" below).
+- **Precision**: fp32 weights and AdamW state (default `training.dtype`), bf16
+  forward/backward compute (`mixed_precision_param`), fp32 gradient
+  reduce-scatter (`mixed_precision_reduce`).
 - **Full logits by default**: at local batch 1 the `[16384, 202048]` logits
-  fit, and plain cross entropy is ~2% faster than the fused kernel at the same
-  peak HBM. `muse_glimmer_30b_fused_ce` runs the LM-head matmul, soft cap, and
-  cross entropy as one Pallas kernel, one vocab tile at a time, so the logits
-  are never materialized (the TPU counterpart of upstream's
-  `ChunkedLossWrapper`). Use it when raising tokens per microbatch: at local
-  batch 2 it saves ~36 GiB. The regular trainer needs it to fit.
+  are not what sets peak HBM, and plain cross entropy is ~2% faster than the
+  fused kernel. `muse_glimmer_30b_fused_ce` runs the LM-head matmul, soft cap,
+  and cross entropy as one Pallas kernel, one vocab tile at a time, so the
+  logits are never materialized (the TPU counterpart of upstream's
+  `ChunkedLossWrapper`). Use it once the logits dominate memory: larger local
+  batch or longer sequences (at local batch 2 it saves ~36 GiB), the regular
+  trainer (out of HBM with full logits), or when HBM headroom is needed.
 - **Attention**: the JAX Pallas Splash Attention kernel
   (`jax.experimental.pallas.ops.tpu.splash_attention`, via
   `kernels/splash_attention.py`) with 1024 tiles: a local mask for the 39
   sliding-window layers and a causal mask for the 13 global ones. The tokamax
   Splash kernel (0.0.14) measured ~5% slower: its wrapper does not yet skip
   blocks that cross packed-document boundaries.
-- **Config-carried flags**: libtpu init flags (p-state 7, scoped VMEM, SparseCore
-  collective offload including hierarchical reduce-scatter) ride on the config
-  and are exported before PJRT initialization, so the command below does not
-  repeat them. They are the same flags used by `qwen3_32b`.
+- **Config-carried flags**: exported before PJRT initialization, so the command
+  below does not repeat them. Same libtpu set as `qwen3_32b`:
+  - `xla_tpu_dvfs_p_state=7` (throughput power state)
+  - `xla_tpu_scoped_vmem_limit_kib=65472`
+  - `xla_tpu_enable_sparse_core_collective_aggregator=true`,
+    `xla_tpu_enable_latency_hiding_layer_scheduler=true`
+  - `xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false`,
+    `xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true`,
+    `xla_tpu_enable_sparse_core_hierarchical_reduce_scatter=true`
+  - `xla_tpu_enable_diagnostic_coordinator=false` (TPU config default)
+  - XLA flag `xla_enable_hlo_sharding_v3=false`
+
+  "Default libtpu flags" in the table below means
+  `--libtpu-init-flags=xla_tpu_enable_diagnostic_coordinator=false`, which
+  replaces the set above with only the TPU config default; the XLA flag stays.
 - **Tokenizer**: the default `hf_assets_path` is the test tokenizer in
   `./tests/assets/tokenizer`. Step time depends slightly on the data, so compare
   runs only with the same data and tokenizer.
