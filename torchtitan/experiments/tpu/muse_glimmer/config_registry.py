@@ -5,24 +5,46 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer.optimizer import default_adamw
+from torchtitan.components.validate import Validator
+from torchtitan.config.configs import CompileConfig
 from torchtitan.config.configs import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.experiments.tpu import tpu_flags
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.tpu_job_config import LossKernelConfig
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
+from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
 __all__ = [
     "muse_glimmer_debugmodel",
     "muse_glimmer_debugmodel_fused_ce",
+    "muse_glimmer_30b",
+    "muse_glimmer_30b_full_logits",
+    "reg_trainer_muse_glimmer_30b",
+    "reg_trainer_muse_glimmer_30b_fused_ce",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
+
+# Upstream muse_glimmer_30b's default context length.
+_30B_CONTEXT_LENGTH = 16384
 
 # Overrides are identified by the import path of the decorated factory.
 _FUSED_LOSS_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.fused_loss."
     "fused_loss_soft_capped_lm_head"
+)
+
+# The dense tpu7x-4x4x4 launch flags, the same set the Qwen3-8B/32B 4x4x4
+# recipes use.
+_MUSE_GLIMMER_4X4X4_FLAGS = tpu_flags.merge_flags(
+    tpu_flags.TPU7X_THROUGHPUT_P_STATE,
+    {"xla_tpu_scoped_vmem_limit_kib": 65472},
+    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
+    tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
 )
 
 
@@ -100,5 +122,136 @@ def muse_glimmer_debugmodel_fused_ce() -> TPUTrainerConfig:
   so the full fp32 logits are never materialized.
   """
   config = muse_glimmer_debugmodel()
+  _enable_pallas_cross_entropy(config)
+  return config
+
+
+def _muse_glimmer_30b_base() -> TPUTrainerConfig:
+  """Model, data, optimizer and kernels shared by every 30B recipe.
+
+  Model and optimizer settings follow upstream ``muse_glimmer_30b``: context
+  16384, one sequence per device, AdamW lr 3e-4 with 200 warmup steps. The
+  loss is plain ``CrossEntropyLoss`` over the full logits; the recipes below
+  pick the trainer and, optionally, the fused loss.
+  """
+  from torchtitan.experiments.tpu.muse_glimmer import model_registry  # pylint: disable=g-import-not-at-top
+
+  model_spec = model_registry("30B", seq_len=_30B_CONTEXT_LENGTH)
+  config = TPUTrainerConfig(
+      loss=CrossEntropyLoss.Config(),
+      # Test tokenizer, like the other TPU recipes; pass the Muse Glimmer
+      # tokenizer via --hf_assets_path for meaningful loss values.
+      hf_assets_path="./tests/assets/tokenizer",
+      model_spec=model_spec,
+      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
+      lr_scheduler=LRSchedulersContainer.Config(warmup_steps=200),
+      training=TrainingConfig(
+          max_norm=1.0,
+          num_tokens_per_microbatch_per_dp_rank=1 * _30B_CONTEXT_LENGTH,
+          max_context_length=_30B_CONTEXT_LENGTH,
+          steps=30,
+          mixed_precision_reduce="float32",
+      ),
+      dataloader=c4_test_dataloader(),
+      metrics=MetricsProcessor.Config(log_freq=1),
+      parallelism=ParallelismConfig(
+          use_simple_fsdp=True,
+          enable_tpu_topo_mesh=True,
+          data_parallel_shard_degree=-1,
+      ),
+      checkpoint=CheckpointManager.Config(
+          enable=False,
+          interval=500,
+          last_save_model_only=False,
+      ),
+      activation_checkpoint=SelectiveAC.Config(),
+      # Disable Shardy HLO sharding v3 (default since libtpu 0.0.48), matching
+      # the other TPU recipes.
+      xla_flags=tpu_flags.merge_flags(
+          xla_enable_hlo_sharding_v3=False,
+      ),
+      compile=CompileConfig(
+          enable=True,
+          backend="tpu",
+          components=["model"],
+      ),
+      # JAX Pallas Splash (kernels/splash_attention.py): LocalMask for the 39
+      # sliding-window layers, causal for the 13 global ones. Tokamax Splash is
+      # left off: its GQA backward is wrong with segment IDs at head (dk/dv
+      # keep only the last q head of each KV group), and Muse has 32 Q / 2 KV
+      # heads.
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          use_splash_attention_kernel=True,
+          sa_block_q=1024,
+          sa_block_kv=1024,
+          sa_block_dkv=1024,
+          sa_block_kv_compute=1024,
+          sa_block_q_dkv=1024,
+          sa_block_kv_dkv=1024,
+          sa_block_kv_dkv_compute=1024,
+          sa_block_q_dq=1024,
+          sa_block_kv_dq=1024,
+      ),
+      loss_kernel=LossKernelConfig(use_loss_kernel=False),
+      validator=Validator.Config(enable=False),
+  )
+  # Merged into the default, which keeps the diagnostic coordinator off.
+  config.libtpu_init_flags = tpu_flags.merge_flags(
+      config.libtpu_init_flags, _MUSE_GLIMMER_4X4X4_FLAGS
+  )
+  return config
+
+
+def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
+  """``muse_glimmer_30b`` without the fused loss (full fp32 logits)."""
+  config = _muse_glimmer_30b_base()
+  # Zero-3: Zero-2 would keep all ~60 GiB of gathered BF16 weights resident.
+  config.parallelism.fsdp_reshard_after_forward = "always"
+  # GraphTrainer ignores the eager AC config; its graph rematerialization
+  # policy is selected here.
+  config.tpu_config = TPUConfig(
+      use_graph_trainer=True,
+      compile_mode="aot_fx_trace",
+      compile_optimizer=True,
+      optimizer_in_graph=True,
+      graph_trainer_memory_policy="full",
+      enable_graph_trainer_remat_schedule=True,
+      graph_trainer_fsdp_schedule="prefetch",
+  )
+  return config
+
+
+def muse_glimmer_30b() -> TPUTrainerConfig:
+  """Muse Glimmer 30B GraphTrainer recipe for a tpu7x-4x4x4 slice.
+
+  SimpleFSDP Zero-3 over all devices with the prefetch FSDP schedule, full
+  graph rematerialization, JAX Pallas Splash attention and the soft-capped
+  fused cross entropy, so the [tokens, 202048] fp32 logits are never
+  materialized. The 4x4x4 libtpu flags ride on the config.
+  """
+  config = muse_glimmer_30b_full_logits()
+  _enable_pallas_cross_entropy(config)
+  return config
+
+
+def reg_trainer_muse_glimmer_30b() -> TPUTrainerConfig:
+  """Muse Glimmer 30B on the regular ``TPUTrainer`` (full fp32 logits).
+
+  The per-layer compile, selective AC and graph-split setup tuned on
+  tpu7x-2x2x2, with the same model, data and flags as ``muse_glimmer_30b``.
+  """
+  config = _muse_glimmer_30b_base()
+  config.tpu_config = TPUConfig(
+      eager_mode="DEFER_AND_FUSE",
+      use_graph_split=True,
+      compile_mode="layer",
+      compile_grad_norm=True,
+  )
+  return config
+
+
+def reg_trainer_muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
+  """``reg_trainer_muse_glimmer_30b`` with the soft-capped fused loss."""
+  config = reg_trainer_muse_glimmer_30b()
   _enable_pallas_cross_entropy(config)
   return config
