@@ -468,7 +468,6 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
           testcase_name="dense",
           flavor="testmodel",
           enable_moe=False,
-          use_tpu_experts=False,
           logit_atol=5e-2,
           logit_rtol=1e-2,
           loss_atol=5e-3,
@@ -480,19 +479,6 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
           testcase_name="moe",
           flavor="testmodel_moe",
           enable_moe=True,
-          use_tpu_experts=False,
-          logit_atol=1e-1,
-          logit_rtol=2e-2,
-          loss_atol=5e-3,
-          loss_rtol=2e-3,
-          grad_atol=8e-2,
-          grad_rtol=2e-2,
-      ),
-      dict(
-          testcase_name="moe_tpu_grouped_experts",
-          flavor="testmodel_moe",
-          enable_moe=True,
-          use_tpu_experts=True,
           logit_atol=1e-1,
           logit_rtol=2e-2,
           loss_atol=5e-3,
@@ -505,7 +491,6 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
       self,
       flavor: str,
       enable_moe: bool,
-      use_tpu_experts: bool,
       logit_atol: float,
       logit_rtol: float,
       loss_atol: float,
@@ -530,7 +515,7 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
     for layer_cfg in tt_config.layers:
       if layer_cfg.attention.is_sliding:
         layer_cfg.attention.sliding_window_size = sliding_window
-    if use_tpu_experts:
+    if enable_moe:
       converter = TpuGroupedExpertsConverter(
           TpuGroupedExpertsConverter.Config()
       )

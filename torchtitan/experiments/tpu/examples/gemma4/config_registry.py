@@ -1,5 +1,3 @@
-from typing import cast
-
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
@@ -11,34 +9,16 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
-from torchtitan.experiments.tpu import tpu_flags
+from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
-from torchtitan.experiments.tpu.examples.gemma4 import (
-    _build_flavor_config,
-    model_registry,
-)
-from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
-    parallelize_gemma4 as tpu_parallelize_gemma4,
-)
-from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
-from torchtitan.experiments.tpu.examples.gemma4.state_dict_adapter import (
-    Gemma4StateDictAdapter,
-)
+from torchtitan.experiments.tpu.examples.gemma4 import model_registry
 from torchtitan.experiments.tpu.grouped_experts import (
-    TpuGroupedExperts,
     TpuGroupedExpertsConverter,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuTokenDispatcherConverter,
 )
-from torchtitan.experiments.tpu.tpu_job_config import (
-    LossKernelConfig,
-    SplashAttentionKernelConfig,
-    TPUConfig,
-    TPUTrainerConfig,
-)
-from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
 
 def gemma4_debugmodel() -> TPUTrainerConfig:
@@ -46,7 +26,6 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
   model_spec = model_registry(
       "debugmodel", attn_backend="sdpa", enable_weight_tying=False
   )
-  model_spec.parallelize_fn = tpu_parallelize_gemma4
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
@@ -72,7 +51,7 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
           interval=10,
           last_save_model_only=False,
       ),
-      activation_checkpoint=SelectiveAC.Config(),
+      activation_checkpoint=FullAC.Config(),
       validator=Validator.Config(
           freq=5,
           steps=10,
@@ -83,15 +62,10 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
 def gemma4_moe_testmodel() -> TPUTrainerConfig:
   """Gemma4 MoE test model configuration for TPU."""
   cfg = gemma4_debugmodel()
-  cfg.model_spec = ModelSpec(
-      name="gemma4",
-      flavor="testmodel_moe",
-      model=_build_flavor_config("testmodel_moe", enable_weight_tying=False),
-      max_context_length=128,
-      parallelize_fn=tpu_parallelize_gemma4,
-      pipelining_fn=None,
-      post_optimizer_build_fn=None,
-      state_dict_adapter=Gemma4StateDictAdapter,
+  cfg.model_spec = model_registry(
+      "testmodel_moe",
+      attn_backend="sdpa",
+      enable_weight_tying=False,
   )
   cfg.training.max_context_length = 128
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 4 * 128
@@ -118,8 +92,6 @@ def gemma4_31b() -> TPUTrainerConfig:
   model_spec = model_registry(
       "31B", attn_backend="sdpa", enable_weight_tying=False
   )
-  model_spec.parallelize_fn = tpu_parallelize_gemma4
-
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./assets/hf/gemma-4-31B",
@@ -151,35 +123,10 @@ def gemma4_31b() -> TPUTrainerConfig:
           last_save_model_only=False,
       ),
       activation_checkpoint=FullAC.Config(),
-      tpu_config=TPUConfig(
-          eager_mode="DEFER_AND_FUSE",
-          use_graph_split=True,
-          use_jax_profiler=False,
-          compile_mode="layer",
-          compile_grad_norm=True,
-      ),
-      libtpu_init_flags=tpu_flags.merge_flags(
-          xla_tpu_scoped_vmem_limit_kib=61440,
-      ),
       compile=CompileConfig(
           enable=True,
           backend="tpu",
           components=["model"],
-      ),
-      splash_attention_kernel=SplashAttentionKernelConfig(
-          use_splash_attention_kernel=True,
-          sa_block_q=512,
-          sa_block_kv=512,
-          sa_block_dkv=512,
-          sa_block_kv_compute=512,
-          sa_block_q_dkv=512,
-          sa_block_kv_dkv=512,
-          sa_block_kv_dkv_compute=512,
-          sa_block_q_dq=512,
-          sa_block_kv_dq=512,
-      ),
-      loss_kernel=LossKernelConfig(
-          use_loss_kernel=False,
       ),
       validator=Validator.Config(
           enable=False,
@@ -202,11 +149,5 @@ def gemma4_26b_a4b() -> TPUTrainerConfig:
       ],
       enable_weight_tying=False,
   )
-  model_config = cast(Gemma4Model.Config, cfg.model_spec.model)
-  for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
-    experts.use_pallas_grouped_mm = True
-    experts.use_pallas_paired_grouped_mm = True
-    experts.pallas_grouped_mm_tile_m = 256
-    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
-    experts.use_kernel_native_weight_layout = True
   return cfg
+

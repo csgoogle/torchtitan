@@ -5,6 +5,9 @@ import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
+from torchtitan.experiments.tpu.examples.gemma4.infra.parallelize import (
+    parallelize_gemma4,
+)
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 from torchtitan.models.common.attention import (
     FusedQKVLinear,
@@ -22,7 +25,6 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .infra.parallelize import parallelize_gemma4
 from .model import (
     Gemma4Attention,
     Gemma4Embedding,
