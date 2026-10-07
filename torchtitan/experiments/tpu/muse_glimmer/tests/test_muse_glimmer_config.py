@@ -8,6 +8,7 @@ TPU model registry. CPU vs. device parity lives in test_muse_glimmer.py.
 import dataclasses
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import torch
 from torch.nn.attention import flex_attention
 from torchtitan.components.loss import CrossEntropyLoss
@@ -48,7 +49,7 @@ def _get_model_config(model_name: str = "testmodel") -> MuseGlimmerModel.Config:
   return muse_glimmer_tpu.muse_glimmer_configs[model_name]
 
 
-class MuseGlimmerConfigTest(absltest.TestCase):
+class MuseGlimmerConfigTest(parameterized.TestCase):
   """Device-independent tests of the TPU attention and config wiring."""
 
   def test_sliding_window_mask_semantics(self):
@@ -353,66 +354,60 @@ class MuseGlimmerConfigTest(absltest.TestCase):
     with self.assertRaisesRegex(ValueError, "PallasCrossEntropyLoss"):
       workarounds._check_fused_loss_logit_transform(model, config)
 
-
-  def test_30b_recipes_share_upstream_model_and_flags(self):
+  @parameterized.parameters(
+      "muse_glimmer_30b_full_logits",
+      "muse_glimmer_30b_fused_ce",
+      "reg_trainer_muse_glimmer_30b_fused_ce",
+  )
+  def test_30b_recipes_share_upstream_model_and_flags(self, name):
     """Tests the 30B recipes: upstream model/data settings, 4x4x4 flags."""
-    for name in (
-        "muse_glimmer_30b_full_logits",
-        "muse_glimmer_30b_fused_ce",
-        "reg_trainer_muse_glimmer_30b_fused_ce",
-    ):
-      with self.subTest(name):
-        config = getattr(config_registry, name)()
-        self.assertEqual(config.model_spec.flavor, "30B")
-        self.assertEqual(config.training.max_context_length, 16384)
-        self.assertEqual(
-            config.training.num_tokens_per_microbatch_per_dp_rank, 16384
-        )
-        flags = config.libtpu_init_flags
-        self.assertEqual(flags["xla_tpu_dvfs_p_state"], "7")
-        self.assertEqual(
-            flags["xla_tpu_enable_sparse_core_hierarchical_reduce_scatter"],
-            "true",
-        )
-        # The config default must survive the merge.
-        self.assertEqual(
-            flags["xla_tpu_enable_diagnostic_coordinator"], "false"
-        )
-        self.assertTrue(config.splash_attention_kernel.use_splash_attention_kernel)
-        self.assertFalse(
-            config.splash_attention_kernel.use_tokamax_splash_attention_kernel
-        )
+    config = getattr(config_registry, name)()
+    self.assertEqual(config.model_spec.flavor, "30B")
+    self.assertEqual(config.training.max_context_length, 16384)
+    self.assertEqual(
+        config.training.num_tokens_per_microbatch_per_dp_rank, 16384
+    )
+    flags = config.libtpu_init_flags
+    self.assertEqual(flags["xla_tpu_dvfs_p_state"], "7")
+    self.assertEqual(
+        flags["xla_tpu_enable_sparse_core_hierarchical_reduce_scatter"],
+        "true",
+    )
+    # The config default must survive the merge.
+    self.assertEqual(flags["xla_tpu_enable_diagnostic_coordinator"], "false")
+    self.assertTrue(config.splash_attention_kernel.use_splash_attention_kernel)
+    self.assertFalse(
+        config.splash_attention_kernel.use_tokamax_splash_attention_kernel
+    )
 
-  def test_30b_recipe_trainer_and_loss_selection(self):
+  @parameterized.parameters(
+      ("muse_glimmer_30b_full_logits", True, False),
+      ("muse_glimmer_30b_fused_ce", True, True),
+      ("reg_trainer_muse_glimmer_30b_fused_ce", False, True),
+  )
+  def test_30b_recipe_trainer_and_loss_selection(
+      self, name, graph_trainer, fused
+  ):
     """Tests which 30B recipes use GraphTrainer and the fused loss."""
-    expected = {
-        "muse_glimmer_30b_full_logits": (True, False),
-        "muse_glimmer_30b_fused_ce": (True, True),
-        "reg_trainer_muse_glimmer_30b_fused_ce": (False, True),
-    }
-    for name, (graph_trainer, fused) in expected.items():
-      with self.subTest(name):
-        config = getattr(config_registry, name)()
-        self.assertEqual(config.tpu_config.use_graph_trainer, graph_trainer)
-        self.assertEqual(
-            isinstance(config.loss, PallasCrossEntropyLoss.Config), fused
-        )
-        self.assertEqual(
-            _FUSED_LOSS_OVERRIDE_PATH in config.override.imports, fused
-        )
-    for name in (
-        "muse_glimmer_30b_full_logits",
-        "muse_glimmer_30b_fused_ce",
-    ):
-      with self.subTest(name):
-        config = getattr(config_registry, name)()
-        self.assertEqual(
-            config.parallelism.fsdp_reshard_after_forward, "always"
-        )
-        self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
-        self.assertNotEqual(
-            config.tpu_config.graph_trainer_fsdp_schedule, "none"
-        )
+    config = getattr(config_registry, name)()
+    self.assertEqual(config.tpu_config.use_graph_trainer, graph_trainer)
+    self.assertEqual(
+        isinstance(config.loss, PallasCrossEntropyLoss.Config), fused
+    )
+    self.assertEqual(
+        _FUSED_LOSS_OVERRIDE_PATH in config.override.imports, fused
+    )
+
+  @parameterized.parameters(
+      "muse_glimmer_30b_full_logits",
+      "muse_glimmer_30b_fused_ce",
+  )
+  def test_30b_graph_trainer_recipes_use_zero3_full_remat(self, name):
+    """Tests the GraphTrainer recipes' Zero-3, remat and FSDP schedule."""
+    config = getattr(config_registry, name)()
+    self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
+    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
+    self.assertNotEqual(config.tpu_config.graph_trainer_fsdp_schedule, "none")
 
   def test_30b_fused_ce_recipe_passes_logit_transform_check(self):
     """Tests that the 30B head and loss agree on cap and 0.196 multiplier."""
