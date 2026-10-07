@@ -22,10 +22,9 @@ class TPUTransformersBackendConfig(TPUTrainerConfig):
   """
 
   hf_model: str = ""
-  # Comma-separated ``key=value`` pairs applied to the loaded HF config after
-  # the flavor's overrides (values parsed as Python literals, else kept as
-  # strings), e.g. ``attention_probs_dropout_prob=0,hidden_dropout_prob=0`` to
-  # train an encoder checkpoint without its dropout. Read by the shared
+  # A JSON object applied to the loaded HF config after the flavor's
+  # overrides, e.g. ``{"attn_pdrop": 0, "resid_pdrop": 0}`` to train a
+  # checkpoint without its dropout. Read by the shared
   # backend's ``update_from_config`` through the same ``getattr(config, ...)``
   # path as ``hf_model``.
   hf_config_overrides: str = ""

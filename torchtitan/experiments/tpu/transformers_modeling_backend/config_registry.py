@@ -272,7 +272,7 @@ def hf_debugmodel() -> TPUTransformersBackendConfig:
 
 
 def hf_debugmodel_max() -> TPUTransformersBackendConfig:
-  """hf_full_max's feature set on the two-layer kernel-shaped debug model.
+  """``hf_full_max``'s feature set on the two-layer kernel-shaped debug model.
 
   Splash attention, fused CE, selective AC keeping the attention output and
   per-layer compile, at parity-test scale. The fused-CE token tile must
@@ -294,98 +294,38 @@ def hf_debugmodel_kernels_splash() -> TPUTransformersBackendConfig:
                         attn="splash_tpu")
 
 
-def hf_full() -> TPUTransformersBackendConfig:
-  """The published model at its real width and depth."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL)
-
-
-def hf_debugmodel_compile() -> TPUTransformersBackendConfig:
-  """`hf_debugmodel` with per-layer torch.compile on the TPU backend."""
-  return _tpu_hf_config("debugmodel", _DEFAULT_HF_MODEL, seq_len=512, compile=True)
-
-
-def hf_full_compile() -> TPUTransformersBackendConfig:
-  """`hf_full` with per-layer torch.compile on the TPU backend."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True)
-
-
-def hf_full_splash() -> TPUTransformersBackendConfig:
-  """`hf_full` with attention served by the TPU splash-attention kernel."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, attn="splash_tpu")
-
-
-def hf_full_splash_compile() -> TPUTransformersBackendConfig:
-  """Splash attention plus per-layer torch.compile."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True, attn="splash_tpu")
-
-
-def hf_full_fused() -> TPUTransformersBackendConfig:
-  """`hf_full` with the vocab projection fused into the Pallas CE kernel."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, fused_loss=True)
-
-
-def hf_full_fused_compile() -> TPUTransformersBackendConfig:
-  """Fused CE plus per-layer torch.compile."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True, fused_loss=True)
-
-
-def hf_full_kernels() -> TPUTransformersBackendConfig:
-  """Splash attention + fused CE in eager mode (hf_full_max without compile).
-
-  The eager counterpart of the frontier config: the splash adapter's fallback
-  report fires only outside Dynamo tracing, so this is the config for asking
-  "does this model run on the kernels, and did they actually fire".
-  """
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, attn="splash_tpu", fused_loss=True)
-
-
 def hf_full_max() -> TPUTransformersBackendConfig:
-  """Everything on: splash attention, fused CE, per-layer compile."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
-                        attn="splash_tpu", fused_loss=True)
+  """The lane's config: splash attention, fused CE, per-layer compile.
 
-def hf_full_max_saveattn() -> TPUTransformersBackendConfig:
-  """`hf_full_max` with the attention output saved instead of recomputed."""
+  Selective AC also keeps the Pallas attention output instead of recomputing
+  it. Variants are CLI flags rather than configs: ``--compile.no-enable`` for
+  eager (the splash adapter reports fallbacks only outside Dynamo tracing),
+  ``--hf_model`` / ``--hf_config_overrides`` for the checkpoint. A head the
+  fused CE cannot reproduce (head bias, a transform block, a logit transform
+  it does not take) is refused; use ``hf_full_max_plain_ce`` for those.
+  """
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
                         attn="splash_tpu", fused_loss=True, save_attention=True)
 
 
-def hf_moe() -> TPUTransformersBackendConfig:
-  """A MoE checkpoint on the TPU grouped-expert kernel.
-
-  The backend gates its MoE replacement on the flavor being a
-  TitanMoeModelConfig, and --hf-model is applied after the config is built, so
-  the flavor cannot be chosen from the model id -- pick this config explicitly
-  for a MoE checkpoint. No expert parallelism: experts stay replicated and
-  SimpleFSDP shards them, as on the qwen3 lane.
-  """
-  return _tpu_hf_config("full_moe", _DEFAULT_HF_MODEL, attn="splash_tpu")
-
-
-def hf_moe_compile() -> TPUTransformersBackendConfig:
-  """hf_moe with torch.compile enabled."""
-  return _tpu_hf_config("full_moe", _DEFAULT_HF_MODEL, attn="splash_tpu", compile=True)
+def hf_full_max_plain_ce() -> TPUTransformersBackendConfig:
+  """``hf_full_max`` with the model's own head and plain cross entropy."""
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
+                        attn="splash_tpu", save_attention=True)
 
 
 def hf_moe_auto() -> TPUTransformersBackendConfig:
-  """A real MoE checkpoint, built at ITS OWN architecture.
+  """A MoE checkpoint, built at its own architecture, on TPU grouped experts.
 
-  Use this, not hf_moe, to run a named MoE checkpoint. hf_moe selects the
-  "full_moe" flavor, whose dims are set explicitly and therefore override the
-  loaded HF config -- every --hf-model under hf_moe builds the same synthetic
-  2048-dim / 48-layer / 128-expert model, so the checkpoint's architecture is
-  never exercised (and its expert weights are ~29 GB in fp32, which is what
-  OOMs a v6e chip before step 1). "full_moe_auto" leaves the HF-mapped fields
-  at None so AutoConfig supplies them, while still being a
-  TitanMoeModelConfig, which is what gates the MoE replacement.
+  The backend gates its MoE replacement on the flavor being a
+  TitanMoeModelConfig, and ``--hf_model`` is applied after the config is
+  built, so a MoE checkpoint needs this config. "full_moe_auto" leaves the
+  HF-mapped fields at None so AutoConfig supplies them (the backend's
+  "full_moe" flavor sets them explicitly and would build the same synthetic
+  model for every checkpoint). No expert parallelism: experts stay replicated
+  and SimpleFSDP shards them. Eager by default; ``--compile.enable`` compiles.
   """
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu")
-
-
-def hf_moe_auto_compile() -> TPUTransformersBackendConfig:
-  """hf_moe_auto with torch.compile enabled."""
-  return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
-                        compile=True)
 
 
 def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBackendConfig:
@@ -401,11 +341,11 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
   The attention implementation is deliberately left at ``splash_tpu``: on CPU
   the adapter falls back to SDPA with the mask the kernel applies (documents
   from positions, padding, causal, window), so both sides compute the same
-  attention. Switching to plain ``sdpa`` would not -- HF's bidirectional
-  masks (BERT) never infer documents from reset positions, so the reference
-  would attend across packed documents while the kernel does not. The
-  mask derivation itself is checked independently by the single-chip
-  reference test, which builds the dense document mask by hand.
+  attention. Switching to plain ``sdpa`` would not -- HF's own masks do not
+  infer documents from reset positions for every architecture, so the
+  reference could attend across packed documents while the kernel does not.
+  The mask derivation itself is checked against HF's mask functions by
+  ``tests/test_attention_masks.py``.
   """
   model_config = config.model_spec.model
   if getattr(model_config, "fused_loss", False):

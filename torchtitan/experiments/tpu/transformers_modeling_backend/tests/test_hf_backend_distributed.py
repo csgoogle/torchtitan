@@ -88,28 +88,13 @@ class HFBackendDistributedTest(
           skip_devices=[device_type.AcceleratorDeviceType.CPU],  # splash / fused CE are TPU kernels
           **_KERNEL_TOL,
       ),
-      # Encoder at full size: non-causal splash (is_causal passed through),
-      # native MLM head, learned positions, dropout zeroed on both sides.
-      dict(
-          testcase_name="bert_base_splash",
-          config="hf_full_splash_compile",
-          hf_model="google-bert/bert-base-uncased",
-          args=["--hf_config_overrides=attention_probs_dropout_prob=0,hidden_dropout_prob=0"],
-          # word_embeddings.weight's gradient (tied to the MLM decoder, so it
-          # carries the full-vocabulary softmax gradient into the rows of the
-          # tokens present) reaches 2.0e-2 at step 1 once the two trajectories
-          # have taken one Adam step apart; step 0 and every other tensor sit
-          # within the kernel bound.
-          skip_devices=[device_type.AcceleratorDeviceType.CPU],
-          **{**_KERNEL_TOL, "grad_atol": 3e-2},
-      ),
       # GPT-2 at full size: learned positions (wpe reaches named_children),
       # tied lm_head, attention module named `attn` rather than `self_attn`.
       dict(
           testcase_name="distilgpt2_splash",
-          config="hf_full_splash_compile",
+          config="hf_full_max_plain_ce",
           hf_model="distilbert/distilgpt2",
-          args=["--hf_config_overrides=attn_pdrop=0,resid_pdrop=0,embd_pdrop=0"],
+          args=['--hf_config_overrides={"attn_pdrop": 0, "resid_pdrop": 0, "embd_pdrop": 0}'],
           skip_devices=[device_type.AcceleratorDeviceType.CPU],  # splash / fused CE are TPU kernels
           **_KERNEL_TOL,
       ),

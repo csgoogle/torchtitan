@@ -31,8 +31,6 @@ import logging
 from typing import Any
 
 import torch
-# The splash options workarounds.apply_patches forwards from the job config.
-from torchtitan.experiments.tpu.workarounds import _SPLASH_KEYS as KERNEL_KWARG_NAMES
 from torchtitan.models.common.attention import segment_ids_from_positions
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.masking_utils import AttentionMaskInterface, flash_attention_mask
@@ -41,12 +39,10 @@ from transformers.modeling_utils import AttentionInterface
 from torchtitan.tools.logging import logger
 
 # Kernel tuning (block sizes, backward variant, layouts) comes from the job
-# config's ``splash_attention_kernel`` section -- the same ``sa_*`` fields the
-# native lane's ``SplashAttention`` modules take -- pushed in through
-# ``configure_kernel`` by ``workarounds.apply_patches``. The HF adapter is a
-# function rather than a module, so the tuning lives here at module level.
-# Empty until configured, in which case ``splash_sdpa``'s own defaults apply.
-_KERNEL_KWARGS: dict[str, Any] = {}
+# config's ``splash_attention_kernel`` section. ``update_from_config`` copies it
+# onto the model config as ``splash_kernel_kwargs``; HF passes each attention
+# layer in as ``module``, so the adapter reads it from ``module.config`` rather
+# than from process-global state. Unset means ``splash_sdpa``'s defaults.
 # The kernel needs both sequence lengths to be whole blocks, so every
 # configured block is stepped down to the largest size that divides them
 # (Mosaic's floor is 128) instead of gating on one number and launching with
@@ -85,20 +81,6 @@ def _log_once(key: str, message: str, *args) -> None:
         logger.info(message, *args)
 
 
-def configure_kernel(**kwargs: Any) -> None:
-    """Apply recipe / CLI kernel tuning (``--splash_attention_kernel.sa_*``).
-
-    Keys are the ``KERNEL_KWARG_NAMES`` (the ``sa_*`` options without the
-    prefix); ``None`` leaves a key untouched.
-    """
-    for key, value in kwargs.items():
-        if value is None:
-            continue
-        if key not in KERNEL_KWARG_NAMES:
-            raise ValueError(f"Unknown splash attention kernel option: {key}")
-        _KERNEL_KWARGS[key] = value
-
-
 def _pick_block(q_len: int, kv_len: int, preferred: int) -> int | None:
     """Largest block <= ``preferred`` that tiles both lengths, or None."""
     block = preferred
@@ -109,9 +91,9 @@ def _pick_block(q_len: int, kv_len: int, preferred: int) -> int | None:
     return None
 
 
-def _kernel_kwargs(q_len: int, kv_len: int) -> dict[str, Any]:
-    """The configured tuning with every block clamped to the sequence."""
-    out = dict(_KERNEL_KWARGS)
+def _kernel_kwargs(module, q_len: int, kv_len: int) -> dict[str, Any]:
+    """The model's configured tuning with every block clamped to the sequence."""
+    out = dict(getattr(getattr(module, "config", None), "splash_kernel_kwargs", None) or {})
     for key, value in out.items():
         if key.startswith("block_") and isinstance(value, int):
             out[key] = _pick_block(q_len, kv_len, value)
@@ -136,7 +118,7 @@ def _padding_mask(attention_mask) -> torch.Tensor | None:
     return attention_mask != 0
 
 
-def _unsupported(query, key, attention_mask, dropout) -> str | None:
+def _unsupported(query, key, attention_mask, dropout, is_causal, window) -> str | None:
     """Why splash cannot take this call, or None if it can."""
     if attention_mask is not None and _padding_mask(attention_mask) is None:
         return (
@@ -151,14 +133,43 @@ def _unsupported(query, key, attention_mask, dropout) -> str | None:
         return f"sequence {q_len}x{kv_len} is not a multiple of {_MIN_BLOCK}"
     if query.device.type != "tpu":
         return f"tensors are on {query.device.type}, not tpu"
+    if window is not None and not is_causal:
+        # splash_sdpa's window is a causal LocalMask((w, 0)); a bidirectional
+        # sliding window (ModernBERT's local layers) needs a symmetric one.
+        return f"bidirectional sliding window {window}; splash's window is causal-only"
     return None
 
 
-def _segment_ids(module, attention_mask, position_ids) -> torch.Tensor | None:
+def _window(module, kwargs) -> int | None:
+    """The layer's sliding window in HF's convention, or None.
+
+    HF passes it to the attention function as ``sliding_window`` (Mistral and
+    Mixtral set nothing on the module); others also keep it on the module.
+    Only a genuine positive int is used: whatever happens to sit under that
+    name on a wrapped module is how a bogus mask extent reaches the kernel.
+    """
+    window = kwargs.get("sliding_window")
+    if window is None:
+        window = getattr(module, "sliding_window", None)
+    return window if isinstance(window, int) and window > 0 else None
+
+
+def document_segment_ids(position_ids: torch.Tensor) -> torch.Tensor:
+    """Per-document segment ids (numbered from 1) from packed ``position_ids``.
+
+    The model computes this once per forward and passes it to every layer as
+    ``tpu_segment_ids``: deriving it inside each attention call repeats the
+    same work in every layer.
+    """
+    return segment_ids_from_positions(position_ids) + 1
+
+
+def _segment_ids(module, attention_mask, kwargs) -> torch.Tensor | None:
     """Fold document boundaries and padding into one segment-id tensor.
 
-    Documents come from ``position_ids`` (restart at 0 per packed sample) and
-    are numbered from 1; padding tokens get segment 0, the MaxText convention
+    Documents come from the model's ``tpu_segment_ids`` (or, failing that,
+    ``position_ids``, which restart at 0 per packed sample) and are numbered
+    from 1; padding tokens get segment 0, the MaxText convention
     (``tfds_data_processing_c4_mlperf`` / ``tunix_adapter``). Real tokens then
     never share a segment with padding, padding attends only to padding (so
     no all-masked row goes NaN), and the loss ignores those rows anyway.
@@ -166,8 +177,18 @@ def _segment_ids(module, attention_mask, position_ids) -> torch.Tensor | None:
     plain causal / full mask with no segment pass at all.
     """
     seg = None
-    if _document_masked(module) and position_ids is not None:
-        seg = segment_ids_from_positions(position_ids) + 1
+    if _document_masked(module):
+        seg = kwargs.get("tpu_segment_ids")
+        if seg is None:
+            position_ids = kwargs.get("position_ids")
+            if position_ids is None:
+                raise ValueError(
+                    "splash_tpu: document-causal attention (attn_mask_type="
+                    "'block_causal') needs position_ids or tpu_segment_ids; "
+                    "without them packed documents would attend across "
+                    "boundaries"
+                )
+            seg = document_segment_ids(position_ids)
     keep = _padding_mask(attention_mask)
     if keep is not None:
         if seg is None:
@@ -176,7 +197,7 @@ def _segment_ids(module, attention_mask, position_ids) -> torch.Tensor | None:
     return seg
 
 
-def _fallback_mask(module, query, key, attention_mask, position_ids, is_causal):
+def _fallback_mask(module, query, key, attention_mask, kwargs, is_causal, window):
     """The dense equivalent of the kernel's mask, for the SDPA fallback.
 
     Returns ``(mask, is_causal)`` for ``sdpa_attention_forward``. Documents and
@@ -190,10 +211,7 @@ def _fallback_mask(module, query, key, attention_mask, position_ids, is_causal):
     """
     q_len, kv_len = query.shape[-2], key.shape[-2]
     two_d = attention_mask if (isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2) else None
-    seg = _segment_ids(module, two_d, position_ids) if q_len == kv_len else None
-    window = getattr(module, "sliding_window", None)
-    if not isinstance(window, int) or window <= 0:
-        window = None
+    seg = _segment_ids(module, two_d, kwargs) if q_len == kv_len else None
     if seg is None and window is None:
         return (None if two_d is not None else attention_mask), is_causal
     q_pos = torch.arange(q_len, device=query.device)[:, None] + (kv_len - q_len)
@@ -201,8 +219,13 @@ def _fallback_mask(module, query, key, attention_mask, position_ids, is_causal):
     allowed = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device)
     if is_causal:
         allowed = allowed & (k_pos <= q_pos)
-    if window is not None:
-        allowed = allowed & (q_pos - k_pos <= window)
+    # HF's conventions: a causal window of W keeps the W keys ending at the
+    # query (``sliding_window_overlay``: q - k < W); a bidirectional one keeps
+    # |q - k| <= W (``sliding_window_bidirectional_overlay``).
+    if window is not None and is_causal:
+        allowed = allowed & (q_pos - k_pos < window)
+    elif window is not None:
+        allowed = allowed & ((q_pos - k_pos).abs() <= window)
     allowed = allowed[None]
     if seg is not None:
         allowed = allowed & (seg[:, :, None] == seg[:, None, :])
@@ -244,7 +267,8 @@ def splash_attention_forward(
     # say is the decoder-style causal one.
     if is_causal is None:
         is_causal = getattr(module, "is_causal", True)
-    reason = _unsupported(query, key, attention_mask, dropout)
+    window = _window(module, kwargs)
+    reason = _unsupported(query, key, attention_mask, dropout, is_causal, window)
     if reason is not None:
         if not _tracing():
             _report(reason)
@@ -253,8 +277,9 @@ def splash_attention_forward(
         # position_ids), so a bare SDPA call would let packed documents attend
         # across boundaries and ignore the sliding window.
         fb_mask, fb_causal = _fallback_mask(
-            module, query, key, attention_mask, kwargs.get("position_ids"), is_causal
+            module, query, key, attention_mask, kwargs, is_causal, window
         )
+        kwargs.pop("tpu_segment_ids", None)
         return sdpa_attention_forward(
             module, query, key, value, fb_mask,
             dropout=dropout, scaling=scaling, is_causal=fb_causal, **kwargs,
@@ -270,13 +295,6 @@ def splash_attention_forward(
         key = key.repeat_interleave(repeat, dim=1)
         value = value.repeat_interleave(repeat, dim=1)
 
-    # Only forward a genuine int window. Reading whatever `sliding_window`
-    # happens to be off a wrapped module and handing it to the kernel is how
-    # you get a bogus mask extent and a segfault rather than an exception.
-    window = getattr(module, "sliding_window", None)
-    if not isinstance(window, int) or window <= 0:
-        window = None
-
     # The trainer hands the model one token-major stream per rank (batch
     # folded into the sequence: 8 x 2048 arrives as [1, 16384]). Without
     # segment ids the kernel runs ONE causal problem over the whole stream:
@@ -287,8 +305,8 @@ def splash_attention_forward(
     # ``position_ids`` restart at 0 at every document boundary; turning them
     # into segment ids restores per-document masking AND lets the kernel skip
     # every block whose q and kv segments do not overlap.
-    segment_ids = _segment_ids(module, attention_mask, kwargs.get("position_ids"))
-    kernel_kwargs = _kernel_kwargs(query.shape[-2], key.shape[-2])
+    segment_ids = _segment_ids(module, attention_mask, kwargs)
+    kernel_kwargs = _kernel_kwargs(module, query.shape[-2], key.shape[-2])
 
     if not _tracing():
         _log_once(
@@ -314,7 +332,9 @@ def splash_attention_forward(
         segment_ids=segment_ids,
         scale=scaling,
         is_causal=is_causal,
-        local_window_size=window,
+        # splash's LocalMask((w, 0)) keeps q - k <= w, i.e. w + 1 keys; HF's
+        # window of W keeps W (its FA2 path passes W - 1 the same way).
+        local_window_size=None if window is None else window - 1,
         **kernel_kwargs,
     )
     if not _tracing():

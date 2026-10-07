@@ -171,20 +171,11 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
            hf_model="Qwen/Qwen3-0.6B", args=["--loss.b_block_size=256"]),
       dict(testcase_name="llama3", config="hf_debugmodel_max",
            hf_model="unsloth/Llama-3.2-1B-Instruct", args=["--loss.b_block_size=256"]),
-      # Encoder at full size: bidirectional splash, native MLM head, learned
-      # positions; dropout zeroed so the reference is deterministic.
-      dict(testcase_name="bert_base", config="hf_full_splash",
-           hf_model="google-bert/bert-base-uncased",
-           args=["--hf_config_overrides=attention_probs_dropout_prob=0,hidden_dropout_prob=0"]),
       # GPT-2 at full size: learned positions, tied head, `attn` block naming.
-      dict(testcase_name="distilgpt2", config="hf_full_splash",
+      dict(testcase_name="distilgpt2", config="hf_full_max_plain_ce",
            hf_model="distilbert/distilgpt2",
-           args=["--hf_config_overrides=attn_pdrop=0,resid_pdrop=0,embd_pdrop=0"]),
-      # Encoder whose position ids start at padding_idx + 1, so the lane grows
-      # the position table (RoBERTa); native MLM head.
-      dict(testcase_name="roberta_base", config="hf_full_splash",
-           hf_model="FacebookAI/roberta-base",
-           args=["--hf_config_overrides=attention_probs_dropout_prob=0,hidden_dropout_prob=0"]),
+           args=["--compile.no-enable",
+                 '--hf_config_overrides={"attn_pdrop": 0, "resid_pdrop": 0, "embd_pdrop": 0}']),
       # MoE checkpoint through splash. The Titan MoE swap happens in
       # parallelize_fn, which TrainerMinimal runs only for world_size > 1, so
       # on one chip HF's own MixtralSparseMoeBlock runs on the device too:

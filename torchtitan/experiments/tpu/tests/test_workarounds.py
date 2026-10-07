@@ -398,7 +398,7 @@ class WorkaroundsTest(parameterized.TestCase):
     workarounds.use_tokamax_splash_attention_patch(model, _NotASplashConfig())
 
   def test_tokamax_patch_drops_kwargs_the_kernel_does_not_accept(self):
-    """_SPLASH_KEYS is the union over splash implementations.
+    """SPLASH_KEYS is the union over splash implementations.
 
     tokamax's splash_sdpa accepts a strict subset - it has no
     use_document_aware_block_skipping - so forwarding the whole set made every run
@@ -412,7 +412,7 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertIn("segment_ids", accepted)
     # every key the patch may forward must be one the callee accepts
     self.assertContainsSubset(
-        workarounds._SPLASH_KEYS & accepted, accepted,
+        workarounds.SPLASH_KEYS & accepted, accepted,
         "the forwarded set must be a subset of the callee signature",
     )
 

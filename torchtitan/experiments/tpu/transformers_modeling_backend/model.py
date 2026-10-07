@@ -29,9 +29,9 @@ class's ``Config`` (``as_tpu_model_config``) so ``Config.build`` constructs a
 ``TPUHFTransformerModel``.
 """
 
-import ast
 import contextlib
 import copy
+import json
 from dataclasses import dataclass
 
 import torch
@@ -67,19 +67,20 @@ class _Attrs:
 
 
 def _parse_config_overrides(spec: str) -> dict:
-  """Parse ``"a=1,b=0.5,c=foo"`` into ``{"a": 1, "b": 0.5, "c": "foo"}``.
+  """Parse a JSON object of HF config overrides, e.g. ``{"attn_pdrop": 0}``.
 
-  Values are Python literals when they parse as one, otherwise strings.
+  JSON rather than ``key=value`` pairs: lists and nested values survive, and a
+  typo (``false`` vs ``False``, an unquoted string) is an error instead of a
+  silently kept string.
   """
-  out = {}
-  for item in filter(None, (s.strip() for s in spec.split(","))):
-    if "=" not in item:
-      raise ValueError(f"hf_config_overrides: expected key=value, got {item!r}")
-    key, raw = (x.strip() for x in item.split("=", 1))
-    try:
-      out[key] = ast.literal_eval(raw)
-    except (ValueError, SyntaxError):
-      out[key] = raw
+  if not spec.strip():
+    return {}
+  try:
+    out = json.loads(spec)
+  except json.JSONDecodeError as e:
+    raise ValueError(f"hf_config_overrides is not valid JSON: {spec!r} ({e})") from e
+  if not isinstance(out, dict):
+    raise ValueError(f"hf_config_overrides must be a JSON object, got {spec!r}")
   return out
 
 
@@ -90,6 +91,15 @@ class TPUHFTransformerModel(HFTransformerModel):
   class Config(HFTransformerModel.Config):
     """Adds no fields, so a flavor Config can be re-classed in place; the
     fused-loss switch rides on the instance as ``fused_loss``."""
+
+    # Composite checkpoints whose text tower has no causal-LM / AutoModel
+    # entry, by the parent's model_type.
+    _TEXT_TOWERS = {
+        "blip": "BlipTextModel",
+        "clap": "ClapTextModel",
+        "kosmos-2": "Kosmos2TextModel",
+        "siglip": "SiglipTextModel",
+    }
 
     # Zero-argument super() is unusable in these methods: @dataclass(slots=True)
     # rebuilds the class, so the cell it would resolve against is the
@@ -124,6 +134,15 @@ class TPUHFTransformerModel(HFTransformerModel):
       ):
         self.head_dim = _structure.derive_head_dim(_Attrs(raw))
 
+      # Splash tuning from the job config's ``splash_attention_kernel``
+      # section, carried on the model config: HF hands each attention layer to
+      # the adapter as ``module``, which reads it from ``module.config``.
+      # Injected like the attention fields so it reaches the loaded HF config.
+      from torchtitan.experiments.tpu.workarounds import extract_splash_kwargs  # pylint: disable=g-import-not-at-top
+
+      self._titan_injected_model_args["splash_kernel_kwargs"] = extract_splash_kwargs(
+          getattr(config, "splash_attention_kernel", None)
+      )
       HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
       self._complete_from_hf_config(hf_model_id)
 
@@ -157,7 +176,7 @@ class TPUHFTransformerModel(HFTransformerModel):
       # the patch states its own 1.0 directly.
       self.initializer_range = raw.get("initializer_range", 0.02)
 
-      # Per-run HF config overrides from the job config (``key=value`` pairs,
+      # Per-run HF config overrides from the job config (a JSON object,
       # e.g. zeroing a checkpoint's attention dropout because the splash
       # kernel has no dropout path), applied last so they win over both the
       # checkpoint and the flavor. An unknown field is an error, not a no-op.
@@ -232,25 +251,20 @@ class TPUHFTransformerModel(HFTransformerModel):
 
       # A text tower with no causal-LM class: build the bare text model. The
       # AutoModel mapping knows some (Qwen2-VL's Qwen2VLTextModel); the rest
-      # (SiglipTextModel, BlipTextModel, ClapTextModel, Kosmos2TextModel)
-      # are only reachable as <Prefix>TextModel in the parent's module.
+      # are only reachable as a <Prefix>TextModel in the parent's module, and
+      # are named explicitly rather than picked from the module's exports.
       if not getattr(self, "architectures", None):
-        import importlib
-
         from transformers.models.auto.modeling_auto import MODEL_MAPPING_NAMES
 
         cls_name = MODEL_MAPPING_NAMES.get(hf_config.model_type)
         if cls_name is None and top_config is not hf_config:
-          try:
-            module = importlib.import_module(
-                f"transformers.models.{top_config.model_type.replace('-', '_')}"
+          cls_name = self._TEXT_TOWERS.get(top_config.model_type)
+          if cls_name is None:
+            raise ValueError(
+                f"{hf_model_id}: no causal-LM or text-tower class known for "
+                f"model_type {top_config.model_type!r}; add it to "
+                "TPUHFTransformerModel.Config._TEXT_TOWERS"
             )
-            cls_name = next(
-                (n for n in dir(module) if n.endswith("TextModel") and not n.startswith("_")),
-                None,
-            )
-          except ImportError:
-            cls_name = None
         if cls_name:
           self.architectures = [cls_name]
 
@@ -309,8 +323,8 @@ class TPUHFTransformerModel(HFTransformerModel):
         raise ValueError(
             f"fused_loss is not supported for {type(self.model).__name__}: "
             f"{blocker}. The fused CE computes hidden @ weight and nothing else, "
-            "so it would train a different model. Use a config with the plain "
-            "cross entropy (hf_full_splash, hf_full_splash_compile)."
+            "so it would train a different model. Use the plain cross-entropy "
+            "config (hf_full_max_plain_ce)."
         )
 
   # Post-head logit transforms in HF causal-LM heads, as config fields, with the
@@ -603,6 +617,16 @@ class TPUHFTransformerModel(HFTransformerModel):
     if attention_masks is not None:
       kwargs["attention_mask"] = attention_masks
 
+    # Document segment ids for the splash adapter, derived once per forward
+    # and threaded to every layer through HF's attention kwargs; each layer
+    # deriving its own repeats the same work per layer.
+    if (
+        positions is not None
+        and getattr(self.model.config, "_attn_implementation", None) == "splash_tpu"
+        and getattr(self.model.config, "attn_mask_type", "causal") == "block_causal"
+    ):
+      kwargs["tpu_segment_ids"] = _attention.document_segment_ids(kwargs["position_ids"])
+
     # The trainer folds the batch into one token-major stream, so the stream
     # is BS x seq_len long while the position table only has to cover one
     # sample: with per-document ``positions`` (reset at every sample boundary)
@@ -661,8 +685,8 @@ class TPUHFTransformerModel(HFTransformerModel):
         # rescales before its head, so the pair cannot be recovered here.
         raise ValueError(
             f"fused_loss is not supported for {type(self.model).__name__}: it "
-            "returns logits rather than hidden states. Use a config with the "
-            "plain cross entropy (hf_full_splash, hf_full_splash_compile)."
+            "returns logits rather than hidden states. Use the plain "
+            "cross-entropy config (hf_full_max_plain_ce)."
         )
       return logits.squeeze(0)
     hidden_states = hidden.squeeze(0)
