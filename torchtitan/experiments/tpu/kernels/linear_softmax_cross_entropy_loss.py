@@ -13,7 +13,14 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Linear Softmax Cross-Entropy Loss wrapped for TPU."""
+"""Linear Softmax Cross-Entropy Loss wrapped for TPU.
+
+The identity case (``soft_cap=None``, ``output_multiplier=1.0``) dispatches to
+the installed Tokamax kernel exactly as before. A configured logit transform
+(Muse Glimmer's ``SoftCappedLinear`` LM head: ``cap * tanh(z * mul / cap)``)
+dispatches to the vendored copy in ``linear_softmax_ce_softcap_kernel``, which
+applies the transform to each logits tile in-kernel (see that module's doc).
+"""
 
 import hashlib
 
@@ -42,6 +49,10 @@ import torch
 from torch_tpu._internal.pallas import pallas
 
 
+def _has_logit_transform(soft_cap, output_multiplier) -> bool:
+  return soft_cap is not None or output_multiplier != 1.0
+
+
 def _my_fwd(
     x,
     labels,
@@ -51,7 +62,27 @@ def _my_fwd(
     b_block_size,
     h_block_size,
     v_block_size,
+    soft_cap=None,
+    output_multiplier=1.0,
 ):
+  if _has_logit_transform(soft_cap, output_multiplier):
+    from torchtitan.experiments.tpu.kernels import linear_softmax_ce_softcap_kernel as softcap_kernel  # pylint: disable=g-import-not-at-top
+
+    fwd_fn = (
+        softcap_kernel.linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu
+    )
+    return fwd_fn(
+        x,
+        labels,
+        weights,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+        reduction=reduction,
+        soft_cap=soft_cap,
+        output_multiplier=output_multiplier,
+    )
+
   if implementation == "xla":
     from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference  # pylint: disable=g-import-not-at-top
 
@@ -85,12 +116,36 @@ def _my_bwd(
     b_block_size,
     h_block_size,
     v_block_size,
+    soft_cap=None,
+    output_multiplier=1.0,
 ):
   # The Torch custom op exposes the reduced loss as a one-element tensor, but
   # Tokamax's backward API consumes its cotangent as a scalar. Whole-graph XLA
   # can fold that distinction away; an executable boundary preserves the
   # one-element shape, so normalize it explicitly before entering Tokamax.
   dout = jax.numpy.reshape(dout, ())
+  if _has_logit_transform(soft_cap, output_multiplier):
+    from torchtitan.experiments.tpu.kernels import linear_softmax_ce_softcap_kernel as softcap_kernel  # pylint: disable=g-import-not-at-top
+
+    grad_fn = (
+        softcap_kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu
+    )
+    grad_x, grad_w = grad_fn(
+        dout,
+        lse,
+        x,
+        labels,
+        weights,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+        reduction=reduction,
+        soft_cap=soft_cap,
+        output_multiplier=output_multiplier,
+    )
+    # Same autograd dtype contract as the identity paths below.
+    return grad_x.astype(x.dtype), grad_w.astype(weights.dtype)
+
   if implementation == "xla":
     from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference  # pylint: disable=g-import-not-at-top
 
@@ -127,7 +182,13 @@ _loss_op_name_cache = {}
 
 @torch._dynamo.assume_constant_result
 def _get_loss_op_names(
-    reduction, implementation, b_block_size, h_block_size, v_block_size
+    reduction,
+    implementation,
+    b_block_size,
+    h_block_size,
+    v_block_size,
+    soft_cap=None,
+    output_multiplier=1.0,
 ):
   cache_key = (
       reduction,
@@ -136,11 +197,19 @@ def _get_loss_op_names(
       h_block_size,
       v_block_size,
   )
+  if _has_logit_transform(soft_cap, output_multiplier):
+    # Only extend the key for a configured transform so the identity case keeps
+    # its historical op names (and compilation-cache entries).
+    cache_key = cache_key + (soft_cap, output_multiplier)
   if cache_key in _loss_op_name_cache:
     return _loss_op_name_cache[cache_key]
 
-  compiled_fwd = pallas.custom_jax_kernel(_my_fwd, static_argnums=(3, 4, 5, 6, 7))
-  compiled_bwd = pallas.custom_jax_kernel(_my_bwd, static_argnums=(5, 6, 7, 8, 9))
+  compiled_fwd = pallas.custom_jax_kernel(
+      _my_fwd, static_argnums=(3, 4, 5, 6, 7, 8, 9)
+  )
+  compiled_bwd = pallas.custom_jax_kernel(
+      _my_bwd, static_argnums=(5, 6, 7, 8, 9, 10, 11)
+  )
 
   def fwd_wrapped(x, labels, weights):
     return compiled_fwd(
@@ -152,6 +221,8 @@ def _get_loss_op_names(
         b_block_size,
         h_block_size,
         v_block_size,
+        soft_cap,
+        output_multiplier,
     )
 
   def bwd_wrapped(dout, lse, x, labels, weights):
@@ -166,6 +237,8 @@ def _get_loss_op_names(
         b_block_size,
         h_block_size,
         v_block_size,
+        soft_cap,
+        output_multiplier,
     )
 
   # Truncate SHA-256 to 16 hex characters (64 bits) for op name readability.
@@ -220,11 +293,19 @@ class TorchLinearLoss(torch.autograd.Function):
       b_block_size=1024,
       h_block_size=512,
       v_block_size=2048,
+      soft_cap=None,
+      output_multiplier=1.0,
   ):
     labels_int32 = labels.to(torch.int32)
 
     fwd_name, _ = _get_loss_op_names(
-        reduction, implementation, b_block_size, h_block_size, v_block_size
+        reduction,
+        implementation,
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        soft_cap,
+        output_multiplier,
     )
     torch_fwd_fn = getattr(torch.ops.pallas, fwd_name)
     loss, lse = torch_fwd_fn(x, labels_int32, weights)
@@ -234,6 +315,8 @@ class TorchLinearLoss(torch.autograd.Function):
     ctx.b_block_size = b_block_size
     ctx.h_block_size = h_block_size
     ctx.v_block_size = v_block_size
+    ctx.soft_cap = soft_cap
+    ctx.output_multiplier = output_multiplier
 
     return loss
 
@@ -247,12 +330,18 @@ class TorchLinearLoss(torch.autograd.Function):
     v_block_size = ctx.v_block_size
 
     _, bwd_name = _get_loss_op_names(
-        reduction, implementation, b_block_size, h_block_size, v_block_size
+        reduction,
+        implementation,
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        ctx.soft_cap,
+        ctx.output_multiplier,
     )
     torch_bwd_fn = getattr(torch.ops.pallas, bwd_name)
     grad_x, grad_w = torch_bwd_fn(grad_output, lse, x, labels, weights)
 
-    return grad_x, None, grad_w, None, None, None, None, None
+    return grad_x, None, grad_w, None, None, None, None, None, None, None
 
 
 def linear_softmax_cross_entropy_loss(
@@ -264,6 +353,8 @@ def linear_softmax_cross_entropy_loss(
     b_block_size: int = 1024,
     h_block_size: int = 512,
     v_block_size: int = 2048,
+    soft_cap: float | None = None,
+    output_multiplier: float = 1.0,
 ) -> torch.Tensor:
   """Linear Softmax Cross-Entropy Loss.
 
@@ -280,10 +371,26 @@ def linear_softmax_cross_entropy_loss(
       b_block_size: Block size for batch dimension.
       h_block_size: Block size for hidden dimension.
       v_block_size: Block size for vocab dimension.
+      soft_cap: Optional tanh soft-cap on the logits, applied in-kernel as
+        ``soft_cap * tanh(logits * output_multiplier / soft_cap)`` (Muse
+        Glimmer's ``SoftCappedLinear``). ``None`` leaves the logits uncapped.
+      output_multiplier: Multiplier on the logits (applied before the cap).
+        ``1.0`` together with ``soft_cap=None`` is the unchanged Tokamax path.
 
   Returns:
       The Cross-Entropy loss.
+
+  Raises:
+      ValueError: If a logit transform is combined with a non-Mosaic
+        ``implementation``.
   """
+  if _has_logit_transform(soft_cap, output_multiplier) and (
+      implementation != "mosaic_tpu"
+  ):
+    raise ValueError(
+        "soft_cap / output_multiplier are only supported with"
+        f" implementation='mosaic_tpu', got {implementation!r}"
+    )
   return TorchLinearLoss.apply(
       x,
       labels.to(torch.int32),
@@ -293,4 +400,6 @@ def linear_softmax_cross_entropy_loss(
       b_block_size,
       h_block_size,
       v_block_size,
+      soft_cap,
+      output_multiplier,
   )

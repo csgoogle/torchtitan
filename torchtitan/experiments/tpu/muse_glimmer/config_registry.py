@@ -9,11 +9,39 @@ from torchtitan.config.configs import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
-__all__ = ["muse_glimmer_debugmodel"]
+__all__ = [
+    "muse_glimmer_debugmodel",
+    "muse_glimmer_debugmodel_fused_ce",
+]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
+
+# Overrides are identified by the import path of the decorated factory.
+_FUSED_LOSS_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.fused_loss."
+    "fused_loss_soft_capped_lm_head"
+)
+
+
+def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
+  """Select the fused loss and its pre-construction LM-head override together.
+
+  Same idiom as the qwen3 registry, with two Muse specifics: the override
+  targets ``SoftCappedLinear.Config`` (Muse's lm_head type), and the head's
+  soft-cap / output multiplier are copied into the loss config, because the
+  wrapper only hands ``(hidden, weight.T)`` to the loss and the transform is
+  applied inside the fused kernel.
+  """
+  lm_head = config.model_spec.model.lm_head
+  config.loss = PallasCrossEntropyLoss.Config(
+      soft_cap=lm_head.output_soft_cap_temp,
+      output_multiplier=lm_head.output_multiplier,
+  )
+  if _FUSED_LOSS_OVERRIDE not in config.override.imports:
+    config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
 def muse_glimmer_debugmodel() -> TPUTrainerConfig:
@@ -25,9 +53,11 @@ def muse_glimmer_debugmodel() -> TPUTrainerConfig:
   soft-cap lives in ``SoftCappedLinear`` (the ``lm_head``), so it is still
   applied on the full-logits path.
 
-  The Pallas fused loss (``--loss_kernel.use_loss_kernel``) is not supported:
-  it bypasses ``SoftCappedLinear.forward`` and would drop the output multiplier
-  and soft-cap, so ``workarounds.use_output_projection_patch`` rejects it.
+  The legacy Pallas fused loss (``--loss_kernel.use_loss_kernel``) is not
+  supported: it bypasses ``SoftCappedLinear.forward`` and would drop the output
+  multiplier and soft-cap, so ``workarounds.use_output_projection_patch``
+  rejects it. Use ``muse_glimmer_debugmodel_fused_ce`` instead, which applies
+  the soft-cap inside the fused kernel.
   """
   # Imported here to avoid a circular import: the package __init__ imports this
   # module at the end.
@@ -59,3 +89,16 @@ def muse_glimmer_debugmodel() -> TPUTrainerConfig:
       ),
       activation_checkpoint=SelectiveAC.Config(),
   )
+
+
+def muse_glimmer_debugmodel_fused_ce() -> TPUTrainerConfig:
+  """``muse_glimmer_debugmodel`` with the fused Pallas cross entropy.
+
+  The ``SoftCappedLinear`` lm_head is replaced by ``FusedLossLinearWrapper`` and
+  ``PallasCrossEntropyLoss`` re-applies the head's ``cap * tanh(z * mul / cap)``
+  to each logits tile in-kernel (cap 20, multiplier 1.0 for the debug flavor),
+  so the full fp32 logits are never materialized.
+  """
+  config = muse_glimmer_debugmodel()
+  _enable_pallas_cross_entropy(config)
+  return config

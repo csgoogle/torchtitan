@@ -621,8 +621,58 @@ def use_cpu_safe_histc_patch() -> None:
   logger.info("Monkey-patched torch.histc to support int dtypes on CPU")
 
 
+def _check_fused_loss_logit_transform(model: nn.Module, job_config: Any) -> None:
+  """Raises if the fused loss would apply a different logit transform.
+
+  ``FusedLossLinearWrapper`` replaces the LM head at config time and records the
+  replaced head's ``soft_cap`` / ``output_multiplier``, but never applies them:
+  ``PallasCrossEntropyLoss`` does, from its own copy of the two values. If the
+  copies diverge (e.g. a recipe builds the loss for one Muse Glimmer flavor and
+  then swaps in another), training would silently use the wrong logits.
+
+  Args:
+    model: The built model (or one pipeline stage of it).
+    job_config: The TPU job config whose loss will consume the head's output.
+
+  Raises:
+    ValueError: If the head and the loss disagree, or if the head is a fused
+      loss wrapper but no fused loss is configured.
+  """
+  lm_head = getattr(model, "lm_head", None)
+  # FusedLossLinearWrapper marks itself with `returns_loss_operands`.
+  if not getattr(lm_head, "returns_loss_operands", False):
+    return
+  # Matched by fields rather than by type: importing loss.py here would create
+  # a models -> workarounds -> loss -> models dependency cycle.
+  loss_config = getattr(job_config, "loss", None)
+  if hasattr(loss_config, "soft_cap") and hasattr(
+      loss_config, "output_multiplier"
+  ):
+    loss = (loss_config.soft_cap, loss_config.output_multiplier)
+  elif getattr(
+      getattr(job_config, "loss_kernel", None), "use_loss_kernel", False
+  ):
+    # loss.build_cross_entropy_loss's legacy path: an untransformed fused loss.
+    loss = (None, 1.0)
+  else:
+    raise ValueError(
+        f"lm_head is a {type(lm_head).__name__} but the loss is"
+        f" {type(loss_config).__name__}; the wrapper only returns"
+        " (hidden, weight) operands for PallasCrossEntropyLoss."
+    )
+  head = (lm_head.soft_cap, lm_head.output_multiplier)
+  if head != loss:
+    raise ValueError(
+        "Fused-loss logit transform mismatch: lm_head was replaced with"
+        f" (soft_cap, output_multiplier)={head}, but the fused loss is"
+        f" configured with {loss}."
+    )
+
+
 def apply_patches(model: nn.Module, job_config: Any) -> None:
   """Applies all TPU-specific patches and workarounds to the model."""
+  _check_fused_loss_logit_transform(model, job_config)
+
   # Enable CPU safe histc workaround.
   use_cpu_safe_histc_patch()
 

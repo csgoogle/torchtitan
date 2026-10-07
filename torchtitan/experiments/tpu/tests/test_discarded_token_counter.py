@@ -1,7 +1,5 @@
 """Tests for the discarded MoE token-counter override."""
 
-import contextlib
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
@@ -11,7 +9,6 @@ from torchtitan.experiments.tpu.overrides.discarded_token_counter import (
     TpuDiscardedTokenCounterMoE,
     tpu_discarded_token_counter,
 )
-from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 from torchtitan.models.common.config_utils import make_aux_loss_config, make_moe_config
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import (
@@ -58,27 +55,14 @@ def _moe_config(*, load_balance_coeff: float | None) -> MoE.Config:
   if aux:
     # Upstream d771abb0 dropped `make_moe_config(aux_loss_type=...)`; its
     # `aux_loss_coeff` only builds the microbatch-wise loss. The sequence-wise
-    # variant this test exercises is a fork addition that hangs off
-    # `MoE.Config.aux_loss`.
-    config.aux_loss = make_aux_loss_config(
+    # variant this test exercises is a fork addition set as
+    # `TokenChoiceTopKRouter.Config.aux_loss`.
+    config.router.aux_loss = make_aux_loss_config(
         type="sequence_wise", coeff=1e-3, top_k=_TOP_K
     )
+    config.router.aux_loss.global_batch_size = _BATCH
+    config.router.aux_loss.seq_len = _SEQ
   return config
-
-
-@contextlib.contextmanager
-def _sequence_boundaries(active: bool):
-  """TT-UNFLATTEN-SHIM: tell the sequence-wise aux loss where sequences end.
-
-  Only the fork's `_sequence_wise_load_balance_loss` needs this; the bias
-  scheme counts tokens and does not care. Delete this along with the shim once
-  that loss is `[T]`-native.
-  """
-  if not active:
-    yield
-    return
-  with set_unflatten_seq_len(_SEQ):
-    yield
 
 
 class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
@@ -91,8 +75,7 @@ class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
     for p in moe.parameters():
       nn.init.normal_(p, std=0.02)
 
-    with _sequence_boundaries(coeff is None):
-      moe(torch.randn(_TOKENS, _DIM))
+    moe(torch.randn(_TOKENS, _DIM))
 
     expected = _TOKENS * _TOP_K if coeff is not None else 0
     self.assertEqual(moe.tokens_per_expert_E.sum().item(), expected)
@@ -106,8 +89,7 @@ class TpuDiscardedTokenCounterMoETest(parameterized.TestCase):
     overridden.load_state_dict(base.state_dict())
 
     x = torch.randn(_TOKENS, _DIM)
-    with _sequence_boundaries(True):
-      torch.testing.assert_close(overridden(x), base(x), rtol=0, atol=0)
+    torch.testing.assert_close(overridden(x), base(x), rtol=0, atol=0)
 
 
 if __name__ == "__main__":

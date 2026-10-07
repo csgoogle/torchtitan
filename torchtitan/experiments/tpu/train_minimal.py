@@ -165,7 +165,24 @@ class TrainerMinimal:
     )
 
     model_config = self.model_spec.model
-    model_config.update_from_config(config=job_config)
+    # MoELoadBalanceAuxLoss needs sample-counted batch sizes, and
+    # Qwen3Model.update_from_config raises without them. Same formula as
+    # Trainer, with the batch mesh's degree as the data-parallel degree.
+    training = job_config.training
+    local_global_batch_size = (
+        training.num_tokens_per_microbatch_per_dp_rank
+        // training.max_context_length
+    ) * batch_degree
+    global_batch_size = training.num_tokens_per_train_step
+    if global_batch_size < 0:  # One gradient accumulation step.
+      global_batch_size = local_global_batch_size
+    else:
+      global_batch_size //= training.max_context_length
+    model_config.update_from_config(
+        config=job_config,
+        local_global_batch_size=local_global_batch_size,
+        global_batch_size=global_batch_size,
+    )
     self.model_config = model_config
 
     if (

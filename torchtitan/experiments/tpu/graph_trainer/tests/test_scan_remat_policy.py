@@ -20,6 +20,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 # Imported for the same reason as in `test_layer_stack`: production scans run
 # with it installed, so these do too.
 from torchtitan.experiments.tpu import scan_backward_patch  # noqa: F401  pylint: disable=unused-import,g-bad-import-order
+from torchtitan.experiments.tpu.graph_trainer import scan_remat_policy
 from torchtitan.experiments.tpu.graph_trainer.scan_remat_policy import (
     count_collectives,
     scan_body_remat_window,
@@ -96,10 +97,14 @@ def _real_aux_term(dp_group, cp_group):
     """The real batch-wise aux loss, its in-place all-reduces over two groups."""
 
     def term(scores: torch.Tensor) -> torch.Tensor:
+        # As the router builds it: a one-hot [T, E] map of each token's experts.
         ids = scores.topk(TOP_K, dim=-1).indices
+        routing_map = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+            -1, ids, True
+        )
         return _batch_wise_load_balance_loss(
             scores.unsqueeze(0),
-            ids.unsqueeze(0),
+            routing_map.unsqueeze(0),
             TOP_K,
             0.01,
             dp_mesh=_Mesh(dp_group),
@@ -147,6 +152,12 @@ def _run(window, *, extra=_aux_term):
 
 def _legacy_window():
     return functorch_config.patch(activation_memory_budget=0.0)
+
+
+def _has_count_source(graph_module) -> bool:
+    return any(
+        scan_remat_policy._is_count_source(n) for n in graph_module.graph.nodes
+    )
 
 
 def _ops(graph_module) -> list[str]:
@@ -266,10 +277,15 @@ class TestScanBodyRematWindow(unittest.TestCase):
             2,
             "expected one count all-reduce per group -- test is vacuous",
         )
+        # The real loss counts by summing the routing map, not with `histc`.
+        self.assertTrue(
+            _has_count_source(legacy[0][1]),
+            "expected budget 0.0 to recompute the counts -- test is vacuous",
+        )
         budget, backward = captured[0]
         self.assertEqual(budget, 1.0)
         ops = _ops(backward)
-        self.assertNotIn("aten.histc.default", ops)
+        self.assertFalse(_has_count_source(backward))
         self.assertNotIn("_c10d_functional.all_reduce.default", ops)
         for name, g, w in zip(("out", "h.grad", "w.grad"), got, want):
             torch.testing.assert_close(g, w, rtol=0, atol=0, msg=name)

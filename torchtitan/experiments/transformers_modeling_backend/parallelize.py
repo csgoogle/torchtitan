@@ -93,6 +93,7 @@ def parallelize_hf_transformers(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
     """Apply parallelism to the HF model using the titan Module protocol.
 
@@ -162,11 +163,15 @@ def parallelize_hf_transformers(
 
     convert_hf_to_module(model)
 
-    # 3. Set sharding configs on all non-MoE modules
-    set_hf_sharding_configs(
-        model,
-        enable_sp=parallel_dims.tp_enabled,
-    )
+    # 3. Set sharding configs on all non-MoE modules (they assume Llama-style
+    # block names; with no TP/EP/CP there is nothing to place, so skip them).
+    # CP needs this pass too: it attaches the flex kernels that step 3b wraps
+    # to all-gather K/V across the CP axis.
+    if parallel_dims.tp_enabled or parallel_dims.ep > 1 or parallel_dims.cp_enabled:
+        set_hf_sharding_configs(
+            model,
+            enable_sp=parallel_dims.tp_enabled,
+        )
 
     # 3b. Under CP, wrap each flex kernel forward to all-gather k/v across
     # the CP axis (on the seq dim). Must run before model.parallelize so the
@@ -195,6 +200,9 @@ def parallelize_hf_transformers(
             compile_config=compile_config,
             parallel_dims=parallel_dims,
         )
+
+    if skip_dp:  # the caller supplies its own data-parallel wrapping
+        return model
 
     dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
     edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)

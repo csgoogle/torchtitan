@@ -12,6 +12,7 @@ import torch
 
 from torchtitan.config import derive, override
 from torchtitan.models.common import Linear
+from torchtitan.models.muse_glimmer.model import SoftCappedLinear
 
 
 class FusedLossLinearWrapper(Linear):
@@ -25,6 +26,12 @@ class FusedLossLinearWrapper(Linear):
 
   Constructing the wrapper from ``Linear.Config`` preserves the normal weight
   initialization, sharding, optimizer ownership, and checkpoint key.
+
+  When the replaced head was a ``SoftCappedLinear`` (Muse Glimmer), its
+  ``soft_cap`` / ``output_multiplier`` are recorded on the wrapper so the head
+  it stands in for is auditable; the transform itself is applied by
+  ``PallasCrossEntropyLoss`` (configured with the same two values), since the
+  wrapper never sees the logits.
   """
 
   # Tells workarounds.use_output_projection_patch that forward already returns
@@ -33,12 +40,15 @@ class FusedLossLinearWrapper(Linear):
 
   @dataclass(kw_only=True, slots=True)
   class Config(Linear.Config):
-    pass
+    soft_cap: float | None = None
+    output_multiplier: float = 1.0
 
   def __init__(self, config: Config):
     if config.bias:
       raise ValueError("Fused linear loss does not support a biased LM head")
     super().__init__(config)
+    self.soft_cap = config.soft_cap
+    self.output_multiplier = config.output_multiplier
 
   def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return x, self.weight.t()
@@ -57,4 +67,28 @@ def fused_loss_lm_head(cfg: Linear.Config) -> FusedLossLinearWrapper.Config:
   return derive(cfg, FusedLossLinearWrapper.Config)
 
 
-__all__ = ["FusedLossLinearWrapper", "fused_loss_lm_head"]
+@override(
+    target=SoftCappedLinear.Config,
+    fqns=["model_spec.model.lm_head"],
+    exact=True,
+    description=(
+        "Defer the Muse Glimmer soft-capped LM-head projection to TPU fused"
+        " cross entropy (the cap is re-applied inside the loss kernel)."
+    ),
+)
+def fused_loss_soft_capped_lm_head(
+    cfg: SoftCappedLinear.Config,
+) -> FusedLossLinearWrapper.Config:
+  return derive(
+      cfg,
+      FusedLossLinearWrapper.Config,
+      soft_cap=cfg.output_soft_cap_temp,
+      output_multiplier=cfg.output_multiplier,
+  )
+
+
+__all__ = [
+    "FusedLossLinearWrapper",
+    "fused_loss_lm_head",
+    "fused_loss_soft_capped_lm_head",
+]

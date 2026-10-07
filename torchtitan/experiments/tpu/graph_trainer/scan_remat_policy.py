@@ -15,8 +15,9 @@ fully exposed, per-layer DCN round trip for 128 floats.
 
 This module keeps the budget-0.0 behaviour for everything except those counts:
 
-* All-reduces whose operand is an expert count (``histc``/``bincount``,
-  through dtype casts, views and earlier count all-reduces) are tagged
+* All-reduces whose operand is an expert count (``histc``/``bincount``, or a
+  sum over the router's boolean routing map, through dtype casts, views and
+  earlier count all-reduces) are tagged
   ``MUST_SAVE``. Other collectives on counts -- expert parallelism's routing
   count ``all_to_all_single`` -- are not.
 * Every other forward node is tagged ``MUST_RECOMPUTE``, which is what budget
@@ -54,8 +55,10 @@ __all__ = [
 
 _aten = torch.ops.aten
 
-# Where an expert count is born.
+# Where an expert count is born: from expert ids, or (see `_sums_a_routing_map`)
+# by summing the router's one-hot routing map.
 _COUNT_SOURCES = frozenset({_aten.histc.default, _aten.bincount.default})
+_SUMS = frozenset({_aten.sum.dim_IntList, _aten.sum.default})
 
 # Ops a count may pass through on its way to (and between) the collectives
 # without becoming something else: casts, views and copies. `.to(dtype)` in
@@ -89,6 +92,36 @@ _COUNT_COLLECTIVES = frozenset(
 )
 
 
+def _is_bool(node: fx.Node) -> bool:
+    val = node.meta.get("val")
+    return isinstance(val, torch.Tensor) and val.dtype == torch.bool
+
+
+def _sums_a_routing_map(node: fx.Node) -> bool:
+    """A sum over a boolean (one-hot routing map) tensor, through casts/views.
+
+    The MoE aux losses count tokens per expert this way: MoELoadBalanceAuxLoss
+    as ``routing_map.sum(...).to(dtype)``, upstream's
+    MicrobatchWiseLoadBalanceLoss as ``routing_map.to(dtype).sum(...)``.
+    """
+    if node.op != "call_function" or node.target not in _SUMS:
+        return False
+    src = node.args[0]
+    while isinstance(src, fx.Node):
+        if _is_bool(src):
+            return True
+        if src.op != "call_function" or src.target not in _COUNT_PASSTHROUGH:
+            return False
+        src = src.args[0]
+    return False
+
+
+def _is_count_source(node: fx.Node) -> bool:
+    return node.op == "call_function" and (
+        node.target in _COUNT_SOURCES or _sums_a_routing_map(node)
+    )
+
+
 def _is_collective(node: fx.Node) -> bool:
     return (
         isinstance(node.target, torch._ops.OpOverload)
@@ -99,16 +132,13 @@ def _is_collective(node: fx.Node) -> bool:
 def _reached_from_counts(graph: fx.Graph) -> set[fx.Node]:
     """Count sources and everything a count flows to unmixed.
 
-    Flows forward from each ``histc``/``bincount`` through casts, views,
-    all-reduces and waits only. Anything that mixes the count with another
-    value ends the flow, and so does any other collective.
+    Flows forward from each count source (``histc``/``bincount``, or a sum over
+    a boolean routing map) through casts, views, all-reduces and waits only.
+    Anything that mixes the count with another value ends the flow, and so does
+    any other collective.
     """
     reached: set[fx.Node] = set()
-    stack = [
-        n
-        for n in graph.nodes
-        if n.op == "call_function" and n.target in _COUNT_SOURCES
-    ]
+    stack = [n for n in graph.nodes if _is_count_source(n)]
     while stack:
         node = stack.pop()
         if node in reached:
@@ -139,7 +169,7 @@ def _count_values_to_save(graph: fx.Graph) -> list[fx.Node]:
     Saving just the collectives is not enough. An in-place ``dist.all_reduce``
     -- what `_all_reduce_expert_counts` does -- functionalizes to
     ``aten.copy(dst=<counts before the reduce>, src=<reduced>)``, and a
-    recomputed copy needs its ``dst``, which drags the ``histc`` back into
+    recomputed copy needs its ``dst``, which drags the count source back into
     backward. Everything after the first count all-reduce is an ``[E]``-sized
     count, so saving all of it costs nothing.
     """

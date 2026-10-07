@@ -298,7 +298,7 @@ def make_aux_loss_config(
     coeff: float,
     top_k: int,
 ) -> MoELoadBalanceAuxLoss.Config:
-    """Build a MoELoadBalanceAuxLoss.Config."""
+    """Build a MoELoadBalanceAuxLoss.Config for ``router.aux_loss``."""
     return MoELoadBalanceAuxLoss.Config(type=type, coeff=coeff, top_k=top_k)
 
 
@@ -458,30 +458,40 @@ def make_routed_experts_config(
     )
 
 
+def moe_load_balance_aux_loss_configs(
+    layers: list,
+) -> list[MoELoadBalanceAuxLoss.Config]:
+    """The ``MoELoadBalanceAuxLoss`` router configs among ``layers``.
+
+    Upstream aux losses (e.g. MicrobatchWiseLoadBalanceLoss) self-normalize and
+    are not included.
+    """
+    configs = []
+    for layer_cfg in layers:
+        moe_cfg = getattr(layer_cfg, "moe", None)
+        aux_loss = getattr(getattr(moe_cfg, "router", None), "aux_loss", None)
+        if isinstance(aux_loss, MoELoadBalanceAuxLoss.Config):
+            configs.append(aux_loss)
+    return configs
+
+
 def update_moe_aux_loss_configs(
     layers: list,
     *,
     pp_enabled: bool,
     local_global_batch_size: int,
     global_batch_size: int,
+    seq_len: int,
 ) -> None:
     """Update aux loss configs for all MoE layers from trainer config.
 
     Call this from each model's ``update_from_config`` to set
     ``global_batch_size`` for gradient normalization across PP microbatches,
-    gradient accumulation steps, and DP ranks (FSDP sum). Also validates
+    gradient accumulation steps, and DP ranks (FSDP sum), and ``seq_len`` so
+    the loss can work on the router's flat ``[T, E]`` outputs. Also validates
     that batch-wise aux loss is not used with PP or gradient accumulation.
     """
-    for layer_cfg in layers:
-        moe_cfg = getattr(layer_cfg, "moe", None)
-        if moe_cfg is None:
-            continue
-        aux_loss = getattr(moe_cfg, "aux_loss", None)
-        if aux_loss is None and hasattr(moe_cfg, "router"):
-            aux_loss = getattr(moe_cfg.router, "aux_loss", None)
-        # Upstream aux losses (e.g. MicrobatchWiseLoadBalanceLoss) self-normalize.
-        if not isinstance(aux_loss, MoELoadBalanceAuxLoss.Config):
-            continue
+    for aux_loss in moe_load_balance_aux_loss_configs(layers):
         if aux_loss.type == "batch_wise" and pp_enabled:
             raise ValueError(
                 "batch_wise MoE aux loss is incompatible with pipeline "
@@ -489,9 +499,12 @@ def update_moe_aux_loss_configs(
             )
         if aux_loss.type == "batch_wise" and global_batch_size != local_global_batch_size:
             raise ValueError(
-                "batch_wise MoE aux loss is incompatible with gradient "
-                "accumulation. Use sequence_wise instead or set "
-                "training.global_batch_size to local_batch_size * data-parallel degree."
+                "batch_wise MoE aux loss is incompatible with gradient accumulation: "
+                f"global batch is {global_batch_size} sequences but one step covers "
+                f"{local_global_batch_size} (per-rank microbatch x DP degree). Use "
+                "sequence_wise, or set training.num_tokens_per_train_step to "
+                "training.num_tokens_per_microbatch_per_dp_rank * data-parallel degree."
             )
         aux_loss.global_batch_size = global_batch_size
+        aux_loss.seq_len = seq_len
 

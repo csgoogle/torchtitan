@@ -83,7 +83,7 @@ from torchtitan.experiments.tpu.token_dispatcher import (
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
 from torchtitan.models.common import ComplexRoPE, Linear
-from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.moe import MoE, MoELoadBalanceAuxLoss
 from torchtitan.models.llama3.config_registry import (
     model_registry as llama3_model_registry,
 )
@@ -727,7 +727,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     moes = list(config.model_spec.model.traverse(MoE.Config))
     self.assertLen(moes, 94)
     self.assertTrue(all(moe.load_balance_coeff is None for _, moe, _, _ in moes))
-    self.assertTrue(all(moe.aux_loss is not None for _, moe, _, _ in moes))
+    self.assertTrue(
+        all(moe.router.aux_loss is not None for _, moe, _, _ in moes)
+    )
     self.assertFalse(config.metrics.enable_moe_routing)
     # Clearing the coeff leaves a dead in-place write scan also rejects, so the
     # override has to reach every MoE.
@@ -747,11 +749,31 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertLen(moes, 94)
     for _, moe, _, _ in moes:
       self.assertIsNone(moe.load_balance_coeff)
-      self.assertIsNotNone(moe.aux_loss)
-      assert moe.aux_loss is not None
-      self.assertEqual(moe.aux_loss.type, "batch_wise")
-      self.assertEqual(moe.aux_loss.coeff, 1e-3)
-      self.assertEqual(moe.aux_loss.top_k, moe.router.top_k)
+      aux_loss = moe.router.aux_loss
+      self.assertIsInstance(aux_loss, MoELoadBalanceAuxLoss.Config)
+      assert isinstance(aux_loss, MoELoadBalanceAuxLoss.Config)
+      self.assertEqual(aux_loss.type, "batch_wise")
+      self.assertEqual(aux_loss.coeff, 1e-3)
+      self.assertEqual(aux_loss.top_k, moe.router.top_k)
+
+  def test_30b_global_aux_recipe_uses_global_batch_aux_loss(self) -> None:
+    # 30B-A3B-global-aux (and the fsdp_only recipes derived from it) must get
+    # the fork's global-batch loss, not upstream's microbatch-wise one.
+    config = qwen3_moe_30b_fsdp_only_full_ac_benchmark()
+
+    assert config.model_spec is not None
+    self.assertEqual(config.model_spec.flavor, "30B-A3B-global-aux")
+    self.assertTrue(config.metrics.enable_moe_routing)
+    moes = list(config.model_spec.model.traverse(MoE.Config))
+    self.assertLen(moes, 48)
+    for _, moe, _, _ in moes:
+      self.assertIsNone(moe.load_balance_coeff)
+      aux_loss = moe.router.aux_loss
+      self.assertIsInstance(aux_loss, MoELoadBalanceAuxLoss.Config)
+      assert isinstance(aux_loss, MoELoadBalanceAuxLoss.Config)
+      self.assertEqual(aux_loss.type, "batch_wise")
+      self.assertEqual(aux_loss.coeff, 1e-3)
+      self.assertEqual(aux_loss.top_k, moe.router.top_k)
 
   def test_235b_splitter_uses_tokamax_splash_attention(self) -> None:
     for config in (
