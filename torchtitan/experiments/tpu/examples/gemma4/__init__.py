@@ -105,13 +105,6 @@ def _make_moe_config(
     return Gemma4MoE.Config(
         num_experts=num_experts,
         load_balance_coeff=load_balance_coeff,
-        aux_loss=MoELoadBalanceAuxLoss.Config(
-            type="sequence_wise",
-            coeff=aux_loss_coeff,
-            top_k=top_k,
-        )
-        if aux_loss_coeff > 0
-        else None,
         pre_feedforward_layernorm_2=_gemma4_norm(dim, eps=norm_eps),
         router=Gemma4Router.Config(
             dim=dim,
@@ -119,6 +112,13 @@ def _make_moe_config(
             top_k=top_k,
             score_func="softmax",
             route_norm=True,
+            aux_loss=MoELoadBalanceAuxLoss.Config(
+                type="sequence_wise",
+                coeff=aux_loss_coeff,
+                top_k=top_k,
+            )
+            if aux_loss_coeff > 0
+            else None,
             norm=RMSNorm.Config(
                 normalized_shape=dim,
                 eps=norm_eps,
