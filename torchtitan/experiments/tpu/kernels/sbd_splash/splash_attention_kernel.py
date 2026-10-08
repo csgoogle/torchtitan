@@ -101,6 +101,14 @@ def _not(x: jax.Array | bool) -> jax.Array | bool:
   return not x
 
 
+def _and(x: jax.Array | bool, y: jax.Array | bool) -> jax.Array | bool:
+  # sbd fork: keeps a statically-known predicate static, so `pl.when` on the
+  # non-dynamic-grid path still folds away instead of emitting a branch.
+  if isinstance(x, jax.Array) or isinstance(y, jax.Array):
+    return jnp.logical_and(x, y)
+  return x and y
+
+
 class SegmentIds(NamedTuple):
   """SegmentIds for Q and KV sequences.
 
@@ -610,6 +618,12 @@ def flash_attention_kernel(
 
   if block_mask_ref is not None:
     should_not_mask = block_mask_ref[grid_idx].astype(jnp.int32) != 1
+    # sbd fork: `block_mask == 0` means "visit this step, initialize and write
+    # the row's output tile, compute nothing" -- the state the wrapper's
+    # document-aware skipping puts a kept-but-empty row anchor in, and the
+    # same convention the dkv kernel already carries. Without the gate a 0
+    # would fall into the `!= 1` branch and be computed UNMASKED.
+    should_run = block_mask_ref[grid_idx].astype(jnp.int32) != 0
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
     j = active_cols_ref[grid_idx].astype(jnp.int32)
@@ -618,6 +632,7 @@ def flash_attention_kernel(
       i_row = active_rows_ref[grid_idx].astype(jnp.int32)
   else:
     should_not_mask = False
+    should_run = True
     j = grid_idx % kv_steps
     should_initialize = j == 0
     should_write = j == kv_steps - 1
@@ -1032,11 +1047,11 @@ def flash_attention_kernel(
       k_ref.shape[0 if config.k_layout == HEAD_DIM_MINOR else 1] // bkv_compute
   )
 
-  @pl.when(should_not_mask)
+  @pl.when(_and(should_not_mask, should_run))
   def _():
     lax.fori_loop(0, num_iters, body, None, unroll=True)
 
-  @pl.when(jnp.logical_not(should_not_mask))
+  @pl.when(_and(_not(should_not_mask), should_run))
   def _():
     lax.fori_loop(
         0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
@@ -1111,6 +1126,7 @@ def _splash_attention_forward(
     bias_function=None,
     fwd_mask_sparsity: float = 1.0,
     max_logit_value: jax.Array | None = None,
+    save_max_logits: bool = True,
 ) -> base.SplashCustomReturnType:
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
@@ -1416,6 +1432,13 @@ def _splash_attention_forward(
   ]
   if save_residuals:
     logsumexp_index_map = unravel(lambda h_block, i, j, *_: (h_block, i, 0))
+    # sbd fork: `max_logits` is a lane-padded (num_q_heads, q_seq_len, 128)
+    # fp32 buffer -- 268 MB at the HF lane's 16k x 32-head op-point -- and a
+    # custom call's outputs are opaque to XLA, so one the caller never reads
+    # is allocated all the same. `fuse_reciprocal` needs it to rebuild
+    # logsumexp; nothing else does, so a caller that wants only logsumexp
+    # can opt out.
+    need_max_logits = save_max_logits or not fuse_reciprocal
 
     out_shapes += [
         # logsumexp
@@ -1427,7 +1450,9 @@ def _splash_attention_forward(
         if not fuse_reciprocal
         else None,
         # max_logits
-        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32),
+        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
+        if need_max_logits
+        else None,
     ]
     out_specs += [
         pl.BlockSpec(
@@ -1442,7 +1467,9 @@ def _splash_attention_forward(
         else None,
         pl.BlockSpec(
             (num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map
-        ),
+        )
+        if need_max_logits
+        else None,
     ]
   else:
     out_shapes += [None, None, None]
@@ -1600,8 +1627,8 @@ def _splash_attention_forward(
   out = init_if_empty(out, 0.0)
 
   if save_residuals:
-    assert max_logits is not None
-    max_logits = init_if_empty(max_logits[..., 0], mask_value)
+    if max_logits is not None:
+      max_logits = init_if_empty(max_logits[..., 0], mask_value)
 
     if fuse_reciprocal:
       assert logsumexp is not None
@@ -1701,7 +1728,8 @@ def _splash_attention_custom(
     out, stats = ret
     if config.use_base2_exp:  # for user, output values in natural base
       stats["logsumexp"] = stats["logsumexp"] / LOG2E
-      stats["max_logits"] = stats["max_logits"] / LOG2E
+      if stats["max_logits"] is not None:
+        stats["max_logits"] = stats["max_logits"] / LOG2E
     return out, stats
   else:
     return ret
@@ -1755,7 +1783,8 @@ def _splash_attention_fwd(
   logsumexp = stats["logsumexp"]  # save in the config base for the bwd pass
   if config.use_base2_exp:  # for user, output values in natural base
     stats["logsumexp"] = stats["logsumexp"] / LOG2E
-    stats["max_logits"] = stats["max_logits"] / LOG2E
+    if stats["max_logits"] is not None:
+      stats["max_logits"] = stats["max_logits"] / LOG2E
   residuals = (
       q, k, v, bias, dropout_mask, dropout_seed, segment_ids, sinks, out,
       logsumexp, dkv_mask_info,
@@ -1815,11 +1844,13 @@ def _flash_attention_dq_kernel(
   if block_mask_ref is not None:
     kv_index = active_cols_ref[grid_idx].astype(jnp.int32)
     should_not_mask = block_mask_ref[grid_idx].astype(jnp.int32) != 1
+    should_run = block_mask_ref[grid_idx].astype(jnp.int32) != 0  # sbd fork
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
   else:
     kv_index = grid_idx % kv_steps
     should_not_mask = False
+    should_run = True
     should_initialize = kv_index == 0
     should_write = kv_index == kv_steps - 1
 
