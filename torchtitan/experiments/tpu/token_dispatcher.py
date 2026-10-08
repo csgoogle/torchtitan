@@ -25,13 +25,12 @@ from dataclasses import dataclass
 
 import torch
 from torch.autograd.function import once_differentiable
-from torch.fx.traceback import annotate_fn
 
 from torchtitan.config import derive
 from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.experiments.tpu.remat_regions import (
+    annotate_region,
     MOE_ROUTE_PERMUTATION,
-    REMAT_REGION,
 )
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
@@ -218,12 +217,6 @@ class _LocalReorder(torch.autograd.Function):
     return grad_x_TD, grad_scores_TK, None, None
 
 
-@annotate_fn({REMAT_REGION: MOE_ROUTE_PERMUTATION})
-def _stable_route_permutation(expert_ids_N: torch.Tensor) -> torch.Tensor:
-  """Sort routes by expert; marked so a selective memory policy can keep it."""
-  return torch.argsort(expert_ids_N, stable=True)
-
-
 def local_reorder(
     x_TD: torch.Tensor,
     scores_TK: torch.Tensor,
@@ -231,7 +224,9 @@ def local_reorder(
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Sort routes by expert while keeping all gathers row-indexed."""
-  permutation_N = _stable_route_permutation(expert_ids_TK.reshape(-1))
+  # Marked so that a selective memory policy can save the sort order.
+  with annotate_region(MOE_ROUTE_PERMUTATION):
+    permutation_N = torch.argsort(expert_ids_TK.reshape(-1), stable=True)
   return _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k)
 
 

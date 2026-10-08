@@ -76,10 +76,11 @@ def select_route_permutations(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     """Return the expert-sort permutations that ``local_reorder`` marks.
 
     ``token_dispatcher.py`` has three argsorts, so an op or module FQN alone
-    cannot pick this one; the dispatcher marks it with a region hint instead.
-    Every node traced inside the hinted function carries the hint (the sort
-    and its getitems), so keep the one-dimensional integer value that leaves
-    the region: the permutation itself.
+    cannot pick this one; the dispatcher computes it inside an
+    ``annotate_region`` block instead. Every node traced in that block carries
+    the hint (the reshape, the sort and its getitems), so keep the
+    one-dimensional integer value that leaves the region: the permutation
+    itself.
     """
     return [
         node
