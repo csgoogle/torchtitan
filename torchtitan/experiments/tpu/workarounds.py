@@ -9,7 +9,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan.tools.logging import logger
 
 
-_SPLASH_KEYS = {
+SPLASH_KEYS = {
     "block_q", "block_kv", "block_dkv", "block_kv_compute",
     "block_q_dkv", "block_kv_dkv", "block_kv_dkv_compute",
     "block_q_dq", "block_kv_dq", "use_fused_bwd_kernel",
@@ -18,12 +18,12 @@ _SPLASH_KEYS = {
 }
 
 
-def _extract_splash_kwargs(sa_config: Any) -> dict[str, Any]:
+def extract_splash_kwargs(sa_config: Any) -> dict[str, Any]:
   """Safe prefix-mapping helper to map sa_config attributes to standard names."""
   if sa_config is None:
     return {}
   kwargs = {}
-  for k in _SPLASH_KEYS:
+  for k in SPLASH_KEYS:
     val = getattr(sa_config, f"sa_{k}", getattr(sa_config, k, None))
     if val is not None:
       kwargs[k] = val
@@ -36,7 +36,7 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
   import types
 
   # Extract parameters internally using our safe prefix mapper
-  sa_kwargs = _extract_splash_kwargs(sa_config)
+  sa_kwargs = extract_splash_kwargs(sa_config)
 
   def _splash_forward(
       self,
@@ -284,7 +284,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
   def _get_kwargs(**kwargs):
     return {k: v for k, v in kwargs.items() if v is not None}
 
-  # _SPLASH_KEYS is the union over splash implementations; tokamax's splash_sdpa
+  # SPLASH_KEYS is the union over splash implementations; tokamax's splash_sdpa
   # accepts a strict subset of it (e.g. it has no use_document_aware_block_skipping),
   # so filtering against the static set passes kwargs the callee rejects with
   # "Unexpected keyword arguments". Derive the filter from the callee's actual
@@ -300,7 +300,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     return {k: v for k, v in kwargs_dict.items() if k in _tokamax_sdpa_params}
 
   # Extract parameters dynamically using our shared prefix mapper helper!
-  sa_kwargs = _extract_splash_kwargs(sa_config)
+  sa_kwargs = extract_splash_kwargs(sa_config)
   _dropped_sa = sorted(set(sa_kwargs) - _tokamax_sdpa_params)
   if _dropped_sa:
     logger.info(
@@ -707,3 +707,22 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
         skip_reason=bld_skip_reason(job_config.parallelism, tpu_config),
     )
 
+
+def raise_dynamo_recompile_limits(model_config) -> None:
+  """Size Dynamo's recompile limits for per-layer compile under SimpleFSDP.
+
+  Parametrization / AC wrapping gives every decoder layer its own module
+  class, so Dynamo recompiles the shared checkpoint-wrapper ``forward`` once
+  per layer (a type guard miss, not a real recompile). torch's default
+  recompile_limit of 8 exactly fits the 8-layer debug models and fails hard
+  (fullgraph) at 52/80 layers. Called by both TPU trainers before the first
+  compiled forward.
+  """
+  import torch._dynamo.config as dynamo_config  # pylint: disable=g-import-not-at-top
+
+  n_layers = len(getattr(model_config, "layers", ()) or ())
+  wanted = max(64, 2 * n_layers + 16)
+  dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, wanted)
+  dynamo_config.accumulated_recompile_limit = max(
+      dynamo_config.accumulated_recompile_limit, 8 * wanted
+  )

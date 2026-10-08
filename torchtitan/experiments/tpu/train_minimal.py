@@ -97,6 +97,17 @@ class TrainerMinimal:
           enable_cpu_backend=job_config.training.enable_cpu_offload,
           base_folder=job_config.dump_folder,
       )
+    elif job_config.parallelism.spmd_backend == "spmd_types":
+      # spmd_types needs a device mesh, and a mesh needs torch.distributed.
+      # A single-process run (e.g. a parity test's CPU reference) has neither,
+      # and with one rank the backends are numerically identical.
+      logger.info(
+          "Single-process run: using the partial_dtensor SPMD backend"
+          " (spmd_types needs an initialized process group)"
+      )
+      job_config.parallelism.spmd_backend = "partial_dtensor"
+    # Same activation as Trainer.__init__: the backend is a process global.
+    dist_utils.set_spmd_backend(job_config.parallelism.spmd_backend)
 
     parallelism_config = self.job_config.parallelism
     self.parallel_dims = ParallelDims(
@@ -107,6 +118,7 @@ class TrainerMinimal:
         pp=parallelism_config.pipeline_parallel_degree,
         ep=parallelism_config.expert_parallel_degree,
         world_size=self.world_size,
+        spmd_backend=parallelism_config.spmd_backend,
     )
 
     logger.info(f"parallel_dims: {self.parallel_dims}")
@@ -226,6 +238,7 @@ class TrainerMinimal:
 
     # Apply TPU-specific patches/workarounds
     workarounds.apply_patches(model, job_config)
+    workarounds.raise_dynamo_recompile_limits(model_config)
 
     if self.world_size > 1:
       self.model_spec.parallelize_fn(
@@ -273,19 +286,42 @@ class TrainerMinimal:
     """Runs a simple training loop on the specified device."""
     from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len  # pylint: disable=g-import-not-at-top
     from torchtitan.models.common.decoder import Decoder  # pylint: disable=g-import-not-at-top
+    from torchtitan.protocols.model import BaseModel  # pylint: disable=g-import-not-at-top
 
     data_iterator = iter(self.dataloader)
     seq_len = self.job_config.training.max_context_length
 
     try:
 
+      # Models that implement preprocess_inputs get their forward inputs built
+      # exactly as Trainer builds them (positions, masks, SPMD annotations);
+      # the protocol default raises, so bespoke-pipeline models keep the bare
+      # tokens path below.
+      uses_preprocess_inputs = (
+          type(self.model).preprocess_inputs is not BaseModel.preprocess_inputs
+      )
+
       def get_batch():
+        """One microbatch as ``(tokens, labels, forward_kwargs)``."""
         batch = next(data_iterator)
         if isinstance(batch, tuple):
           input_dict, labels_raw = batch
         else:
           input_dict = batch
           labels_raw = batch["labels"]
+        if uses_preprocess_inputs:
+          batch = {
+              k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+              for k, v in {**input_dict, "labels": labels_raw}.items()
+              if k != "num_valid_tokens"
+          }
+          return self.model.preprocess_inputs(
+              batch,
+              parallel_dims=self.parallel_dims,
+              parallelism=self.job_config.parallelism,
+              max_num_documents=getattr(self.dataloader, "max_num_documents", None),
+              max_context_length=seq_len,
+          )
         tokens = input_dict["input"].to(self.device)
         labels = labels_raw.to(self.device)
         positions = input_dict.get("positions")
@@ -294,7 +330,10 @@ class TrainerMinimal:
         if not isinstance(self.model, Decoder) and tokens.ndim == 1:
           tokens = tokens.reshape(-1, seq_len)
           labels = labels.reshape(-1, seq_len)
-        return tokens, labels, positions
+        forward_kwargs = {}
+        if isinstance(self.model, Decoder) and positions is not None:
+          forward_kwargs["positions"] = positions
+        return tokens, labels, forward_kwargs
 
       def _get_dummy_batch():
         vocab_size = getattr(self.model_config, "vocab_size", 32000)
@@ -338,7 +377,10 @@ class TrainerMinimal:
         for step in range(self.job_config.training.steps):
           step_start_time = time.time()
           self.optimizers.zero_grad()
-          tokens, labels, positions = get_batch()
+          # preprocess_inputs runs inside train_context so spmd_types
+          # annotations see the mesh.
+          with self.train_context():  # pytype: disable=not-callable
+            tokens, labels, forward_kwargs = get_batch()
           # In distributed settings, we sum locally calculated valid tokens
           # across all data-parallel ranks to get the global token count,
           # which is used to scale the loss and gradients.
@@ -349,7 +391,8 @@ class TrainerMinimal:
           # default is -100), representing padding or ignored tokens.
           local_valid_tokens = (labels != IGNORE_INDEX).sum().to(self.device)
           if self.world_size > 1 and self.parallel_dims.dp_enabled:
-            global_valid_tokens = dist_utils.dist_sum(
+            # On device, as Trainer keeps it: spmd_types losses type-check it.
+            global_valid_tokens = dist_utils.dist_sum_tensor(
                 local_valid_tokens, self.batch_mesh
             )
           else:
@@ -358,10 +401,7 @@ class TrainerMinimal:
           # train_context would take care of converting labels to DTensors using
           # https://docs.pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.loss_parallel
           with self.train_context():  # pytype: disable=not-callable
-            if isinstance(self.model, Decoder) and positions is not None:
-              pred = self.model(tokens, positions=positions)
-            else:
-              pred = self.model(tokens)
+            pred = self.model(tokens, **forward_kwargs)
             loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
             # need to free pred before bwd to avoid peaking memory
             del pred
@@ -373,11 +413,17 @@ class TrainerMinimal:
           if self.step_callback is not None:
             gathered_tokens = tokens
             gathered_labels = labels
+            gathered_positions = forward_kwargs.get("positions")
             if self.batch_mesh is not None:
               dp_group = self.batch_mesh.get_group()
               gathered_tokens = _gather_along_first_dim(tokens, dp_group)
               gathered_labels = _gather_along_first_dim(labels, dp_group)
-            self.step_callback(step, self.model, loss, gathered_tokens, gathered_labels)
+              if gathered_positions is not None:
+                gathered_positions = _gather_along_first_dim(gathered_positions, dp_group)
+            callback_kwargs = {}
+            if gathered_positions is not None:
+              callback_kwargs["positions"] = gathered_positions
+            self.step_callback(step, self.model, loss, gathered_tokens, gathered_labels, **callback_kwargs)
 
           # Upstream d771abb0 replaced training.local_batch_size *
           # training.seq_len with the single token-based

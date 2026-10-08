@@ -11,6 +11,7 @@ lane's existing ones.
         --config=hf_debugmodel
 """
 
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
@@ -23,16 +24,18 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.experiments.tpu.activation_checkpoint import AttentionSavingSelectiveAC
 from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
                                             #  flavor Configs at import time)
 from torchtitan.experiments.transformers_modeling_backend import (
+    TitanModelConfig,
     TitanMoeModelConfig,
     flavors as _shared_flavors,
     model_registry,
 )
 from torchtitan.experiments.transformers_modeling_backend.model import HFTransformerModel
-from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
+from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig, TPUConfig
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
@@ -61,6 +64,14 @@ _TPU_FLAVORS = {
     "full_moe_auto": HFTransformerModel.Config(
         model_config=TitanMoeModelConfig(experts_implementation="native")
     ),
+    # A two-layer model shaped for the kernels: head_dim 128 (the backend's
+    # "debugmodel" has 16-wide heads, which the splash kernel does not take)
+    # and grouped-query attention, so a parity test exercises the same code
+    # paths as the full model at a few MB of state. --hf-model still picks
+    # the family (Qwen3, Llama, ...); these override its size.
+    "debugmodel_kernels": HFTransformerModel.Config(
+        model_config=TitanModelConfig(dim=512, n_layers=2, n_heads=4, n_kv_heads=2)
+    ),
 }
 
 
@@ -72,6 +83,26 @@ def _model_registry(flavor: str, *, seq_len: int):
     spec.model = _TPU_FLAVORS[flavor]
     return spec
   return model_registry(flavor, seq_len=seq_len)
+
+def _fused_ce_loss() -> PallasCrossEntropyLoss.Config:
+  """The fused-CE loss config with this lane's tuned Mosaic tiles.
+
+  The kernel's own defaults (b=1024, h=512, v=2048) come from the muse_glimmer
+  recipe, not from this op-point. `b_block_size` must divide the token count
+  (loss.py rejects a mismatch rather than falling back to XLA silently).
+
+  b is 2048 here: swept on Llama-3.2-1B at 16,384 tokens per rank, 512 / 1024
+  / 2048 gave 20,342 / 21,716 / 22,161 tok/s/device and 4096 will not compile
+  (RESOURCE_EXHAUSTED). h and v stay at the recipe's values -- both directions
+  on each were worse (256: 21,562; 1024: 21,535; v=1024: 20,892; v=4096:
+  20,639, which also perturbs the first-step loss). Sweep from the CLI with
+  ``--loss.b_block_size=...`` (the job config's ``loss`` section is the single
+  source; ``build_cross_entropy_loss`` reads it after CLI parsing).
+  """
+  return PallasCrossEntropyLoss.Config(
+      b_block_size=2048, h_block_size=512, v_block_size=2048
+  )
+
 
 # Small enough to compile and run a step on a single v6e chip.
 _DEFAULT_HF_MODEL = "Qwen/Qwen3-0.6B"
@@ -125,6 +156,22 @@ def _set_attn_implementation(model_config, attn: str) -> None:
   model_config._attn_implementation = attn
 
 
+def _set_attn_mask_type(model_config, mask_type: str) -> None:
+  """Select causal vs document-causal masking for the packed token stream.
+
+  The Grain packer folds the batch into one token-major stream per rank and
+  resets ``positions`` at every document boundary. ``block_causal`` keeps each
+  sample's attention inside its own document (flex builds a document BlockMask
+  on GPU; the splash adapter turns the same positions into segment ids on
+  TPU). The backend's ``full`` flavor defaults to plain ``causal``, under which
+  a 16k-token stream is ONE causal attention problem -- 8x the work of eight
+  2k sequences and cross-sample attention. Same injection path as
+  _set_attn_implementation so update_from_config re-applies it.
+  """
+  model_config._titan_injected_model_args["attn_mask_type"] = mask_type
+  model_config.attn_mask_type = mask_type
+
+
 def _c4_test_loader() -> GrainDataLoader.Config:
   """This base replaced the HF text dataloader with Grain (upstream #4088)."""
   return GrainDataLoader.Config(
@@ -143,6 +190,8 @@ def _tpu_hf_config(
     compile: bool = False,
     attn: str = "sdpa",
     fused_loss: bool = False,
+    attn_mask_type: str = "block_causal",
+    save_attention: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
   model_spec = _model_registry(flavor, seq_len=seq_len)
@@ -152,6 +201,7 @@ def _tpu_hf_config(
   # also leaves the shared flavors table untouched.
   model_spec.model = as_tpu_model_config(model_spec.model, fused_loss=fused_loss)
   model_spec.parallelize_fn = parallelize_hf_transformers_tpu
+  _set_attn_mask_type(model_spec.model, attn_mask_type)
   # flex attention has no TPU lowering. "sdpa" is the portable default;
   # "splash_tpu" routes attention through the TPU splash kernel via HF's
   # AttentionInterface (see attention.py), which works for any architecture
@@ -162,8 +212,7 @@ def _tpu_hf_config(
   _set_attn_implementation(model_spec.model, attn)
   return TPUTransformersBackendConfig(
       hf_model=hf_model,
-      loss=(PallasCrossEntropyLoss.Config() if fused_loss
-            else CrossEntropyLoss.Config()),
+      loss=_fused_ce_loss() if fused_loss else CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
       optimizer=default_adamw(lr=8e-4, implementation="foreach"),
@@ -187,6 +236,15 @@ def _tpu_hf_config(
       # access path, so the graph break lands before the layer body and the
       # body stays one compile region.
       tpu_config=TPUConfig(compile_mode="layer"),
+      # Kernel tuning for the splash_tpu attention implementation, pushed to
+      # the HF adapter by workarounds.apply_patches; CLI overrides via
+      # --splash_attention_kernel.sa_*. 1024 forward/dkv blocks are the
+      # measured optimum on the packed stream (v004: 512 worse, 2048 will not
+      # compile); the dq blocks are unused under the fused backward.
+      splash_attention_kernel=SplashAttentionKernelConfig(
+          sa_block_q=1024, sa_block_kv=1024, sa_block_kv_compute=1024,
+          sa_block_q_dkv=1024, sa_block_kv_dkv=1024, sa_block_kv_dkv_compute=1024,
+      ),
       compile=CompileConfig(
           enable=compile,
           backend="tpu",
@@ -198,7 +256,13 @@ def _tpu_hf_config(
           interval=10,
           last_save_model_only=False,
       ),
-      activation_checkpoint=SelectiveAC.Config(),
+      # ``save_attention`` swaps in the policy that also keeps the Pallas
+      # attention output, as upstream's default set already does for every
+      # attention implementation it knows about (SDPA variants, flex).
+      activation_checkpoint=(
+          AttentionSavingSelectiveAC.Config() if save_attention
+          else SelectiveAC.Config()
+      ),
   )
 
 
@@ -207,80 +271,85 @@ def hf_debugmodel() -> TPUTransformersBackendConfig:
   return _tpu_hf_config("debugmodel", _DEFAULT_HF_MODEL, seq_len=512)
 
 
-def hf_full() -> TPUTransformersBackendConfig:
-  """The published model at its real width and depth."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL)
+def hf_debugmodel_max() -> TPUTransformersBackendConfig:
+  """``hf_full_max``'s feature set on the two-layer kernel-shaped debug model.
+
+  Splash attention, fused CE, selective AC keeping the attention output and
+  per-layer compile, at parity-test scale. The fused-CE token tile must
+  divide the token count: pass ``--loss.b_block_size`` for small batches.
+  """
+  return _tpu_hf_config("debugmodel_kernels", _DEFAULT_HF_MODEL, compile=True,
+                        attn="splash_tpu", fused_loss=True, save_attention=True)
 
 
-def hf_debugmodel_compile() -> TPUTransformersBackendConfig:
-  """`hf_debugmodel` with per-layer torch.compile on the TPU backend."""
-  return _tpu_hf_config("debugmodel", _DEFAULT_HF_MODEL, seq_len=512, compile=True)
+def hf_debugmodel_kernels_sdpa() -> TPUTransformersBackendConfig:
+  """The kernel-shaped debug model on the portable path (sdpa, plain CE,
+  per-layer compile): the control for hf_debugmodel_max in parity tests."""
+  return _tpu_hf_config("debugmodel_kernels", _DEFAULT_HF_MODEL, compile=True)
 
 
-def hf_full_compile() -> TPUTransformersBackendConfig:
-  """`hf_full` with per-layer torch.compile on the TPU backend."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True)
-
-
-def hf_full_splash() -> TPUTransformersBackendConfig:
-  """`hf_full` with attention served by the TPU splash-attention kernel."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, attn="splash_tpu")
-
-
-def hf_full_splash_compile() -> TPUTransformersBackendConfig:
-  """Splash attention plus per-layer torch.compile."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True, attn="splash_tpu")
-
-
-def hf_full_fused() -> TPUTransformersBackendConfig:
-  """`hf_full` with the vocab projection fused into the Pallas CE kernel."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, fused_loss=True)
-
-
-def hf_full_fused_compile() -> TPUTransformersBackendConfig:
-  """Fused CE plus per-layer torch.compile."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True, fused_loss=True)
+def hf_debugmodel_kernels_splash() -> TPUTransformersBackendConfig:
+  """The kernel-shaped debug model with splash attention and plain CE."""
+  return _tpu_hf_config("debugmodel_kernels", _DEFAULT_HF_MODEL, compile=True,
+                        attn="splash_tpu")
 
 
 def hf_full_max() -> TPUTransformersBackendConfig:
-  """Everything on: splash attention, fused CE, per-layer compile."""
-  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
-                        attn="splash_tpu", fused_loss=True)
+  """The lane's config: splash attention, fused CE, per-layer compile.
 
-def hf_moe() -> TPUTransformersBackendConfig:
-  """A MoE checkpoint on the TPU grouped-expert kernel.
-
-  The backend gates its MoE replacement on the flavor being a
-  TitanMoeModelConfig, and --hf-model is applied after the config is built, so
-  the flavor cannot be chosen from the model id -- pick this config explicitly
-  for a MoE checkpoint. No expert parallelism: experts stay replicated and
-  SimpleFSDP shards them, as on the qwen3 lane.
+  Selective AC also keeps the Pallas attention output instead of recomputing
+  it. Variants are CLI flags rather than configs: ``--compile.no-enable`` for
+  eager (the splash adapter reports fallbacks only outside Dynamo tracing),
+  ``--hf_model`` / ``--hf_config_overrides`` for the checkpoint. A head the
+  fused CE cannot reproduce (head bias, a transform block, a logit transform
+  it does not take) is refused; use ``hf_full_max_plain_ce`` for those.
   """
-  return _tpu_hf_config("full_moe", _DEFAULT_HF_MODEL, attn="splash_tpu")
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
+                        attn="splash_tpu", fused_loss=True, save_attention=True)
 
 
-def hf_moe_compile() -> TPUTransformersBackendConfig:
-  """hf_moe with torch.compile enabled."""
-  return _tpu_hf_config("full_moe", _DEFAULT_HF_MODEL, attn="splash_tpu", compile=True)
+def hf_full_max_plain_ce() -> TPUTransformersBackendConfig:
+  """``hf_full_max`` with the model's own head and plain cross entropy."""
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
+                        attn="splash_tpu", save_attention=True)
 
 
 def hf_moe_auto() -> TPUTransformersBackendConfig:
-  """A real MoE checkpoint, built at ITS OWN architecture.
+  """A MoE checkpoint, built at its own architecture, on TPU grouped experts.
 
-  Use this, not hf_moe, to run a named MoE checkpoint. hf_moe selects the
-  "full_moe" flavor, whose dims are set explicitly and therefore override the
-  loaded HF config -- every --hf-model under hf_moe builds the same synthetic
-  2048-dim / 48-layer / 128-expert model, so the checkpoint's architecture is
-  never exercised (and its expert weights are ~29 GB in fp32, which is what
-  OOMs a v6e chip before step 1). "full_moe_auto" leaves the HF-mapped fields
-  at None so AutoConfig supplies them, while still being a
-  TitanMoeModelConfig, which is what gates the MoE replacement.
+  The backend gates its MoE replacement on the flavor being a
+  TitanMoeModelConfig, and ``--hf_model`` is applied after the config is
+  built, so a MoE checkpoint needs this config. "full_moe_auto" leaves the
+  HF-mapped fields at None so AutoConfig supplies them (the backend's
+  "full_moe" flavor sets them explicitly and would build the same synthetic
+  model for every checkpoint). No expert parallelism: experts stay replicated
+  and SimpleFSDP shards them. Eager by default; ``--compile.enable`` compiles.
   """
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu")
 
 
-def hf_moe_auto_compile() -> TPUTransformersBackendConfig:
-  """hf_moe_auto with torch.compile enabled."""
-  return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
-                        compile=True)
+def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBackendConfig:
+  """The single-device CPU counterpart of a lane config, for parity tests.
 
+  Everything the lane chooses because it runs on TPU is turned back into the
+  portable equivalent: the fused Pallas cross entropy becomes the model's
+  logits plus plain cross entropy, compile is off. Model, data, optimizer and
+  schedule are untouched, so a CPU run of this config on the same batches is
+  the reference the TPU run is compared against
+  (``base_distributed_device_test._run_cpu_verification``).
+
+  The attention implementation is deliberately left at ``splash_tpu``: on CPU
+  the adapter falls back to SDPA with the mask the kernel applies (documents
+  from positions, padding, causal, window), so both sides compute the same
+  attention. Switching to plain ``sdpa`` would not -- HF's own masks do not
+  infer documents from reset positions for every architecture, so the
+  reference could attend across packed documents while the kernel does not.
+  The mask derivation itself is checked against HF's mask functions by
+  ``tests/test_attention_masks.py``.
+  """
+  model_config = config.model_spec.model
+  if getattr(model_config, "fused_loss", False):
+    model_config.fused_loss = False
+    config.loss = CrossEntropyLoss.Config()
+  config.compile.enable = False
+  return config

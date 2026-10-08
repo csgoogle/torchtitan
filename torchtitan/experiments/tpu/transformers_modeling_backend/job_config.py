@@ -22,3 +22,9 @@ class TPUTransformersBackendConfig(TPUTrainerConfig):
   """
 
   hf_model: str = ""
+  # A JSON object applied to the loaded HF config after the flavor's
+  # overrides, e.g. ``{"attn_pdrop": 0, "resid_pdrop": 0}`` to train a
+  # checkpoint without its dropout. Read by the shared
+  # backend's ``update_from_config`` through the same ``getattr(config, ...)``
+  # path as ``hf_model``.
+  hf_config_overrides: str = ""

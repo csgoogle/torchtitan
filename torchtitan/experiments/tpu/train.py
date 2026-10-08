@@ -220,6 +220,9 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   if rank == 0:
     init_logger()
 
+  from torchtitan.experiments.tpu import workarounds  # pylint: disable=g-import-not-at-top
+
+  workarounds.raise_dynamo_recompile_limits(train_config.model_spec.model)
   profiler_workaround.init(train_config)
 
   trainer: Optional[torchtitan.trainer.Trainer] = None
