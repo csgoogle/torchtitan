@@ -1,8 +1,8 @@
-"""Device tests for the HF backend's Pallas expert-kernel selection.
+"""Device tests for the HF backend's TPU MoE substitutions.
 
 Checks that the default K/N-tiled kernels compile within scoped VMEM at real
-expert widths, and that batches whose routed-row count is not a tile_m
-multiple are padded correctly.
+expert widths, that batches whose routed-row count is not a tile_m multiple
+are padded correctly, and that the swapped MoE gets the TPU token dispatcher.
 """
 
 from absl.testing import absltest
@@ -11,8 +11,13 @@ import torch
 import torch.nn.functional as F
 
 from torchtitan.experiments.tpu import base_device_test
+from types import SimpleNamespace
+
 from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.experiments.tpu.transformers_modeling_backend import model as hf_model
+from torchtitan.models.common.config_utils import make_routed_experts_config
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
 
 def _reference(x, w1, w2, w3, group_sizes):
@@ -83,6 +88,24 @@ class PallasExpertsTest(base_device_test.BaseAcceleratorDeviceTest):
     self.assertLess(_rel_err(out.cpu(), ref.detach()), 1e-2)
     for name, g, rg in zip(("dx", "dw1", "dw2", "dw3"), grads, ref_grads):
       self.assertLess(_rel_err(g.cpu(), rg), 2e-2, name)
+
+
+class TokenDispatcherTest(base_device_test.BaseAcceleratorDeviceTest):
+
+  def test_swapped_moe_gets_tpu_dispatcher(self):
+    # The standard dispatcher's combine backward is an element-wise gather of
+    # rows x dim values, which XLA runs at a few percent of HBM bandwidth on
+    # TPU; the TPU dispatcher's VJPs gather whole rows.
+    cfg = make_routed_experts_config(
+        dim=256, hidden_dim=128, num_experts=4, top_k=2, param_init={},
+        comm_backend="standard",
+    )
+    layer = SimpleNamespace(_native_moe_config=cfg)
+    model = SimpleNamespace(layers={"0": layer}, _tpu_moe_pallas=False)
+    hf_model.substitute_tpu_experts(model)
+    found = [type(c) for _, c, _, _ in
+             layer._native_moe_config.traverse(AllToAllTokenDispatcher.Config)]
+    self.assertEqual(found, [TpuAllToAllTokenDispatcher.Config])
 
 
 if __name__ == "__main__":
