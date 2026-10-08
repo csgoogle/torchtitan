@@ -81,13 +81,14 @@ class SbdConfig:
   block_kv_dkv: int = 512
   block_kv_dkv_compute: int = 512
   use_experimental_scheduler: bool = False  # tokamax default; see module note
-  # exp2 with LOG2E folded into q (tokamax's default) multiplies q by LOG2E
-  # in q's dtype -- a second bf16 rounding of q that the stock splash kernel
-  # does not do. False keeps natural exp: vs a float64 reference at 16k
-  # (1 v6e chip, the lane's head layouts) the output error drops ~25-60% to
-  # exactly stock splash's, dk/dv error ends 20-50% below stock splash's
-  # (which sums repeated K/V grads in bf16), at +2-3% kernel time.
-  use_base2_exp: bool = True
+  # Natural exp (False) or exp2 with LOG2E folded into q (True, tokamax's
+  # default). True multiplies q by LOG2E in q's dtype -- a second bf16
+  # rounding of q that the stock splash kernel does not do. Vs a float64
+  # reference at 16k (1 v6e chip, the lane's head layouts), False has stock
+  # splash's output error exactly (True: 25-60% higher) and dk/dv error
+  # 20-50% below stock splash's (which sums repeated K/V grads in bf16);
+  # True is 2.4% faster (median fwd+bwd; forward +0.2%, backward +3.4%).
+  use_base2_exp: bool = False
   # Dropout (the verified frontier config; rate 0.0 disables the paths).
   dropout_rate: float = 0.0
   dropout_fold_rescale: bool = True
