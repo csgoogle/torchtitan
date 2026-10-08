@@ -284,7 +284,10 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             "--tpu_config.graph_trainer_memory_policy=tpu_selective",
             "--tpu_config.graph_trainer_save_regions",
             "moe.route_permutation",
-            "--tpu_config.graph_trainer_memory_policy_save_budget_gb=4.2",
+            "attention.inner_attention",
+            "--tpu_config.graph_trainer_save_last_n_layers",
+            "attention.inner_attention",
+            "4",
         ]),
     )
     graph_config = to_tpu_graph_trainer_config(
@@ -296,48 +299,64 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(graph_config.compile.memory_policy, "tpu_selective")
     self.assertEqual(
         graph_config.tpu_config.graph_trainer_save_regions,
-        ("moe.route_permutation",),
+        ("moe.route_permutation", "attention.inner_attention"),
     )
     self.assertEqual(
-        graph_config.tpu_config.graph_trainer_memory_policy_save_budget_gb, 4.2
+        graph_config.tpu_config.graph_trainer_save_last_n_layers,
+        {"attention.inner_attention": 4},
     )
 
   @parameterized.named_parameters(
-      ("no_classes", "tpu_selective", (), None, False, "needs"),
-      ("unknown_class", "tpu_selective", ("moe.nope",), None, False, "Unknown"),
+      ("no_regions", "tpu_selective", (), {}, False, "needs"),
+      ("unknown_region", "tpu_selective", ("moe.nope",), {}, False, "Unknown"),
       (
-          "negative_budget",
+          "limit_on_unlisted_region",
           "tpu_selective",
           ("moe.route_permutation",),
-          -1.0,
+          {"attention.inner_attention": 2},
           False,
-          "nonnegative",
+          "not in graph_trainer_save_regions",
+      ),
+      (
+          "zero_layers",
+          "tpu_selective",
+          ("attention.inner_attention",),
+          {"attention.inner_attention": 0},
+          False,
+          "positive integer",
       ),
       (
           "scan",
           "tpu_selective",
           ("moe.route_permutation",),
-          None,
+          {},
           True,
           "use-scan-layers",
       ),
       (
-          "classes_without_policy",
+          "regions_without_policy",
           "full",
           ("moe.route_permutation",),
-          None,
+          {},
           False,
           "only apply",
       ),
-      ("budget_without_policy", "full", (), 1.0, False, "only apply"),
+      (
+          "limits_without_policy",
+          "full",
+          (),
+          {"attention.inner_attention": 2},
+          False,
+          "only apply",
+      ),
   )
   def test_tpu_selective_rejects_bad_settings(
-      self, policy, save_regions, budget_gb, scanned, message
+      self, policy, save_regions, last_n_layers, scanned, message
   ) -> None:
     config = qwen3_8b()
     config.tpu_config.graph_trainer_memory_policy = policy
     config.tpu_config.graph_trainer_save_regions = save_regions
-    config.tpu_config.graph_trainer_memory_policy_save_budget_gb = budget_gb
+    config.tpu_config.graph_trainer_save_last_n_layers = last_n_layers
     config.tpu_config.use_scan_layers = scanned
 
     with self.assertRaisesRegex(ValueError, message):

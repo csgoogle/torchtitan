@@ -104,10 +104,13 @@ class TPUConfig:
   # and are the keys of ``SAVE_REGIONS`` in
   # ``graph_trainer/tpu_memory_policy.py``, e.g. ("moe.route_permutation",).
   graph_trainer_save_regions: tuple[str, ...] = ()
-  # ``tpu_selective`` only: GiB that the saved regions may use. Always-saved
-  # regions are charged first; budgeted ones fill the rest from the last layer
-  # backward. None means unlimited.
-  graph_trainer_memory_policy_save_budget_gb: float | None = None
+  # ``tpu_selective`` only: save a region only in its last N transformer
+  # layers, which backward reaches first. Regions not listed are saved in
+  # every layer. Example: {"attention.inner_attention": 4}, or on the CLI
+  # --tpu_config.graph_trainer_save_last_n_layers attention.inner_attention 4
+  graph_trainer_save_last_n_layers: dict[str, int] = dataclasses.field(
+      default_factory=dict
+  )
   # Run the decoder layers as a single scan instead of a Python loop, so the
   # compiler sees one loop body rather than n_layers copies of it. Each layer's
   # weights become a row of one stacked tensor, which is what gives the scan

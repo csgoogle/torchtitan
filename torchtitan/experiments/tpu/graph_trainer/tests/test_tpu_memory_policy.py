@@ -19,6 +19,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
+    _NOT_IN_LAYERS,
     annotate_module_fqns,
     compute_parameter_gradients,
 )
@@ -45,12 +46,12 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_remat_schedule,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
-    _saved_bytes,
+    check_save_last_n_layers,
     full_remat_with_saves,
     is_splash_forward_op_name,
     resolve_save_regions,
     ROUTE_PERMUTATION_CLASS,
-    save_budget_bytes,
+    SaveCandidateClass,
     select_route_permutations,
     select_saves,
     select_splash_attention,
@@ -331,37 +332,60 @@ class TestRoutePermutationClass(unittest.TestCase):
 
 
 def _selective_config(
-    save_regions: tuple[str, ...], budget_gb: float | None = None
+    save_regions: tuple[str, ...], last_n_layers: dict[str, int] | None = None
 ) -> SimpleNamespace:
     return SimpleNamespace(
         tpu_config=SimpleNamespace(
             graph_trainer_save_regions=save_regions,
-            graph_trainer_memory_policy_save_budget_gb=budget_gb,
+            graph_trainer_save_last_n_layers=last_n_layers or {},
         ),
         parallelism=_parallelism("always"),
     )
 
 
 class TestSelectSaves(unittest.TestCase):
-    def test_required_class_without_candidates_raises(self) -> None:
+    def test_region_without_candidates_raises(self) -> None:
         traced, _ = _trace_toy(_DenseToy())
 
-        with self.assertRaisesRegex(ValueError, "'moe.route_permutation' is required"):
-            select_saves(traced.gm, [ROUTE_PERMUTATION_CLASS], budget_bytes=None)
+        with self.assertRaisesRegex(ValueError, "'moe.route_permutation' matched no"):
+            select_saves(traced.gm, [ROUTE_PERMUTATION_CLASS], {})
 
-    def test_always_saved_classes_must_fit_the_budget(self) -> None:
+    def test_last_n_layers_keeps_only_the_last_layers(self) -> None:
         torch.manual_seed(0)
-        traced, _ = _trace_toy(_MoEToy())
+        traced, _ = _trace_toy(_MoEToy(_splash_cores()))
         routes = select_route_permutations(traced.gm)
-        route_bytes = sum(_saved_bytes(node) for node in routes)
+        splash = select_splash_attention(traced.gm)
+        regions = [ROUTE_PERMUTATION_CLASS, SPLASH_ATTENTION_CLASS]
 
-        for budget_bytes in (None, route_bytes):
-            self.assertEqual(
-                select_saves(traced.gm, [ROUTE_PERMUTATION_CLASS], budget_bytes),
-                set(routes),
-            )
-        with self.assertRaisesRegex(ValueError, "save budget"):
-            select_saves(traced.gm, [ROUTE_PERMUTATION_CLASS], route_bytes - 1)
+        for n_layers, saved_layers in (
+            (1, [2]),
+            (2, [1, 2]),
+            (3, [0, 1, 2]),
+            (5, [0, 1, 2]),
+        ):
+            with self.subTest(n_layers=n_layers):
+                chosen = select_saves(
+                    traced.gm, regions, {"attention.inner_attention": n_layers}
+                )
+                # A region without a limit is saved in every layer.
+                self.assertEqual(chosen - set(splash), set(routes))
+                self.assertEqual(
+                    sorted(_get_layer_id(node) for node in chosen & set(splash)),
+                    saved_layers,
+                )
+
+    def test_limit_needs_values_inside_the_layers(self) -> None:
+        traced, _ = _trace_toy(_DenseToy())
+        outside = next(
+            node
+            for node in traced.gm.graph.nodes
+            if node.op == "call_function" and _get_layer_id(node) == _NOT_IN_LAYERS
+        )
+        region = SaveCandidateClass(name="test.outside", select=lambda gm: [outside])
+
+        self.assertEqual(select_saves(traced.gm, [region], {}), {outside})
+        with self.assertRaisesRegex(ValueError, "outside the transformer layers"):
+            select_saves(traced.gm, [region], {"test.outside": 1})
 
     def test_config_values_are_checked(self) -> None:
         self.assertEqual(
@@ -377,10 +401,17 @@ class TestSelectSaves(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     resolve_save_regions(names)
 
-        self.assertIsNone(save_budget_bytes(None))
-        self.assertEqual(save_budget_bytes(0.5), 512 * 1024**2)
-        with self.assertRaisesRegex(ValueError, "nonnegative"):
-            save_budget_bytes(-1.0)
+        save_regions = ("attention.inner_attention",)
+        check_save_last_n_layers({"attention.inner_attention": 2}, save_regions)
+        for last_n_layers, message in (
+            ({"moe.route_permutation": 1}, "not in graph_trainer_save_regions"),
+            ({"attention.inner_attention": 0}, "positive integer"),
+            ({"attention.inner_attention": True}, "positive integer"),
+            ({"attention.inner_attention": 2.0}, "positive integer"),
+        ):
+            with self.subTest(last_n_layers=last_n_layers):
+                with self.assertRaisesRegex(ValueError, message):
+                    check_save_last_n_layers(last_n_layers, save_regions)
 
 
 class TestTpuSelectivePolicy(unittest.TestCase):
@@ -388,7 +419,7 @@ class TestTpuSelectivePolicy(unittest.TestCase):
         self,
         model: nn.Module,
         save_regions: tuple[str, ...],
-        budget_gb: float | None = None,
+        last_n_layers: dict[str, int] | None = None,
     ) -> set[torch.fx.Node]:
         """Apply tpu_selective, remat and the TPU remat schedule to ``model``.
 
@@ -405,13 +436,11 @@ class TestTpuSelectivePolicy(unittest.TestCase):
         ]
         remove_parameter_gradient_markers_pass(traced.gm, traced.example_inputs)
         chosen = select_saves(
-            traced.gm,
-            resolve_save_regions(save_regions),
-            save_budget_bytes(budget_gb),
+            traced.gm, resolve_save_regions(save_regions), last_n_layers or {}
         )
 
         MEMORY_POLICY_REGISTRY["tpu_selective"](
-            traced.gm, config=_selective_config(save_regions, budget_gb)
+            traced.gm, config=_selective_config(save_regions, last_n_layers)
         )
         for node in chosen:
             self.assertIs(node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
@@ -448,7 +477,7 @@ class TestTpuSelectivePolicy(unittest.TestCase):
                 node.meta["custom"][REMAT_REGION], MOE_ROUTE_PERMUTATION
             )
 
-    def test_saves_routes_and_every_splash_without_a_budget(self) -> None:
+    def test_saves_routes_and_every_splash_by_default(self) -> None:
         torch.manual_seed(0)
         chosen = self._run(
             _MoEToy(_splash_cores()),
@@ -459,22 +488,15 @@ class TestTpuSelectivePolicy(unittest.TestCase):
         self.assertEqual(sorted(_get_layer_id(node) for node in splash), [0, 1, 2])
         self.assertEqual(len(chosen), 6)
 
-    def test_budget_saves_only_the_last_splash(self) -> None:
+    def test_last_n_layers_saves_only_the_last_splash(self) -> None:
         # Recomputing layers 0-1 while layer 2's backward reads its saved
         # Splash output directly is the case the remat entry barrier must
         # handle.
-        route_bytes = 3 * _TOKENS * _TOP_K * torch.int64.itemsize
-        splash_bytes = (
-            _TOKENS * _DIM * torch.bfloat16.itemsize
-            + _HEADS * _TOKENS * torch.float32.itemsize
-        )
-        budget_bytes = route_bytes + splash_bytes + splash_bytes // 2
-
         torch.manual_seed(0)
         chosen = self._run(
             _MoEToy(_splash_cores()),
             ("moe.route_permutation", "attention.inner_attention"),
-            budget_gb=budget_bytes / 1024**3,
+            last_n_layers={"attention.inner_attention": 1},
         )
 
         splash = [node for node in chosen if _is_splash_node(node)]
@@ -542,29 +564,6 @@ class TestSplashAttentionClass(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not return"):
             select_splash_attention(gm)
-
-    def test_budget_fills_from_the_last_layer(self) -> None:
-        torch.manual_seed(0)
-        traced, _ = _trace_toy(_MoEToy(_splash_cores()))
-        routes = select_route_permutations(traced.gm)
-        splash = select_splash_attention(traced.gm)
-        route_bytes = sum(_saved_bytes(node) for node in routes)
-        splash_bytes = _saved_bytes(splash[0])
-        classes = [ROUTE_PERMUTATION_CLASS, SPLASH_ATTENTION_CLASS]
-
-        for budget_bytes, saved_layers in (
-            (route_bytes, []),
-            (route_bytes + splash_bytes, [2]),
-            (route_bytes + 2 * splash_bytes + 1, [1, 2]),
-            (None, [0, 1, 2]),
-        ):
-            with self.subTest(budget_bytes=budget_bytes):
-                chosen = select_saves(traced.gm, classes, budget_bytes)
-                self.assertEqual(chosen - set(splash), set(routes))
-                self.assertEqual(
-                    sorted(_get_layer_id(node) for node in chosen & set(splash)),
-                    saved_layers,
-                )
 
 
 if __name__ == "__main__":

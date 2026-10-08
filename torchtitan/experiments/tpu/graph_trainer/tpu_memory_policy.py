@@ -7,7 +7,7 @@
 """TPU-only GraphTrainer memory policies."""
 
 import re
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -15,6 +15,7 @@ import torch
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
     _is_backward_node,
+    _NOT_IN_LAYERS,
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import (
     tag_all_offloadable_activations,
@@ -41,17 +42,10 @@ class SaveCandidateClass:
     Attributes:
         name: The name used in ``graph_trainer_save_regions``.
         select: Returns this class's candidate forward nodes, in forward order.
-        required: Raise if the graph has no candidates. A model or tracing
-            change that hides the values then fails loudly instead of quietly
-            recomputing them.
-        budgeted: ``False`` means always save. Those classes are charged
-            against the budget first.
     """
 
     name: str
     select: Callable[[torch.fx.GraphModule], list[torch.fx.Node]]
-    required: bool
-    budgeted: bool
 
 
 def _forward_call_nodes(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
@@ -95,12 +89,10 @@ def select_route_permutations(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 
 
 # Saving the permutation avoids re-running a stable sort per layer in backward.
-# It is small, so it is always saved rather than competing for the budget.
+# It is small (one integer per routed token), so recipes save it in every layer.
 ROUTE_PERMUTATION_CLASS = SaveCandidateClass(
     name=MOE_ROUTE_PERMUTATION,
     select=select_route_permutations,
-    required=True,
-    budgeted=False,
 )
 
 # The forward ops of both TPU Splash kernels. Stock Splash
@@ -173,7 +165,8 @@ def select_splash_attention(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 
 
 # Saving the output and LSE lets backward skip re-running the Splash forward.
-# It is large, so it competes for the budget, from the last layer backward.
+# It is large (and the LSE is padded on device), so recipes may save it only in
+# the last few layers with ``graph_trainer_save_last_n_layers``.
 #
 # This is not the same as an eager ``RegionAC`` save region of the same name.
 # Here only what the Splash backward reads is saved (output and LSE); its
@@ -183,8 +176,6 @@ def select_splash_attention(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 SPLASH_ATTENTION_CLASS = SaveCandidateClass(
     name=ATTENTION_INNER_ATTENTION,
     select=select_splash_attention,
-    required=True,
-    budgeted=True,
 )
 
 SAVE_REGIONS: dict[str, SaveCandidateClass] = {
@@ -244,84 +235,58 @@ def _saved_bytes(node: torch.fx.Node) -> int:
     )
 
 
-def _log_class(name: str, selected: int, candidates: int, nbytes: int) -> None:
+def _log_region(name: str, selected: int, candidates: int, nbytes: int) -> None:
     logger.info(
         f"tpu_selective: {name}: saving {selected}/{candidates} candidates, "
-        f"{nbytes / 1024**3:.3f} GiB"
+        f"{nbytes / 1024**3:.3f} GiB (logical)"
     )
+
+
+def _in_last_n_layers(
+    nodes: list[torch.fx.Node], name: str, n_layers: int
+) -> list[torch.fx.Node]:
+    """Keep the ``nodes`` in the ``n_layers`` highest-numbered layers."""
+    layer_ids = {_get_layer_id(node) for node in nodes}
+    if _NOT_IN_LAYERS in layer_ids:
+        raise ValueError(
+            f"graph_trainer_save_last_n_layers limits {name!r}, but some of its "
+            "values are outside the transformer layers."
+        )
+    kept_layer_ids = set(sorted(layer_ids)[-n_layers:])
+    return [node for node in nodes if _get_layer_id(node) in kept_layer_ids]
 
 
 def select_saves(
     gm: torch.fx.GraphModule,
-    classes: Sequence[SaveCandidateClass],
-    budget_bytes: int | None,
+    regions: Sequence[SaveCandidateClass],
+    last_n_layers: Mapping[str, int],
 ) -> set[torch.fx.Node]:
-    """Choose which candidate nodes to save within ``budget_bytes``.
+    """Choose which candidate nodes of ``regions`` to save.
 
-    1. Always-save (non-budgeted) classes are charged first. Raise if they
-       alone exceed the budget.
-    2. Budgeted classes then share what is left, in the order given. Each one
-       fills from the last layer backward: backward reaches later layers
-       first, so their values are held for the shortest time. A value that
-       does not fit is skipped, and a smaller earlier one may still fit.
+    A region named in ``last_n_layers`` is saved only in its last N layers:
+    backward reaches later layers first, so their values are held for the
+    shortest time. Other regions are saved in every layer.
 
-    ``budget_bytes=None`` means unlimited. Raises if a required class has no
-    candidates.
+    Raises if a region matches no forward nodes, so a model or tracing change
+    that hides its values fails loudly instead of quietly recomputing them.
     """
-    candidates: dict[str, list[torch.fx.Node]] = {}
-    for candidate_class in classes:
-        nodes = candidate_class.select(gm)
-        if candidate_class.required and not nodes:
-            raise ValueError(
-                f"Save region {candidate_class.name!r} is required but matched no "
-                "forward nodes; the model or its tracing no longer exposes it."
-            )
-        candidates[candidate_class.name] = nodes
-
     selected: set[torch.fx.Node] = set()
-    used_bytes = 0
-    for candidate_class in classes:
-        if candidate_class.budgeted:
-            continue
-        nodes = [n for n in candidates[candidate_class.name] if n not in selected]
-        class_bytes = sum(_saved_bytes(node) for node in nodes)
+    for region in regions:
+        candidates = region.select(gm)
+        if not candidates:
+            raise ValueError(
+                f"Save region {region.name!r} matched no forward nodes; the "
+                "model or its tracing no longer exposes it."
+            )
+        nodes = candidates
+        if region.name in last_n_layers:
+            nodes = _in_last_n_layers(nodes, region.name, last_n_layers[region.name])
         selected.update(nodes)
-        used_bytes += class_bytes
-        _log_class(candidate_class.name, len(nodes), len(nodes), class_bytes)
-    if budget_bytes is not None and used_bytes > budget_bytes:
-        raise ValueError(
-            f"Always-saved classes need {used_bytes} bytes, more than the "
-            f"{budget_bytes}-byte save budget."
-        )
-
-    position = {node: index for index, node in enumerate(gm.graph.nodes)}
-    for candidate_class in classes:
-        if not candidate_class.budgeted:
-            continue
-        nodes = candidates[candidate_class.name]
-        count = class_bytes = 0
-        for node in sorted(
-            nodes, key=lambda n: (_get_layer_id(n), position[n]), reverse=True
-        ):
-            node_bytes = _saved_bytes(node)
-            if node in selected or (
-                budget_bytes is not None and used_bytes + node_bytes > budget_bytes
-            ):
-                continue
-            selected.add(node)
-            used_bytes += node_bytes
-            class_bytes += node_bytes
-            count += 1
-        _log_class(candidate_class.name, count, len(nodes), class_bytes)
-
-    budget = (
-        "unlimited"
-        if budget_bytes is None
-        else f"{budget_bytes / 1024**3:.3f} GiB"
-    )
+        region_bytes = sum(_saved_bytes(node) for node in nodes)
+        _log_region(region.name, len(nodes), len(candidates), region_bytes)
+    total_bytes = sum(_saved_bytes(node) for node in selected)
     logger.info(
-        f"tpu_selective: saving {used_bytes / 1024**3:.3f} GiB in total "
-        f"(budget {budget})"
+        f"tpu_selective: saving {total_bytes / 1024**3:.3f} GiB in total (logical)"
     )
     return selected
 
@@ -342,16 +307,21 @@ def resolve_save_regions(names: Sequence[str]) -> list[SaveCandidateClass]:
     return [SAVE_REGIONS[name] for name in names]
 
 
-def save_budget_bytes(budget_gb: float | None) -> int | None:
-    """Convert the GiB save budget to bytes; ``None`` means unlimited."""
-    if budget_gb is None:
-        return None
-    if budget_gb < 0:
-        raise ValueError(
-            "graph_trainer_memory_policy_save_budget_gb must be nonnegative "
-            "(None means unlimited)."
-        )
-    return int(budget_gb * 1024**3)
+def check_save_last_n_layers(
+    last_n_layers: Mapping[str, int], save_regions: Sequence[str]
+) -> None:
+    """Reject ``graph_trainer_save_last_n_layers`` entries that cannot apply."""
+    for name, n_layers in last_n_layers.items():
+        if name not in save_regions:
+            raise ValueError(
+                f"graph_trainer_save_last_n_layers names {name!r}, which is not "
+                f"in graph_trainer_save_regions {list(save_regions)}."
+            )
+        if isinstance(n_layers, bool) or not isinstance(n_layers, int) or n_layers < 1:
+            raise ValueError(
+                f"graph_trainer_save_last_n_layers[{name!r}] must be a positive "
+                f"integer, got {n_layers!r}."
+            )
 
 
 @register_memory_policy("tpu_selective")
@@ -360,11 +330,10 @@ def _tpu_selective_memory_policy_pass(
     *,
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
-    """Full recompute, except the configured save regions within the budget."""
+    """Full recompute, except the configured save regions."""
     tpu_config = config.tpu_config
-    classes = resolve_save_regions(tpu_config.graph_trainer_save_regions)
-    budget_bytes = save_budget_bytes(
-        tpu_config.graph_trainer_memory_policy_save_budget_gb
-    )
-    full_remat_with_saves(gm, config, select_saves(gm, classes, budget_bytes))
+    regions = resolve_save_regions(tpu_config.graph_trainer_save_regions)
+    last_n_layers = tpu_config.graph_trainer_save_last_n_layers
+    check_save_last_n_layers(last_n_layers, tpu_config.graph_trainer_save_regions)
+    full_remat_with_saves(gm, config, select_saves(gm, regions, last_n_layers))
     return gm

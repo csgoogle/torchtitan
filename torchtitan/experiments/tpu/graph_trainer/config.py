@@ -22,8 +22,8 @@ from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
+    check_save_last_n_layers,
     resolve_save_regions,
-    save_budget_bytes,
 )
 from torchtitan.experiments.tpu.layer_loop import builds_layer_loop
 from torchtitan.experiments.tpu.tpu_job_config import TPUConfig, TPUTrainerConfig
@@ -64,13 +64,12 @@ def _validate_fsdp_allreduce_slice(
 
 def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
   save_regions = tpu_config.graph_trainer_save_regions
-  save_budget_gb = tpu_config.graph_trainer_memory_policy_save_budget_gb
+  last_n_layers = tpu_config.graph_trainer_save_last_n_layers
   if tpu_config.graph_trainer_memory_policy != "tpu_selective":
-    if save_regions or save_budget_gb is not None:
+    if save_regions or last_n_layers:
       raise ValueError(
-          "graph_trainer_save_regions and "
-          "graph_trainer_memory_policy_save_budget_gb only apply to "
-          "graph_trainer_memory_policy='tpu_selective'"
+          "graph_trainer_save_regions and graph_trainer_save_last_n_layers "
+          "only apply to graph_trainer_memory_policy='tpu_selective'"
       )
     return
   if tpu_config.use_scan_layers:
@@ -82,7 +81,7 @@ def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
         "--tpu-config.use-scan-layers"
     )
   resolve_save_regions(save_regions)
-  save_budget_bytes(save_budget_gb)
+  check_save_last_n_layers(last_n_layers, save_regions)
 
 
 def to_tpu_graph_trainer_config(
