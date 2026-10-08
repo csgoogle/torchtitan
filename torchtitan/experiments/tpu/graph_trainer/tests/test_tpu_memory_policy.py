@@ -48,8 +48,6 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     _saved_bytes,
     full_remat_with_saves,
     is_splash_forward_op_name,
-    MOE_ROUTE_PERMUTATION,
-    REMAT_REGION,
     resolve_save_regions,
     ROUTE_PERMUTATION_CLASS,
     save_budget_bytes,
@@ -57,6 +55,10 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     select_saves,
     select_splash_attention,
     SPLASH_ATTENTION_CLASS,
+)
+from torchtitan.experiments.tpu.remat_regions import (
+    MOE_ROUTE_PERMUTATION,
+    REMAT_REGION,
 )
 from torchtitan.experiments.tpu.token_dispatcher import (
     local_reorder,

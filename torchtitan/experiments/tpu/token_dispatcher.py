@@ -28,11 +28,11 @@ from torch.autograd.function import once_differentiable
 from torch.fx.traceback import annotate_fn
 
 from torchtitan.config import derive
-from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
+from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
+from torchtitan.experiments.tpu.remat_regions import (
     MOE_ROUTE_PERMUTATION,
     REMAT_REGION,
 )
-from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
     AllToAllTokenDispatcher,

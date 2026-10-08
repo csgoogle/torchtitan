@@ -26,14 +26,12 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
+from torchtitan.experiments.tpu.remat_regions import (
+    ATTENTION_INNER_ATTENTION,
+    MOE_ROUTE_PERMUTATION,
+    REMAT_REGION,
+)
 from torchtitan.tools.logging import logger
-
-# Semantic hints that model code attaches with ``torch.fx.traceback.annotate_fn``
-# so a policy can find values that op names alone cannot tell apart. There is
-# one key, and the values are named after upstream ``RegionAC`` regions so that
-# eager and graph AC can later share one vocabulary.
-REMAT_REGION = "remat_region"
-MOE_ROUTE_PERMUTATION = "moe.route_permutation"
 
 
 @dataclass(frozen=True)
@@ -104,8 +102,6 @@ ROUTE_PERMUTATION_CLASS = SaveCandidateClass(
     required=True,
     budgeted=False,
 )
-
-ATTENTION_INNER_ATTENTION = "attention.inner_attention"
 
 # The forward ops of both TPU Splash kernels. Stock Splash
 # (``kernels/splash_attention.py``) registers one op per kernel configuration,
