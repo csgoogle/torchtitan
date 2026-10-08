@@ -191,7 +191,7 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
       dict(testcase_name="gemma2_attn_and_final_softcap", config="hf_debugmodel_max",
            hf_model="google/gemma-2-2b",
            args=["--loss.b_block_size=256",
-                 "--hf_config_overrides=attn_logit_softcapping=2.0,final_logit_softcapping=0.5,query_pre_attn_scalar=0.01"],
+                 '--hf_config_overrides={"attn_logit_softcapping": 2.0, "final_logit_softcapping": 0.5, "query_pre_attn_scalar": 0.01}'],
            # bf16 attention through a deliberately saturated cap moves the tied
            # embedding's gradient by ~1.7e-2 (the kernel-level soft-cap test pins
            # the arithmetic itself in fp32). Detection does not rest on grads:
