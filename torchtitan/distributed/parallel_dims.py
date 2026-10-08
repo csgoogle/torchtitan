@@ -26,6 +26,7 @@ def init_device_mesh(
     mesh_shape: tuple[int, ...],
     mesh_dim_names: tuple[str, ...] | None = None,
     enable_tpu_topo_mesh: bool = False,
+    dcn_mesh_shape: tuple[int, ...] | None = None,
 ) -> DeviceMesh:
     if (
         enable_tpu_topo_mesh
@@ -33,7 +34,13 @@ def init_device_mesh(
         and hasattr(torch, "tpu")
         and hasattr(torch.tpu, "topology_aware_mesh")
     ):
-        rank_mesh = torch.tpu.topology_aware_mesh(mesh_shape)
+        # dcn_mesh_shape=None lets torch_tpu read the slice count off the
+        # devices and split the outermost non-trivial axis itself, which is the
+        # right choice for both single- and multi-slice jobs. An explicit value
+        # overrides that inference.
+        rank_mesh = torch.tpu.topology_aware_mesh(
+            mesh_shape, dcn_mesh_shape=dcn_mesh_shape
+        )
         # ``preserve_rank_order=True`` makes DeviceMesh honour the
         # topology-aware ordering everywhere: it stops the default process
         # group from being reused for a permuted world-size mesh dim, and it
@@ -112,6 +119,7 @@ class ParallelDims:
     world_size: int
     spmd_backend: Literal["partial_dtensor", "spmd_types"] = "partial_dtensor"
     enable_tpu_topo_mesh: bool = False
+    dcn_mesh_shape: tuple[int, ...] | None = None
     # Cache by axis name(s); DeviceMesh equality is by identity, so reuse the
     # same object instead of re-slicing a submesh on every lookup.
     _single_axis_meshes: dict[str, DeviceMesh] = field(default_factory=dict)
@@ -132,6 +140,7 @@ class ParallelDims:
             world_size=world_size,
             spmd_backend=parallelism_config.spmd_backend,
             enable_tpu_topo_mesh=parallelism_config.enable_tpu_topo_mesh,
+            dcn_mesh_shape=parallelism_config.dcn_mesh_shape,
         )
 
     def __post_init__(self):
@@ -260,6 +269,7 @@ class ParallelDims:
             (self.world_size,),
             mesh_dim_names=("world",),
             enable_tpu_topo_mesh=self.enable_tpu_topo_mesh,
+            dcn_mesh_shape=self.dcn_mesh_shape,
         )
         dataloading_mesh = unflatten_mesh(
             self._world_mesh,

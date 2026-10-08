@@ -38,6 +38,51 @@ _TPU_CHIP_TO_HOST_BOUNDS = frozendict.frozendict({
 })
 
 
+def get_num_slices(environ: dict[str, str] | None = None) -> int:
+  """Returns the number of TPU slices this job spans.
+
+  Multi-slice jobs are identified by ``MEGASCALE_NUM_SLICES``, which the
+  launcher sets (and which GKE propagates to every pod of a multi-slice
+  JobSet). A single-slice job either omits it or sets it to 1.
+
+  Args:
+    environ: Environment to read. Defaults to ``os.environ``.
+
+  Returns:
+    The slice count, at least 1.
+
+  Raises:
+    ValueError: If ``MEGASCALE_NUM_SLICES`` is set but is not a positive
+      integer.
+  """
+  if environ is None:
+    environ = os.environ
+  raw = environ.get("MEGASCALE_NUM_SLICES", "1")
+  try:
+    num_slices = int(raw)
+  except ValueError as e:
+    raise ValueError(
+        f"MEGASCALE_NUM_SLICES must be a positive integer, got {raw!r}."
+    ) from e
+  if num_slices < 1:
+    raise ValueError(
+        f"MEGASCALE_NUM_SLICES must be a positive integer, got {raw!r}."
+    )
+  return num_slices
+
+
+def get_slice_id(environ: dict[str, str] | None = None) -> int:
+  """Returns this process's slice index, 0 on a single-slice job."""
+  if environ is None:
+    environ = os.environ
+  return int(environ.get("MEGASCALE_SLICE_ID", "0"))
+
+
+def is_multi_slice(environ: dict[str, str] | None = None) -> bool:
+  """Whether this job spans more than one TPU slice."""
+  return get_num_slices(environ) > 1
+
+
 def _maybe_init_distributed_on_gke(
     slicebuilder_first_worker_port: int = 10000,
     environ: dict[str, str] | None = None,
@@ -75,6 +120,23 @@ def _maybe_init_distributed_on_gke(
   world_size = int(environ["WORLD_SIZE"])
   local_rank = int(environ["LOCAL_RANK"])
   rank = int(environ["RANK"])
+
+  # On a multi-slice job WORLD_SIZE spans every slice, while the TPU_*_BOUNDS
+  # that GKE injects describe ONE slice. SliceBuilder is also per-slice: each
+  # slice builds its own ICI mesh and MegaScale joins them over DCN. So every
+  # comparison against the bounds below, and the task id handed to the slice's
+  # PJRT client, must use the PER-SLICE world size and the WITHIN-SLICE rank.
+  # Using the global values makes the bounds check fail and this function bail
+  # out, leaving TORCH_TPU_SLICEBUILDER_ADDRESSES unset.
+  num_slices = get_num_slices(environ)
+  if world_size % num_slices:
+    raise ValueError(
+        f"WORLD_SIZE={world_size} is not divisible by "
+        f"MEGASCALE_NUM_SLICES={num_slices}; every slice must contribute the "
+        "same number of processes."
+    )
+  slice_world_size = world_size // num_slices
+  slice_rank = rank % slice_world_size
   is_v7 = ("TPU_ACCELERATOR_TYPE" in environ and
            environ["TPU_ACCELERATOR_TYPE"].startswith("tpu7x"))
 
@@ -101,7 +163,10 @@ def _maybe_init_distributed_on_gke(
   if is_v7:
     tpu_chips_per_host_bounds_product *= 2
 
-  if tpu_chips_per_host_bounds_product * tpu_host_bounds_product != world_size:
+  if (
+      tpu_chips_per_host_bounds_product * tpu_host_bounds_product
+      != slice_world_size
+  ):
     return False  # environment is likely to set incorrectly.
 
   environ["TPU_CHIPS_PER_HOST_BOUNDS"] = ",".join(
@@ -114,7 +179,8 @@ def _maybe_init_distributed_on_gke(
     environ["TPU_HOST_BOUNDS"] += ",2"
 
   environ["TPU_VISIBLE_CHIPS"] = str(local_rank)
-  environ["CLOUD_TPU_TASK_ID"] = str(rank)
+  # Within-slice: the slice's PJRT client numbers its own tasks from zero.
+  environ["CLOUD_TPU_TASK_ID"] = str(slice_rank)
   ports = list(
       range(
           slicebuilder_first_worker_port,
@@ -130,6 +196,33 @@ def _maybe_init_distributed_on_gke(
   environ["TPU_PROCESS_ADDRESSES"] = tpu_worker_addresses_str
   environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = tpu_worker_addresses_str
   environ["TORCH_TPU_TOPOLOGY"] = environ["TPU_HOST_BOUNDS"]
+
+  if num_slices > 1:
+    # The MegaScale PJRT client is what gives devices a slice index and a
+    # globally unique id; without it every slice numbers its devices from zero
+    # and torch_tpu's topology_aware_mesh rejects the job with "duplicate pjrt
+    # device ids across torch ranks".
+    missing = [
+        v
+        for v in ("MEGASCALE_COORDINATOR_ADDRESS", "MEGASCALE_SLICE_ID")
+        if v not in environ
+    ]
+    if missing:
+      raise ValueError(
+          f"MEGASCALE_NUM_SLICES={num_slices} requires {missing} to be set so "
+          "libtpu creates the MegaScale PJRT client. Without it each slice "
+          "numbers its devices from zero and the mesh cannot be built."
+      )
+    logger.info(
+        "Multi-slice TPU: %d slices, this is slice %d. Per-slice world size"
+        " %d (global %d), within-slice task id %d, per-slice topology %s.",
+        num_slices,
+        get_slice_id(environ),
+        slice_world_size,
+        world_size,
+        slice_rank,
+        environ["TORCH_TPU_TOPOLOGY"],
+    )
   return True
 
 
@@ -189,6 +282,54 @@ def _maybe_init_distributed_on_tpu_vm() -> bool:
   os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = tpu_worker_addresses_str
   os.environ["TORCH_TPU_TOPOLOGY"] = os.environ["TPU_HOST_BOUNDS"]
   return True
+
+
+def apply_multislice_parallelism_defaults(parallelism_config) -> None:
+  """Points the HSDP replicate axis at the slice boundary, in place.
+
+  On a multi-slice job the whole point of HSDP is that gradients are
+  reduce-scattered inside a slice over ICI and only all-reduced between slices
+  over the much slower DCN. That holds when the replicate axis is exactly the
+  slice count, so this defaults ``data_parallel_replicate_degree`` to the
+  number of slices when the recipe left it at 1. An explicit value is
+  respected, but it must be a multiple of the slice count -- otherwise a shard
+  group straddles DCN, which is the layout multi-slice exists to avoid.
+
+  No-op on a single-slice job.
+
+  Args:
+    parallelism_config: The run's ``ParallelismConfig``, mutated in place.
+
+  Raises:
+    ValueError: If an explicit replicate degree is not a multiple of the slice
+      count.
+  """
+  num_slices = get_num_slices()
+  if num_slices == 1:
+    return
+
+  replicate = parallelism_config.data_parallel_replicate_degree
+  if replicate == 1:
+    parallelism_config.data_parallel_replicate_degree = num_slices
+    logger.info(
+        "Multi-slice: defaulting data_parallel_replicate_degree to the slice"
+        " count (%d) so every FSDP shard group stays inside one slice.",
+        num_slices,
+    )
+  elif replicate % num_slices:
+    raise ValueError(
+        f"data_parallel_replicate_degree={replicate} is not a multiple of the"
+        f" slice count {num_slices}. The replicate axis is what gets split"
+        " across DCN, so an indivisible value would put FSDP shard groups on"
+        " both sides of the inter-slice link."
+    )
+  else:
+    logger.info(
+        "Multi-slice: keeping the recipe's data_parallel_replicate_degree=%d"
+        " across %d slices.",
+        replicate,
+        num_slices,
+    )
 
 
 def maybe_init_distributed() -> bool:
