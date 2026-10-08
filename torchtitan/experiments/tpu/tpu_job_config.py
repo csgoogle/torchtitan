@@ -100,9 +100,10 @@ class TPUConfig:
   # CPU-offload controls propagated into GraphTrainer's compile config.
   graph_trainer_cpu_offload_budget_gb: float = 100.0
   # ``tpu_selective`` only: full recompute, except these save regions, whose
-  # values are saved for backward. Names follow upstream ``RegionAC`` regions
-  # and are the keys of ``SAVE_REGIONS`` in
-  # ``graph_trainer/tpu_memory_policy.py``, e.g. ("moe.route_permutation",).
+  # values are saved for backward: "moe.route_permutation",
+  # "moe.router.routing_decision" and "attention.inner_attention" (see
+  # ``experiments/tpu/remat_regions.py``). The names follow upstream
+  # ``RegionAC`` regions.
   graph_trainer_save_regions: tuple[str, ...] = ()
   # ``tpu_selective`` only: save a region only in its last N transformer
   # layers, which backward reaches first. Regions not listed are saved in

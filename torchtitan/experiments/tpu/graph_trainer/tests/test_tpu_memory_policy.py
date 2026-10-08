@@ -6,6 +6,7 @@
 
 """Tests for the TPU selective memory policies on traced toy graphs."""
 
+import operator
 from types import SimpleNamespace
 import unittest
 
@@ -19,6 +20,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
+    _is_backward_node,
     _NOT_IN_LAYERS,
     annotate_module_fqns,
     compute_parameter_gradients,
@@ -51,8 +53,10 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     is_splash_forward_op_name,
     resolve_save_regions,
     ROUTE_PERMUTATION_CLASS,
+    ROUTING_DECISION_CLASS,
     SaveCandidateClass,
     select_route_permutations,
+    select_routing_decisions,
     select_saves,
     select_splash_attention,
     SPLASH_ATTENTION_CLASS,
@@ -65,9 +69,12 @@ from torchtitan.experiments.tpu.token_dispatcher import (
     local_reorder,
     stable_grouped_reduce,
 )
+from torchtitan.models.common.linear import RouterGateLinear
+from torchtitan.models.common.moe import TokenChoiceTopKRouter
 
 _TOKENS = 8
 _DIM = 8
+_EXPERTS = 4
 _TOP_K = 2
 _HEADS = 2
 
@@ -200,17 +207,32 @@ class _Attention(nn.Module):
         return q if self.core is None else self.core(q)
 
 
-class _MoE(nn.Module):
-    """Top-k routing through the real TPU local reorder and grouped reduce."""
+def _router(num_expert_groups: int | None) -> TokenChoiceTopKRouter:
+    """Upstream's router: softmax top-2 of 4 experts, optionally in 2 groups.
 
-    def __init__(self, dim: int, n_experts: int = 4) -> None:
+    With groups, the router keeps the best of 2 groups and then takes the
+    top-2 of its experts, so it runs three top-ks in all.
+    """
+    return TokenChoiceTopKRouter.Config(
+        num_experts=_EXPERTS,
+        gate=RouterGateLinear.Config(in_features=_DIM, out_features=_EXPERTS),
+        num_expert_groups=num_expert_groups,
+        num_limited_groups=None if num_expert_groups is None else 1,
+        top_k=_TOP_K,
+        score_func="softmax",
+    ).build()
+
+
+class _MoE(nn.Module):
+    """Upstream routing, then the real TPU local reorder and grouped reduce."""
+
+    def __init__(self, dim: int, num_expert_groups: int | None) -> None:
         super().__init__()
-        self.router = nn.Parameter(torch.randn(dim, n_experts))
+        self.router = _router(num_expert_groups)
         self.expert = nn.Parameter(torch.randn(dim, dim) * 0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scores = torch.softmax(x.float() @ self.router, dim=-1)
-        top_scores, expert_ids = torch.topk(scores, _TOP_K, dim=-1)
+        top_scores, expert_ids, _ = self.router(x)
         routed, token_indices, routed_scores = local_reorder(
             x, top_scores, expert_ids, _TOP_K
         )
@@ -220,10 +242,10 @@ class _MoE(nn.Module):
 
 
 class _Block(nn.Module):
-    def __init__(self, dim: int, core=None) -> None:
+    def __init__(self, dim: int, core, num_expert_groups: int | None) -> None:
         super().__init__()
         self.attention = _Attention(dim, core)
-        self.moe = _MoE(dim)
+        self.moe = _MoE(dim, num_expert_groups)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attention(x)
@@ -231,9 +253,13 @@ class _Block(nn.Module):
 
 
 class _MoEToy(nn.Module):
-    def __init__(self, cores=(None, None)) -> None:
+    def __init__(
+        self, cores=(None, None), num_expert_groups: int | None = None
+    ) -> None:
         super().__init__()
-        self.layers = nn.ModuleList(_Block(_DIM, core) for core in cores)
+        self.layers = nn.ModuleList(
+            _Block(_DIM, core, num_expert_groups) for core in cores
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
@@ -331,6 +357,54 @@ class TestRoutePermutationClass(unittest.TestCase):
             )
 
 
+def _router_topks(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    return [
+        node
+        for node in gm.graph.nodes
+        if node.target is torch.ops.aten.topk.default
+        and not _is_backward_node(node)
+        and node.meta["custom"]["module_fqn"].endswith(".moe.router")
+    ]
+
+
+class TestRoutingDecisionClass(unittest.TestCase):
+    def test_selects_the_last_topk_of_each_router(self) -> None:
+        for num_expert_groups, topks_per_router in ((None, 1), (2, 3)):
+            with self.subTest(num_expert_groups=num_expert_groups):
+                torch.manual_seed(0)
+                traced, _ = _trace_toy(_MoEToy(num_expert_groups=num_expert_groups))
+                topks = _router_topks(traced.gm)
+                self.assertEqual(len(topks), 2 * topks_per_router)
+
+                decisions = select_routing_decisions(traced.gm)
+
+                self.assertEqual(
+                    [node.args for node in decisions],
+                    [(topks[topks_per_router - 1], 1), (topks[-1], 1)],
+                )
+                self.assertEqual(
+                    [node.meta["custom"]["module_fqn"] for node in decisions],
+                    ["layers.0.moe.router", "layers.1.moe.router"],
+                )
+                for node in decisions:
+                    self.assertEqual(node.meta["val"].shape, (_TOKENS, _TOP_K))
+                    self.assertEqual(node.meta["val"].dtype, torch.int64)
+
+    def test_unexpected_router_topk_raises(self) -> None:
+        graph = torch.fx.Graph()
+        scores = graph.placeholder("scores")
+        topk = graph.call_function(torch.ops.aten.topk.default, args=(scores, 2))
+        topk.meta["custom"] = {"module_fqn": "layers.0.moe.router"}
+        indices = graph.call_function(operator.getitem, args=(topk, 1))
+        # 1-D ids are not what the selector was written for.
+        indices.meta["val"] = torch.empty(16, dtype=torch.int64, device="meta")
+        graph.output(indices)
+        gm = torch.fx.GraphModule(nn.Module(), graph)
+
+        with self.assertRaisesRegex(ValueError, "does not have one 2-D integer"):
+            select_routing_decisions(gm)
+
+
 def _selective_config(
     save_regions: tuple[str, ...], last_n_layers: dict[str, int] | None = None
 ) -> SimpleNamespace:
@@ -389,8 +463,10 @@ class TestSelectSaves(unittest.TestCase):
 
     def test_config_values_are_checked(self) -> None:
         self.assertEqual(
-            resolve_save_regions(("moe.route_permutation",)),
-            [ROUTE_PERMUTATION_CLASS],
+            resolve_save_regions(
+                ("moe.route_permutation", "moe.router.routing_decision")
+            ),
+            [ROUTE_PERMUTATION_CLASS, ROUTING_DECISION_CLASS],
         )
         for names, message in (
             ((), "needs graph_trainer_save_regions"),
@@ -501,6 +577,28 @@ class TestTpuSelectivePolicy(unittest.TestCase):
 
         splash = [node for node in chosen if _is_splash_node(node)]
         self.assertEqual([_get_layer_id(node) for node in splash], [2])
+
+    def test_saved_routing_decisions_skip_the_router_topk_recompute(self) -> None:
+        # Backward needs each router's expert ids to scatter the gate-score
+        # gradients. Unless they are saved, it re-runs every top-k behind
+        # them: three per router with group-limited routing, two layers.
+        for save_regions, recomputed_topks in (
+            (("moe.route_permutation",), 6),
+            (("moe.route_permutation", "moe.router.routing_decision"), 0),
+        ):
+            with self.subTest(save_regions=save_regions):
+                torch.manual_seed(0)
+                chosen = self._run(_MoEToy(num_expert_groups=2), save_regions)
+
+                # The chosen nodes are in the graph that _run transformed.
+                graph = next(iter(chosen)).graph
+                recomputed = [
+                    node
+                    for node in graph.nodes
+                    if node.target is torch.ops.aten.topk.default
+                    and node.name.endswith("_recomputed")
+                ]
+                self.assertEqual(len(recomputed), recomputed_topks)
 
 
 def _is_splash_node(node: torch.fx.Node) -> bool:

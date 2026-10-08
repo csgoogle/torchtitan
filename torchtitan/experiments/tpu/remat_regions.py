@@ -24,3 +24,6 @@ REMAT_REGION = "remat_region"
 ATTENTION_INNER_ATTENTION = "attention.inner_attention"
 # The expert-sort permutation in ``token_dispatcher.local_reorder``.
 MOE_ROUTE_PERMUTATION = "moe.route_permutation"
+# The router's top-k expert ids: upstream's ``routing_decision`` region in
+# ``TokenChoiceTopKRouter``.
+MOE_ROUTING_DECISION = "moe.router.routing_decision"

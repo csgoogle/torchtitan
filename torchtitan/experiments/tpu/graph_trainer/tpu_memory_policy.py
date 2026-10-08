@@ -6,6 +6,7 @@
 
 """TPU-only GraphTrainer memory policies."""
 
+import operator
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -14,8 +15,10 @@ import torch
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
+    _get_module_fqn,
     _is_backward_node,
     _NOT_IN_LAYERS,
+    matches_module_fqn_pattern,
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import (
     tag_all_offloadable_activations,
@@ -30,6 +33,7 @@ from torchtitan.experiments.graph_trainer.registry import register_memory_policy
 from torchtitan.experiments.tpu.remat_regions import (
     ATTENTION_INNER_ATTENTION,
     MOE_ROUTE_PERMUTATION,
+    MOE_ROUTING_DECISION,
     REMAT_REGION,
 )
 from torchtitan.tools.logging import logger
@@ -60,10 +64,10 @@ def _in_remat_region(node: torch.fx.Node, region: str) -> bool:
     return node.meta.get("custom", {}).get(REMAT_REGION) == region
 
 
-def _is_integer_vector(value: object) -> bool:
+def _is_integer_tensor(value: object, ndim: int) -> bool:
     return (
         isinstance(value, torch.Tensor)
-        and value.ndim == 1
+        and value.ndim == ndim
         and value.dtype in (torch.int32, torch.int64)
     )
 
@@ -81,7 +85,7 @@ def select_route_permutations(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
         node
         for node in _forward_call_nodes(gm)
         if _in_remat_region(node, MOE_ROUTE_PERMUTATION)
-        and _is_integer_vector(node.meta.get("val"))
+        and _is_integer_tensor(node.meta.get("val"), ndim=1)
         and any(
             not _in_remat_region(user, MOE_ROUTE_PERMUTATION) for user in node.users
         )
@@ -93,6 +97,54 @@ def select_route_permutations(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 ROUTE_PERMUTATION_CLASS = SaveCandidateClass(
     name=MOE_ROUTE_PERMUTATION,
     select=select_route_permutations,
+)
+
+# The module that runs ``TokenChoiceTopKRouter._select_experts``.
+_ROUTER_FQN_PATTERN = "layers.*.moe.router"
+
+
+def select_routing_decisions(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return each MoE router's top-k expert ids.
+
+    ``TokenChoiceTopKRouter._select_experts`` ends in ``torch.topk``, whose
+    indices are the routing decision. Group-limited routing runs group
+    top-ks before it, so keep the indices of the last top-k in each router.
+    Raises if they are not one 2-D integer value, so a router change fails
+    loudly instead of silently saving the wrong thing.
+    """
+    last_topk: dict[str, torch.fx.Node] = {}
+    for node in _forward_call_nodes(gm):
+        fqn = _get_module_fqn(node)
+        if node.target is torch.ops.aten.topk.default and (
+            matches_module_fqn_pattern(_ROUTER_FQN_PATTERN, fqn)
+        ):
+            last_topk[fqn] = node
+    decisions = set()
+    for topk in last_topk.values():
+        indices = [
+            user
+            for user in topk.users
+            if user.target is operator.getitem and user.args[1] == 1
+        ]
+        if len(indices) != 1 or not _is_integer_tensor(
+            indices[0].meta.get("val"), ndim=2
+        ):
+            raise ValueError(
+                f"Router top-k {topk.name} does not have one 2-D integer indices "
+                "value; update select_routing_decisions for this router."
+            )
+        decisions.add(indices[0])
+    return [node for node in _forward_call_nodes(gm) if node in decisions]
+
+
+# Saving the top-k expert ids keeps backward on the forward's routing: a
+# recomputed top-k can pick different experts when scores (nearly) tie.
+# Upstream eager AC always keeps this region (``recompute=False``) for the
+# same reason. It also skips the top-k recompute, and it is small (top_k
+# integers per token), so recipes save it in every layer.
+ROUTING_DECISION_CLASS = SaveCandidateClass(
+    name=MOE_ROUTING_DECISION,
+    select=select_routing_decisions,
 )
 
 # The forward ops of both TPU Splash kernels. Stock Splash
@@ -180,7 +232,11 @@ SPLASH_ATTENTION_CLASS = SaveCandidateClass(
 
 SAVE_REGIONS: dict[str, SaveCandidateClass] = {
     candidate_class.name: candidate_class
-    for candidate_class in (ROUTE_PERMUTATION_CLASS, SPLASH_ATTENTION_CLASS)
+    for candidate_class in (
+        ROUTE_PERMUTATION_CLASS,
+        ROUTING_DECISION_CLASS,
+        SPLASH_ATTENTION_CLASS,
+    )
 }
 
 
