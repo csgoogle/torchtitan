@@ -103,7 +103,8 @@ class TPUConfig:
   # values are saved for backward: "moe.route_permutation",
   # "moe.router.routing_decision" and "attention.inner_attention" (see
   # ``experiments/tpu/remat_regions.py``). The names follow upstream
-  # ``RegionAC`` regions.
+  # ``RegionAC`` regions. "moe.route_permutation" also needs
+  # "moe.router.routing_decision", in at least the same layers.
   graph_trainer_save_regions: tuple[str, ...] = ()
   # ``tpu_selective`` only: save a region only in its last N transformer
   # layers, which backward reaches first. Regions not listed are saved in

@@ -284,6 +284,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             "--tpu_config.graph_trainer_memory_policy=tpu_selective",
             "--tpu_config.graph_trainer_save_regions",
             "moe.route_permutation",
+            "moe.router.routing_decision",
             "attention.inner_attention",
             "--tpu_config.graph_trainer_save_last_n_layers",
             "attention.inner_attention",
@@ -299,7 +300,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(graph_config.compile.memory_policy, "tpu_selective")
     self.assertEqual(
         graph_config.tpu_config.graph_trainer_save_regions,
-        ("moe.route_permutation", "attention.inner_attention"),
+        (
+            "moe.route_permutation",
+            "moe.router.routing_decision",
+            "attention.inner_attention",
+        ),
     )
     self.assertEqual(
         graph_config.tpu_config.graph_trainer_save_last_n_layers,
@@ -312,7 +317,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
       (
           "limit_on_unlisted_region",
           "tpu_selective",
-          ("moe.route_permutation",),
+          ("moe.router.routing_decision",),
           {"attention.inner_attention": 2},
           False,
           "not in graph_trainer_save_regions",
@@ -324,6 +329,22 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           {"attention.inner_attention": 0},
           False,
           "positive integer",
+      ),
+      (
+          "routes_without_routing_decisions",
+          "tpu_selective",
+          ("moe.route_permutation",),
+          {},
+          False,
+          "needs 'moe.router.routing_decision'",
+      ),
+      (
+          "routing_decisions_in_fewer_layers",
+          "tpu_selective",
+          ("moe.route_permutation", "moe.router.routing_decision"),
+          {"moe.router.routing_decision": 2},
+          False,
+          "in fewer layers than",
       ),
       (
           "scan",

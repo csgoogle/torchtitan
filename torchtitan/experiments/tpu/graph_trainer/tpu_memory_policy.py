@@ -94,6 +94,12 @@ def select_route_permutations(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 
 # Saving the permutation avoids re-running a stable sort per layer in backward.
 # It is small (one integer per routed token), so recipes save it in every layer.
+#
+# It is only safe with ``moe.router.routing_decision`` saved in the same layers,
+# which the config checks enforce. Backward also reads the router's top-k ids
+# (for the per-expert counts and the score gather). Recomputed, a near-tie could
+# pick a different expert than the saved permutation did, and backward would
+# then pair some tokens with the wrong expert.
 ROUTE_PERMUTATION_REGION = SaveRegion(
     name=MOE_ROUTE_PERMUTATION,
     select=select_route_permutations,
@@ -360,13 +366,19 @@ def resolve_save_regions(names: Sequence[str]) -> list[SaveRegion]:
         raise ValueError(f"Unknown save regions {unknown}; known regions: {known}.")
     if len(set(names)) != len(names):
         raise ValueError(f"Duplicate entries in graph_trainer_save_regions: {names}.")
+    if MOE_ROUTE_PERMUTATION in names and MOE_ROUTING_DECISION not in names:
+        raise ValueError(
+            f"Save region {MOE_ROUTE_PERMUTATION!r} needs {MOE_ROUTING_DECISION!r} "
+            "too, so that backward does not pair the saved routes with recomputed "
+            "top-k ids."
+        )
     return [SAVE_REGIONS[name] for name in names]
 
 
 def check_save_last_n_layers(
     last_n_layers: Mapping[str, int], save_regions: Sequence[str]
 ) -> None:
-    """Reject ``graph_trainer_save_last_n_layers`` entries that cannot apply."""
+    """Reject bad or unsafe ``graph_trainer_save_last_n_layers`` entries."""
     for name, n_layers in last_n_layers.items():
         if name not in save_regions:
             raise ValueError(
@@ -377,6 +389,15 @@ def check_save_last_n_layers(
             raise ValueError(
                 f"graph_trainer_save_last_n_layers[{name!r}] must be a positive "
                 f"integer, got {n_layers!r}."
+            )
+    decision_layers = last_n_layers.get(MOE_ROUTING_DECISION)
+    if MOE_ROUTE_PERMUTATION in save_regions and decision_layers is not None:
+        route_layers = last_n_layers.get(MOE_ROUTE_PERMUTATION)
+        if route_layers is None or route_layers > decision_layers:
+            raise ValueError(
+                f"graph_trainer_save_last_n_layers saves {MOE_ROUTING_DECISION!r} "
+                f"in fewer layers than {MOE_ROUTE_PERMUTATION!r}; every layer that "
+                "saves routes must also save their top-k ids."
             )
 
 
