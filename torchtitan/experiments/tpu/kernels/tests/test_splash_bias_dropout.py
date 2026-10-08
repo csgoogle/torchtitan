@@ -435,7 +435,7 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
     def build(seq, blk):
       return splash_bias_dropout._build_kernel(
           seq, True, 1.0, -1, False, False, blk, blk, blk, blk, blk, blk,
-          False, None, 0.0, True, 4, True, 0, False, True,
+          False, True, None, 0.0, True, 4, True, 0, False, True,
       )[1]
 
     def steps(mi, seg, blk, is_dkv):

@@ -81,6 +81,13 @@ class SbdConfig:
   block_kv_dkv: int = 512
   block_kv_dkv_compute: int = 512
   use_experimental_scheduler: bool = False  # tokamax default; see module note
+  # exp2 with LOG2E folded into q (tokamax's default) multiplies q by LOG2E
+  # in q's dtype -- a second bf16 rounding of q that the stock splash kernel
+  # does not do. False keeps natural exp: vs a float64 reference at 16k
+  # (1 v6e chip, the lane's head layouts) the output error drops ~25-60% to
+  # exactly stock splash's, dk/dv error ends 20-50% below stock splash's
+  # (which sums repeated K/V grads in bf16), at +2-3% kernel time.
+  use_base2_exp: bool = True
   # Dropout (the verified frontier config; rate 0.0 disables the paths).
   dropout_rate: float = 0.0
   dropout_fold_rescale: bool = True
@@ -95,10 +102,10 @@ class SbdConfig:
   attn_logits_soft_cap: Optional[float] = None
   # Skip grid steps that no document in the pack can need (see
   # `_document_aware_mask_info`). Only ever active when `segment_ids` is
-  # passed. Per-example block metadata makes XLA lower the surrounding
-  # `vmap` as a serial batch loop: free at batch 1 (the lane folds its
-  # batch into one packed stream), and the price of skipping above it.
-  # Off is exact too, just denser.
+  # passed. Per-example block metadata serializes the batch (see
+  # `_batch_map`): free at batch 1 (the lane folds its batch into one packed
+  # stream); above it, ~9% on a pass whose samples are single documents, a
+  # win as soon as they hold several. Off is exact too, just denser.
   document_aware_skipping: bool = True
   # The fork's `SplashConfig.dq_reduction_steps`: 0 keeps its default (one
   # unreduced dq partial per kv step, fp32 once kv_steps > 4, summed outside
@@ -111,8 +118,12 @@ class SbdConfig:
   # dtype. Measured on Llama-3.2-1B, bs 8, seq 2048, 4x v6e: the dkv kernel
   # 178.7 -> 75.9 ms and the 45 ms dq sum gone (+19% tok/s, +15% over stock
   # splash); over 40 steps its loss stays within 2.5e-3 of 0's, inside the
-  # 4.0e-3 that separates 0 from stock splash.
-  dq_reduction_steps: int = 3
+  # 4.0e-3 that separates 0 from stock splash. -1 (default) picks by
+  # length: 3 from four kv blocks up, else 0. At two kv blocks there is
+  # almost nothing to reduce and 3's dynamic list costs ~10% of the dkv
+  # pass; at four the two tie, at eight 3 is 15-25% faster (1 v6e chip,
+  # block 1024).
+  dq_reduction_steps: int = -1
 
   @classmethod
   def update(cls, **kwargs):
@@ -131,6 +142,7 @@ class SbdConfig:
         cls.block_kv_dkv,
         cls.block_kv_dkv_compute,
         cls.use_experimental_scheduler,
+        cls.use_base2_exp,
         cls.attn_logits_soft_cap,
         cls.dropout_rate,
         cls.dropout_fold_rescale,
@@ -158,6 +170,7 @@ def _build_kernel(
     block_kv_dkv: int,
     block_kv_dkv_compute: int,
     use_experimental_scheduler: bool,
+    use_base2_exp: bool,
     attn_logits_soft_cap: float | None,
     dropout_rate: float,
     dropout_fold_rescale: bool,
@@ -169,6 +182,8 @@ def _build_kernel(
     dq_reduction_steps: int = 0,
 ):
   """Constructs the fork kernel + static mask infos for one configuration."""
+  if dq_reduction_steps < 0:
+    dq_reduction_steps = 3 if seq_len >= 4 * min(block_kv_dkv, seq_len) else 0
   cfg = sbd_kernel.SplashConfig(
       block_q=min(block_q, seq_len),
       block_kv=min(block_kv, seq_len),
@@ -177,7 +192,7 @@ def _build_kernel(
       block_kv_dkv=min(block_kv_dkv, seq_len),
       block_kv_dkv_compute=min(block_kv_dkv_compute, seq_len),
       use_experimental_scheduler=use_experimental_scheduler,
-      use_base2_exp=True,
+      use_base2_exp=use_base2_exp,
       # See `SbdConfig.dq_reduction_steps`. 3 used to return wrong dk/dv for
       # every grouped-KV / MQA shape with a single kv block; fixed in the fork
       # (`_splash_attention_bwd_dkv`, `bounds_end == 2`).
@@ -214,6 +229,24 @@ def _build_kernel(
       downcast_smem_data=False,
   )
   return cfg, kernel
+
+
+def _batch_map(fn, args, in_axes, serial):
+  """`vmap(fn, in_axes)(*args)`, or a `lax.scan` over the batch if `serial`.
+
+  Per-example block metadata (document-aware skipping) already makes XLA
+  run the batched kernel as a serial loop. Spelling that loop as a scan
+  instead lets XLA place each example's operands in VMEM, which the batched
+  form does not: on 1 v6e chip, 8 x 2048 single-document samples, the dkv
+  kernel drops 3.25 -> 2.85 ms (Llama-3.2-1B heads) and fwd+bwd is 7-12%
+  faster across the lane's head layouts. Without per-example metadata the
+  vmap stays one batched kernel, which is the faster form there (an
+  MHA 20 x 128 bidirectional pass: 4.7 vs 5.3 ms). `None` args (an absent
+  seed / segment_ids) broadcast either way.
+  """
+  if serial:
+    return jax.lax.scan(lambda c, xs: (c, fn(*xs)), None, tuple(args))[1]
+  return jax.vmap(fn, in_axes=in_axes)(*args)
 
 
 def _kernel_statics(kernel):
@@ -399,6 +432,7 @@ def sbd_attention_fwd(
     block_kv_dkv: int,
     block_kv_dkv_compute: int,
     use_experimental_scheduler: bool,
+    use_base2_exp: bool,
     attn_logits_soft_cap: float | None,
     dropout_rate: float,
     dropout_fold_rescale: bool,
@@ -437,6 +471,7 @@ def sbd_attention_fwd(
       block_kv_dkv,
       block_kv_dkv_compute,
       use_experimental_scheduler,
+      use_base2_exp,
       attn_logits_soft_cap,
       dropout_rate,
       dropout_fold_rescale,
@@ -500,10 +535,12 @@ def sbd_attention_fwd(
     return out_b, stats_b["logsumexp"]
 
   # in_axes=None broadcasts an absent seed / segment_ids to every batch element.
-  out_tr, lse = jax.vmap(
+  out_tr, lse = _batch_map(
       _fwd_b,
-      in_axes=(0, 0, 0, 0 if use_dropout else None, 0 if segment_ids is not None else None),
-  )(q_tr, k_tr, v_tr, dropout_seed, segment_ids)
+      (q_tr, k_tr, v_tr, dropout_seed, segment_ids),
+      (0, 0, 0, 0 if use_dropout else None, 0 if segment_ids is not None else None),
+      serial=_per_example(fwd_mi, segment_ids, document_aware_skipping),
+  )
   out = out_tr if heads_first else jnp.transpose(out_tr, (0, 2, 1, 3))
   return out, lse
 
@@ -529,6 +566,7 @@ def sbd_attention_bwd(
     block_kv_dkv: int,
     block_kv_dkv_compute: int,
     use_experimental_scheduler: bool,
+    use_base2_exp: bool,
     attn_logits_soft_cap: float | None,
     dropout_rate: float,
     dropout_fold_rescale: bool,
@@ -561,6 +599,7 @@ def sbd_attention_bwd(
       block_kv_dkv,
       block_kv_dkv_compute,
       use_experimental_scheduler,
+      use_base2_exp,
       attn_logits_soft_cap,
       dropout_rate,
       dropout_fold_rescale,
@@ -625,11 +664,13 @@ def sbd_attention_bwd(
       dbias_b = jnp.zeros((0,), dtype=q_b.dtype)
     return dq_b, dk_b, dv_b, dbias_b
 
-  dq_tr, dk_tr, dv_tr, dbias_b = jax.vmap(
+  dq_tr, dk_tr, dv_tr, dbias_b = _batch_map(
       _bwd_b,
-      in_axes=(0, 0, 0, 0, 0, 0, 0 if use_dropout else None,
-               0 if segment_ids is not None else None),
-  )(q_tr, k_tr, v_tr, out_tr, logsumexp, g_tr, dropout_seed, segment_ids)
+      (q_tr, k_tr, v_tr, out_tr, logsumexp, g_tr, dropout_seed, segment_ids),
+      (0, 0, 0, 0, 0, 0, 0 if use_dropout else None,
+       0 if segment_ids is not None else None),
+      serial=_per_example(dkv_mi, segment_ids, document_aware_skipping),
+  )
 
   # chain rule for q * scale; grads leave in the layout q arrived in.
   if heads_first:
@@ -655,6 +696,18 @@ def sbd_attention_bwd(
   return dq, dk, dv, dbias
 
 
+def _per_example(mask_info, segment_ids, document_aware_skipping):
+  """Whether `_document_aware_mask_info` gives each of several examples its
+  own metadata (`_batch_map`'s `serial`). At batch 1 the vmap is the faster
+  form of the single call: 8.15 vs 8.47 ms fwd+bwd, Llama-3.2-1B heads, 16k."""
+  return (
+      segment_ids is not None
+      and segment_ids.shape[0] > 1
+      and document_aware_skipping
+      and mask_info.block_mask is not None
+  )
+
+
 def _segment_ids(seg_b):
   """One batch element's `(S,)` ids as the kernel's `SegmentIds`, or None.
 
@@ -671,7 +724,7 @@ def _segment_ids(seg_b):
 _sbd_fwd = pallas.jax_op("pallas::sbd_splash_attn_fwd", sbd_attention_fwd)
 _sbd_bwd = pallas.jax_op("pallas::sbd_splash_attn_bwd", sbd_attention_bwd)
 
-_NUM_STATIC_ARGS = 21  # causal, scale, window, layout + 17 SbdConfig values
+_NUM_STATIC_ARGS = 4 + len(SbdConfig.static_args())  # causal, scale, window, layout + SbdConfig
 
 
 def _setup_context(ctx, inputs, output):
