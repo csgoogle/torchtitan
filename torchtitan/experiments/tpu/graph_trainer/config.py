@@ -74,7 +74,7 @@ def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
     return
   if tpu_config.use_scan_layers:
     # A scan node stands for the whole layer loop and is always saved; the
-    # values these classes select live inside its body, where the policy
+    # values these regions select live inside its body, where the policy
     # cannot see them.
     raise ValueError(
         "graph_trainer_memory_policy='tpu_selective' does not support "

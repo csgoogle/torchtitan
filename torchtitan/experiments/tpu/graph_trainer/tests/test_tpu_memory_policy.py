@@ -52,14 +52,14 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
     full_remat_with_saves,
     is_splash_forward_op_name,
     resolve_save_regions,
-    ROUTE_PERMUTATION_CLASS,
-    ROUTING_DECISION_CLASS,
-    SaveCandidateClass,
+    ROUTE_PERMUTATION_REGION,
+    ROUTING_DECISION_REGION,
+    SaveRegion,
     select_route_permutations,
     select_routing_decisions,
     select_saves,
     select_splash_attention,
-    SPLASH_ATTENTION_CLASS,
+    SPLASH_ATTENTION_REGION,
 )
 from torchtitan.experiments.tpu.remat_regions import (
     MOE_ROUTE_PERMUTATION,
@@ -340,7 +340,7 @@ class TestFullRematWithSaves(unittest.TestCase):
                 )
 
 
-class TestRoutePermutationClass(unittest.TestCase):
+class TestRoutePermutationRegion(unittest.TestCase):
     def test_selects_one_permutation_per_layer(self) -> None:
         torch.manual_seed(0)
         traced, _ = _trace_toy(_MoEToy())
@@ -367,7 +367,7 @@ def _router_topks(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     ]
 
 
-class TestRoutingDecisionClass(unittest.TestCase):
+class TestRoutingDecisionRegion(unittest.TestCase):
     def test_selects_the_last_topk_of_each_router(self) -> None:
         for num_expert_groups, topks_per_router in ((None, 1), (2, 3)):
             with self.subTest(num_expert_groups=num_expert_groups):
@@ -422,14 +422,14 @@ class TestSelectSaves(unittest.TestCase):
         traced, _ = _trace_toy(_DenseToy())
 
         with self.assertRaisesRegex(ValueError, "'moe.route_permutation' matched no"):
-            select_saves(traced.gm, [ROUTE_PERMUTATION_CLASS], {})
+            select_saves(traced.gm, [ROUTE_PERMUTATION_REGION], {})
 
     def test_last_n_layers_keeps_only_the_last_layers(self) -> None:
         torch.manual_seed(0)
         traced, _ = _trace_toy(_MoEToy(_splash_cores()))
         routes = select_route_permutations(traced.gm)
         splash = select_splash_attention(traced.gm)
-        regions = [ROUTE_PERMUTATION_CLASS, SPLASH_ATTENTION_CLASS]
+        regions = [ROUTE_PERMUTATION_REGION, SPLASH_ATTENTION_REGION]
 
         for n_layers, saved_layers in (
             (1, [2]),
@@ -455,7 +455,7 @@ class TestSelectSaves(unittest.TestCase):
             for node in traced.gm.graph.nodes
             if node.op == "call_function" and _get_layer_id(node) == _NOT_IN_LAYERS
         )
-        region = SaveCandidateClass(name="test.outside", select=lambda gm: [outside])
+        region = SaveRegion(name="test.outside", select=lambda gm: [outside])
 
         self.assertEqual(select_saves(traced.gm, [region], {}), {outside})
         with self.assertRaisesRegex(ValueError, "outside the transformer layers"):
@@ -466,7 +466,7 @@ class TestSelectSaves(unittest.TestCase):
             resolve_save_regions(
                 ("moe.route_permutation", "moe.router.routing_decision")
             ),
-            [ROUTE_PERMUTATION_CLASS, ROUTING_DECISION_CLASS],
+            [ROUTE_PERMUTATION_REGION, ROUTING_DECISION_REGION],
         )
         for names, message in (
             ((), "needs graph_trainer_save_regions"),
@@ -607,7 +607,7 @@ def _is_splash_node(node: torch.fx.Node) -> bool:
     )
 
 
-class TestSplashAttentionClass(unittest.TestCase):
+class TestSplashAttentionRegion(unittest.TestCase):
     def test_matches_stock_and_tokamax_forward_ops_only(self) -> None:
         self.assertEqual(
             torch.ops.pallas.splash_attn_fwd_0123456789abcdef.default.name(),

@@ -40,12 +40,12 @@ from torchtitan.tools.logging import logger
 
 
 @dataclass(frozen=True)
-class SaveCandidateClass:
+class SaveRegion:
     """One kind of forward value that a TPU selective policy may keep.
 
     Attributes:
         name: The name used in ``graph_trainer_save_regions``.
-        select: Returns this class's candidate forward nodes, in forward order.
+        select: Returns this region's candidate forward nodes, in forward order.
     """
 
     name: str
@@ -94,7 +94,7 @@ def select_route_permutations(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 
 # Saving the permutation avoids re-running a stable sort per layer in backward.
 # It is small (one integer per routed token), so recipes save it in every layer.
-ROUTE_PERMUTATION_CLASS = SaveCandidateClass(
+ROUTE_PERMUTATION_REGION = SaveRegion(
     name=MOE_ROUTE_PERMUTATION,
     select=select_route_permutations,
 )
@@ -142,7 +142,7 @@ def select_routing_decisions(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 # Upstream eager AC always keeps this region (``recompute=False``) for the
 # same reason. It also skips the top-k recompute, and it is small (top_k
 # integers per token), so recipes save it in every layer.
-ROUTING_DECISION_CLASS = SaveCandidateClass(
+ROUTING_DECISION_REGION = SaveRegion(
     name=MOE_ROUTING_DECISION,
     select=select_routing_decisions,
 )
@@ -225,17 +225,17 @@ def select_splash_attention(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
 # q/k/v inputs are still recomputed from the layer boundary. An eager save
 # region also keeps the region's inputs. The difference is on purpose, so
 # don't "align" the two.
-SPLASH_ATTENTION_CLASS = SaveCandidateClass(
+SPLASH_ATTENTION_REGION = SaveRegion(
     name=ATTENTION_INNER_ATTENTION,
     select=select_splash_attention,
 )
 
-SAVE_REGIONS: dict[str, SaveCandidateClass] = {
-    candidate_class.name: candidate_class
-    for candidate_class in (
-        ROUTE_PERMUTATION_CLASS,
-        ROUTING_DECISION_CLASS,
-        SPLASH_ATTENTION_CLASS,
+SAVE_REGIONS: dict[str, SaveRegion] = {
+    region.name: region
+    for region in (
+        ROUTE_PERMUTATION_REGION,
+        ROUTING_DECISION_REGION,
+        SPLASH_ATTENTION_REGION,
     )
 }
 
@@ -314,7 +314,7 @@ def _in_last_n_layers(
 
 def select_saves(
     gm: torch.fx.GraphModule,
-    regions: Sequence[SaveCandidateClass],
+    regions: Sequence[SaveRegion],
     last_n_layers: Mapping[str, int],
 ) -> set[torch.fx.Node]:
     """Choose which candidate nodes of ``regions`` to save.
@@ -347,8 +347,8 @@ def select_saves(
     return selected
 
 
-def resolve_save_regions(names: Sequence[str]) -> list[SaveCandidateClass]:
-    """Map ``graph_trainer_save_regions`` to classes, rejecting bad names."""
+def resolve_save_regions(names: Sequence[str]) -> list[SaveRegion]:
+    """Map ``graph_trainer_save_regions`` names to regions, rejecting bad ones."""
     known = ", ".join(sorted(SAVE_REGIONS))
     if not names:
         raise ValueError(
