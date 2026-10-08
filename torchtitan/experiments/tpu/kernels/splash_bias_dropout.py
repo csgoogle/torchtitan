@@ -108,8 +108,11 @@ class SbdConfig:
   # `_document_aware_mask_info` then compacts like the forward's. Not
   # bit-identical to 0: the dq (and grouped-KV dk/dv) fp32 summation order
   # changes (~1e-6 at fp32 inputs on v6e), and the dq partials round to q's
-  # dtype, so it is opt-in pending a loss-gated lane experiment.
-  dq_reduction_steps: int = 0
+  # dtype. Measured on Llama-3.2-1B, bs 8, seq 2048, 4x v6e: the dkv kernel
+  # 178.7 -> 75.9 ms and the 45 ms dq sum gone (+19% tok/s, +15% over stock
+  # splash); over 40 steps its loss stays within 2.5e-3 of 0's, inside the
+  # 4.0e-3 that separates 0 from stock splash.
+  dq_reduction_steps: int = 3
 
   @classmethod
   def update(cls, **kwargs):
