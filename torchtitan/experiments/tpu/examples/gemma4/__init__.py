@@ -57,7 +57,7 @@ __all__ = [
 
 _NORM_INIT: dict[str, Callable] = {"weight": nn.init.ones_}
 _EMBEDDING_INIT: dict[str, Callable] = {
-    "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
+    "weight": partial(nn.init.normal_, mean=0.0, std=0.02)
 }
 _EMBEDDING_SKIP_INIT: dict[str, Callable] = {"weight": skip_param_init}
 _OUTPUT_INIT: dict[str, Callable] = {

@@ -126,9 +126,13 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
     self.assertIsNot(
         untied_model.tok_embeddings.weight, untied_model.lm_head.weight
     )
-    # An untied embedding must get a real init, not skip_param_init.
+    # An untied embedding must get a real init (std=0.02 matching HF
+    # initializer_range so sqrt(dim) scaling stays O(1)), not skip_param_init.
     self.assertIsNot(
         untied.tok_embeddings.param_init["weight"], skip_param_init
+    )
+    self.assertEqual(
+        untied.tok_embeddings.param_init["weight"].keywords["std"], 0.02
     )
 
   def test_silu_delegates_to_super_and_gelu_uses_grouped_mm_seam(self):
