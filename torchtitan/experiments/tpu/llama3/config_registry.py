@@ -197,7 +197,10 @@ def llama3_8b() -> TPUTrainerConfig:
       ),
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=5),
-      parallelism=ParallelismConfig(use_simple_fsdp=True),
+      parallelism=ParallelismConfig(
+          use_simple_fsdp=True,
+          enable_tpu_topo_mesh=True,
+      ),
       checkpoint=CheckpointManager.Config(
           enable=False,
           interval=500,
@@ -261,7 +264,10 @@ def llama3_70b() -> TPUTrainerConfig:
       ),
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=5),
-      parallelism=ParallelismConfig(use_simple_fsdp=True),
+      parallelism=ParallelismConfig(
+          use_simple_fsdp=True,
+          enable_tpu_topo_mesh=True,
+      ),
       checkpoint=CheckpointManager.Config(
           enable=False,
           interval=500,
@@ -325,7 +331,10 @@ def llama3_405b() -> TPUTrainerConfig:
       ),
       dataloader=c4_test_dataloader(),
       metrics=MetricsProcessor.Config(log_freq=5),
-      parallelism=ParallelismConfig(use_simple_fsdp=True),
+      parallelism=ParallelismConfig(
+          use_simple_fsdp=True,
+          enable_tpu_topo_mesh=True,
+      ),
       checkpoint=CheckpointManager.Config(
           enable=False,
           interval=500,
@@ -415,7 +424,10 @@ def sft_llama3_8b_metamath() -> TPUTrainerConfig:
           enable_tensorboard=True,
           save_tb_folder="tb_logs/sft_llama3_8b_metamath",
       ),
-      parallelism=ParallelismConfig(use_simple_fsdp=True),
+      parallelism=ParallelismConfig(
+          use_simple_fsdp=True,
+          enable_tpu_topo_mesh=True,
+      ),
       checkpoint=CheckpointManager.Config(
           # `enable` is on only so the initial HF weight load happens;
           # `load_only` then suppresses every save, including the
