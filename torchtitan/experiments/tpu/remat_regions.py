@@ -6,9 +6,10 @@
 
 """Names of the regions that TPU selective memory policies can save.
 
-The names follow upstream ``RegionAC`` regions (``<block-relative module
+The names use upstream ``RegionAC``'s naming (``<block-relative module
 FQN>.<local name>``), so eager and graph AC can later share one vocabulary.
-``--tpu-config.graph-trainer-save-regions`` takes these names.
+``graph_trainer_save_regions`` and ``graph_trainer_save_last_n_layers`` take
+these names.
 
 Model code marks values that op names alone cannot tell apart by computing
 them inside ``with annotate_region(<region name>):``.
@@ -26,11 +27,11 @@ REMAT_REGION = "remat_region"
 
 # The Splash output and LSE that the attention backward reads.
 ATTENTION_INNER_ATTENTION = "attention.inner_attention"
-# The expert-sort permutation in ``token_dispatcher.local_reorder``.
-MOE_ROUTE_PERMUTATION = "moe.route_permutation"
-# The router's top-k expert ids: upstream's ``routing_decision`` region in
-# ``TokenChoiceTopKRouter``.
-MOE_ROUTING_DECISION = "moe.router.routing_decision"
+# Each MoE layer's routing: the router's top-k expert ids (upstream's
+# ``routing_decision`` region in ``TokenChoiceTopKRouter``) and the
+# expert-sort permutation that ``token_dispatcher.local_reorder`` computes from
+# them.
+MOE_ROUTING = "moe.routing"
 
 
 def annotate_region(name: str) -> AbstractContextManager[None]:

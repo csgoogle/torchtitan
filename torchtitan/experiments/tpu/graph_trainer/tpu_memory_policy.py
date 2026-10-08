@@ -32,8 +32,7 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
 from torchtitan.experiments.graph_trainer.registry import register_memory_policy
 from torchtitan.experiments.tpu.remat_regions import (
     ATTENTION_INNER_ATTENTION,
-    MOE_ROUTE_PERMUTATION,
-    MOE_ROUTING_DECISION,
+    MOE_ROUTING,
     REMAT_REGION,
 )
 from torchtitan.tools.logging import logger
@@ -85,26 +84,11 @@ def select_route_permutations(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     return [
         node
         for node in _forward_call_nodes(gm)
-        if _in_remat_region(node, MOE_ROUTE_PERMUTATION)
+        if _in_remat_region(node, MOE_ROUTING)
         and _is_integer_tensor(node.meta.get("val"), ndim=1)
-        and any(
-            not _in_remat_region(user, MOE_ROUTE_PERMUTATION) for user in node.users
-        )
+        and any(not _in_remat_region(user, MOE_ROUTING) for user in node.users)
     ]
 
-
-# Saving the permutation avoids re-running a stable sort per layer in backward.
-# It is small (one integer per routed token), so recipes save it in every layer.
-#
-# It is only safe with ``moe.router.routing_decision`` saved in the same layers,
-# which the config checks enforce. Backward also reads the router's top-k ids
-# (for the per-expert counts and the score gather). Recomputed, a near-tie could
-# pick a different expert than the saved permutation did, and backward would
-# then pair some tokens with the wrong expert.
-ROUTE_PERMUTATION_REGION = SaveRegion(
-    name=MOE_ROUTE_PERMUTATION,
-    select=select_route_permutations,
-)
 
 # The module that runs ``TokenChoiceTopKRouter._select_experts``.
 _ROUTER_FQN_PATTERN = "layers.*.moe.router"
@@ -144,15 +128,36 @@ def select_routing_decisions(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     return [node for node in _forward_call_nodes(gm) if node in decisions]
 
 
-# Saving the top-k expert ids keeps backward on the forward's routing: a
-# recomputed top-k can pick different experts when scores (nearly) tie.
-# Upstream eager AC always keeps this region (``recompute=False``) for the
-# same reason. It also skips the top-k recompute, and it is small (top_k
-# integers per token), so recipes save it in every layer.
-ROUTING_DECISION_REGION = SaveRegion(
-    name=MOE_ROUTING_DECISION,
-    select=select_routing_decisions,
-)
+def select_routing(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    """Return each MoE layer's top-k expert ids and route permutation.
+
+    Raises unless both are found, in the same layers, so that neither is saved
+    without the other.
+    """
+    decisions = select_routing_decisions(gm)
+    permutations = select_route_permutations(gm)
+    decision_layers = sorted({_get_layer_id(node) for node in decisions})
+    permutation_layers = sorted({_get_layer_id(node) for node in permutations})
+    if decision_layers != permutation_layers:
+        raise ValueError(
+            f"Save region {MOE_ROUTING!r} found router top-k ids in layers "
+            f"{decision_layers} but route permutations in layers "
+            f"{permutation_layers}; every MoE layer needs both."
+        )
+    selected = {*decisions, *permutations}
+    return [node for node in _forward_call_nodes(gm) if node in selected]
+
+
+# Saving the routing keeps backward on the forward's routing: a recomputed
+# top-k can pick different experts when scores (nearly) tie. Backward reads
+# both values (the permutation, and the top-k ids for the per-expert counts and
+# the score gather). A saved permutation next to recomputed top-k ids could
+# pair some tokens with the wrong expert, so the two form one region. Upstream
+# eager AC always keeps the top-k ids (``recompute=False``) for the same
+# reason. Saving both also skips re-running the router top-ks and the stable
+# sort in backward, and both are small (top_k integers per token), so recipes
+# save them in every layer.
+ROUTING_REGION = SaveRegion(name=MOE_ROUTING, select=select_routing)
 
 # The forward ops of both TPU Splash kernels. Stock Splash
 # (``kernels/splash_attention.py``) registers one op per kernel configuration,
@@ -240,8 +245,7 @@ SPLASH_ATTENTION_REGION = SaveRegion(
 SAVE_REGIONS: dict[str, SaveRegion] = {
     region.name: region
     for region in (
-        ROUTE_PERMUTATION_REGION,
-        ROUTING_DECISION_REGION,
+        ROUTING_REGION,
         SPLASH_ATTENTION_REGION,
     )
 }
@@ -354,52 +358,46 @@ def select_saves(
     return selected
 
 
-def resolve_save_regions(names: Sequence[str]) -> list[SaveRegion]:
-    """Map ``graph_trainer_save_regions`` names to regions, rejecting bad ones."""
+def resolve_save_regions(
+    save_regions: Sequence[str], last_n_layers: Mapping[str, int]
+) -> list[SaveRegion]:
+    """Check the save-region settings and return the regions they name.
+
+    ``save_regions`` (``graph_trainer_save_regions``) are saved in every
+    layer. ``last_n_layers`` (``graph_trainer_save_last_n_layers``) maps
+    regions to save only in their last N layers. Each region goes in one of
+    the two.
+    """
     known = ", ".join(sorted(SAVE_REGIONS))
+    names = [*save_regions, *last_n_layers]
     if not names:
         raise ValueError(
-            "graph_trainer_memory_policy='tpu_selective' needs "
-            f"graph_trainer_save_regions; known regions: {known}."
+            "graph_trainer_memory_policy='tpu_selective' needs a region in "
+            "graph_trainer_save_regions or graph_trainer_save_last_n_layers; "
+            f"known regions: {known}."
         )
     unknown = [name for name in names if name not in SAVE_REGIONS]
     if unknown:
         raise ValueError(f"Unknown save regions {unknown}; known regions: {known}.")
-    if len(set(names)) != len(names):
-        raise ValueError(f"Duplicate entries in graph_trainer_save_regions: {names}.")
-    if MOE_ROUTE_PERMUTATION in names and MOE_ROUTING_DECISION not in names:
+    if len(set(save_regions)) != len(save_regions):
         raise ValueError(
-            f"Save region {MOE_ROUTE_PERMUTATION!r} needs {MOE_ROUTING_DECISION!r} "
-            "too, so that backward does not pair the saved routes with recomputed "
-            "top-k ids."
+            f"Duplicate entries in graph_trainer_save_regions: {list(save_regions)}."
         )
-    return [SAVE_REGIONS[name] for name in names]
-
-
-def check_save_last_n_layers(
-    last_n_layers: Mapping[str, int], save_regions: Sequence[str]
-) -> None:
-    """Reject bad or unsafe ``graph_trainer_save_last_n_layers`` entries."""
+    in_both = [name for name in last_n_layers if name in save_regions]
+    if in_both:
+        raise ValueError(
+            f"Save regions {in_both} are in both graph_trainer_save_regions and "
+            "graph_trainer_save_last_n_layers. List each region once: in "
+            "graph_trainer_save_regions to save it in every layer, or in "
+            "graph_trainer_save_last_n_layers to save it in its last N layers."
+        )
     for name, n_layers in last_n_layers.items():
-        if name not in save_regions:
-            raise ValueError(
-                f"graph_trainer_save_last_n_layers names {name!r}, which is not "
-                f"in graph_trainer_save_regions {list(save_regions)}."
-            )
         if isinstance(n_layers, bool) or not isinstance(n_layers, int) or n_layers < 1:
             raise ValueError(
                 f"graph_trainer_save_last_n_layers[{name!r}] must be a positive "
                 f"integer, got {n_layers!r}."
             )
-    decision_layers = last_n_layers.get(MOE_ROUTING_DECISION)
-    if MOE_ROUTE_PERMUTATION in save_regions and decision_layers is not None:
-        route_layers = last_n_layers.get(MOE_ROUTE_PERMUTATION)
-        if route_layers is None or route_layers > decision_layers:
-            raise ValueError(
-                f"graph_trainer_save_last_n_layers saves {MOE_ROUTING_DECISION!r} "
-                f"in fewer layers than {MOE_ROUTE_PERMUTATION!r}; every layer that "
-                "saves routes must also save their top-k ids."
-            )
+    return [SAVE_REGIONS[name] for name in names]
 
 
 @register_memory_policy("tpu_selective")
@@ -410,8 +408,7 @@ def _tpu_selective_memory_policy_pass(
 ) -> torch.fx.GraphModule:
     """Full recompute, except the configured save regions."""
     tpu_config = config.tpu_config
-    regions = resolve_save_regions(tpu_config.graph_trainer_save_regions)
     last_n_layers = tpu_config.graph_trainer_save_last_n_layers
-    check_save_last_n_layers(last_n_layers, tpu_config.graph_trainer_save_regions)
+    regions = resolve_save_regions(tpu_config.graph_trainer_save_regions, last_n_layers)
     full_remat_with_saves(gm, config, select_saves(gm, regions, last_n_layers))
     return gm

@@ -30,7 +30,7 @@ from torchtitan.config import derive
 from torchtitan.experiments.tpu.kernels.route_score import route_score_grad
 from torchtitan.experiments.tpu.remat_regions import (
     annotate_region,
-    MOE_ROUTE_PERMUTATION,
+    MOE_ROUTING,
 )
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata,
@@ -225,7 +225,7 @@ def local_reorder(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Sort routes by expert while keeping all gathers row-indexed."""
   # Marked so that a selective memory policy can save the sort order.
-  with annotate_region(MOE_ROUTE_PERMUTATION):
+  with annotate_region(MOE_ROUTING):
     permutation_N = torch.argsort(expert_ids_TK.reshape(-1), stable=True)
   return _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k)
 

@@ -22,7 +22,6 @@ from torchtitan.experiments.tpu.graph_trainer.scan_guards import (
     check_scan_parallelism,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
-    check_save_last_n_layers,
     resolve_save_regions,
 )
 from torchtitan.experiments.tpu.layer_loop import builds_layer_loop
@@ -80,8 +79,7 @@ def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
         "graph_trainer_memory_policy='tpu_selective' does not support "
         "--tpu-config.use-scan-layers"
     )
-  resolve_save_regions(save_regions)
-  check_save_last_n_layers(last_n_layers, save_regions)
+  resolve_save_regions(save_regions, last_n_layers)
 
 
 def to_tpu_graph_trainer_config(

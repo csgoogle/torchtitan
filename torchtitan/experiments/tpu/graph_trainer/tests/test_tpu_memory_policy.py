@@ -48,23 +48,19 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_remat_schedule,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
-    check_save_last_n_layers,
     full_remat_with_saves,
     is_splash_forward_op_name,
     resolve_save_regions,
-    ROUTE_PERMUTATION_REGION,
-    ROUTING_DECISION_REGION,
+    ROUTING_REGION,
     SaveRegion,
     select_route_permutations,
+    select_routing,
     select_routing_decisions,
     select_saves,
     select_splash_attention,
     SPLASH_ATTENTION_REGION,
 )
-from torchtitan.experiments.tpu.remat_regions import (
-    MOE_ROUTE_PERMUTATION,
-    REMAT_REGION,
-)
+from torchtitan.experiments.tpu.remat_regions import MOE_ROUTING, REMAT_REGION
 from torchtitan.experiments.tpu.token_dispatcher import (
     local_reorder,
     stable_grouped_reduce,
@@ -340,7 +336,43 @@ class TestFullRematWithSaves(unittest.TestCase):
                 )
 
 
-class TestRoutePermutationRegion(unittest.TestCase):
+def _router_topks(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
+    return [
+        node
+        for node in gm.graph.nodes
+        if node.target is torch.ops.aten.topk.default
+        and not _is_backward_node(node)
+        and node.meta["custom"]["module_fqn"].endswith(".moe.router")
+    ]
+
+
+def _hand_built_routing_graph(
+    with_topk: bool, with_routes: bool
+) -> torch.fx.GraphModule:
+    """A layer-0 graph with a router top-k, a marked route sort, or both."""
+    graph = torch.fx.Graph()
+    scores = graph.placeholder("scores")
+    outputs = []
+    if with_topk:
+        topk = graph.call_function(torch.ops.aten.topk.default, args=(scores, 2))
+        topk.meta["custom"] = {"module_fqn": "layers.0.moe.router"}
+        ids = graph.call_function(operator.getitem, args=(topk, 1))
+        ids.meta["custom"] = {"module_fqn": "layers.0.moe.router"}
+        ids.meta["val"] = torch.empty(8, 2, dtype=torch.int64, device="meta")
+        outputs.append(ids)
+    if with_routes:
+        routes = graph.call_function(torch.ops.aten.argsort.default, args=(scores,))
+        routes.meta["custom"] = {
+            "module_fqn": "layers.0.moe",
+            REMAT_REGION: MOE_ROUTING,
+        }
+        routes.meta["val"] = torch.empty(16, dtype=torch.int64, device="meta")
+        outputs.append(routes)
+    graph.output(tuple(outputs))
+    return torch.fx.GraphModule(nn.Module(), graph)
+
+
+class TestRoutingRegion(unittest.TestCase):
     def test_selects_one_permutation_per_layer(self) -> None:
         torch.manual_seed(0)
         traced, _ = _trace_toy(_MoEToy())
@@ -352,22 +384,8 @@ class TestRoutePermutationRegion(unittest.TestCase):
         self.assertEqual([_get_layer_id(node) for node in routes], [0, 1])
         for node in routes:
             self.assertEqual(node.meta["val"].shape, (_TOKENS * _TOP_K,))
-            self.assertEqual(
-                node.meta["custom"][REMAT_REGION], MOE_ROUTE_PERMUTATION
-            )
+            self.assertEqual(node.meta["custom"][REMAT_REGION], MOE_ROUTING)
 
-
-def _router_topks(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
-    return [
-        node
-        for node in gm.graph.nodes
-        if node.target is torch.ops.aten.topk.default
-        and not _is_backward_node(node)
-        and node.meta["custom"]["module_fqn"].endswith(".moe.router")
-    ]
-
-
-class TestRoutingDecisionRegion(unittest.TestCase):
     def test_selects_the_last_topk_of_each_router(self) -> None:
         for num_expert_groups, topks_per_router in ((None, 1), (2, 3)):
             with self.subTest(num_expert_groups=num_expert_groups):
@@ -404,6 +422,30 @@ class TestRoutingDecisionRegion(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not have one 2-D integer"):
             select_routing_decisions(gm)
 
+    def test_selects_top_k_ids_and_permutation_of_every_moe_layer(self) -> None:
+        torch.manual_seed(0)
+        traced, _ = _trace_toy(_MoEToy(num_expert_groups=2))
+
+        routing = select_routing(traced.gm)
+
+        self.assertEqual(
+            set(routing),
+            {
+                *select_routing_decisions(traced.gm),
+                *select_route_permutations(traced.gm),
+            },
+        )
+        self.assertEqual(sorted(_get_layer_id(node) for node in routing), [0, 0, 1, 1])
+
+    def test_needs_both_in_the_same_layers(self) -> None:
+        # A saved permutation next to recomputed top-k ids could disagree on a
+        # tie, so finding only one of the two is an error.
+        for with_topk, with_routes in ((False, True), (True, False)):
+            with self.subTest(with_topk=with_topk, with_routes=with_routes):
+                with self.assertRaisesRegex(ValueError, "every MoE layer needs both"):
+                    select_routing(_hand_built_routing_graph(with_topk, with_routes))
+        self.assertEqual(len(select_routing(_hand_built_routing_graph(True, True))), 2)
+
 
 def _selective_config(
     save_regions: tuple[str, ...], last_n_layers: dict[str, int] | None = None
@@ -417,27 +459,23 @@ def _selective_config(
     )
 
 
-# Routes and top-k ids in every layer, plus Splash.
-_ROUTES_TOPK_SPLASH = (
-    "moe.route_permutation",
-    "moe.router.routing_decision",
-    "attention.inner_attention",
-)
+# Routing and Splash, both in every layer.
+_ROUTING_SPLASH = ("moe.routing", "attention.inner_attention")
 
 
 class TestSelectSaves(unittest.TestCase):
     def test_region_without_candidates_raises(self) -> None:
         traced, _ = _trace_toy(_DenseToy())
 
-        with self.assertRaisesRegex(ValueError, "'moe.route_permutation' matched no"):
-            select_saves(traced.gm, [ROUTE_PERMUTATION_REGION], {})
+        with self.assertRaisesRegex(ValueError, "'moe.routing' matched no"):
+            select_saves(traced.gm, [ROUTING_REGION], {})
 
     def test_last_n_layers_keeps_only_the_last_layers(self) -> None:
         torch.manual_seed(0)
         traced, _ = _trace_toy(_MoEToy(_splash_cores()))
-        routes = select_route_permutations(traced.gm)
+        routing = select_routing(traced.gm)
         splash = select_splash_attention(traced.gm)
-        regions = [ROUTE_PERMUTATION_REGION, SPLASH_ATTENTION_REGION]
+        regions = [ROUTING_REGION, SPLASH_ATTENTION_REGION]
 
         for n_layers, saved_layers in (
             (1, [2]),
@@ -450,7 +488,7 @@ class TestSelectSaves(unittest.TestCase):
                     traced.gm, regions, {"attention.inner_attention": n_layers}
                 )
                 # A region without a limit is saved in every layer.
-                self.assertEqual(chosen - set(splash), set(routes))
+                self.assertEqual(chosen - set(splash), set(routing))
                 self.assertEqual(
                     sorted(_get_layer_id(node) for node in chosen & set(splash)),
                     saved_layers,
@@ -470,57 +508,37 @@ class TestSelectSaves(unittest.TestCase):
             select_saves(traced.gm, [region], {"test.outside": 1})
 
     def test_config_values_are_checked(self) -> None:
-        self.assertEqual(
-            resolve_save_regions(
-                ("moe.route_permutation", "moe.router.routing_decision")
+        for save_regions, last_n_layers, expected in (
+            (_ROUTING_SPLASH, {}, [ROUTING_REGION, SPLASH_ATTENTION_REGION]),
+            (
+                ("moe.routing",),
+                {"attention.inner_attention": 2},
+                [ROUTING_REGION, SPLASH_ATTENTION_REGION],
             ),
-            [ROUTE_PERMUTATION_REGION, ROUTING_DECISION_REGION],
-        )
-        for names, message in (
-            ((), "needs graph_trainer_save_regions"),
-            (("moe.nope",), "Unknown save regions"),
-            (("moe.route_permutation",) * 2, "Duplicate"),
+            # Listing a region only in last_n_layers is enough.
+            ((), {"attention.inner_attention": 2}, [SPLASH_ATTENTION_REGION]),
         ):
-            with self.subTest(names=names):
+            with self.subTest(save_regions=save_regions, last_n_layers=last_n_layers):
+                self.assertEqual(
+                    resolve_save_regions(save_regions, last_n_layers), expected
+                )
+        for save_regions, last_n_layers, message in (
+            ((), {}, "needs a region"),
+            (("moe.nope",), {}, "Unknown save regions"),
+            ((), {"moe.nope": 1}, "Unknown save regions"),
+            (("moe.routing",) * 2, {}, "Duplicate"),
+            (
+                ("attention.inner_attention",),
+                {"attention.inner_attention": 2},
+                "in both",
+            ),
+            ((), {"attention.inner_attention": 0}, "positive integer"),
+            ((), {"attention.inner_attention": True}, "positive integer"),
+            ((), {"attention.inner_attention": 2.0}, "positive integer"),
+        ):
+            with self.subTest(save_regions=save_regions, last_n_layers=last_n_layers):
                 with self.assertRaisesRegex(ValueError, message):
-                    resolve_save_regions(names)
-
-        save_regions = ("attention.inner_attention",)
-        check_save_last_n_layers({"attention.inner_attention": 2}, save_regions)
-        for last_n_layers, message in (
-            ({"moe.route_permutation": 1}, "not in graph_trainer_save_regions"),
-            ({"attention.inner_attention": 0}, "positive integer"),
-            ({"attention.inner_attention": True}, "positive integer"),
-            ({"attention.inner_attention": 2.0}, "positive integer"),
-        ):
-            with self.subTest(last_n_layers=last_n_layers):
-                with self.assertRaisesRegex(ValueError, message):
-                    check_save_last_n_layers(last_n_layers, save_regions)
-
-    def test_routes_need_their_routing_decisions(self) -> None:
-        # Saved routes and recomputed top-k ids could disagree on a tie.
-        with self.assertRaisesRegex(ValueError, "needs 'moe.router.routing_decision'"):
-            resolve_save_regions(("moe.route_permutation",))
-
-        both = ("moe.route_permutation", "moe.router.routing_decision")
-        for last_n_layers in (
-            {"moe.route_permutation": 1},
-            {"moe.route_permutation": 2, "moe.router.routing_decision": 2},
-            {"moe.route_permutation": 1, "moe.router.routing_decision": 2},
-        ):
-            with self.subTest(last_n_layers=last_n_layers):
-                check_save_last_n_layers(last_n_layers, both)
-        for last_n_layers in (
-            {"moe.router.routing_decision": 2},
-            {"moe.route_permutation": 2, "moe.router.routing_decision": 1},
-        ):
-            with self.subTest(last_n_layers=last_n_layers):
-                with self.assertRaisesRegex(ValueError, "in fewer layers than"):
-                    check_save_last_n_layers(last_n_layers, both)
-        # Without saved routes, the top-k ids may be limited freely.
-        check_save_last_n_layers(
-            {"moe.router.routing_decision": 1}, ("moe.router.routing_decision",)
-        )
+                    resolve_save_regions(save_regions, last_n_layers)
 
 
 class TestTpuSelectivePolicy(unittest.TestCase):
@@ -537,6 +555,7 @@ class TestTpuSelectivePolicy(unittest.TestCase):
         graph computes exactly what the traced graph did. Returns the chosen
         nodes.
         """
+        last_n_layers = last_n_layers or {}
         n_layers = len(model.layers)
         traced, x = _trace_toy(model)
         expected = [
@@ -545,7 +564,9 @@ class TestTpuSelectivePolicy(unittest.TestCase):
         ]
         remove_parameter_gradient_markers_pass(traced.gm, traced.example_inputs)
         chosen = select_saves(
-            traced.gm, resolve_save_regions(save_regions), last_n_layers or {}
+            traced.gm,
+            resolve_save_regions(save_regions, last_n_layers),
+            last_n_layers,
         )
 
         MEMORY_POLICY_REGISTRY["tpu_selective"](
@@ -576,16 +597,14 @@ class TestTpuSelectivePolicy(unittest.TestCase):
             )
         return chosen
 
-    def test_saves_routes_and_their_routing_decisions(self) -> None:
+    def test_saves_routing_in_every_layer(self) -> None:
         torch.manual_seed(0)
-        chosen = self._run(
-            _MoEToy(), ("moe.route_permutation", "moe.router.routing_decision")
-        )
+        chosen = self._run(_MoEToy(), ("moe.routing",))
 
         routes = {
             node
             for node in chosen
-            if node.meta["custom"].get(REMAT_REGION) == MOE_ROUTE_PERMUTATION
+            if node.meta["custom"].get(REMAT_REGION) == MOE_ROUTING
         }
         self.assertEqual(sorted(_get_layer_id(node) for node in routes), [0, 1])
         self.assertEqual(
@@ -593,9 +612,9 @@ class TestTpuSelectivePolicy(unittest.TestCase):
             ["layers.0.moe.router", "layers.1.moe.router"],
         )
 
-    def test_saves_routes_and_every_splash_by_default(self) -> None:
+    def test_saves_routing_and_every_splash_by_default(self) -> None:
         torch.manual_seed(0)
-        chosen = self._run(_MoEToy(_splash_cores()), _ROUTES_TOPK_SPLASH)
+        chosen = self._run(_MoEToy(_splash_cores()), _ROUTING_SPLASH)
 
         splash = [node for node in chosen if _is_splash_node(node)]
         self.assertEqual(sorted(_get_layer_id(node) for node in splash), [0, 1, 2])
@@ -609,26 +628,29 @@ class TestTpuSelectivePolicy(unittest.TestCase):
         torch.manual_seed(0)
         chosen = self._run(
             _MoEToy(_splash_cores()),
-            _ROUTES_TOPK_SPLASH,
+            ("moe.routing",),
             last_n_layers={"attention.inner_attention": 1},
         )
 
         splash = [node for node in chosen if _is_splash_node(node)]
         self.assertEqual([_get_layer_id(node) for node in splash], [2])
 
-    def test_saved_routing_decisions_skip_the_router_topk_recompute(self) -> None:
+    def test_saved_routing_skips_the_router_topk_recompute(self) -> None:
         # Backward needs each router's expert ids to scatter the gate-score
         # gradients. Unless they are saved, it re-runs every top-k behind
         # them: three per router with group-limited routing, three layers.
-        for save_regions, recomputed_topks in (
-            (("attention.inner_attention",), 9),
-            (("moe.router.routing_decision", "attention.inner_attention"), 0),
-            (_ROUTES_TOPK_SPLASH, 0),
+        for save_regions, last_n_layers, recomputed_topks in (
+            (("attention.inner_attention",), {}, 9),
+            (_ROUTING_SPLASH, {}, 0),
+            # Routing saved in the last layer only: layers 0 and 1 re-run theirs.
+            (("attention.inner_attention",), {"moe.routing": 1}, 6),
         ):
-            with self.subTest(save_regions=save_regions):
+            with self.subTest(save_regions=save_regions, last_n_layers=last_n_layers):
                 torch.manual_seed(0)
                 chosen = self._run(
-                    _MoEToy(_splash_cores(), num_expert_groups=2), save_regions
+                    _MoEToy(_splash_cores(), num_expert_groups=2),
+                    save_regions,
+                    last_n_layers,
                 )
 
                 # The chosen nodes are in the graph that _run transformed.
