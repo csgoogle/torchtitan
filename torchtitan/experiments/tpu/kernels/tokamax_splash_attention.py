@@ -223,8 +223,16 @@ def _make_splash_attention_fn(
         out_b,
         logsumexp_b,
         dkv_mask_info,
-        None,  # prng_key (added in upstream tokamax)
     )
+    import inspect
+
+    try:
+      if "prng_key" in inspect.getsource(
+          splash_attention_kernel._splash_attention_bwd
+      ):
+        res = res + (None,)
+    except OSError:
+      res = res + (None,)
     # pylint: disable=protected-access
     all_grads = splash_attention_kernel._splash_attention_bwd(
         False,  # save_residuals (nondiff)

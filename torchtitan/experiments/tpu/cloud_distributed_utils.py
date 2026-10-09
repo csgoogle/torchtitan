@@ -21,7 +21,6 @@ import frozendict
 from torchtitan.experiments.tpu import local_tpu_device
 from torchtitan.tools.logging import logger
 
-
 _TPU_CHIP_TO_HOST_BOUNDS = frozendict.frozendict({
     (local_tpu_device.TpuChip.V7X, 8): "2,2,1,2",
     (local_tpu_device.TpuChip.V7X, 4): "2,2,1,1",
@@ -75,8 +74,9 @@ def _maybe_init_distributed_on_gke(
   world_size = int(environ["WORLD_SIZE"])
   local_rank = int(environ["LOCAL_RANK"])
   rank = int(environ["RANK"])
-  is_v7 = ("TPU_ACCELERATOR_TYPE" in environ and
-           environ["TPU_ACCELERATOR_TYPE"].startswith("tpu7x"))
+  is_v7 = "TPU_ACCELERATOR_TYPE" in environ and environ[
+      "TPU_ACCELERATOR_TYPE"
+  ].startswith("tpu7x")
 
   tpu_chips_per_host_bounds = list(
       map(int, environ["TPU_CHIPS_PER_HOST_BOUNDS"].split(","))
@@ -101,12 +101,12 @@ def _maybe_init_distributed_on_gke(
   if is_v7:
     tpu_chips_per_host_bounds_product *= 2
 
-  if tpu_chips_per_host_bounds_product * tpu_host_bounds_product != world_size:
+  slice_size = tpu_chips_per_host_bounds_product * tpu_host_bounds_product
+  num_slices = int(environ.get("MEGASCALE_NUM_SLICES", "1"))
+  if slice_size * num_slices != world_size:
     return False  # environment is likely to set incorrectly.
 
-  environ["TPU_CHIPS_PER_HOST_BOUNDS"] = ",".join(
-      ["1"] * (4 if is_v7 else 3)
-  )
+  environ["TPU_CHIPS_PER_HOST_BOUNDS"] = ",".join(["1"] * (4 if is_v7 else 3))
   for i in range(len(tpu_host_bounds)):
     tpu_host_bounds[i] = tpu_host_bounds[i] * tpu_chips_per_host_bounds[i]
   environ["TPU_HOST_BOUNDS"] = ",".join(map(str, tpu_host_bounds))
@@ -114,7 +114,7 @@ def _maybe_init_distributed_on_gke(
     environ["TPU_HOST_BOUNDS"] += ",2"
 
   environ["TPU_VISIBLE_CHIPS"] = str(local_rank)
-  environ["CLOUD_TPU_TASK_ID"] = str(rank)
+  environ["CLOUD_TPU_TASK_ID"] = str(rank % slice_size)
   ports = list(
       range(
           slicebuilder_first_worker_port,
@@ -130,6 +130,14 @@ def _maybe_init_distributed_on_gke(
   environ["TPU_PROCESS_ADDRESSES"] = tpu_worker_addresses_str
   environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = tpu_worker_addresses_str
   environ["TORCH_TPU_TOPOLOGY"] = environ["TPU_HOST_BOUNDS"]
+  if num_slices > 1 and "MEGASCALE_COORDINATOR_ADDRESS" in environ:
+    coord_host = environ["MEGASCALE_COORDINATOR_ADDRESS"].split(":")[0]
+    megascale_base_port = int(environ.get("MEGASCALE_BASE_PORT", "12345"))
+    environ["MEGASCALE_COORDINATOR_ADDRESS"] = (
+        f"{coord_host}:{megascale_base_port}"
+    )
+    environ["MEGASCALE_PORT"] = str(megascale_base_port + local_rank)
+    environ["MEGASCALE_DEBUG_PORT"] = str(8081 + local_rank)
   return True
 
 

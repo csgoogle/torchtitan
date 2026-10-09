@@ -11,6 +11,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
+import os
+
 import torch
 
 from torchtitan.components.data.dataset import TextSequence
@@ -30,7 +32,12 @@ TrainerBatch: TypeAlias = dict[str, Any]
 # out of pageable memory is synchronous whatever ``non_blocking`` says. There has
 # to be an accelerator to pin for -- allocating with ``pin_memory=True`` raises
 # without one -- so CPU-only runs fall back to ordinary pageable memory.
-HAS_PIN_MEMORY = torch.accelerator.is_available()
+# TODO(samuelandersen): Remove once libtpu releases include cl/992905887,
+# which implements HostMemoryAllocator on MultiSlicePjRtClient.
+HAS_PIN_MEMORY = (
+    torch.accelerator.is_available()
+    and int(os.environ.get("MEGASCALE_NUM_SLICES", "1")) <= 1
+)
 
 
 class Collator(Configurable, ABC):
