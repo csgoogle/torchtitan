@@ -213,6 +213,17 @@ def _maybe_init_distributed_on_gke(
           "libtpu creates the MegaScale PJRT client. Without it each slice "
           "numbers its devices from zero and the mesh cannot be built."
       )
+    # The MegaScale PJRT client exposes no HostMemoryAllocator, so any pinned
+    # host allocation aborts the process from inside the PJRT C API. Opt the
+    # data path out of page-locked batches before the first one is built.
+    environ.setdefault("TORCHTITAN_PIN_HOST_MEMORY", "0")
+    if environ["TORCHTITAN_PIN_HOST_MEMORY"] != "0":
+      logger.warning(
+          "TORCHTITAN_PIN_HOST_MEMORY=%s was set explicitly on a multi-slice"
+          " job; pinned host allocations abort under the MegaScale PJRT"
+          " client, which implements no host memory allocator.",
+          environ["TORCHTITAN_PIN_HOST_MEMORY"],
+      )
     logger.info(
         "Multi-slice TPU: %d slices, this is slice %d. Per-slice world size"
         " %d (global %d), within-slice task id %d, per-slice topology %s.",

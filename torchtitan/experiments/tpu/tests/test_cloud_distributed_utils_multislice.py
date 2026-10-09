@@ -151,5 +151,41 @@ class ReplicateAxisDefaultTest(unittest.TestCase):
       self.assertEqual(config.data_parallel_replicate_degree, 1)
 
 
+class PinnedHostMemoryTest(unittest.TestCase):
+  """Multi-slice must opt out of page-locked batches.
+
+  The MegaScale PJRT client implements no HostMemoryAllocator, and the pinned
+  allocation aborts the process from inside the PJRT C API rather than raising,
+  so the decision has to be made before the first batch is built.
+  """
+
+  def test_multi_slice_disables_pinning(self):
+    env = _gke_env(num_slices=2)
+    cdu._maybe_init_distributed_on_gke(environ=env)
+    self.assertEqual(env["TORCHTITAN_PIN_HOST_MEMORY"], "0")
+
+  def test_single_slice_leaves_pinning_alone(self):
+    env = _gke_env(num_slices=1, vms=2)
+    for k in (
+        "MEGASCALE_NUM_SLICES",
+        "MEGASCALE_SLICE_ID",
+        "MEGASCALE_COORDINATOR_ADDRESS",
+    ):
+      del env[k]
+    cdu._maybe_init_distributed_on_gke(environ=env)
+    self.assertNotIn("TORCHTITAN_PIN_HOST_MEMORY", env)
+
+  def test_collator_reads_the_flag_lazily(self):
+    """A module-level constant would latch the value before the setup runs."""
+    from torchtitan.components.data import collators
+
+    collators.pin_host_memory.cache_clear()
+    try:
+      with mock.patch.dict("os.environ", {"TORCHTITAN_PIN_HOST_MEMORY": "0"}):
+        self.assertFalse(collators.pin_host_memory())
+    finally:
+      collators.pin_host_memory.cache_clear()
+
+
 if __name__ == "__main__":
   unittest.main()
