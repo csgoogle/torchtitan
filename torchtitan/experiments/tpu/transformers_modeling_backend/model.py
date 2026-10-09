@@ -816,11 +816,9 @@ class TPUHFTransformerModel(HFTransformerModel):
       self.model.config.initializer_range = saved
     self._init_untouched_parameters()
 
-    # Titan MoE modules swapped in by moe_replacement initialize themselves at
-    # parallelize time (to_empty(cpu) + init_states(cpu)), but the trainer
-    # parallelizes FIRST and materializes SECOND, so the to_empty() that
-    # precedes this call hands those expert weights fresh, uninitialized
-    # storage. HF's _init_weights dispatches on module type and a stacked
+    # Titan MoE modules swapped in by moe_replacement stay on meta until the
+    # trainer's to_empty() (it parallelizes FIRST and materializes SECOND), so
+    # those expert weights arrive here as fresh, uninitialized storage. HF's _init_weights dispatches on module type and a stacked
     # [E, *, *] expert weight is not an nn.Linear, so nothing rewrites them
     # and the first MoE forward reads nan (measured: finite=0.0000 for
     # w1/w2/w3 with healthy activations and routing entering the same call).
