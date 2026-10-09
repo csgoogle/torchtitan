@@ -32,6 +32,7 @@ class's ``Config`` (``as_tpu_model_config``) so ``Config.build`` constructs a
 import contextlib
 import copy
 import json
+import types
 from dataclasses import dataclass
 
 import torch
@@ -64,6 +65,21 @@ class _Attrs:
   def __getattr__(self, name):
     v = self._d.get(name)
     return _Attrs(v) if isinstance(v, dict) else v
+
+
+def _gemma4_router_forward(self, hidden_states):
+  """transformers' Gemma4TextRouter.forward with the top-k renormalization
+  out of place (``w = w / sum`` instead of ``w /= sum``)."""
+  hidden_states = self.norm(hidden_states)
+  hidden_states = hidden_states * self.scale * self.scalar_root_size
+  expert_scores = self.proj(hidden_states)
+  router_probabilities = nn.functional.softmax(expert_scores, dim=-1, dtype=torch.float32)
+  top_k_weights, top_k_index = torch.topk(
+      router_probabilities, k=self.config.top_k_experts, dim=-1
+  )
+  top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+  top_k_weights = top_k_weights * self.per_expert_scale[top_k_index]
+  return router_probabilities, top_k_weights, top_k_index
 
 
 def _parse_config_overrides(spec: str) -> dict:
@@ -387,6 +403,14 @@ class TPUHFTransformerModel(HFTransformerModel):
             f"attached an lm_head tied to the token embedding "
             f"({emb.embedding_dim} -> {emb.num_embeddings})."
         )
+
+    # Gemma-4's router renormalizes its top-k weights in place. Selective AC
+    # saves top-k outputs, so the recompute would read the mutated tensor
+    # (torch raises "Tensor cached during selective activation checkpoint has
+    # been mutated"); the out-of-place form computes the same values.
+    for module in self.model.modules():
+      if type(module).__name__ == "Gemma4TextRouter":
+        module.forward = types.MethodType(_gemma4_router_forward, module)
 
     if self._fused_loss:
       blocker = self._fused_loss_blocker()
