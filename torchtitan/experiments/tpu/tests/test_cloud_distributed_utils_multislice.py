@@ -240,5 +240,45 @@ class PinnedHostMemoryTest(unittest.TestCase):
       collators.HAS_PIN_MEMORY = original
 
 
+class NodeRankTest(unittest.TestCase):
+  """Nodes-per-slice is derived, never a function of chips per host."""
+
+  def _env(self, *, vms: int, slices: int, slice_id: int, worker: int):
+    return {
+        "TPU_WORKER_HOSTNAMES": ",".join(f"h{i}" for i in range(vms)),
+        "MEGASCALE_NUM_SLICES": str(slices),
+        "TPU_WORKER_ID": str(worker),
+        "HOSTNAME": f"w-main-job-{slice_id}-{worker}",
+    }
+
+  def test_nodes_per_slice_is_the_host_list_length(self):
+    for vms in (1, 4, 8, 16):
+      with self.subTest(vms=vms):
+        env = self._env(vms=vms, slices=2, slice_id=0, worker=0)
+        self.assertEqual(cdu.get_nodes_per_slice(env), vms)
+
+  def test_global_node_rank_is_slice_major(self):
+    # 8 VMs per slice, 2 slices: slice 1 starts at node rank 8.
+    for slice_id, worker, expected in ((0, 0, 0), (0, 7, 7), (1, 0, 8), (1, 7, 15)):
+      with self.subTest(slice_id=slice_id, worker=worker):
+        env = self._env(vms=8, slices=2, slice_id=slice_id, worker=worker)
+        self.assertEqual(cdu.get_global_node_rank(env), expected)
+
+  def test_independent_of_chips_per_host(self):
+    """A generation with a different VM count per slice needs no code change."""
+    env = self._env(vms=4, slices=2, slice_id=1, worker=2)
+    self.assertEqual(cdu.get_global_node_rank(env), 6)
+
+  def test_four_slices(self):
+    env = self._env(vms=8, slices=4, slice_id=3, worker=5)
+    self.assertEqual(cdu.get_global_node_rank(env), 29)
+
+  def test_returns_none_rather_than_guessing(self):
+    self.assertIsNone(cdu.get_nodes_per_slice({}))
+    self.assertIsNone(cdu.get_global_node_rank({}))
+    # host list present but no worker id
+    self.assertIsNone(cdu.get_global_node_rank({"TPU_WORKER_HOSTNAMES": "h0,h1"}))
+
+
 if __name__ == "__main__":
   unittest.main()

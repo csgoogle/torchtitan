@@ -73,6 +73,41 @@ def get_num_slices(environ: dict[str, str] | None = None) -> int:
   return num_slices
 
 
+def get_nodes_per_slice(environ: dict[str, str] | None = None) -> int | None:
+  """Returns the number of VMs in one slice, or None if GKE has not said.
+
+  ``TPU_WORKER_HOSTNAMES`` is the slice's own host list, so its length is the
+  VM count for this slice -- derived, never a function of chips per host or of
+  the topology string.
+  """
+  if environ is None:
+    environ = os.environ
+  hostnames = environ.get("TPU_WORKER_HOSTNAMES")
+  if not hostnames:
+    return None
+  return len(hostnames.split(","))
+
+
+def get_global_node_rank(environ: dict[str, str] | None = None) -> int | None:
+  """Returns this worker's node rank across the whole job, or None.
+
+  ``slice_id * nodes_per_slice + within_slice_worker_id``. Global ranks have to
+  be handed out in slice order, because that ordering is what lets the slice
+  index be recovered from a rank later; ``get_slice_id`` cross-checks the two
+  and raises on a mismatch.
+
+  Returns None when the environment does not yet carry what is needed, so a
+  caller can fall back rather than launch with a wrong rank.
+  """
+  if environ is None:
+    environ = os.environ
+  nodes_per_slice = get_nodes_per_slice(environ)
+  worker_id = environ.get("TPU_WORKER_ID")
+  if nodes_per_slice is None or worker_id is None:
+    return None
+  return get_slice_id(environ) * nodes_per_slice + int(worker_id)
+
+
 def _slice_id_from_hostname(environ: dict[str, str]) -> int | None:
   """Reads the slice index out of the pod hostname, or None.
 

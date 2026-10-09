@@ -576,12 +576,15 @@ gcluster job submit \
     --env MEGASCALE_NUM_SLICES=2 \
     --env MEGASCALE_COORDINATOR_ADDRESS="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME:8080" \
     --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
-    --command 'SLICE=$(hostname | sed -E "s/.*-([0-9]+)-[0-9]+$/\1/"); torchrun \
-        --nnodes=16 \
+    --command '
+        SLICE=$(hostname | sed -E "s/.*-([0-9]+)-[0-9]+$/\1/");
+        VMS=$(echo "$TPU_WORKER_HOSTNAMES" | awk -F, "{print NF}");
+        torchrun \
+        --nnodes=$(( MEGASCALE_NUM_SLICES * VMS )) \
         --nproc_per_node=4 \
         --rdzv_backend=static \
         --rdzv_endpoint=$WORKERS_0_HOSTNAME:29501 \
-        --node_rank=$(( SLICE * 8 + TPU_WORKER_ID )) \
+        --node_rank=$(( SLICE * VMS + TPU_WORKER_ID )) \
         -m torchtitan.experiments.tpu.train \
         --module=torchtitan.experiments.tpu.muse_glimmer \
         --config=muse_glimmer_30b_full_logits \
@@ -592,8 +595,12 @@ gcluster job submit \
 
 Three differences from the single-slice command:
 
-* `--num-slices 2`, and `--nnodes` is slices x VMs-per-slice (2 x 8 = 16). `WORLD_SIZE` spans the
-  whole job; each slice still builds its own SliceBuilder mesh from its own hosts.
+* `--num-slices 2`, and `--nnodes` is slices x VMs-per-slice. Both of those are **derived, not
+  hardcoded**: `TPU_WORKER_HOSTNAMES` is the slice's own host list, so its length is the VM count
+  for this slice, whatever the topology or the chips-per-host of the generation you are on.
+  `WORLD_SIZE` spans the whole job; each slice still builds its own SliceBuilder mesh from its own
+  hosts. (`--nproc_per_node` is chips per VM -- 4 on v6e, 8 on v7x, which has two TensorCores per
+  chip.)
 * `MEGASCALE_NUM_SLICES` and `MEGASCALE_COORDINATOR_ADDRESS`. The coordinator address is what makes
   libtpu create the MegaScale PJRT client; without it each slice numbers its devices from zero and
   the mesh cannot be built.
@@ -602,7 +609,8 @@ Three differences from the single-slice command:
   (`main-job`) with `replicas: N`, so a pod is named
   `<workload>-main-job-<sliceIndex>-<workerIndex>` and the slice index is the second-to-last
   component of the hostname. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects.
-  You do not need to pass a slice index as an environment variable.
+  You do not need to pass a slice index as an environment variable. If you launch from Python
+  rather than a shell, `cloud_distributed_utils.get_global_node_rank()` returns the same value.
 
 * `--parallelism.enable_min_cost_redistribute` is worth setting on multi-slice. The default greedy
   DTensor planner all-reduces the **full** gradient on the replicate axis -- the axis that crosses
