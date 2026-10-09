@@ -9,17 +9,22 @@ finds nothing and raises.
 That interface is the generic hook. Registering a kernel here reaches every HF
 architecture that uses the standard attention path, without naming any of them.
 
-The shape contract already matches: HF hands attention (B, H, S, D), which is
-what `splash_sdpa` takes, and expects (B, S, H, D) back, which is one transpose.
+One kernel serves every call: tokamax splash attention
+(``kernels.tokamax_splash_attention.splash_sdpa``). Since tokamax 0.0.16 it
+prunes, inside the kernel, every tile whose q and kv segments cannot
+overlap, so a packed stream only computes same-document blocks (8 x 2048
+tokens folded into one 16k stream, block 1024: 24 of 136 causal blocks per
+layer), and it runs attention dropout in-kernel from a per-call seed -- so
+dropout models do not fall back to SDPA.
 
-Splash takes boolean structure -- causal / bidirectional / sliding window,
-plus per-token segment ids -- and nothing else. This adapter translates what
-HF hands it into that vocabulary: ``is_causal`` is passed through (encoders
-run bidirectional), document boundaries and a 2D padding mask both become
-segment ids. What it cannot express (an additive float bias, dropout, a
-sequence that is not a whole number of blocks) falls back to SDPA and *says
-so*, once per distinct reason. A silent fallback is how a kernel that never
-fired gets reported as a speedup.
+The translation of HF's contract: ``is_causal`` passed through (encoders run
+bidirectional), document boundaries and a 2D padding mask as segment ids,
+grouped-KV / MQA heads straight through (no K/V expansion), a sliding
+window, and heads-first operands handed over without a transpose. What the
+kernel cannot express (an additive float mask, a sequence that is not a
+whole number of blocks) falls back to SDPA and *says so*, once per distinct
+reason. A silent fallback is how a kernel that never fired gets reported as
+a speedup.
 
 HF builds a mask only for implementations registered with its
 ``AttentionMaskInterface``; ``splash_tpu`` registers FA2's mask function, so
@@ -42,7 +47,24 @@ from torchtitan.tools.logging import logger
 # config's ``splash_attention_kernel`` section. ``update_from_config`` copies it
 # onto the model config as ``splash_kernel_kwargs``; HF passes each attention
 # layer in as ``module``, so the adapter reads it from ``module.config`` rather
-# than from process-global state. Unset means ``splash_sdpa``'s defaults.
+# than from process-global state. Unset means ``TokamaxConfig``'s defaults.
+# Which of those ``sa_*`` fields the kernel has, and what it calls them. The
+# rest of ``workarounds.SPLASH_KEYS`` -- the dq-kernel blocks, the backward-variant
+# switches, the operand layouts -- has no counterpart here and is reported
+# once as ignored.
+# Tile pruning by segment is always on in the kernel, so the stock kernel's
+# ``use_document_aware_block_skipping`` switch has no counterpart.
+_KERNEL_KWARGS = {
+    "block_q": "block_q",
+    "block_kv": "block_kv",
+    "block_kv_compute": "block_kv_compute",
+    "block_q_dkv": "block_q_dkv",
+    "block_kv_dkv": "block_kv_dkv",
+    "block_kv_dkv_compute": "block_kv_dkv_compute",
+}
+# Keys in ``_reported`` that are informational (the kernel ran); everything
+# else in that set is a fallback reason. Tests read this.
+INFO_REPORTS = frozenset({"splash_tpu fired", "splash_tpu args", "splash_tpu ignored"})
 # The kernel needs both sequence lengths to be whole blocks, so every
 # configured block is stepped down to the largest size that divides them
 # (Mosaic's floor is 128) instead of gating on one number and launching with
@@ -50,6 +72,8 @@ from torchtitan.tools.logging import logger
 # not a 1024-multiple through the gate and into a kernel shape error.
 _MIN_BLOCK = 128
 _reported: set[str] = set()
+# Resolved on first dropout call; see `_seed_salt`.
+_SEED_SALT: int | None = None
 
 
 def _tracing() -> bool:
@@ -81,6 +105,24 @@ def _log_once(key: str, message: str, *args) -> None:
         logger.info(message, *args)
 
 
+def _seed_salt() -> int:
+    """A per-rank constant to fold into the dropout seed (0 off a mesh).
+
+    Resolved once: the rank cannot change within a process, and a python int
+    folds into a captured graph as a constant.
+    """
+    global _SEED_SALT
+    if _SEED_SALT is None:
+        try:
+            import torch.distributed as dist
+
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        except Exception:  # pragma: no cover - no mesh is the common local case
+            rank = 0
+        _SEED_SALT = (rank * 0x9E3779B1) & 0x7FFFFFFF
+    return _SEED_SALT
+
+
 def _pick_block(q_len: int, kv_len: int, preferred: int) -> int | None:
     """Largest block <= ``preferred`` that tiles both lengths, or None."""
     block = preferred
@@ -106,8 +148,8 @@ def _padding_mask(attention_mask) -> torch.Tensor | None:
     HF's 2D mask is ``(B, S)`` int/bool with 1/True for real tokens and
     0/False for padding; that is exactly one segment-id bit. Anything else --
     a 4D additive float mask, a BlockMask -- carries structure this adapter
-    does not decode (a float bias is the one thing the kernel truly cannot
-    take; see ``splash_bias_dropout`` for that), so the caller falls back.
+    does not decode (a float bias is the one thing the kernel cannot take),
+    so the caller falls back.
     The dtype test is deliberately shape/dtype-only: inspecting values would
     be a device sync in eager and a graph break under compile.
     """
@@ -118,7 +160,7 @@ def _padding_mask(attention_mask) -> torch.Tensor | None:
     return attention_mask != 0
 
 
-def _unsupported(query, key, attention_mask, dropout, is_causal, window) -> str | None:
+def _unsupported(module, query, key, attention_mask, dropout, is_causal, window) -> str | None:
     """Why splash cannot take this call, or None if it can."""
     if attention_mask is not None and _padding_mask(attention_mask) is None:
         return (
@@ -126,8 +168,6 @@ def _unsupported(query, key, attention_mask, dropout, is_causal, window) -> str 
             f"{attention_mask.dtype} is not a 2D padding mask; splash takes "
             "boolean structure only (causal / window / segment ids)"
         )
-    if dropout:
-        return f"dropout={dropout}; splash has no dropout path"
     q_len, kv_len = query.shape[-2], key.shape[-2]
     if _pick_block(q_len, kv_len, _MIN_BLOCK) is None:
         return f"sequence {q_len}x{kv_len} is not a multiple of {_MIN_BLOCK}"
@@ -136,7 +176,7 @@ def _unsupported(query, key, attention_mask, dropout, is_causal, window) -> str 
     if window is not None and not is_causal:
         # splash_sdpa's window is a causal LocalMask((w, 0)); a bidirectional
         # sliding window (ModernBERT's local layers) needs a symmetric one.
-        return f"bidirectional sliding window {window}; splash's window is causal-only"
+        return f"bidirectional sliding window {window}; the kernel's window is causal-only"
     return None
 
 
@@ -268,7 +308,7 @@ def splash_attention_forward(
     if is_causal is None:
         is_causal = getattr(module, "is_causal", True)
     window = _window(module, kwargs)
-    reason = _unsupported(query, key, attention_mask, dropout, is_causal, window)
+    reason = _unsupported(module, query, key, attention_mask, dropout, is_causal, window)
     if reason is not None:
         if not _tracing():
             _report(reason)
@@ -285,15 +325,6 @@ def splash_attention_forward(
             dropout=dropout, scaling=scaling, is_causal=fb_causal, **kwargs,
         )
 
-    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
-
-    # splash_sdpa keeps enable_gqa only for signature compatibility, so the
-    # kv heads have to be expanded here when the model is grouped-query.
-    heads, kv_heads = query.shape[1], key.shape[1]
-    if kv_heads != heads:
-        repeat = heads // kv_heads
-        key = key.repeat_interleave(repeat, dim=1)
-        value = value.repeat_interleave(repeat, dim=1)
 
     # The trainer hands the model one token-major stream per rank (batch
     # folded into the sequence: 8 x 2048 arrives as [1, 16384]). Without
@@ -312,19 +343,65 @@ def splash_attention_forward(
         _log_once(
             "splash_tpu args",
             "splash_tpu: first call q=%s k=%s v=%s dtype=%s scaling=%s window=%s "
-            "is_causal=%s kernel=%s",
+            "is_causal=%s dropout=%s kernel=%s",
             tuple(query.shape), tuple(key.shape), tuple(value.shape),
-            query.dtype, scaling, window, is_causal, kernel_kwargs,
+            query.dtype, scaling, window, is_causal, dropout, kernel_kwargs,
         )
+    seg_desc = (
+        "none" if segment_ids is None
+        else "document+padding" if attention_mask is not None
+        else "document"
+    )
 
-    # splash_sdpa defaults every block to 512, which is the library's default
-    # rather than a tuned one; the HF registry's ``splash_attention_kernel``
-    # section sets 1024. Measured on Llama-3.2-1B at batch 8, seq 2048, 4x
-    # v6e: 512 gives 17.08%, 1024 gives 18.12%, 2048 gives 17.78% and 256
-    # gives 11.88% -- an interior optimum, +6.0% over the default, against a
-    # repeat-measured run-to-run spread of 0.05pp. The forward blocks carry
-    # most of it, which matches the profile: the two splash forward kernels
-    # are 20.8% of device time against 12.5% for the backward dkv.
+    out = _kernel_forward(query, key, value, segment_ids, is_causal, scaling, window,
+                       dropout, kernel_kwargs, seg_desc)
+    return out, None
+
+
+def _kernel_forward(query, key, value, segment_ids, is_causal, scaling, window,
+                    dropout, kernel_kwargs, seg_desc):
+    """The kernel call: segment pruning, exact segment masking at token
+    granularity, in-kernel PRNG dropout."""
+    from torchtitan.experiments.tpu.kernels.tokamax_splash_attention import (
+        TokamaxConfig,
+        splash_sdpa,
+    )
+
+    ignored = sorted(k for k in kernel_kwargs if k not in _KERNEL_KWARGS)
+    if ignored and not _tracing():
+        _log_once("splash_tpu ignored", "splash_tpu: the kernel has no %s; ignored", ignored)
+    blocks = {
+        _KERNEL_KWARGS[k]: v
+        for k, v in kernel_kwargs.items()
+        if k in _KERNEL_KWARGS
+    }
+    # The seed is a (B, 2) int32 tensor drawn from torch's RNG on the device:
+    # fresh per call and per layer, reproducible under torch.manual_seed, and
+    # a tensor operand so a new seed never retraces the op. Verified
+    # 2026-10-01 on v6e that the draw survives graph capture -- three
+    # successive calls on identical inputs differ under eager AND under
+    # `torch.compile(backend="tpu", fullgraph=True)`, while two calls after
+    # the same `manual_seed` agree bit-for-bit. A frozen draw would be
+    # invisible otherwise: dropout would still *look* applied, with one mask
+    # reused for the whole run.
+    dropout_seed = torch.randint(
+        -(2**31), 2**31 - 1, (query.shape[0], 2), dtype=torch.int32, device=query.device
+    )
+    # torchtitan seeds every rank identically (weights and data order depend
+    # on it), so without a rank-dependent salt every data-parallel rank would
+    # drop the same (position, head) entries -- the kernel's docstring asks
+    # the caller to fold the rank in for exactly this reason. The salt is a
+    # rank constant, so it costs nothing in a captured graph.
+    salt = _seed_salt()
+    if salt:
+        dropout_seed = dropout_seed ^ salt
+    # Natural exp: exp2 folds LOG2E into q in its dtype, a second bf16
+    # rounding of q that costs ~25-60% more attention-output error.
+    TokamaxConfig.update(use_base2_exp=False, **blocks)
+    # HF hands (B, H, S, D) and wants it back; `heads_first` is the kernel's
+    # own layout, so nothing is transposed on either side (the torch-standard
+    # entry would cost three full-size copies per call, saved until the
+    # backward). Grouped-KV and MQA go in as-is, no K/V expansion.
     out = splash_sdpa(
         query.contiguous(),
         key.contiguous(),
@@ -332,22 +409,26 @@ def splash_attention_forward(
         segment_ids=segment_ids,
         scale=scaling,
         is_causal=is_causal,
-        # splash's LocalMask((w, 0)) keeps q - k <= w, i.e. w + 1 keys; HF's
+        # The kernel's LocalMask((w, 0)) keeps q - k <= w, i.e. w + 1 keys; HF's
         # window of W keeps W (its FA2 path passes W - 1 the same way).
         local_window_size=None if window is None else window - 1,
-        **kernel_kwargs,
+        enable_gqa=query.shape[1] != key.shape[1],
+        heads_first=True,
+        dropout_p=float(dropout),
+        dropout_seed=dropout_seed,
     )
     if not _tracing():
         _log_once(
             "splash_tpu fired",
             "splash_tpu: kernel active (heads=%d kv_heads=%d seq=%d head_dim=%d "
-            "causal=%s segment_ids=%s)",
-            heads, kv_heads, query.shape[-2], query.shape[-1], is_causal,
-            "none" if segment_ids is None
-            else "document+padding" if attention_mask is not None
-            else "document",
+            "causal=%s dropout=%s segment_ids=%s)",
+            query.shape[1], key.shape[1], query.shape[-2], query.shape[-1], is_causal,
+            dropout, seg_desc,
         )
-    return out.transpose(1, 2).contiguous(), None
+    # HF's contract is (B, S, H, D) out (its own sdpa path transposes too),
+    # while heads-first hands back (B, H, S, D) -- the same single transpose
+    # the splash path above does, with three input copies saved.
+    return out.transpose(1, 2).contiguous()
 
 
 def register() -> None:

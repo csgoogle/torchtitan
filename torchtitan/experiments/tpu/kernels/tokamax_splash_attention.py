@@ -2,6 +2,14 @@
 
 Wraps Tokamax's splash_attention_kernel for use with PyTorch tensors on TPU.
 Uses torch_tpu._internal.pallas.pallas.jax_op to bridge JAX -> PyTorch.
+
+Operands are token-major ``(B, S, H, D)`` by default, or heads-first
+``(B, H, S, D)`` with ``heads_first=True`` (no transposes on either side).
+Packed documents are masked from ``segment_ids`` inside the kernel, which
+since tokamax 0.0.16 also prunes the tiles whose q and kv segments cannot
+overlap. ``dropout_p`` runs tokamax's in-kernel PRNG dropout from a
+``(B, 2)`` int32 seed tensor: one key per example, so a new seed never
+retraces, and the kernel regenerates the same mask in the backward.
 """
 
 import math
@@ -60,6 +68,9 @@ class TokamaxConfig:
   block_kv_dq: Optional[int] = None
   use_fused_bwd_kernel: bool = True
   use_vmap_bwd: bool = False
+  # exp2 with LOG2E folded into q (tokamax's default) rounds q a second time
+  # in its dtype; False keeps natural exp at ~2% kernel time.
+  use_base2_exp: bool = True
   q_layout: str = "HEAD_DIM_MINOR"
   k_layout: str = "HEAD_DIM_MINOR"
   v_layout: str = "HEAD_DIM_MINOR"
@@ -90,6 +101,8 @@ def _make_splash_attention_fn(
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
     use_vmap_bwd: bool = False,
+    use_base2_exp: bool = True,
+    dropout_rate: float = 0.0,
 ):
   """Create JAX splash attention forward and backward functions using Tokamax.
 
@@ -128,6 +141,15 @@ def _make_splash_attention_fn(
       q_layout=_get_layout(q_layout),
       k_layout=_get_layout(k_layout),
       v_layout=_get_layout(v_layout),
+      use_base2_exp=use_base2_exp,
+      dropout_rate=dropout_rate,
+      # The mask is drawn on a canonical grid every tile size must divide:
+      # the coarsest grid common to the forward and dkv tiles.
+      dropout_block_q=math.gcd(min(block_q, seq_len), min(block_q_dkv, seq_len))
+      if dropout_rate else None,
+      dropout_block_kv=math.gcd(
+          min(block_kv_compute, seq_len), min(block_kv_dkv_compute, seq_len)
+      ) if dropout_rate else None,
   )
 
   mask_shape = (seq_len, seq_len)
@@ -174,7 +196,7 @@ def _make_splash_attention_fn(
       return None
     return splash_attention_kernel.SegmentIds(q=segment_ids_b, kv=segment_ids_b)
 
-  def _single_fwd_with_lse(q_b, k_b, v_b, segment_ids_b):
+  def _single_fwd_with_lse(q_b, k_b, v_b, segment_ids_b, key_b=None):
     """Forward for one batch element; returns (out_b, logsumexp_b)."""
     # q_b is already scaled (q * 1/sqrt(head_dim)) from the caller.
     # pylint: disable=protected-access
@@ -191,17 +213,26 @@ def _make_splash_attention_fn(
         save_residuals=True,
         mask_function=_mask_function,
         fwd_mask_sparsity=_fwd_mask_sparsity,
+        prng_key=key_b,
     )
     # pylint: enable=protected-access
     return out_b, stats_b["logsumexp"]
 
 
   @jax.jit
-  def splash_fn(q, k, v, segment_ids=None):
+  def splash_fn(q, k, v, segment_ids=None, keys=None):
     """Forward: returns (out, logsumexp) for the whole batch."""
     head_dim = q.shape[-1]
     scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
     q_scaled = q * scale
+    if keys is not None:
+      # The dropout key is a scalar-prefetch operand, which Pallas cannot
+      # vmap: one kernel call per example.
+      def body(carry, xs):
+        return carry, _single_fwd_with_lse(*xs)
+      _, (out, logsumexp) = jax.lax.scan(
+          body, None, (q_scaled, k, v, segment_ids, keys))
+      return out, logsumexp
     # in_axes=None broadcasts a None segment_ids to every batch element.
     seg_axis = None if segment_ids is None else 0
     out, logsumexp = jax.vmap(
@@ -209,7 +240,8 @@ def _make_splash_attention_fn(
     )(q_scaled, k, v, segment_ids)
     return out, logsumexp
 
-  def _single_bwd(q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b, segment_ids_b):
+  def _single_bwd(q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b, segment_ids_b,
+                  key_b=None):
     """Backward for one batch element using precomputed residuals.
 
     Calls _splash_attention_bwd directly — no extra forward pass.
@@ -223,7 +255,7 @@ def _make_splash_attention_fn(
         out_b,
         logsumexp_b,
         dkv_mask_info,
-        None,  # prng_key (added in upstream tokamax)
+        key_b,  # prng_key: regenerates the forward's dropout mask
     )
     # pylint: disable=protected-access
     all_grads = splash_attention_kernel._splash_attention_bwd(
@@ -243,29 +275,26 @@ def _make_splash_attention_fn(
 
   def _scan_bwd_body(carry, args):
     """Single-element backward body for jax.lax.scan (sequential over batch)."""
-    q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b = args[:6]
-    segment_ids_b = args[6] if len(args) > 6 else None
+    q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b, segment_ids_b, key_b = args
     dq_scaled_b, dk_b, dv_b = _single_bwd(
-        q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b, segment_ids_b
+        q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b, segment_ids_b, key_b
     )
     return carry, (dq_scaled_b, dk_b, dv_b)
 
   @jax.jit
-  def splash_bwd_fn(q, k, v, out, logsumexp, g, segment_ids=None):
+  def splash_bwd_fn(q, k, v, out, logsumexp, g, segment_ids=None, keys=None):
     """Backward: uses saved (out, logsumexp) — no extra forward pass."""
     head_dim = q.shape[-1]
     scale = jnp.array(1.0 / math.sqrt(head_dim), dtype=q.dtype)
     q_scaled = q * scale
 
-    if use_vmap_bwd:
+    if use_vmap_bwd and keys is None:
       seg_axis = None if segment_ids is None else 0
       dq_scaled, dk, dv = jax.vmap(
           _single_bwd, in_axes=(0, 0, 0, 0, 0, 0, seg_axis)
       )(q_scaled, k, v, out, logsumexp, g, segment_ids)
     else:
-      scan_xs = (q_scaled, k, v, out, logsumexp, g)
-      if segment_ids is not None:
-        scan_xs += (segment_ids,)
+      scan_xs = (q_scaled, k, v, out, logsumexp, g, segment_ids, keys)
       _, (dq_scaled, dk, dv) = jax.lax.scan(_scan_bwd_body, None, scan_xs)
     # Chain rule: q_scaled = q * scale  =>  dq = dq_scaled * scale
     dq = dq_scaled * scale
@@ -274,14 +303,34 @@ def _make_splash_attention_fn(
   return splash_fn, splash_bwd_fn
 
 
+def _to_kernel_layout(q, k, v, heads_first):
+  """(B, H, S, D) for q and grouped k/v, (B, S, D) for MQA k/v."""
+  if not heads_first:
+    q, k, v = (jnp.transpose(t, (0, 2, 1, 3)) for t in (q, k, v))
+  if k.shape[1] == 1:
+    k, v = jnp.squeeze(k, axis=1), jnp.squeeze(v, axis=1)
+  return q, k, v
+
+
+def _dropout_keys(dropout_seed, dropout_rate):
+  """One PRNG key per example from a (B, 2) int32 seed tensor, or None."""
+  if not dropout_rate:
+    return None
+  return jax.random.wrap_key_data(
+      jax.lax.bitcast_convert_type(dropout_seed, jnp.uint32))
+
+
 def jax_attention_fwd(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
     segment_ids: jax.Array | None,
+    dropout_seed: jax.Array | None,
     is_causal: bool,
     local_window_size: int,  # Sentinel int: -1 means None
     scale: float,
+    heads_first: bool,
+    dropout_rate: float,
     block_q: int,
     block_kv: int,
     block_kv_compute: int,
@@ -292,37 +341,29 @@ def jax_attention_fwd(
     block_kv_dq: int | None,
     use_fused_bwd_kernel: bool,
     use_vmap_bwd: bool,
+    use_base2_exp: bool,
     q_layout: str,
     k_layout: str,
     v_layout: str,
 ) -> tuple[jax.Array, jax.Array]:
   """Forward attention in JAX using Pallas.
 
-  Accepts raw PyTorch layouts: (batch, seq_len, heads, head_dim), and
-  optional int32 ``segment_ids`` of shape (batch, seq_len) for packed documents.
-  The tiling/layout fields arrive as arguments (see _kernel_config_args) so
-  they are part of the jax_op compile-cache key.
+  Accepts PyTorch layouts -- (batch, seq_len, heads, head_dim), or
+  (batch, heads, seq_len, head_dim) with ``heads_first`` -- optional int32
+  ``segment_ids`` (batch, seq_len) for packed documents, and a (batch, 2)
+  int32 ``dropout_seed`` when ``dropout_rate`` > 0. The tiling/layout fields
+  arrive as arguments (see _kernel_config_args) so they are part of the
+  jax_op compile-cache key.
   """
-  seq_len = q.shape[1]
-  n_heads = q.shape[2]
-  n_kv_heads = k.shape[2]
-
+  h_axis, s_axis = (1, 2) if heads_first else (2, 1)
+  seq_len = q.shape[s_axis]
   local_window_size_opt = local_window_size if local_window_size != -1 else None
-
-  # 1. Transpose/Squeeze inside JAX so JIT fuses operations
-  q_tr = jnp.transpose(q, (0, 2, 1, 3))
-
-  if n_kv_heads == 1:
-    k_tr = jnp.squeeze(k, axis=2)
-    v_tr = jnp.squeeze(v, axis=2)
-  else:
-    k_tr = jnp.transpose(k, (0, 2, 1, 3))
-    v_tr = jnp.transpose(v, (0, 2, 1, 3))
+  q_tr, k_tr, v_tr = _to_kernel_layout(q, k, v, heads_first)
 
   splash_fn, _ = _make_splash_attention_fn(
       seq_len=seq_len,
-      n_heads=n_heads,
-      n_kv_heads=n_kv_heads,
+      n_heads=q.shape[h_axis],
+      n_kv_heads=k.shape[h_axis],
       is_causal=is_causal,
       local_window_size=local_window_size_opt,
       block_q=block_q,
@@ -338,6 +379,8 @@ def jax_attention_fwd(
       q_layout=q_layout,
       k_layout=k_layout,
       v_layout=v_layout,
+      use_base2_exp=use_base2_exp,
+      dropout_rate=dropout_rate,
   )
 
   # Apply scaling inside the compiled JAX pipeline
@@ -345,10 +388,9 @@ def jax_attention_fwd(
   if abs(scale - default_scale) > 1e-6:
     q_tr = q_tr * (scale / default_scale)
 
-  out_tr, logsumexp = splash_fn(q_tr, k_tr, v_tr, segment_ids)
-
-  # Transpose back: (B, H, S, d) -> (B, S, H, d)
-  out = jnp.transpose(out_tr, (0, 2, 1, 3))
+  out_tr, logsumexp = splash_fn(
+      q_tr, k_tr, v_tr, segment_ids, _dropout_keys(dropout_seed, dropout_rate))
+  out = out_tr if heads_first else jnp.transpose(out_tr, (0, 2, 1, 3))
   return out, logsumexp
 
 
@@ -360,9 +402,12 @@ def jax_attention_bwd(
     logsumexp: jax.Array,
     grad_out: jax.Array,
     segment_ids: jax.Array | None,
+    dropout_seed: jax.Array | None,
     is_causal: bool,
     local_window_size: int,  # Sentinel int: -1 means None
     scale: float,
+    heads_first: bool,
+    dropout_rate: float,
     block_q: int,
     block_kv: int,
     block_kv_compute: int,
@@ -373,32 +418,26 @@ def jax_attention_bwd(
     block_kv_dq: int | None,
     use_fused_bwd_kernel: bool,
     use_vmap_bwd: bool,
+    use_base2_exp: bool,
     q_layout: str,
     k_layout: str,
     v_layout: str,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Backward attention in JAX calling direct Pallas kernel backward."""
-  seq_len = q.shape[1]
-  n_heads = q.shape[2]
-  n_kv_heads = k.shape[2]
-
+  h_axis, s_axis = (1, 2) if heads_first else (2, 1)
+  seq_len = q.shape[s_axis]
+  n_kv_heads = k.shape[h_axis]
   local_window_size_opt = local_window_size if local_window_size != -1 else None
-
-  # 1. Transpose/Squeeze inputs inside JAX
-  q_tr = jnp.transpose(q, (0, 2, 1, 3))
-  out_tr = jnp.transpose(out, (0, 2, 1, 3))
-  grad_out_tr = jnp.transpose(grad_out, (0, 2, 1, 3))
-
-  if n_kv_heads == 1:
-    k_tr = jnp.squeeze(k, axis=2)
-    v_tr = jnp.squeeze(v, axis=2)
+  q_tr, k_tr, v_tr = _to_kernel_layout(q, k, v, heads_first)
+  if heads_first:
+    out_tr, grad_out_tr = out, grad_out
   else:
-    k_tr = jnp.transpose(k, (0, 2, 1, 3))
-    v_tr = jnp.transpose(v, (0, 2, 1, 3))
+    out_tr = jnp.transpose(out, (0, 2, 1, 3))
+    grad_out_tr = jnp.transpose(grad_out, (0, 2, 1, 3))
 
   _, splash_bwd_fn = _make_splash_attention_fn(
       seq_len=seq_len,
-      n_heads=n_heads,
+      n_heads=q.shape[h_axis],
       n_kv_heads=n_kv_heads,
       is_causal=is_causal,
       local_window_size=local_window_size_opt,
@@ -415,6 +454,8 @@ def jax_attention_bwd(
       q_layout=q_layout,
       k_layout=k_layout,
       v_layout=v_layout,
+      use_base2_exp=use_base2_exp,
+      dropout_rate=dropout_rate,
   )
 
   default_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -422,7 +463,8 @@ def jax_attention_bwd(
     q_tr = q_tr * (scale / default_scale)
 
   dq_tr, dk_tr, dv_tr = splash_bwd_fn(
-      q_tr, k_tr, v_tr, out_tr, logsumexp, grad_out_tr, segment_ids
+      q_tr, k_tr, v_tr, out_tr, logsumexp, grad_out_tr, segment_ids,
+      _dropout_keys(dropout_seed, dropout_rate),
   )
 
   # Chain rule for the q pre-scaling above: splash_bwd_fn returns the
@@ -431,17 +473,12 @@ def jax_attention_bwd(
   if abs(scale - default_scale) > 1e-6:
     dq_tr = dq_tr * (scale / default_scale)
 
-  # Transpose/Expand back to original PyTorch layouts
-  dq = jnp.transpose(dq_tr, (0, 2, 1, 3))
-
+  # Back to the layouts the operands arrived in.
   if n_kv_heads == 1:
-    dk = jnp.expand_dims(dk_tr, axis=2)
-    dv = jnp.expand_dims(dv_tr, axis=2)
-  else:
-    dk = jnp.transpose(dk_tr, (0, 2, 1, 3))
-    dv = jnp.transpose(dv_tr, (0, 2, 1, 3))
-
-  return dq, dk, dv
+    dk_tr, dv_tr = dk_tr[:, None], dv_tr[:, None]  # (B, S, D) -> (B, 1, S, D)
+  if heads_first:
+    return dq_tr, dk_tr, dv_tr
+  return tuple(jnp.transpose(t, (0, 2, 1, 3)) for t in (dq_tr, dk_tr, dv_tr))
 
 
 # Register standard top-level global Custom Operators exactly like call_kernel.py!
@@ -465,6 +502,7 @@ _KERNEL_CONFIG_FIELDS = (
     "block_kv_dq",
     "use_fused_bwd_kernel",
     "use_vmap_bwd",
+    "use_base2_exp",
     "q_layout",
     "k_layout",
     "v_layout",
@@ -483,38 +521,21 @@ def _kernel_config_args() -> tuple:
 
 def setup_context(ctx, inputs, output, **kwargs):
   del kwargs
-  # inputs: q, k, v, segment_ids, is_causal, local_window_size, scale, then
-  # the _KERNEL_CONFIG_FIELDS values.
-  q, k, v, segment_ids, is_causal, local_window_size, scale = inputs[:7]
+  q, k, v, segment_ids, dropout_seed = inputs[:5]
   out, logsumexp = output
-  ctx.save_for_backward(q, k, v, out, logsumexp, segment_ids)
-
-  ctx.is_causal = is_causal
-  ctx.local_window_size = local_window_size
-  ctx.scale = scale
-  ctx.kernel_config = inputs[7:]
+  ctx.save_for_backward(q, k, v, out, logsumexp, segment_ids, dropout_seed)
+  # is_causal, window, scale, heads_first, dropout_rate, then the config.
+  ctx.call_args = inputs[5:]
 
 
 def backward(ctx, grad_out, grad_lse):
   del grad_lse  # Unused
-  q, k, v, out, logsumexp, segment_ids = ctx.saved_tensors
-
-  # Call our clean JAX backward global top-level custom operator!
+  q, k, v, out, logsumexp, segment_ids, dropout_seed = ctx.saved_tensors
   dq, dk, dv = splash_op_backward(
-      q,
-      k,
-      v,
-      out,
-      logsumexp,
-      grad_out,
-      segment_ids,
-      ctx.is_causal,
-      ctx.local_window_size,
-      ctx.scale,
-      *ctx.kernel_config,
+      q, k, v, out, logsumexp, grad_out, segment_ids, dropout_seed, *ctx.call_args
   )
-  # One gradient per forward input; segment_ids and the scalars get None.
-  return (dq, dk, dv) + (None,) * (4 + len(ctx.kernel_config))
+  # One gradient per forward input; segment_ids, the seed and the scalars get None.
+  return (dq, dk, dv) + (None,) * (len(ctx.call_args) + 2)
 
 
 # Register the autograd!
@@ -545,12 +566,19 @@ def splash_sdpa(
     q_layout: Optional[str] = None,
     k_layout: Optional[str] = None,
     v_layout: Optional[str] = None,
+    heads_first: bool = False,
+    dropout_p: float = 0.0,
+    dropout_seed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
   """Replacement for F.scaled_dot_product_attention using Tokamax splash attention.
 
   ``segment_ids`` is an optional (batch, seq_len) int32 tensor of per-token
   document ids for packed sequences; tokens attend only within their own
-  document, on top of the causal/local mask.
+  document, on top of the causal/local mask. ``heads_first`` takes and
+  returns (batch, heads, seq_len, head_dim) instead of (batch, seq_len,
+  heads, head_dim). ``dropout_p`` > 0 needs ``dropout_seed``, a (batch, 2)
+  int32 tensor: a tensor operand, so drawing a new seed per call never
+  retraces.
   """
   # These are accepted for signature compatibility with the JAX splash wrapper
   # but are NOT the channel that reaches the kernel: the kernel is configured
@@ -586,7 +614,8 @@ def splash_sdpa(
   # stock raises, tokamax runs on. That check catches a real mistake (passing
   # enable_gqa=False for a GQA shape); dropping it when the flag is flipped
   # would lose the assertion precisely when the kernel changes underneath you.
-  n_heads, n_kv_heads = q.shape[2], k.shape[2]
+  h_axis = 1 if heads_first else 2
+  n_heads, n_kv_heads = q.shape[h_axis], k.shape[h_axis]
   if enable_gqa != (n_heads != n_kv_heads):
     raise ValueError(
         f"enable_gqa ({enable_gqa}) does not match inputs: "
@@ -598,15 +627,20 @@ def splash_sdpa(
     scale = 1.0 / math.sqrt(head_dim)
 
   local_window_size_val = local_window_size if local_window_size is not None else -1
+  if dropout_p and dropout_seed is None:
+    raise ValueError("dropout_p > 0 needs a (batch, 2) int32 dropout_seed")
 
   out, _ = splash_op(
       q,
       k,
       v,
       segment_ids,
+      dropout_seed if dropout_p else None,
       is_causal,
       local_window_size_val,
       scale,
+      heads_first,
+      float(dropout_p),
       *_kernel_config_args(),
   )
   return out

@@ -133,7 +133,7 @@ def one_step_vs_reference(config_args: list[str], device: torch.device) -> dict:
       "model_class": type(hf).__name__,
       "attn_impl": getattr(hf.config, "_attn_implementation", None),
       "splash_fired": "splash_tpu fired" in reports,
-      "fallbacks": sorted(r for r in reports if r not in ("splash_tpu fired", "splash_tpu args")),
+      "fallbacks": sorted(r for r in reports if r not in splash_adapter.INFO_REPORTS),
       "fused_loss": wrapper._fused_loss,
       "fused_operands": isinstance(pred, tuple),  # (hidden, head weight) for the fused CE
       "n_valid": int(valid.cpu()),
@@ -186,10 +186,22 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
       dict(testcase_name="tiny_mixtral_moe", config="hf_moe_auto",
            hf_model="hf-internal-testing/tiny-random-MixtralForCausalLM",
            grad_atol=2e-2, grad_rtol=1e-1),
+      # GPT-2 with its shipped attention dropout KEPT (attn_pdrop=0.1; Granite
+      # and Seed-Coder also train with 0.1): the in-kernel PRNG dropout path,
+      # where the adapter used to fall back to sdpa. The reference runs
+      # undropped, so this case checks the path -- the kernel fired, no
+      # fallback, loss finite and near the undropped value -- not the numbers;
+      # dropout's own parity is the kernel test
+      # (test_tokamax_splash_attention.test_dropout).
+      dict(testcase_name="distilgpt2_with_dropout", config="hf_full_max_plain_ce",
+           hf_model="distilbert/distilgpt2",
+           args=["--compile.no-enable",
+                 '--hf_config_overrides={"resid_pdrop": 0, "embd_pdrop": 0}'],
+           loss_atol=0.5, loss_rtol=0.05, check_grads=False),
   ])
   def test_one_step_matches_hf(
       self, config, hf_model, args=None, loss_atol=1e-2, loss_rtol=1e-3,
-      grad_atol=5e-3, grad_rtol=5e-3,
+      grad_atol=5e-3, grad_rtol=5e-3, check_grads=True,
   ):
     # Eager: the adapter's fallback report fires outside Dynamo tracing, so a
     # kernel that did not run is visible rather than silently measured as sdpa.
@@ -213,6 +225,8 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
         result["device_loss"], result["ref_loss"], atol=loss_atol, rtol=loss_rtol,
         check_name="Loss", **labels,
     )
+    if not check_grads:
+      return
     device_grads, ref_grads = result["device_grads"], result["ref_grads"]
     self.assertEqual(set(device_grads), set(ref_grads), "gradient sets differ")
     worst = max((float((device_grads[n] - ref_grads[n]).abs().max()), n) for n in ref_grads)

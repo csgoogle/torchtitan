@@ -476,6 +476,53 @@ class SplashAttentionTokamaxTest(base_device_test.BaseAcceleratorDeviceTest):
     # fwd + bwd each traced once per config value.
     self.assertEqual(sorted(seen), [False, False, True, True])
 
+  def _grads(self, fn, qkv, g):
+    q, k, v = [t.clone().requires_grad_() for t in qkv]
+    out = fn(q, k, v)
+    return [x.float().cpu() for x in (out, *torch.autograd.grad(out, (q, k, v), g))]
+
+  @parameterized.named_parameters(("mha", 4), ("gqa", 2), ("mqa", 1))
+  def test_heads_first_matches_token_major(self, n_kv_heads):
+    """``heads_first`` (B, H, S, D) gives exactly the token-major result."""
+    device = self.accelerator_device
+    b, s, h, d = 2, 1024, 4, 128
+    gen = torch.Generator().manual_seed(3)
+    qkv = [torch.randn(b, hh, s, d, generator=gen).bfloat16().to(device)
+           for hh in (h, n_kv_heads, n_kv_heads)]
+    g = torch.randn(b, h, s, d, generator=gen).bfloat16().to(device)
+    seg = (torch.arange(s) // 384 + 1).to(torch.int32).expand(b, s).contiguous().to(device)
+    call = functools.partial(tokamax_splash_attention.splash_sdpa, segment_ids=seg,
+                             enable_gqa=n_kv_heads != h)
+    hf = self._grads(functools.partial(call, heads_first=True), qkv, g)
+    tm = self._grads(call, [t.transpose(1, 2).contiguous() for t in qkv],
+                     g.transpose(1, 2).contiguous())
+    for name, a, b_ in zip(("out", "dq", "dk", "dv"), hf, tm):
+      torch.testing.assert_close(a, b_.transpose(1, 2), rtol=0, atol=0, msg=name)
+
+  def test_dropout(self):
+    """In-kernel dropout fires, follows the seed, and keeps grads finite."""
+    device = self.accelerator_device
+    b, s, h, h_kv, d = 2, 1024, 4, 2, 128
+    gen = torch.Generator().manual_seed(4)
+    qkv = [torch.randn(b, hh, s, d, generator=gen).bfloat16().to(device)
+           for hh in (h, h_kv, h_kv)]
+    g = torch.randn(b, h, s, d, generator=gen).bfloat16().to(device)
+    seed = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32, device=device)
+
+    def run(p, seed):
+      return self._grads(functools.partial(
+          tokamax_splash_attention.splash_sdpa, heads_first=True, enable_gqa=True,
+          dropout_p=p, dropout_seed=seed), qkv, g)
+
+    plain, first, again, other = run(0.0, None), run(0.1, seed), run(0.1, seed), run(0.1, seed + 7)
+    for a, b_ in zip(first, again):
+      torch.testing.assert_close(a, b_, rtol=0, atol=0)
+    self.assertGreater(float((first[0] - other[0]).abs().max()), 1e-3, "seed ignored")
+    self.assertGreater(float((first[0] - plain[0]).abs().max()), 1e-3, "dropout did not fire")
+    self.assertTrue(all(torch.isfinite(x).all() for x in first))
+    with self.assertRaisesRegex(ValueError, "dropout_seed"):
+      tokamax_splash_attention.splash_sdpa(*qkv, heads_first=True, enable_gqa=True, dropout_p=0.1)
+
 
 if __name__ == "__main__":
   absltest.main()
