@@ -15,6 +15,7 @@ entry point selects a tagging strategy via ``--compile.memory_policy``.
 
 from __future__ import annotations
 
+import fnmatch
 import operator
 from collections import defaultdict
 from collections.abc import Callable
@@ -122,7 +123,11 @@ def _parse_full_recompute_save_ops(
                 f"{raw_selector.strip()!r}; expected 'MODULE_FQN_PATTERN::OP'"
             )
         module_fqn_pattern, op_name = (part.strip() for part in parts)
-        selectors.append((module_fqn_pattern, _resolve_op_target(op_name)))
+        # Wildcard op names stay fnmatch patterns over ``str(node.target)``:
+        # lazily registered ops (e.g. per-mask Pallas kernels with hashed
+        # names) do not exist yet when the config is validated.
+        target = op_name if "*" in op_name else _resolve_op_target(op_name)
+        selectors.append((module_fqn_pattern, target))
     return tuple(selectors)
 
 
@@ -191,7 +196,12 @@ def _make_full_memory_policy(save_ops: str = "") -> Callable:
             return CheckpointPolicy.MUST_SAVE
         fqn = _get_module_fqn(node)
         if any(
-            node.target == target and matches_module_fqn_pattern(fqn_pattern, fqn)
+            (
+                fnmatch.fnmatchcase(str(node.target), target)
+                if isinstance(target, str)
+                else node.target == target
+            )
+            and matches_module_fqn_pattern(fqn_pattern, fqn)
             for fqn_pattern, target in save_selectors
         ):
             return CheckpointPolicy.MUST_SAVE

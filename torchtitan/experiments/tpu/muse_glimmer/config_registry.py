@@ -23,6 +23,7 @@ __all__ = [
     "muse_glimmer_debugmodel_fused_ce",
     "muse_glimmer_30b_full_logits",
     "muse_glimmer_30b_fused_ce",
+    "muse_glimmer_30b_v003",
     "reg_trainer_muse_glimmer_30b_fused_ce",
 ]
 
@@ -255,6 +256,22 @@ def muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
   """
   config = muse_glimmer_30b_full_logits()
   _enable_pallas_cross_entropy(config)
+  return config
+
+
+def muse_glimmer_30b_v003() -> TPUTrainerConfig:
+  """``muse_glimmer_30b_full_logits`` that keeps the Splash forward outputs
+  (out + logsumexp) of the 13 global-attention layers for backward instead of
+  recomputing the kernel.
+
+  The Splash patch replaces ``inner_attention`` after module FQNs are
+  annotated, so the kernel's nodes carry the ``layers.<i>.attention`` FQN.
+  """
+  config = muse_glimmer_30b_full_logits()
+  config.tpu_config.graph_trainer_full_recompute_save_ops = " | ".join(
+      f"layers.{i}.attention::pallas.splash_attn_fwd_*.default"
+      for i in range(3, 52, 4)
+  )
   return config
 
 

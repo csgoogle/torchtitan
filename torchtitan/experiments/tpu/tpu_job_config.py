@@ -96,6 +96,9 @@ class TPUConfig:
   graph_trainer_memory_policy: TpuGraphTrainerMemoryPolicy = "default"
   # CPU-offload controls propagated into GraphTrainer's compile config.
   graph_trainer_cpu_offload_budget_gb: float = 100.0
+  # ``MODULE_FQN_PATTERN::OP | ...`` exceptions to the "full" memory policy,
+  # propagated into GraphTrainer's ``compile.full_recompute_save_ops``.
+  graph_trainer_full_recompute_save_ops: str = ""
   # Run the decoder layers as a single scan instead of a Python loop, so the
   # compiler sees one loop body rather than n_layers copies of it. Each layer's
   # weights become a row of one stacked tensor, which is what gives the scan

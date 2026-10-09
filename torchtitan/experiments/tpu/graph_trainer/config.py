@@ -96,6 +96,9 @@ def to_tpu_graph_trainer_config(
   )
   graph_config.compile.memory_policy = memory_policy
   graph_config.compile.cpu_offload_budget_gb = budget
+  graph_config.compile.full_recompute_save_ops = (
+      tpu_config.graph_trainer_full_recompute_save_ops
+  )
   if tpu_config.use_scan_layers:
     check_scan_parallelism(train_config.parallelism)
     # Expert parallelism shards the routed experts on a mesh of their own. A
