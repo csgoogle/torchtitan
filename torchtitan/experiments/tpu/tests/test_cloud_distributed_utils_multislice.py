@@ -77,6 +77,43 @@ class SliceCountTest(unittest.TestCase):
         2,
     )
 
+  def test_slice_id_from_the_pod_hostname(self):
+    """gcluster renders <workload>-main-job-<sliceIndex>-<workerIndex>."""
+    for host, slices, expected in (
+        ("muse-ms-main-job-1-3", "2", 1),
+        ("muse-ms-main-job-0-0", "2", 0),
+        ("muse-ms-main-job-3-7", "4", 3),
+        ("muse-ms-main-job-9-0", "2", None),  # out of range for the slice count
+        ("no-index-here", "2", None),
+    ):
+      with self.subTest(host=host):
+        self.assertEqual(
+            cdu._slice_id_from_hostname(
+                {"HOSTNAME": host, "MEGASCALE_NUM_SLICES": slices}
+            ),
+            expected,
+        )
+
+  def test_hostname_is_used_when_no_rank_is_available_yet(self):
+    """The launcher needs the slice index before torchrun assigns ranks."""
+    self.assertEqual(
+        cdu.get_slice_id(
+            {"HOSTNAME": "w-main-job-1-5", "MEGASCALE_NUM_SLICES": "2"}
+        ),
+        1,
+    )
+
+  def test_rank_takes_precedence_over_the_hostname(self):
+    self.assertEqual(
+        cdu.get_slice_id({
+            "HOSTNAME": "w-main-job-1-5",
+            "MEGASCALE_NUM_SLICES": "2",
+            "WORLD_SIZE": "128",
+            "RANK": "3",
+        }),
+        0,
+    )
+
   def test_explicit_slice_id_is_cross_checked_against_the_rank(self):
     """A launcher computing slice ids and node ranks differently would hang."""
     env = {"MEGASCALE_NUM_SLICES": "2", "WORLD_SIZE": "128", "RANK": "64"}

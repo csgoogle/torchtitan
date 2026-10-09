@@ -576,12 +576,12 @@ gcluster job submit \
     --env MEGASCALE_NUM_SLICES=2 \
     --env MEGASCALE_COORDINATOR_ADDRESS="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME:8080" \
     --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
-    --command 'torchrun \
+    --command 'SLICE=$(hostname | sed -E "s/.*-([0-9]+)-[0-9]+$/\1/"); torchrun \
         --nnodes=16 \
         --nproc_per_node=4 \
         --rdzv_backend=static \
         --rdzv_endpoint=$WORKERS_0_HOSTNAME:29501 \
-        --node_rank=$(( MEGASCALE_SLICE_ID * 8 + TPU_WORKER_ID )) \
+        --node_rank=$(( SLICE * 8 + TPU_WORKER_ID )) \
         -m torchtitan.experiments.tpu.train \
         --module=torchtitan.experiments.tpu.muse_glimmer \
         --config=muse_glimmer_30b_full_logits \
@@ -597,16 +597,12 @@ Three differences from the single-slice command:
 * `MEGASCALE_NUM_SLICES` and `MEGASCALE_COORDINATOR_ADDRESS`. The coordinator address is what makes
   libtpu create the MegaScale PJRT client; without it each slice numbers its devices from zero and
   the mesh cannot be built.
-* `node_rank` is **global**. Ranks must be handed out in slice order, which is what lets TorchTitan
-  derive the rest. `MEGASCALE_SLICE_ID` here is the per-slice index the platform provides; if your
-  job template does not set it, expose the JobSet label instead:
-
-```yaml
-- name: MEGASCALE_SLICE_ID
-  valueFrom:
-    fieldRef:
-      fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
-```
+* `node_rank` is **global**, and must be handed out in slice order -- that ordering is what lets
+  TorchTitan derive everything else. `--num-slices N` renders one replicated job
+  (`main-job`) with `replicas: N`, so a pod is named
+  `<workload>-main-job-<sliceIndex>-<workerIndex>` and the slice index is the second-to-last
+  component of the hostname. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects.
+  You do not need to pass a slice index as an environment variable.
 
 * `--parallelism.enable_min_cost_redistribute` is worth setting on multi-slice. The default greedy
   DTensor planner all-reduces the **full** gradient on the replicate axis -- the axis that crosses
@@ -619,7 +615,7 @@ You set the slice count, a coordinator address and a global `node_rank`. Everyth
 
 | Derived | How |
 | :------ | :-- |
-| Slice index | From the rank: the first `WORLD_SIZE / num_slices` ranks are slice 0, and so on. `MEGASCALE_SLICE_ID` is optional for TorchTitan, and when set it is cross-checked against the rank -- a mismatch raises instead of hanging. |
+| Slice index | From the rank where one is available -- the first `WORLD_SIZE / num_slices` ranks are slice 0, and so on -- and otherwise from the pod hostname. `MEGASCALE_SLICE_ID` is therefore optional; when it *is* set it is cross-checked against the rank, and a mismatch raises instead of hanging. |
 | `data_parallel_replicate_degree` | Defaults to the slice count, so no FSDP shard group straddles DCN. An explicit value is kept when it is a multiple of the slice count and rejected otherwise. |
 | The inter-slice mesh split | `torch_tpu.topology_aware_mesh` reads the slice count off the devices and splits the outermost non-trivial axis, which is the replicate axis for an HSDP shape. |
 | `TORCH_TPU_SLICEBUILDER_ADDRESSES`, `TORCH_TPU_TOPOLOGY`, `CLOUD_TPU_TASK_ID` | Per slice, from the `TPU_*` variables GKE injects. Do **not** set these by hand. |
