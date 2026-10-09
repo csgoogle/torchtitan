@@ -16,11 +16,16 @@
 
 import functools
 import os
+import re
 
 import frozendict
 from torchtitan.experiments.tpu import local_tpu_device
 from torchtitan.tools.logging import logger
 
+
+# Trailing "-<job-index>-<pod-index>" of a JobSet pod name; see
+# get_slice_id_from_worker_hostnames.
+_POD_INDEX_RE = re.compile(r"-(\d+)-(\d+)$")
 
 _TPU_CHIP_TO_HOST_BOUNDS = frozendict.frozendict({
     (local_tpu_device.TpuChip.V7X, 8): "2,2,1,2",
@@ -100,6 +105,59 @@ def get_nodes_per_slice(environ: dict[str, str] | None = None) -> int | None:
   return len(hosts) or None
 
 
+def get_slice_id_from_worker_hostnames(
+    environ: dict[str, str] | None = None,
+) -> int | None:
+  """Returns this slice's index, read out of ``TPU_WORKER_HOSTNAMES``, or None.
+
+  GKE injects the slice's own pod DNS names, and a JobSet names a pod
+  ``<jobset>-<replicated-job>-<job-index>-<pod-index>``. One replicated job is
+  rendered per slice, so the job index *is* the slice index -- the same value
+  the ``jobset.sigs.k8s.io/job-index`` label carries. Nothing else in the
+  environment has it: GKE exposes no ``JOBSET_*`` variable, Kubernetes' own
+  ``JOB_COMPLETION_INDEX`` is the pod's index *within* its job (the worker
+  index, identical on every slice), and ``hostNetwork: true`` makes the
+  hostname the node's name. Reading it here is what keeps the slice index out
+  of the launch command.
+
+  The two trailing numbers are parsed off every entry and then checked against
+  what a per-slice host list has to look like: one job index shared by all of
+  them, and pod indices that are exactly ``0..len-1``. A launcher whose pods
+  are named some other way fails that check and gets None rather than a
+  plausible wrong answer, which is the failure that matters -- every slice
+  silently deciding it is slice 0 rendezvouses into a hang.
+
+  Args:
+    environ: Environment to read. Defaults to ``os.environ``.
+
+  Returns:
+    The slice index, or None if the host list is absent or not JobSet-shaped.
+  """
+  if environ is None:
+    environ = os.environ
+  hostnames = environ.get("TPU_WORKER_HOSTNAMES")
+  if not hostnames:
+    return None
+  hosts = [h.strip() for h in hostnames.split(",") if h.strip()]
+  if not hosts:
+    return None
+
+  parsed = []
+  for host in hosts:
+    match = _POD_INDEX_RE.search(host.split(".", 1)[0])
+    if match is None:
+      return None
+    parsed.append((int(match.group(1)), int(match.group(2))))
+
+  job_indices = {job_index for job_index, _ in parsed}
+  pod_indices = sorted(pod_index for _, pod_index in parsed)
+  if len(job_indices) != 1 or pod_indices != list(range(len(hosts))):
+    return None
+
+  slice_id = job_indices.pop()
+  return slice_id if slice_id < get_num_slices(environ) else None
+
+
 def get_global_node_rank(environ: dict[str, str] | None = None) -> int | None:
   """Returns this worker's node rank across the whole job, or None.
 
@@ -109,10 +167,10 @@ def get_global_node_rank(environ: dict[str, str] | None = None) -> int | None:
   and raises on a mismatch.
 
   This runs *before* torchrun assigns ranks, so the slice index cannot be
-  derived from one: ``MEGASCALE_SLICE_ID`` has to be in the environment, which
-  means exposing the JobSet's ``job-index`` label through the downward API. The
-  pod hostname is not an alternative -- GKE TPU workloads run with
-  ``hostNetwork: true``, so it is the node's name.
+  derived from one. It comes instead from ``TPU_WORKER_HOSTNAMES``, which GKE
+  injects per slice -- see ``get_slice_id_from_worker_hostnames`` -- or from an
+  explicit ``MEGASCALE_SLICE_ID``. The pod hostname is not an alternative: GKE
+  TPU workloads run with ``hostNetwork: true``, so it is the node's name.
 
   Returns None when the environment does not carry what is needed, so a caller
   can fail rather than launch every slice at node rank 0.
@@ -123,7 +181,11 @@ def get_global_node_rank(environ: dict[str, str] | None = None) -> int | None:
   worker_id = environ.get("TPU_WORKER_ID")
   if nodes_per_slice is None or worker_id is None:
     return None
-  if get_num_slices(environ) > 1 and "MEGASCALE_SLICE_ID" not in environ:
+  if (
+      get_num_slices(environ) > 1
+      and "MEGASCALE_SLICE_ID" not in environ
+      and get_slice_id_from_worker_hostnames(environ) is None
+  ):
     return None  # no usable slice index; see the docstring
   return get_slice_id(environ) * nodes_per_slice + int(worker_id)
 
@@ -161,10 +223,24 @@ def get_slice_id(environ: dict[str, str] | None = None) -> int:
     if world_size % num_slices == 0:
       derived = int(environ["RANK"]) // (world_size // num_slices)
 
+  from_hostnames = (
+      get_slice_id_from_worker_hostnames(environ) if num_slices > 1 else None
+  )
+
   if "MEGASCALE_SLICE_ID" not in environ:
+    if from_hostnames is not None:
+      return from_hostnames
     return derived if derived is not None else 0
 
   declared = int(environ["MEGASCALE_SLICE_ID"])
+  if from_hostnames is not None and declared != from_hostnames:
+    raise ValueError(
+        f"MEGASCALE_SLICE_ID={declared} disagrees with the slice index in"
+        f" TPU_WORKER_HOSTNAMES={environ['TPU_WORKER_HOSTNAMES']!r}, which is"
+        f" {from_hostnames}. GKE injects that host list per slice, so it is the"
+        " authority on which slice this pod belongs to; a disagreement means"
+        " the variable is wired to the wrong label or carries a stale value."
+    )
   if derived is not None and declared != derived:
     raise ValueError(
         f"MEGASCALE_SLICE_ID={declared} disagrees with the slice implied by"
@@ -300,9 +376,20 @@ def _maybe_init_distributed_on_gke(
     # globally unique id; without it every slice numbers its devices from zero
     # and torch_tpu's topology_aware_mesh rejects the job with "duplicate pjrt
     # device ids across torch ranks".
-    # MEGASCALE_SLICE_ID is optional -- get_slice_id() derives it from the rank
-    # -- but the coordinator address is what makes libtpu create the MegaScale
-    # PJRT client, so it cannot be inferred.
+    # MEGASCALE_SLICE_ID is optional in the launch command -- get_slice_id()
+    # recovers it from the per-slice host list -- but libtpu reads it straight
+    # from the environment, so it has to be exported before the first device is
+    # used. The coordinator address is what makes libtpu create the MegaScale
+    # PJRT client at all, and that one cannot be inferred.
+    if "MEGASCALE_SLICE_ID" not in environ:
+      slice_id = get_slice_id(environ)
+      environ["MEGASCALE_SLICE_ID"] = str(slice_id)
+      logger.info(
+          "Exporting MEGASCALE_SLICE_ID=%d, recovered from"
+          " TPU_WORKER_HOSTNAMES; libtpu reads this variable when it creates"
+          " the MegaScale PJRT client.",
+          slice_id,
+      )
     missing = [
         v for v in ("MEGASCALE_COORDINATOR_ADDRESS",) if v not in environ
     ]

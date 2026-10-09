@@ -306,3 +306,134 @@ class NodeRankTest(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class SliceIdFromWorkerHostnamesTest(unittest.TestCase):
+  """The slice index recovered from the per-slice pod DNS list.
+
+  GKE exposes no JOBSET_* variable and Kubernetes' JOB_COMPLETION_INDEX is the
+  worker index, so this host list is the only place the slice index appears
+  without wiring the job-index label through the downward API. Hostnames below
+  are verbatim from a 2-slice v6e run.
+  """
+
+  def test_recovers_each_slice_index(self):
+    for slice_id in (0, 1):
+      environ = {
+          "MEGASCALE_NUM_SLICES": "2",
+          "TPU_WORKER_HOSTNAMES": (
+              f"ms-v6e-fast-main-job-{slice_id}-0.ms-v6e-fast,"
+              f"ms-v6e-fast-main-job-{slice_id}-1.ms-v6e-fast"
+          ),
+      }
+      self.assertEqual(
+          cdu.get_slice_id_from_worker_hostnames(environ),
+          slice_id,
+      )
+
+  def test_single_slice_job_is_slice_zero(self):
+    environ = {
+        "MEGASCALE_NUM_SLICES": "1",
+        "TPU_WORKER_HOSTNAMES": "job-main-job-0-0.svc",
+    }
+    self.assertEqual(
+        cdu.get_slice_id_from_worker_hostnames(environ), 0
+    )
+
+  def test_bare_hostnames_without_subdomain_still_parse(self):
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "TPU_WORKER_HOSTNAMES": "w-main-job-1-0,w-main-job-1-1",
+    }
+    self.assertEqual(
+        cdu.get_slice_id_from_worker_hostnames(environ), 1
+    )
+
+  def test_node_names_are_rejected(self):
+    """hostNetwork pods see node names; those carry no slice index."""
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "TPU_WORKER_HOSTNAMES": "gke-tpu-0d0013c1-1r6v,gke-tpu-46dd3e54-gcfn",
+    }
+    self.assertIsNone(
+        cdu.get_slice_id_from_worker_hostnames(environ)
+    )
+
+  def test_disagreeing_job_indices_are_rejected(self):
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "TPU_WORKER_HOSTNAMES": "w-main-job-0-0.s,w-main-job-1-1.s",
+    }
+    self.assertIsNone(
+        cdu.get_slice_id_from_worker_hostnames(environ)
+    )
+
+  def test_non_contiguous_pod_indices_are_rejected(self):
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "TPU_WORKER_HOSTNAMES": "w-main-job-1-0.s,w-main-job-1-7.s",
+    }
+    self.assertIsNone(
+        cdu.get_slice_id_from_worker_hostnames(environ)
+    )
+
+  def test_slice_index_beyond_the_slice_count_is_rejected(self):
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "TPU_WORKER_HOSTNAMES": "w-main-job-5-0.s,w-main-job-5-1.s",
+    }
+    self.assertIsNone(
+        cdu.get_slice_id_from_worker_hostnames(environ)
+    )
+
+  def test_missing_host_list_is_none(self):
+    self.assertIsNone(
+        cdu.get_slice_id_from_worker_hostnames(
+            {"MEGASCALE_NUM_SLICES": "2"}
+        )
+    )
+
+  def test_get_slice_id_uses_it_without_the_variable(self):
+    """No MEGASCALE_SLICE_ID and no slice-ordered ranks: hostnames decide."""
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "TPU_WORKER_HOSTNAMES": "w-main-job-1-0.s,w-main-job-1-1.s",
+    }
+    self.assertEqual(cdu.get_slice_id(environ), 1)
+
+  def test_get_slice_id_prefers_hostnames_over_the_rank(self):
+    """A rank that is not slice-major must not override the host list."""
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "TPU_WORKER_HOSTNAMES": "w-main-job-1-0.s,w-main-job-1-1.s",
+        "RANK": "0",
+        "WORLD_SIZE": "16",
+    }
+    self.assertEqual(cdu.get_slice_id(environ), 1)
+
+  def test_declared_variable_disagreeing_with_hostnames_raises(self):
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "MEGASCALE_SLICE_ID": "0",
+        "TPU_WORKER_HOSTNAMES": "w-main-job-1-0.s,w-main-job-1-1.s",
+    }
+    with self.assertRaisesRegex(ValueError, "TPU_WORKER_HOSTNAMES"):
+      cdu.get_slice_id(environ)
+
+  def test_global_node_rank_without_the_variable(self):
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "TPU_WORKER_HOSTNAMES": "w-main-job-1-0.s,w-main-job-1-1.s",
+        "TPU_WORKER_ID": "1",
+    }
+    self.assertEqual(cdu.get_global_node_rank(environ), 3)
+
+  def test_global_node_rank_none_when_nothing_carries_the_slice(self):
+    environ = {
+        "MEGASCALE_NUM_SLICES": "2",
+        "TPU_WORKER_HOSTNAMES": "gke-tpu-aaaa-bbbb,gke-tpu-cccc-dddd",
+        "TPU_WORKER_ID": "1",
+    }
+    self.assertIsNone(
+        cdu.get_global_node_rank(environ)
+    )
