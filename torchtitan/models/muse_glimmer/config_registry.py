@@ -240,6 +240,39 @@ def muse_glimmer_30b(seq_len: int | None = None) -> Trainer.Config:
     )
 
 
+def _loss_parity(config: Trainer.Config, steps: int) -> Trainer.Config:
+    """Sets up ``config`` for a loss-parity run against the TPU lane's recipe
+    of the same name (``torchtitan.experiments.tpu.muse_glimmer``).
+
+    Both lanes load one seed checkpoint (pass ``--checkpoint.initial_load_path``),
+    read the bundled ``c4_test`` with the test tokenizer through the same
+    shuffled (seed 42) loader, log the loss every step to TensorBoard and never
+    save a checkpoint. Run with the same number of data-parallel ranks as the
+    TPU side so both see the same global batch.
+    """
+    config.hf_assets_path = "./tests/assets/tokenizer"
+    config.dataloader = GrainDataLoader.Config(
+        dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+        shuffle=True,
+    )
+    config.training.steps = steps
+    config.metrics = MetricsProcessor.Config(log_freq=1, enable_tensorboard=True)
+    config.checkpoint = CheckpointManager.Config(
+        enable=True, load_only=True, initial_load_model_only=True
+    )
+    config.debug.seed = 42
+    return config
+
+
+def muse_glimmer_debugmodel_parity() -> Trainer.Config:
+    """Loss-parity smoke test on the debug model (4 data-parallel ranks)."""
+    return _loss_parity(muse_glimmer_debugmodel(), steps=20)
+
+
+def muse_glimmer_30b_parity() -> Trainer.Config:
+    """Loss-parity run of the 30B model (16 data-parallel ranks)."""
+    return _loss_parity(muse_glimmer_30b(), steps=500)
+
 def muse_glimmer_30b_mm(seq_len: int | None = None) -> Trainer.Config:
     model_spec = model_registry("30B_mm", seq_len=seq_len, attn_backend="flex")
     return Trainer.Config(

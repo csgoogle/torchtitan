@@ -27,6 +27,9 @@ __all__ = [
     "muse_glimmer_30b_v011",
     "muse_glimmer_30b_v011_qkvref",
     "reg_trainer_muse_glimmer_30b_fused_ce",
+    "muse_glimmer_debug_graph_parity",
+    "muse_glimmer_30b_parity",
+    "muse_glimmer_30b_v011_parity",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -307,6 +310,65 @@ def muse_glimmer_30b_v011_qkvref() -> TPUTrainerConfig:
   _save_in_global_layers(config, ("aten.clone.default",))
   return config
 
+
+def _gpu_loss_parity(config: TPUTrainerConfig, steps: int) -> TPUTrainerConfig:
+  """Sets up ``config`` for a loss-parity run against upstream's GPU recipe of
+  the same name (``torchtitan.models.muse_glimmer``).
+
+  Both lanes load one seed checkpoint (pass ``--checkpoint.initial_load_path``),
+  read ``c4_test`` through upstream's loader defaults (shuffled, seed 42), log
+  the loss every step to TensorBoard and never save a checkpoint.
+  """
+  config.dataloader = c4_test_dataloader(shuffle=True)
+  config.training.steps = steps
+  config.metrics = MetricsProcessor.Config(log_freq=1, enable_tensorboard=True)
+  config.checkpoint = CheckpointManager.Config(
+      enable=True, load_only=True, initial_load_model_only=True
+  )
+  config.debug.seed = 42
+  return config
+
+
+def muse_glimmer_debug_graph_parity() -> TPUTrainerConfig:
+  """Debug model on the 30B GraphTrainer path (full remat, Splash, fused AdamW
+  in graph), set up for the loss-parity smoke test (4 data-parallel ranks)."""
+  config = muse_glimmer_debugmodel()
+  config.compile = CompileConfig(enable=True, backend="tpu", components=["model"])
+  config.splash_attention_kernel = SplashAttentionKernelConfig(
+      use_splash_attention_kernel=True,
+      sa_block_q=1024,
+      sa_block_kv=1024,
+      sa_block_dkv=1024,
+      sa_block_kv_compute=1024,
+      sa_block_q_dkv=1024,
+      sa_block_kv_dkv=1024,
+      sa_block_kv_dkv_compute=1024,
+      sa_block_q_dq=1024,
+      sa_block_kv_dq=1024,
+  )
+  config.loss_kernel = LossKernelConfig(use_loss_kernel=False)
+  config.parallelism.fsdp_reshard_after_forward = "always"
+  config.tpu_config = TPUConfig(
+      use_graph_trainer=True,
+      compile_mode="aot_fx_trace",
+      compile_optimizer=True,
+      optimizer_in_graph=True,
+      graph_trainer_memory_policy="full",
+      enable_graph_trainer_remat_schedule=True,
+      graph_trainer_fsdp_schedule="prefetch",
+  )
+  config.optimizer.implementation = "fused"
+  return _gpu_loss_parity(config, steps=20)
+
+
+def muse_glimmer_30b_parity() -> TPUTrainerConfig:
+  """``muse_glimmer_30b_full_logits`` set up for the 30B loss-parity run."""
+  return _gpu_loss_parity(muse_glimmer_30b_full_logits(), steps=500)
+
+
+def muse_glimmer_30b_v011_parity() -> TPUTrainerConfig:
+  """``muse_glimmer_30b_v011`` set up for the 30B loss-parity run."""
+  return _gpu_loss_parity(muse_glimmer_30b_v011(), steps=500)
 
 def reg_trainer_muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
   """Muse Glimmer 30B on the regular ``TPUTrainer`` with the fused loss.
