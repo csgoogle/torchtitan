@@ -588,6 +588,7 @@ gcluster job submit \
         -m torchtitan.experiments.tpu.train \
         --module=torchtitan.experiments.tpu.muse_glimmer \
         --config=muse_glimmer_30b_full_logits \
+        --parallelism.data_parallel_replicate_degree=2 \
         --parallelism.enable_min_cost_redistribute \
         --training.steps=30'
 
@@ -609,8 +610,18 @@ Three differences from the single-slice command:
   (`main-job`) with `replicas: N`, so a pod is named
   `<workload>-main-job-<sliceIndex>-<workerIndex>` and the slice index is the second-to-last
   component of the hostname. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects.
-  You do not need to pass a slice index as an environment variable. If you launch from Python
-  rather than a shell, `cloud_distributed_utils.get_global_node_rank()` returns the same value.
+  If you launch from Python rather than a shell,
+  `cloud_distributed_utils.get_global_node_rank()` returns the same value.
+
+  **`MEGASCALE_SLICE_ID` is not needed.** TorchTitan recovers the slice index from the rank, and
+  from the pod hostname before ranks exist, so there is nothing to pass. If something in your
+  environment does set it, it is checked against the rank and a disagreement raises rather than
+  hanging.
+
+* `--parallelism.data_parallel_replicate_degree` is worth setting explicitly to the slice count.
+  TorchTitan defaults it there, but it is the setting that decides whether an FSDP shard group stays
+  inside one slice, so stating it in the launch command keeps the intent visible and makes a later
+  change to `--num-slices` fail loudly instead of silently re-sharding across DCN.
 
 * `--parallelism.enable_min_cost_redistribute` is worth setting on multi-slice. The default greedy
   DTensor planner all-reduces the **full** gradient on the replicate axis -- the axis that crosses
@@ -623,8 +634,8 @@ You set the slice count, a coordinator address and a global `node_rank`. Everyth
 
 | Derived | How |
 | :------ | :-- |
-| Slice index | From the rank where one is available -- the first `WORLD_SIZE / num_slices` ranks are slice 0, and so on -- and otherwise from the pod hostname. `MEGASCALE_SLICE_ID` is therefore optional; when it *is* set it is cross-checked against the rank, and a mismatch raises instead of hanging. |
-| `data_parallel_replicate_degree` | Defaults to the slice count, so no FSDP shard group straddles DCN. An explicit value is kept when it is a multiple of the slice count and rejected otherwise. |
+| Slice index | From the rank where one is available -- the first `WORLD_SIZE / num_slices` ranks are slice 0, and so on -- and otherwise from the pod hostname. |
+| `data_parallel_replicate_degree` | Defaults to the slice count, so no FSDP shard group straddles DCN. An explicit value is kept when it is a multiple of the slice count and rejected otherwise -- setting it yourself is recommended, as above. |
 | The inter-slice mesh split | `torch_tpu.topology_aware_mesh` reads the slice count off the devices and splits the outermost non-trivial axis, which is the replicate axis for an HSDP shape. |
 | `TORCH_TPU_SLICEBUILDER_ADDRESSES`, `TORCH_TPU_TOPOLOGY`, `CLOUD_TPU_TASK_ID` | Per slice, from the `TPU_*` variables GKE injects. Do **not** set these by hand. |
 | Pageable instead of page-locked batches | The MegaScale PJRT client implements no host memory allocator, so a pinned allocation would abort the process. Costs the async host-to-device copy. |
@@ -636,19 +647,22 @@ On a healthy start, each slice logs a summary:
 ```
 Multi-slice TPU: 2 slices, this is slice 0. Per-slice world size 64 (global 128),
   within-slice task id 0, per-slice topology 2,4,4,2.
-Multi-slice: defaulting data_parallel_replicate_degree to the slice count (2) so
-  every FSDP shard group stays inside one slice.
+Multi-slice: keeping the recipe's data_parallel_replicate_degree=2 across 2 slices.
 Multi-slice: allocating pageable batches. The MegaScale PJRT client implements no
   host memory allocator, ...
 ```
+
+If you leave `data_parallel_replicate_degree` to TorchTitan instead of passing it, the second line
+reads `defaulting data_parallel_replicate_degree to the slice count (2)` -- same outcome, stated
+rather than chosen.
 
 Troubleshooting:
 
 * *duplicate pjrt device ids across torch ranks* -- the MegaScale PJRT client is not active. Check
   that `MEGASCALE_COORDINATOR_ADDRESS` is set and identical on every pod.
-* *`MEGASCALE_SLICE_ID` disagrees with the slice implied by RANK* -- the launcher is computing slice
-  ids and node ranks inconsistently. `node_rank` must be
-  `slice_id * vms_per_slice + worker_id`.
+* *... disagrees with the slice implied by RANK* -- the launcher is computing slice ids and node
+  ranks inconsistently. `node_rank` must be `slice_id * vms_per_slice + worker_id`, with ranks
+  handed out in slice order.
 * A hang with no error during startup usually means a worker is addressing a host that does not
   exist. Pod names are `<jobset>-<replicatedJob>-<jobIndex>-<podIndex>`.
 
