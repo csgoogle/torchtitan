@@ -578,8 +578,8 @@ gcluster job submit \
     --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
     --command '
         VMS=$(echo "$TPU_WORKER_HOSTNAMES" | awk -F, "{print NF}");
-        POD=${TPU_WORKER_HOSTNAMES%%,*}; POD=${POD%%.*};
-        POD=${POD%-*}; SLICE=${POD##*-};
+        POD_DNS=${TPU_WORKER_HOSTNAMES%%,*}; POD=${POD_DNS%%.*};
+        JOB=${POD%-*}; SLICE=${JOB##*-};
         torchrun \
         --nnodes=$(( MEGASCALE_NUM_SLICES * VMS )) \
         --nproc_per_node=4 \
@@ -618,9 +618,13 @@ slice 1:  ms-main-job-1-0.ms,ms-main-job-1-1.ms
 
 So both halves recover it from that list and no YAML editing is needed:
 
-* **The launch command** needs it before `torchrun` starts, for `--node_rank`, and gets it with the
-  three parameter expansions above -- first host, drop the subdomain, drop the pod index, keep the
-  last field.
+* **The launch command** needs it before `torchrun` starts, for `--node_rank`, and walks the
+  Kubernetes ownership chain to get it: first host of the list, drop the subdomain to leave the
+  **Pod** name, drop the pod index to leave the **Job** name, keep its last field. That last field
+  is the job index, and since one replicated job is rendered per slice, the Job *is* the slice.
+  Shell parameter expansion rather than `awk`, because the whole `--command` is already
+  single-quoted -- an awk program cannot be quoted inside it, and under double quotes the
+  container's shell would eat `$(NF-1)` before awk ran.
 * **TorchTitan** needs it in the environment, because libtpu reads it there. `get_slice_id()`
   recovers it the same way and `_maybe_init_distributed_on_gke` exports `MEGASCALE_SLICE_ID`
   before the first device is used, logging `Exporting MEGASCALE_SLICE_ID=...`.
