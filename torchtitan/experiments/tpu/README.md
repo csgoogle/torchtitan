@@ -607,6 +607,11 @@ Differences from the single-slice command:
 * `MEGASCALE_NUM_SLICES` and `MEGASCALE_COORDINATOR_ADDRESS`. The coordinator address is what makes
   libtpu create the MegaScale PJRT client; without it each slice numbers its devices from zero and
   the mesh cannot be built.
+
+  libtpu reads a third variable, `MEGASCALE_SLICE_ID`, which you do **not** pass: TorchTitan
+  recovers the slice index from `TPU_WORKER_HOSTNAMES` and exports it before the first device is
+  used, logging `Exporting MEGASCALE_SLICE_ID=...`. Setting it yourself still works and is
+  cross-checked against that host list, so a wrong value raises instead of building a broken mesh.
 * `node_rank` is **global**, and must be handed out in slice order -- `slice_index * VMS +
   TPU_WORKER_ID`. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects; the slice
   index is recovered from `TPU_WORKER_HOSTNAMES`, whose entries are this slice's own pod DNS names
