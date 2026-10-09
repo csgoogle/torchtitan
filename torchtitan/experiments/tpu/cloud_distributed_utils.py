@@ -74,18 +74,32 @@ def get_num_slices(environ: dict[str, str] | None = None) -> int:
 
 
 def get_nodes_per_slice(environ: dict[str, str] | None = None) -> int | None:
-  """Returns the number of VMs in one slice, or None if GKE has not said.
+  """Returns the number of hosts in one slice, or None if GKE has not said.
 
-  ``TPU_WORKER_HOSTNAMES`` is the slice's own host list, so its length is the
-  VM count for this slice -- derived, never a function of chips per host or of
-  the topology string.
+  ``TPU_WORKER_HOSTNAMES`` is the slice's own host list, not the job's: the
+  long-standing check in ``_maybe_init_distributed_on_gke`` rejects an
+  environment where its length disagrees with the product of
+  ``TPU_HOST_BOUNDS``, and those bounds describe one slice. So the length is
+  the host count for this slice, independent of chips per host and of the
+  topology string.
+
+  **Assumes one pod per host**, which is what makes this the node count
+  torchrun wants. That holds for Cluster Toolkit's TPU JobSet and for XPK
+  without ``--use-parallel-containers``; a launcher that packs several
+  containers onto a host has more nodes than hosts, and this value would be
+  too small. ``TPU_WORKER_ID`` indexes the same thing -- the single-slice
+  launch command uses it directly as ``--node_rank`` -- so the two agree or
+  disagree together.
+
+  Empty entries are ignored so a trailing comma does not inflate the count.
   """
   if environ is None:
     environ = os.environ
   hostnames = environ.get("TPU_WORKER_HOSTNAMES")
   if not hostnames:
     return None
-  return len(hostnames.split(","))
+  hosts = [h for h in hostnames.split(",") if h.strip()]
+  return len(hosts) or None
 
 
 def get_global_node_rank(environ: dict[str, str] | None = None) -> int | None:

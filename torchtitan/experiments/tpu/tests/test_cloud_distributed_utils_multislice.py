@@ -257,6 +257,14 @@ class NodeRankTest(unittest.TestCase):
         env = self._env(vms=vms, slices=2, slice_id=0, worker=0)
         self.assertEqual(cdu.get_nodes_per_slice(env), vms)
 
+  def test_ignores_empty_entries(self):
+    """A trailing comma must not inflate the host count."""
+    self.assertEqual(
+        cdu.get_nodes_per_slice({"TPU_WORKER_HOSTNAMES": "h0,h1,h2,"}), 3
+    )
+    self.assertEqual(cdu.get_nodes_per_slice({"TPU_WORKER_HOSTNAMES": "h0"}), 1)
+    self.assertIsNone(cdu.get_nodes_per_slice({"TPU_WORKER_HOSTNAMES": ","}))
+
   def test_global_node_rank_is_slice_major(self):
     # 8 VMs per slice, 2 slices: slice 1 starts at node rank 8.
     for slice_id, worker, expected in ((0, 0, 0), (0, 7, 7), (1, 0, 8), (1, 7, 15)):
