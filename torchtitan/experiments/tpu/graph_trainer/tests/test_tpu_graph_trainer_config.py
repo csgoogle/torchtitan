@@ -275,6 +275,91 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
           target_cls=TpuGraphTrainer.Config,
       )
 
+  def test_tpu_selective_cli_is_propagated(self) -> None:
+    config = typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_debugmodel",
+            "--tpu_config.graph_trainer_memory_policy=tpu_selective",
+            "--tpu_config.graph_trainer_save_regions",
+            "moe.routing",
+            "--tpu_config.graph_trainer_save_last_n_layers",
+            "attention.inner_attention",
+            "4",
+        ]),
+    )
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+
+    self.assertEqual(graph_config.compile.memory_policy, "tpu_selective")
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_save_regions, ("moe.routing",)
+    )
+    self.assertEqual(
+        graph_config.tpu_config.graph_trainer_save_last_n_layers,
+        {"attention.inner_attention": 4},
+    )
+
+  @parameterized.named_parameters(
+      ("no_regions", "tpu_selective", (), {}, False, "needs a region"),
+      ("unknown_region", "tpu_selective", ("moe.nope",), {}, False, "Unknown"),
+      (
+          "region_in_both_fields",
+          "tpu_selective",
+          ("attention.inner_attention",),
+          {"attention.inner_attention": 2},
+          False,
+          "in both",
+      ),
+      (
+          "zero_layers",
+          "tpu_selective",
+          (),
+          {"attention.inner_attention": 0},
+          False,
+          "positive integer",
+      ),
+      (
+          "scan",
+          "tpu_selective",
+          ("moe.routing",),
+          {},
+          True,
+          "use-scan-layers",
+      ),
+      (
+          "regions_without_policy",
+          "full",
+          ("moe.routing",),
+          {},
+          False,
+          "only apply",
+      ),
+      (
+          "limits_without_policy",
+          "full",
+          (),
+          {"attention.inner_attention": 2},
+          False,
+          "only apply",
+      ),
+  )
+  def test_tpu_selective_rejects_bad_settings(
+      self, policy, save_regions, last_n_layers, scanned, message
+  ) -> None:
+    config = qwen3_8b()
+    config.tpu_config.graph_trainer_memory_policy = policy
+    config.tpu_config.graph_trainer_save_regions = save_regions
+    config.tpu_config.graph_trainer_save_last_n_layers = last_n_layers
+    config.tpu_config.use_scan_layers = scanned
+
+    with self.assertRaisesRegex(ValueError, message):
+      self._qwen3_graph_config(config)
+
   def test_negative_cpu_offload_executable_prefetch_is_rejected(self) -> None:
     config = qwen3_8b()
     config.tpu_config.graph_split.cpu_offload_prefetch_executables = -1
