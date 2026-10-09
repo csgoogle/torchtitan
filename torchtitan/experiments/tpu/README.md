@@ -588,7 +588,7 @@ gcluster job submit \
         -m torchtitan.experiments.tpu.train \
         --module=torchtitan.experiments.tpu.muse_glimmer \
         --config=muse_glimmer_30b_full_logits \
-        --parallelism.data_parallel_replicate_degree=2 \
+        --parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES \
         --parallelism.enable_min_cost_redistribute \
         --training.steps=30'
 
@@ -618,10 +618,11 @@ Three differences from the single-slice command:
   environment does set it, it is checked against the rank and a disagreement raises rather than
   hanging.
 
-* `--parallelism.data_parallel_replicate_degree` is worth setting explicitly to the slice count.
-  TorchTitan defaults it there, but it is the setting that decides whether an FSDP shard group stays
-  inside one slice, so stating it in the launch command keeps the intent visible and makes a later
-  change to `--num-slices` fail loudly instead of silently re-sharding across DCN.
+* `--parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES` is worth stating even
+  though TorchTitan defaults it to exactly that. It is the setting that decides whether an FSDP
+  shard group stays inside one slice, so spelling it out keeps the HSDP layout visible in the
+  launch command. Writing it as the variable rather than a literal states the invariant -- the
+  replicate degree *is* the slice count -- and cannot drift when you change `--num-slices`.
 
 * `--parallelism.enable_min_cost_redistribute` is worth setting on multi-slice. The default greedy
   DTensor planner all-reduces the **full** gradient on the replicate axis -- the axis that crosses
