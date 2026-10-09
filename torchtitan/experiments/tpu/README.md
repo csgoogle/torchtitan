@@ -557,8 +557,17 @@ and sit holding them while the other never starts.
 
 ### Deploy the training workload
 
-Raise `--num-slices`, declare the slice count and a rendezvous address, and make `node_rank` global
-across slices. The following runs Muse Glimmer 30B on two `v6e-32` slices:
+libtpu builds the MegaScale PJRT client -- the thing that makes several slices into one device
+mesh -- from `MEGASCALE_NUM_SLICES`, `MEGASCALE_SLICE_ID` and `MEGASCALE_COORDINATOR_ADDRESS`.
+Two of those are the same on every pod, so `--env` can carry them. The slice id cannot: it differs
+per slice, and the only thing that knows it is the JobSet, through its `job-index` label.
+
+`gcluster job submit --env` renders literal `value:` pairs, so it cannot reference that label, and
+the normal TPU template does not set the variable itself -- only `--pathways` does, with exactly
+the stanza below. That is the gap you are working around: generate the manifest, add the one
+stanza, apply it.
+
+**1. Generate the manifest** instead of applying it, with `-o`:
 
 ```bash
 gcluster job submit \
@@ -589,9 +598,28 @@ gcluster job submit \
         --config=muse_glimmer_30b_full_logits \
         --parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES \
         --parallelism.enable_min_cost_redistribute \
-        --training.steps=30'
+        --training.steps=30' \
+    -o job.yaml
 
 ```
+
+**2. Add the slice index** to the container's `env` in `job.yaml`. `--num-slices N` renders one
+replicated job with `replicas: N`, so the JobSet's `job-index` label *is* this pod's slice index:
+
+```yaml
+- name: MEGASCALE_SLICE_ID
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+```
+
+**3. Apply it:**
+
+```bash
+kubectl apply -f job.yaml
+```
+
+If you launch multi-slice jobs often, override the template once instead -- `gcluster job submit ... --gke-custom-templates-path ./my-templates` -- and keep submitting directly.
 
 Differences from the single-slice command:
 
@@ -606,30 +634,8 @@ Differences from the single-slice command:
   the mesh cannot be built.
 * `node_rank` is **global**, and must be handed out in slice order -- `slice_index * VMS +
   TPU_WORKER_ID`. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects; the slice
-  index has to come from the JobSet, because the launcher needs it before torchrun has assigned
-  any rank. `--num-slices N` renders one replicated job with `replicas: N`, so the JobSet's own
-  `job-index` label *is* the slice index -- expose it through the downward API:
-
-```yaml
-- name: MEGASCALE_SLICE_ID
-  valueFrom:
-    fieldRef:
-      fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
-```
-
-  **`gcluster job submit --env` cannot express this**: it renders literal `value:` pairs, and the
-  normal TPU template sets no per-slice index of its own (only the `--pathways` template does). Two
-  ways to get the stanza in:
-
-```bash
-# (a) emit the manifest, add the stanza, apply it yourself
-gcluster job submit ... -o job.yaml      # --dry-run-out: generate instead of apply
-# insert the MEGASCALE_SLICE_ID block above into the container's env, then:
-kubectl apply -f job.yaml
-
-# (b) or override the template once, for every job
-gcluster job submit ... --gke-custom-templates-path ./my-templates
-```
+  index comes from the `MEGASCALE_SLICE_ID` stanza added in step 2 -- which libtpu needs anyway, so
+  the launcher is reusing a variable that has to be set regardless rather than asking for a new one.
 
   Do **not** try to read the slice index out of the pod hostname. TPU workloads run with
   `hostNetwork: true` (both Cluster Toolkit and XPK set it), so the container sees the *node's*
@@ -639,6 +645,11 @@ gcluster job submit ... --gke-custom-templates-path ./my-templates
 
   TorchTitan itself does not need `MEGASCALE_SLICE_ID` once ranks exist -- it recovers the slice
   index from the rank -- and cross-checks the two, raising on a disagreement instead of hanging.
+
+* If the mesh fails to build with a complaint about devices having no `slice_index`, or about
+  duplicate PJRT device ids, the MegaScale client was not installed. torch_tpu's own message names
+  the inputs: `--megascale_port` must be >= 0 and `SKIP_MEGASCALE_PJRT_CLIENT` must be unset, on
+  top of the three `MEGASCALE_*` variables.
 
 * `--parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES` is **required**. The
   replicate axis is the one split across DCN, so the slice count has to divide it -- that is what
