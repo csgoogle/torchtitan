@@ -348,6 +348,9 @@ class TPUHFTransformerModel(HFTransformerModel):
     self._forward_kwargs = _structure.accepted_kwargs(self.model.forward)
     # Set on the Config by the registry's fused_loss=True configs.
     self._fused_loss = bool(getattr(config, "fused_loss", False))
+    # Set on the Config by the registry's MoE configs: run the experts on the
+    # Pallas grouped-matmul kernels (see _enable_pallas_experts).
+    object.__setattr__(self, "_tpu_moe_pallas", bool(getattr(config, "tpu_moe_pallas", False)))
     # Set by update_from_config when the head's logit transform was handed to
     # the fused CE (see _mirror_logit_transform_into_fused_loss).
     self._mirrored_logit_transform = getattr(config, "fused_loss_logit_transform", None)
@@ -968,11 +971,43 @@ def substitute_tpu_experts(model: nn.Module) -> None:
   from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
 
   converter = TpuGroupedExpertsConverter(TpuGroupedExpertsConverter.Config())
+  use_pallas = bool(getattr(model, "_tpu_moe_pallas", False))
   n = 0
   for layer in model.layers.values():
     cfg = getattr(layer, "_native_moe_config", None)
     if cfg is not None:
-      layer._native_moe_config = converter.convert(cfg)
+      cfg = converter.convert(cfg)
+      if use_pallas:
+        _enable_pallas_experts(cfg)
+      layer._native_moe_config = cfg
       n += 1
   if n:
-    logger.info("Substituted the TPU grouped-expert implementation in %d MoE layer(s).", n)
+    logger.info(
+        "Substituted the TPU grouped-expert implementation in %d MoE layer(s)%s.",
+        n, " (Pallas grouped matmul)" if use_pallas else "",
+    )
+
+
+def _enable_pallas_experts(moe_config) -> None:
+  """Turn on the TPU Pallas expert kernels in a converted MoE config.
+
+  Otherwise the experts run torch._grouped_mm (XLA ragged dot). Uses the
+  unpaired kernels with bounded K/N tiles, which fit scoped VMEM at any expert
+  width. The qwen3 lane's paired W1/W3 kernel is faster but holds full
+  (dim, hidden) weight slabs in VMEM. Where those fit, enable it in the loop
+  below with (it needs an untiled N in the dWeight tiling):
+
+    experts.use_pallas_paired_grouped_mm = True
+    experts.pallas_grouped_mm_tgmm_tiling = (256, tile, 0)
+  """
+  from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+
+  for _, experts, _, _ in moe_config.traverse(TpuGroupedExperts.Config):
+    # 0 selects the full dimension, which is small enough below 512.
+    tile = 512 if min(experts.dim, experts.hidden_dim) >= 512 else 0
+    experts.use_pallas_grouped_mm = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tile_k = tile
+    experts.pallas_grouped_mm_tile_n = tile
+    experts.pallas_grouped_mm_tgmm_tiling = (256, tile, tile)
+    experts.use_kernel_native_weight_layout = True
