@@ -226,9 +226,9 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   workarounds.raise_dynamo_recompile_limits(train_config.model_spec.model)
   profiler_workaround.init(train_config)
 
-  # Align the HSDP replicate axis with the slice boundary before ParallelDims is
+  # Reject a replicate degree that would straddle DCN, before ParallelDims is
   # built from this config. No-op on a single slice.
-  cloud_distributed_utils.maybe_configure_multislice_parallelism(
+  cloud_distributed_utils.maybe_validate_multislice_parallelism(
       train_config.parallelism
   )
   if cloud_distributed_utils.is_multi_slice():

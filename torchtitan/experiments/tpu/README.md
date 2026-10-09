@@ -594,7 +594,7 @@ gcluster job submit \
 
 ```
 
-Three differences from the single-slice command:
+Differences from the single-slice command:
 
 * `--num-slices 2`, and `--nnodes` is slices x VMs-per-slice. Both of those are **derived, not
   hardcoded**: `TPU_WORKER_HOSTNAMES` is the slice's own host list, so its length is the VM count
@@ -618,11 +618,14 @@ Three differences from the single-slice command:
   environment does set it, it is checked against the rank and a disagreement raises rather than
   hanging.
 
-* `--parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES` is worth stating even
-  though TorchTitan defaults it to exactly that. It is the setting that decides whether an FSDP
-  shard group stays inside one slice, so spelling it out keeps the HSDP layout visible in the
-  launch command. Writing it as the variable rather than a literal states the invariant -- the
-  replicate degree *is* the slice count -- and cannot drift when you change `--num-slices`.
+* `--parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES` is **required**. The
+  replicate axis is the one split across DCN, so the slice count has to divide it -- that is what
+  keeps every FSDP shard group, and so every weight all-gather and gradient reduce-scatter, inside
+  a single slice. TorchTitan checks this before building the mesh and refuses to start otherwise,
+  rather than correcting it for you: the default of 1 would put one shard group across both slices,
+  which trains correctly at a fraction of the throughput, and a job that is merely slow is far
+  harder to notice than one that will not launch. Writing it as the variable rather than a literal
+  cannot drift when you change `--num-slices`; any multiple of the slice count is accepted.
 
 * `--parallelism.enable_min_cost_redistribute` is worth setting on multi-slice. The default greedy
   DTensor planner all-reduces the **full** gradient on the replicate axis -- the axis that crosses

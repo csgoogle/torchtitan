@@ -188,30 +188,59 @@ class GkeMultiSliceInitTest(unittest.TestCase):
     )
 
 
-class ReplicateAxisDefaultTest(unittest.TestCase):
+class ReplicateAxisValidationTest(unittest.TestCase):
+  """The replicate axis is the one split across DCN, so the slice count must
+  divide it -- otherwise an FSDP shard group straddles the inter-slice link.
+  Checked, never silently corrected: a quietly rewritten degree means the
+  config a recipe declares is not the config that ran, and the failure being
+  guarded against is a job that trains correctly but far slower, which is much
+  harder to notice than a launch that refuses to start.
+  """
 
-  def test_defaults_replicate_to_slice_count(self):
+  def test_accepts_the_slice_count(self):
     with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "2"}):
-      config = ParallelismConfig()
-      cdu.maybe_configure_multislice_parallelism(config)
+      config = ParallelismConfig(data_parallel_replicate_degree=2)
+      cdu.maybe_validate_multislice_parallelism(config)
       self.assertEqual(config.data_parallel_replicate_degree, 2)
 
-  def test_keeps_an_explicit_multiple(self):
+  def test_accepts_a_multiple_of_the_slice_count(self):
     with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "2"}):
       config = ParallelismConfig(data_parallel_replicate_degree=4)
-      cdu.maybe_configure_multislice_parallelism(config)
+      cdu.maybe_validate_multislice_parallelism(config)
       self.assertEqual(config.data_parallel_replicate_degree, 4)
 
-  def test_rejects_a_replicate_degree_that_straddles_dcn(self):
+  def test_rejects_the_default_of_one_on_multi_slice(self):
+    """A single shard group spanning both slices trains correctly but slowly."""
+    with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "2"}):
+      config = ParallelismConfig()
+      self.assertEqual(config.data_parallel_replicate_degree, 1)
+      with self.assertRaisesRegex(ValueError, "not a multiple"):
+        cdu.maybe_validate_multislice_parallelism(config)
+
+  def test_rejects_a_degree_that_straddles_dcn(self):
     with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "2"}):
       config = ParallelismConfig(data_parallel_replicate_degree=3)
       with self.assertRaisesRegex(ValueError, "not a multiple"):
-        cdu.maybe_configure_multislice_parallelism(config)
+        cdu.maybe_validate_multislice_parallelism(config)
+
+  def test_error_names_the_flag_to_pass(self):
+    with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "2"}):
+      with self.assertRaises(ValueError) as caught:
+        cdu.maybe_validate_multislice_parallelism(ParallelismConfig())
+    self.assertIn("data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES",
+                  str(caught.exception))
+
+  def test_never_mutates(self):
+    with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "4"}):
+      config = ParallelismConfig(data_parallel_replicate_degree=8)
+      cdu.maybe_validate_multislice_parallelism(config)
+      self.assertEqual(config.data_parallel_replicate_degree, 8)
 
   def test_noop_on_single_slice(self):
+    """Even a degree of 1, which would be rejected on multi-slice."""
     with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "1"}):
       config = ParallelismConfig()
-      cdu.maybe_configure_multislice_parallelism(config)
+      cdu.maybe_validate_multislice_parallelism(config)
       self.assertEqual(config.data_parallel_replicate_degree, 1)
 
 

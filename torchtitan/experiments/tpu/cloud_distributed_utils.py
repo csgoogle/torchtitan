@@ -402,57 +402,50 @@ def _maybe_init_distributed_on_tpu_vm() -> bool:
   return True
 
 
-def maybe_configure_multislice_parallelism(parallelism_config) -> None:
-  """Points the HSDP replicate axis at the slice boundary, in place.
+def maybe_validate_multislice_parallelism(parallelism_config) -> None:
+  """Checks that the HSDP replicate axis lands on the slice boundary.
 
-  Both sets and checks: it fills in ``data_parallel_replicate_degree`` when the
-  recipe left it at 1, and rejects an explicit value that the slice count does
-  not divide. "maybe" because it returns immediately on a single-slice job, so
-  it is safe to call unconditionally.
+  On a multi-slice job the replicate axis is the one that crosses DCN, so the
+  slice count has to divide ``data_parallel_replicate_degree``: that is what
+  keeps every FSDP shard group -- and so every all-gather and reduce-scatter --
+  inside a single slice, leaving only the replicated gradient on the slow link.
 
-  On a multi-slice job the whole point of HSDP is that gradients are
-  reduce-scattered inside a slice over ICI and only all-reduced between slices
-  over the much slower DCN. That holds when the replicate axis is exactly the
-  slice count, so this defaults ``data_parallel_replicate_degree`` to the
-  number of slices when the recipe left it at 1. An explicit value is
-  respected, but it must be a multiple of the slice count -- otherwise a shard
-  group straddles DCN, which is the layout multi-slice exists to avoid.
+  Checks rather than fixes. Quietly rewriting the degree would mean the config a
+  recipe declares is not the config that ran, and the failure this guards
+  against is not a crash but a job that trains correctly at a fraction of the
+  throughput -- which is far more expensive to notice later than a launch that
+  refuses to start. The check runs before ``ParallelDims`` is built, so it costs
+  seconds, not a slice-hours-long run.
 
-  No-op on a single-slice job.
+  "maybe" because it returns immediately on a single-slice job, so it is safe to
+  call unconditionally.
 
   Args:
-    parallelism_config: The run's ``ParallelismConfig``, mutated in place.
+    parallelism_config: The run's ``ParallelismConfig``. Not modified.
 
   Raises:
-    ValueError: If an explicit replicate degree is not a multiple of the slice
-      count.
+    ValueError: If the slice count does not divide the replicate degree.
   """
   num_slices = get_num_slices()
   if num_slices == 1:
     return
 
   replicate = parallelism_config.data_parallel_replicate_degree
-  if replicate == 1:
-    parallelism_config.data_parallel_replicate_degree = num_slices
-    logger.info(
-        "Multi-slice: defaulting data_parallel_replicate_degree to the slice"
-        " count (%d) so every FSDP shard group stays inside one slice.",
-        num_slices,
-    )
-  elif replicate % num_slices:
+  if replicate % num_slices:
     raise ValueError(
         f"data_parallel_replicate_degree={replicate} is not a multiple of the"
-        f" slice count {num_slices}. The replicate axis is what gets split"
-        " across DCN, so an indivisible value would put FSDP shard groups on"
-        " both sides of the inter-slice link."
+        f" slice count {num_slices}. The replicate axis is the one split across"
+        " DCN, so an indivisible value puts FSDP shard groups on both sides of"
+        " the inter-slice link and every weight all-gather crosses it. Pass"
+        " --parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES"
+        " (or any multiple of the slice count)."
     )
-  else:
-    logger.info(
-        "Multi-slice: keeping the recipe's data_parallel_replicate_degree=%d"
-        " across %d slices.",
-        replicate,
-        num_slices,
-    )
+  logger.info(
+      "Multi-slice: data_parallel_replicate_degree=%d over %d slices, so each"
+      " FSDP shard group stays inside one slice.",
+      replicate,
+      num_slices,
+  )
 
 
 def maybe_init_distributed() -> bool:
