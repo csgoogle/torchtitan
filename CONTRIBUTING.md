@@ -4,6 +4,20 @@ This repository is Google's distribution of [TorchTitan](https://github.com/pyto
 adding training on Cloud TPU through [TorchTPU](https://github.com/google-pytorch/torch_tpu). It
 tracks upstream closely, and we intend to keep it that way.
 
+## Issues
+
+Bugs and feature requests for TPU support go to
+[this repository's issue tracker](https://github.com/google-pytorch/torchtitan/issues). Problems in
+shared TorchTitan code that also reproduce off TPU belong
+[upstream](https://github.com/pytorch/torchtitan/issues). When in doubt, file here and we will
+redirect it. A clear, well-isolated bug report is itself a valuable contribution, and for anything
+more than a trivial fix, filing an issue first lets us agree on the shape of the solution before
+you write code.
+
+A good report carries what happened against what you expected with the full traceback, the recipe
+and exact launch command that reproduces it, and your environment: `torch`, `torch_tpu` and
+`libtpu` versions, TPU generation and topology, and whether the run was single-host or multi-host.
+
 ## Where your change belongs
 
 **Please keep changes inside `torchtitan/experiments/tpu`.** Everything outside it is upstream code
@@ -32,9 +46,7 @@ This project follows
 
 ## Pull requests
 
-Small and focused beats large and sprawling. For anything more than a trivial fix, please open an
-issue first, so we can agree on the shape of the solution before you write code. A clear,
-well-isolated bug report is itself a valuable contribution.
+Small and focused beats large and sprawling.
 
 Approved pull requests are copied into Google's internal repository by a tool called Copybara. For
 this reason Copybara does not mark a pull request as merged: it closes the pull request and

@@ -18,11 +18,13 @@ kernels, and TPU-specific trainer and parallelism paths.
   [README](https://github.com/pytorch/torchtitan/blob/main/README.md) and
   [docs](https://github.com/pytorch/torchtitan/tree/main/docs) apply unchanged.
 
-## Contributing
+## Issues and contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). In short: TPU-lane changes here, shared TorchTitan changes
-upstream at [pytorch/torchtitan](https://github.com/pytorch/torchtitan), because we keep this
-repository in sync with it.
+File TPU bugs and feature requests in
+[this repository's issue tracker](https://github.com/google-pytorch/torchtitan/issues), and send
+TPU changes here, under `torchtitan/experiments/tpu`. Anything in shared TorchTitan code goes
+upstream to [pytorch/torchtitan](https://github.com/pytorch/torchtitan), because we keep this
+repository in sync with it. See [CONTRIBUTING.md](CONTRIBUTING.md) for the details.
 
 ## License
 
