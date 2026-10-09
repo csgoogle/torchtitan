@@ -1,3 +1,7 @@
+from functools import partial
+from typing import cast
+
+from torch import nn
 from torchtitan.components.checkpointer.dcp import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
@@ -11,7 +15,10 @@ from torchtitan.config.configs import (
 )
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
-from torchtitan.experiments.tpu.examples.gemma4 import model_registry
+from torchtitan.experiments.tpu.examples.gemma4 import (
+    Gemma4Model,
+    model_registry,
+)
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExpertsConverter,
 )
@@ -26,11 +33,22 @@ def gemma4_debugmodel() -> TPUTrainerConfig:
   model_spec = model_registry(
       "debugmodel", attn_backend="sdpa", enable_weight_tying=False
   )
+  model_config = cast(Gemma4Model.Config, model_spec.model)
+  # _EMBEDDING_INIT uses std=0.02 so that Gemma4Embedding's sqrt(dim) scaling
+  # stays O(1) on large models (31B dim=5376, 26B-A4B dim=2816) for convergence.
+  # In the backward pass, layers[0].attention_norm (RMSNorm) divides by
+  # RMS(x_0) ≈ std * sqrt(dim) while Gemma4Embedding multiplies by sqrt(dim),
+  # scaling tok_embeddings.weight.grad by 1/std (50x at std=0.02) and amplifying
+  # bf16-vs-fp32 absolute gradient differences beyond distributed parity test
+  # tolerances. Override to std=1.0 (like qwen3_debugmodel) for debugmodel.
+  model_config.tok_embeddings.param_init = {
+      "weight": partial(nn.init.normal_, mean=0.0, std=1.0)
+  }
   return TPUTrainerConfig(
       loss=CrossEntropyLoss.Config(),
       hf_assets_path="./tests/assets/tokenizer",
       model_spec=model_spec,
-      optimizer=default_adamw(lr=8e-4, implementation="foreach"),
+      optimizer=default_adamw(lr=3e-4, implementation="foreach"),
       lr_scheduler=LRSchedulersContainer.Config(
           warmup_steps=2,
           decay_ratio=0.8,
