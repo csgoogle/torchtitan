@@ -62,6 +62,20 @@ class SliceCountTest(unittest.TestCase):
   def test_slice_id_defaults_to_zero(self):
     self.assertEqual(cdu.get_slice_id({}), 0)
 
+  def test_pod_hostname_is_not_used(self):
+    """GKE TPU pods run hostNetwork, so the hostname is the NODE's name.
+
+    Deriving a slice index from it would silently give 0 for every slice.
+    """
+    self.assertEqual(
+        cdu.get_slice_id({
+            "MEGASCALE_NUM_SLICES": "2",
+            "HOSTNAME": "gke-some-pool-9b74ef28-wx3l",
+        }),
+        0,
+    )
+    self.assertFalse(hasattr(cdu, "_slice_id_from_hostname"))
+
   def test_slice_id_is_derived_from_the_rank(self):
     """Ranks are handed out in slice order, so MEGASCALE_SLICE_ID is optional."""
     base = {"MEGASCALE_NUM_SLICES": "2", "WORLD_SIZE": "128"}
@@ -75,43 +89,6 @@ class SliceCountTest(unittest.TestCase):
             {"MEGASCALE_NUM_SLICES": "4", "WORLD_SIZE": "128", "RANK": "90"}
         ),
         2,
-    )
-
-  def test_slice_id_from_the_pod_hostname(self):
-    """gcluster renders <workload>-main-job-<sliceIndex>-<workerIndex>."""
-    for host, slices, expected in (
-        ("muse-ms-main-job-1-3", "2", 1),
-        ("muse-ms-main-job-0-0", "2", 0),
-        ("muse-ms-main-job-3-7", "4", 3),
-        ("muse-ms-main-job-9-0", "2", None),  # out of range for the slice count
-        ("no-index-here", "2", None),
-    ):
-      with self.subTest(host=host):
-        self.assertEqual(
-            cdu._slice_id_from_hostname(
-                {"HOSTNAME": host, "MEGASCALE_NUM_SLICES": slices}
-            ),
-            expected,
-        )
-
-  def test_hostname_is_used_when_no_rank_is_available_yet(self):
-    """The launcher needs the slice index before torchrun assigns ranks."""
-    self.assertEqual(
-        cdu.get_slice_id(
-            {"HOSTNAME": "w-main-job-1-5", "MEGASCALE_NUM_SLICES": "2"}
-        ),
-        1,
-    )
-
-  def test_rank_takes_precedence_over_the_hostname(self):
-    self.assertEqual(
-        cdu.get_slice_id({
-            "HOSTNAME": "w-main-job-1-5",
-            "MEGASCALE_NUM_SLICES": "2",
-            "WORLD_SIZE": "128",
-            "RANK": "3",
-        }),
-        0,
     )
 
   def test_explicit_slice_id_is_cross_checked_against_the_rank(self):
@@ -277,7 +254,9 @@ class NodeRankTest(unittest.TestCase):
         "TPU_WORKER_HOSTNAMES": ",".join(f"h{i}" for i in range(vms)),
         "MEGASCALE_NUM_SLICES": str(slices),
         "TPU_WORKER_ID": str(worker),
-        "HOSTNAME": f"w-main-job-{slice_id}-{worker}",
+        # from the JobSet job-index label via the downward API; the pod hostname
+        # is unusable because TPU workloads run hostNetwork
+        "MEGASCALE_SLICE_ID": str(slice_id),
     }
 
   def test_nodes_per_slice_is_the_host_list_length(self):
@@ -315,6 +294,14 @@ class NodeRankTest(unittest.TestCase):
     self.assertIsNone(cdu.get_global_node_rank({}))
     # host list present but no worker id
     self.assertIsNone(cdu.get_global_node_rank({"TPU_WORKER_HOSTNAMES": "h0,h1"}))
+
+  def test_none_when_multi_slice_has_no_slice_index(self):
+    """Better to fail than to put every slice at node rank 0."""
+    self.assertIsNone(cdu.get_global_node_rank({
+        "TPU_WORKER_HOSTNAMES": "h0,h1",
+        "TPU_WORKER_ID": "1",
+        "MEGASCALE_NUM_SLICES": "2",
+    }))
 
 
 if __name__ == "__main__":

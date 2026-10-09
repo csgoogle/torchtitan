@@ -577,14 +577,13 @@ gcluster job submit \
     --env MEGASCALE_COORDINATOR_ADDRESS="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME:8080" \
     --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
     --command '
-        SLICE=$(hostname | sed -E "s/.*-([0-9]+)-[0-9]+$/\1/");
         VMS=$(echo "$TPU_WORKER_HOSTNAMES" | awk -F, "{print NF}");
         torchrun \
         --nnodes=$(( MEGASCALE_NUM_SLICES * VMS )) \
         --nproc_per_node=4 \
         --rdzv_backend=static \
         --rdzv_endpoint=$WORKERS_0_HOSTNAME:29501 \
-        --node_rank=$(( SLICE * VMS + TPU_WORKER_ID )) \
+        --node_rank=$(( MEGASCALE_SLICE_ID * VMS + TPU_WORKER_ID )) \
         -m torchtitan.experiments.tpu.train \
         --module=torchtitan.experiments.tpu.muse_glimmer \
         --config=muse_glimmer_30b_full_logits \
@@ -605,18 +604,27 @@ Differences from the single-slice command:
 * `MEGASCALE_NUM_SLICES` and `MEGASCALE_COORDINATOR_ADDRESS`. The coordinator address is what makes
   libtpu create the MegaScale PJRT client; without it each slice numbers its devices from zero and
   the mesh cannot be built.
-* `node_rank` is **global**, and must be handed out in slice order -- that ordering is what lets
-  TorchTitan derive everything else. `--num-slices N` renders one replicated job
-  (`main-job`) with `replicas: N`, so a pod is named
-  `<workload>-main-job-<sliceIndex>-<workerIndex>` and the slice index is the second-to-last
-  component of the hostname. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects.
-  If you launch from Python rather than a shell,
-  `cloud_distributed_utils.get_global_node_rank()` returns the same value.
+* `node_rank` is **global**, and must be handed out in slice order -- `slice_index * VMS +
+  TPU_WORKER_ID`. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects; the slice
+  index has to come from the JobSet, because the launcher needs it before torchrun has assigned
+  any rank. Expose the JobSet's own `job-index` label through the downward API -- `--num-slices N`
+  renders one replicated job with `replicas: N`, so that label *is* the slice index:
 
-  **`MEGASCALE_SLICE_ID` is not needed.** TorchTitan recovers the slice index from the rank, and
-  from the pod hostname before ranks exist, so there is nothing to pass. If something in your
-  environment does set it, it is checked against the rank and a disagreement raises rather than
-  hanging.
+```yaml
+- name: MEGASCALE_SLICE_ID
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+```
+
+  Do **not** try to read the slice index out of the pod hostname. TPU workloads run with
+  `hostNetwork: true` (both Cluster Toolkit and XPK set it), so the container sees the *node's*
+  name -- every slice would come out as 0. If you launch from Python rather than a shell,
+  `cloud_distributed_utils.get_global_node_rank()` computes the same value and returns `None`
+  rather than guessing when the slice index is absent.
+
+  TorchTitan itself does not need `MEGASCALE_SLICE_ID` once ranks exist -- it recovers the slice
+  index from the rank -- and cross-checks the two, raising on a disagreement instead of hanging.
 
 * `--parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES` is **required**. The
   replicate axis is the one split across DCN, so the slice count has to divide it -- that is what

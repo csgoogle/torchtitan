@@ -16,8 +16,6 @@
 
 import functools
 import os
-import re
-import socket
 
 import frozendict
 from torchtitan.experiments.tpu import local_tpu_device
@@ -110,8 +108,14 @@ def get_global_node_rank(environ: dict[str, str] | None = None) -> int | None:
   index be recovered from a rank later; ``get_slice_id`` cross-checks the two
   and raises on a mismatch.
 
-  Returns None when the environment does not yet carry what is needed, so a
-  caller can fall back rather than launch with a wrong rank.
+  This runs *before* torchrun assigns ranks, so the slice index cannot be
+  derived from one: ``MEGASCALE_SLICE_ID`` has to be in the environment, which
+  means exposing the JobSet's ``job-index`` label through the downward API. The
+  pod hostname is not an alternative -- GKE TPU workloads run with
+  ``hostNetwork: true``, so it is the node's name.
+
+  Returns None when the environment does not carry what is needed, so a caller
+  can fail rather than launch every slice at node rank 0.
   """
   if environ is None:
     environ = os.environ
@@ -119,33 +123,15 @@ def get_global_node_rank(environ: dict[str, str] | None = None) -> int | None:
   worker_id = environ.get("TPU_WORKER_ID")
   if nodes_per_slice is None or worker_id is None:
     return None
+  if get_num_slices(environ) > 1 and "MEGASCALE_SLICE_ID" not in environ:
+    return None  # no usable slice index; see the docstring
   return get_slice_id(environ) * nodes_per_slice + int(worker_id)
-
-
-def _slice_id_from_hostname(environ: dict[str, str]) -> int | None:
-  """Reads the slice index out of the pod hostname, or None.
-
-  A JobSet names its pods ``<jobset>-<replicatedJob>-<jobIndex>-<podIndex>``,
-  and the standard multi-slice shape is one replicated job with
-  ``replicas: <num_slices>`` -- which is what Cluster Toolkit's
-  ``gcluster job submit --num-slices N`` emits (``main-job``) -- so the job
-  index is the slice index. Returns None when the hostname does not have that
-  shape, or when the trailing index is out of range for the slice count, rather
-  than guessing.
-  """
-  host = environ.get("HOSTNAME") or socket.gethostname()
-  match = re.search(r"-(\d+)-(\d+)$", host)
-  if match is None:
-    return None
-  slice_id = int(match.group(1))
-  return slice_id if slice_id < get_num_slices(environ) else None
 
 
 def get_slice_id(environ: dict[str, str] | None = None) -> int:
   """Returns this process's slice index, 0 on a single-slice job.
 
-  Derived when it is not set explicitly, from the rank where one is available
-  and otherwise from the pod hostname. Global ranks are handed
+  Derived from the rank when it is not set explicitly. Global ranks are handed
   out in slice order -- a worker's node rank is
   ``slice_id * vms_per_slice + job_completion_index`` -- so the first
   ``WORLD_SIZE / num_slices`` ranks belong to slice 0, the next to slice 1, and
@@ -174,11 +160,6 @@ def get_slice_id(environ: dict[str, str] | None = None) -> int:
     world_size = int(environ["WORLD_SIZE"])
     if world_size % num_slices == 0:
       derived = int(environ["RANK"]) // (world_size // num_slices)
-
-  if derived is None:
-    # No usable rank yet (the launcher needs the slice index *before* torchrun
-    # assigns ranks). Fall back to the pod hostname.
-    derived = _slice_id_from_hostname(environ)
 
   if "MEGASCALE_SLICE_ID" not in environ:
     return derived if derived is not None else 0
