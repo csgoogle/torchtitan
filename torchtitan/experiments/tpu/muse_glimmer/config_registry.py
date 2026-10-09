@@ -24,6 +24,8 @@ __all__ = [
     "muse_glimmer_30b_full_logits",
     "muse_glimmer_30b_fused_ce",
     "muse_glimmer_30b_v003",
+    "muse_glimmer_30b_v011",
+    "muse_glimmer_30b_v011_qkvref",
     "reg_trainer_muse_glimmer_30b_fused_ce",
 ]
 
@@ -272,6 +274,37 @@ def muse_glimmer_30b_v003() -> TPUTrainerConfig:
       f"layers.{i}.attention::pallas.splash_attn_fwd_*.default"
       for i in range(3, 52, 4)
   )
+  return config
+
+
+_GLOBAL_LAYERS_30B = range(3, 52, 4)
+
+
+def _save_in_global_layers(config: TPUTrainerConfig, ops: tuple[str, ...]) -> None:
+  config.tpu_config.graph_trainer_full_recompute_save_ops = " | ".join(
+      f"layers.{i}.attention::{op}" for i in _GLOBAL_LAYERS_30B for op in ops
+  )
+
+
+def muse_glimmer_30b_v011() -> TPUTrainerConfig:
+  """``muse_glimmer_30b_full_logits`` that keeps a consistent first-pass Splash
+  set in the 13 global-attention layers: the kernel inputs (the contiguous
+  q/k/v copies) and outputs (out + logsumexp). Their backward then consumes only
+  first-pass values, and the Splash forward and QKV projection recompute drop
+  out for those layers."""
+  config = muse_glimmer_30b_full_logits()
+  _save_in_global_layers(
+      config, ("aten.clone.default", "pallas.splash_attn_fwd_*.default")
+  )
+  return config
+
+
+def muse_glimmer_30b_v011_qkvref() -> TPUTrainerConfig:
+  """Reference for ``muse_glimmer_30b_v011``: keeps only the Splash inputs of
+  the global layers. Saving the outputs on top of identical inputs must not
+  change any value."""
+  config = muse_glimmer_30b_full_logits()
+  _save_in_global_layers(config, ("aten.clone.default",))
   return config
 
 
