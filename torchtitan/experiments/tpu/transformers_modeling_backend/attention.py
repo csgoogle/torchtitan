@@ -280,6 +280,34 @@ def _segment_ids(module, attention_mask, kwargs) -> torch.Tensor | None:
     return seg
 
 
+def _softcapped_attention(module, query, key, value, mask, is_causal, scaling, softcap, dropout):
+    """Plain attention with HF's soft-cap, for the fallback (SDPA has no cap).
+
+    Same arithmetic as HF's eager path: scale, ``softcap * tanh(x / softcap)``,
+    mask, softmax in fp32, dropout, @ v. ``mask`` is what ``_fallback_mask``
+    built (boolean or additive, broadcast over heads) or None.
+    """
+    heads, kv_heads = query.shape[1], key.shape[1]
+    if kv_heads != heads:
+        key = key.repeat_interleave(heads // kv_heads, dim=1)
+        value = value.repeat_interleave(heads // kv_heads, dim=1)
+    scale = scaling if scaling is not None else query.shape[-1] ** -0.5
+    scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+    scores = softcap * torch.tanh(scores / softcap)
+    if mask is None and is_causal:
+        q_len, kv_len = query.shape[-2], key.shape[-2]
+        mask = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device).tril(kv_len - q_len)
+    if mask is not None:
+        if mask.dtype == torch.bool:
+            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        else:
+            scores = scores + mask
+    probs = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+    if dropout and module.training:
+        probs = torch.nn.functional.dropout(probs, p=dropout)
+    return torch.matmul(probs, value).transpose(1, 2).contiguous()
+
+
 def _fallback_mask(module, query, key, attention_mask, kwargs, is_causal, window):
     """The dense equivalent of the kernel's mask, for the SDPA fallback.
 
@@ -350,6 +378,13 @@ def splash_attention_forward(
     # say is the decoder-style causal one.
     if is_causal is None:
         is_causal = getattr(module, "is_causal", True)
+    # Attention-logit soft-cap (Gemma-2: attn_logit_softcapping=50), which HF
+    # hands every attention implementation as ``softcap``. Neither HF's SDPA
+    # integration nor a kernel that ignores **kwargs applies it, so it must be
+    # taken here or it is silently dropped.
+    softcap = kwargs.pop("softcap", None)
+    if softcap is not None and softcap <= 0:
+        softcap = None
     window = _window(module, kwargs)
     reason = _unsupported(module, query, key, attention_mask, dropout, is_causal, window)
     if reason is not None:
@@ -363,6 +398,10 @@ def splash_attention_forward(
             module, query, key, attention_mask, kwargs, is_causal, window
         )
         kwargs.pop("tpu_segment_ids", None)
+        if softcap is not None:
+            return _softcapped_attention(
+                module, query, key, value, fb_mask, fb_causal, scaling, softcap, dropout
+            ), None
         return sdpa_attention_forward(
             module, query, key, value, fb_mask,
             dropout=dropout, scaling=scaling, is_causal=fb_causal, **kwargs,
@@ -397,12 +436,12 @@ def splash_attention_forward(
     )
 
     out = _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
-                       dropout, kernel_kwargs, seg_desc)
+                       dropout, kernel_kwargs, seg_desc, softcap=softcap)
     return out, None
 
 
 def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
-                 dropout, kernel_kwargs, seg_desc):
+                 dropout, kernel_kwargs, seg_desc, softcap=None):
     """The kernel call: document-aware skipping, exact segment masking at
     token granularity, in-kernel PRNG dropout."""
     from torchtitan.experiments.tpu.kernels.splash_bias_dropout import (
@@ -439,6 +478,10 @@ def _sbd_forward(query, key, value, segment_ids, is_causal, scaling, window,
     if salt:
         dropout_seed = dropout_seed ^ salt
     SbdConfig.update(dropout_rate=float(dropout), **blocks)
+    # Set explicitly, None included: ``update`` skips None values, which would
+    # leak one model's soft-cap into the next call that has none. The kernel
+    # applies it as cap * tanh(logits / cap) on the scaled logits -- HF's form.
+    SbdConfig.attn_logits_soft_cap = softcap
     # HF hands (B, H, S, D) and wants it back; `heads_first` is the kernel's
     # own layout, so nothing is transposed on either side (the torch-standard
     # entry would cost three full-size copies per call, saved until the

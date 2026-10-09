@@ -233,6 +233,33 @@ def _build_kernel(
   return cfg, kernel
 
 
+# Largest `block * head_dim * itemsize` the dkv kernel tiles may span: 512
+# rows of fp32 head_dim 256 (or bf16 head_dim 512). The dkv kernel holds
+# double-buffered q / k / v / do tiles, the dq / dk / dv outputs and fp32
+# dk / dv accumulators, all `(block, head_dim)`; at fp32 head_dim 512 with
+# 512-row blocks that is 16.6 MiB, past the 16 MiB default scoped VMEM limit
+# on v5e (CompileTimeScopedVmemOom on Gemma-4's global layers).
+_DKV_TILE_BYTES = 512 * 256 * 4
+
+
+def _dkv_blocks(block_q_dkv, block_kv_dkv, block_kv_dkv_compute, head_dim, itemsize):
+  """Caps the dkv block sizes so their tiles fit `_DKV_TILE_BYTES`.
+
+  A no-op for every layout up to fp32 head_dim 256 / bf16 head_dim 512;
+  wider (or wider-typed) heads get shorter blocks. The cap is a power of two
+  (never below one 128-row tile), so it divides any sequence length the
+  configured power-of-two blocks divide.
+  """
+  cap = 128
+  while 2 * cap * head_dim * itemsize <= _DKV_TILE_BYTES:
+    cap *= 2
+  return (
+      min(block_q_dkv, cap),
+      min(block_kv_dkv, cap),
+      min(block_kv_dkv_compute, cap),
+  )
+
+
 def _batch_map(fn, args, in_axes, serial):
   """`vmap(fn, in_axes)(*args)`, or a `lax.scan` over the batch if `serial`.
 
@@ -605,6 +632,10 @@ def sbd_attention_bwd(
   use_bias = bias is not None
   use_dropout = dropout_seed is not None
   is_mqa = k.shape[1 if heads_first else 2] == 1
+  block_q_dkv, block_kv_dkv, block_kv_dkv_compute = _dkv_blocks(
+      block_q_dkv, block_kv_dkv, block_kv_dkv_compute, q.shape[-1],
+      jnp.dtype(q.dtype).itemsize,
+  )
   cfg, kernel = _build_kernel(
       seq_len,
       causal,
