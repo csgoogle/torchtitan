@@ -594,49 +594,6 @@ gcluster job submit \
         --training.steps=30'
 ```
 
-#### Where the slice index comes from
-
-libtpu builds the MegaScale PJRT client -- the thing that makes several slices into one device
-mesh -- from `MEGASCALE_NUM_SLICES`, `MEGASCALE_SLICE_ID` and `MEGASCALE_COORDINATOR_ADDRESS`.
-Two of those are the same on every pod, so `--env` carries them. The slice index is the awkward
-one, and nothing hands it over directly: GKE exposes no `JOBSET_*` variable, Kubernetes' own
-`JOB_COMPLETION_INDEX` is the pod's index *within* its job (the worker index, `0` on every slice),
-and `hostNetwork: true` makes the hostname the node's name. The JobSet does label each pod with
-`jobset.sigs.k8s.io/job-index`, but reaching a label needs a `fieldRef`, and `--env` renders
-literal `value:` pairs -- which is why gcluster's `--pathways` template carries a `fieldRef` stanza
-for exactly this and the normal TPU template sets nothing.
-
-It is in the environment, though, spelled as a hostname. GKE injects `TPU_WORKER_HOSTNAMES` with
-*this slice's* pod DNS names, and a JobSet names a pod
-`<jobset>-<replicated-job>-<job-index>-<pod-index>`:
-
-```
-slice 0:  ms-main-job-0-0.ms,ms-main-job-0-1.ms
-slice 1:  ms-main-job-1-0.ms,ms-main-job-1-1.ms
-                        ^ the slice index
-```
-
-So both halves recover it from that list and no YAML editing is needed:
-
-* **The launch command** needs it before `torchrun` starts, for `--node_rank`, and walks the
-  Kubernetes ownership chain to get it: first host of the list, drop the subdomain to leave the
-  **Pod** name, drop the pod index to leave the **Job** name, keep its last field. That last field
-  is the job index, and since one replicated job is rendered per slice, the Job *is* the slice.
-  Shell parameter expansion rather than `awk`, because the whole `--command` is already
-  single-quoted -- an awk program cannot be quoted inside it, and under double quotes the
-  container's shell would eat `$(NF-1)` before awk ran.
-* **TorchTitan** needs it in the environment, because libtpu reads it there. `get_slice_id()`
-  recovers it the same way and `_maybe_init_distributed_on_gke` exports `MEGASCALE_SLICE_ID`
-  before the first device is used, logging `Exporting MEGASCALE_SLICE_ID=...`.
-
-The two derivations are independent, and TorchTitan cross-checks them: `get_slice_id()` compares
-the host list against the slice implied by this process's rank and raises on a disagreement. A
-launch command that computes `node_rank` wrongly therefore fails loudly instead of rendezvousing
-into a silent hang. Setting `MEGASCALE_SLICE_ID` yourself still works and is cross-checked the
-same way -- so the `fieldRef` stanza remains a valid alternative, just no longer a requirement.
-
-
-
 Differences from the single-slice command:
 
 * `--num-slices 2`, and `--nnodes` is slices x VMs-per-slice. Both of those are **derived, not
@@ -650,7 +607,9 @@ Differences from the single-slice command:
   the mesh cannot be built.
 * `node_rank` is **global**, and must be handed out in slice order -- `slice_index * VMS +
   TPU_WORKER_ID`. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects; the slice
-  index is recovered from `TPU_WORKER_HOSTNAMES` as described above. Slice order is not cosmetic:
+  index is recovered from `TPU_WORKER_HOSTNAMES`, whose entries are this slice's own pod DNS names
+  (`<jobset>-<replicated-job>-<job-index>-<pod-index>`), and one replicated job is rendered per
+  slice -- so the job index is the slice index. Slice order is not cosmetic:
   the per-slice task id handed to each slice's PJRT client is `RANK % per_slice_world_size`, so
   ranks that are not slice-major mis-number the devices. That is also why `--rdzv_backend=static`
   matters -- a dynamically-assigned rank carries no slice information.
