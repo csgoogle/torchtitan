@@ -562,10 +562,12 @@ mesh -- from `MEGASCALE_NUM_SLICES`, `MEGASCALE_SLICE_ID` and `MEGASCALE_COORDIN
 Two of those are the same on every pod, so `--env` can carry them. The slice id cannot: it differs
 per slice, and the only thing that knows it is the JobSet, through its `job-index` label.
 
-`gcluster job submit --env` renders literal `value:` pairs, so it cannot reference that label, and
-the normal TPU template does not set the variable itself -- only `--pathways` does, with exactly
-the stanza below. That is the gap you are working around: generate the manifest, add the one
-stanza, apply it.
+Nothing sets it for you. The JobSet controller stamps the `job-index` label on every pod it
+creates, so the value is always there -- but `gcluster job submit --env` renders literal `value:`
+pairs and cannot reference a label, the normal TPU template does not set the variable itself (only
+`--pathways` does, with exactly the stanza below), and GKE's TPU admission webhook injects the
+`TPU_*` family only, never `MEGASCALE_*`. So you supply the one wire from label to variable:
+generate the manifest, add the stanza, apply it.
 
 **1. Generate the manifest** instead of applying it, with `-o`:
 
@@ -604,7 +606,8 @@ gcluster job submit \
 ```
 
 **2. Add the slice index** to the container's `env` in `job.yaml`. `--num-slices N` renders one
-replicated job with `replicas: N`, so the JobSet's `job-index` label *is* this pod's slice index:
+replicated job with `replicas: N`, so the JobSet's `job-index` label *is* this pod's slice index,
+and the downward API reads it into the variable libtpu wants:
 
 ```yaml
 - name: MEGASCALE_SLICE_ID
