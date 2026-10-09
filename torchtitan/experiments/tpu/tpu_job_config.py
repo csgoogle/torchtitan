@@ -5,6 +5,7 @@ from typing import Literal
 
 import torchtitan.config
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerMemoryPolicy
+from torchtitan.experiments.tpu import goodput as goodput_lib
 from torchtitan.experiments.tpu import tpu_flags
 import torchtitan.trainer
 
@@ -307,6 +308,10 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
 @dataclasses.dataclass(kw_only=True, slots=True)
 class TPUTrainerConfig(BaseTPUTrainerConfig):
   tpu_config: TPUConfig = dataclasses.field(default_factory=TPUConfig)
+  # Goodput recording/monitoring; only the graph trainer is instrumented.
+  goodput: goodput_lib.GoodputConfig = dataclasses.field(
+      default_factory=goodput_lib.GoodputConfig
+  )
 
   def __post_init__(self):
     super(TPUTrainerConfig, self).__post_init__()

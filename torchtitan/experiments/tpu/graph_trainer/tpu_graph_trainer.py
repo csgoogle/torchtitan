@@ -34,6 +34,7 @@ from torchtitan.components.optimizer.optimizer import (
     set_moe_routing_metric_tensors,
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+from torchtitan.experiments.tpu import goodput
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.functional import (
     functional_adamw_step,
@@ -169,10 +170,60 @@ class TpuGraphTrainer(GraphTrainer):
                 final_step=tpu_extra.mfu_benchmark_final_step,
             )
 
+        self._goodput_config = getattr(config, "goodput", None)
+        self._goodput_preparation_open = goodput.enabled()
+        self._wrap_goodput_badput()
+
+    def init_distributed(self):
+        """Records process group and device setup as goodput TPU init.
+
+        Also starts goodput training preparation, which covers model build,
+        parallelization, compilation setup and checkpoint load, and ends at the
+        first train step.
+        """
+        with goodput.maybe_record(goodput.GoodputEvent.TPU_INIT):
+            parallel_dims = super().init_distributed()
+        goodput.verify_lead_process()
+        goodput.record_start(goodput.GoodputEvent.TRAINING_PREPARATION)
+        return parallel_dims
+
+    def batch_generator(self, data_iterable):
+        """Records each blocking batch fetch as goodput data loading."""
+        return goodput.record_data_loading(super().batch_generator(data_iterable))
+
+    def _wrap_goodput_badput(self) -> None:
+        """Records blocking checkpoint saves and validation as custom badput."""
+        if not goodput.enabled():
+            return
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is not None and hasattr(checkpointer, "_should_save"):
+
+            def should_record_save(curr_step, last_step=False):
+                return checkpointer._should_save(curr_step, last_step)
+
+            checkpointer.save = goodput.wrap_with_custom_badput(
+                checkpointer.save,
+                goodput.CHECKPOINT_SAVE_BADPUT,
+                should_record=should_record_save,
+            )
+        validator = getattr(self, "validator", None)
+        if validator is not None and hasattr(validator, "validate"):
+            validator.validate = goodput.wrap_with_custom_badput(
+                validator.validate, goodput.EVAL_BADPUT
+            )
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> None:
         """Override of GraphTrainer.train_step to branch into optimizer_in_graph loop when enabled."""
+        if self._goodput_preparation_open:
+            goodput.record_end(goodput.GoodputEvent.TRAINING_PREPARATION)
+            self._goodput_preparation_open = False
+        goodput.record_step_start(
+            self.step,
+            sync_device=self._goodput_config is not None
+            and self._goodput_config.sync_device_before_step,
+        )
         if not self._optimizer_in_graph:
             super().train_step(data_iterator)
         else:
