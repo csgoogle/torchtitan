@@ -192,7 +192,7 @@ def _tpu_hf_config(
     fused_loss: bool = False,
     attn_mask_type: str = "block_causal",
     save_attention: bool = False,
-    moe_kernels: bool = False,
+    use_pallas_grouped_mm: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
   model_spec = _model_registry(flavor, seq_len=seq_len)
@@ -201,9 +201,10 @@ def _tpu_hf_config(
   # return, ...); the shared backend only has the hooks. Re-classing a copy
   # also leaves the shared flavors table untouched.
   model_spec.model = as_tpu_model_config(model_spec.model, fused_loss=fused_loss)
-  # Run swapped MoE experts on the Pallas grouped-matmul kernels instead of
-  # upstream's torch._grouped_mm (see model._enable_pallas_experts).
-  model_spec.model.tpu_moe_pallas = moe_kernels
+  # Sets TpuGroupedExperts.Config.use_pallas_grouped_mm on the swapped MoE
+  # experts instead of upstream's torch._grouped_mm (see
+  # model._use_pallas_grouped_mm).
+  model_spec.model.use_pallas_grouped_mm = use_pallas_grouped_mm
   model_spec.parallelize_fn = parallelize_hf_transformers_tpu
   _set_attn_mask_type(model_spec.model, attn_mask_type)
   # flex attention has no TPU lowering. "sdpa" is the portable default;
@@ -329,20 +330,20 @@ def hf_moe_auto() -> TPUTransformersBackendConfig:
   model for every checkpoint). No expert parallelism: experts stay replicated
   and SimpleFSDP shards them.
 
-  Runs with per-layer compile and the experts on the Pallas grouped-matmul
-  kernels. hf_moe_auto_compile drops the kernels, hf_moe_auto_eager drops both.
+  Runs with per-layer compile and use_pallas_grouped_mm. hf_moe_auto_compile
+  drops use_pallas_grouped_mm, hf_moe_auto_eager drops both.
   """
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
-                        compile=True, moe_kernels=True)
+                        compile=True, use_pallas_grouped_mm=True)
 
 
 def hf_moe_auto_eager() -> TPUTransformersBackendConfig:
-  """hf_moe_auto without compile or the Pallas experts (debugging baseline)."""
+  """hf_moe_auto without compile or use_pallas_grouped_mm (debugging baseline)."""
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu")
 
 
 def hf_moe_auto_compile() -> TPUTransformersBackendConfig:
-  """hf_moe_auto without the Pallas experts (compile only; A/B reference)."""
+  """hf_moe_auto without use_pallas_grouped_mm (compile only; A/B reference)."""
   return _tpu_hf_config("full_moe_auto", _DEFAULT_HF_MODEL, attn="splash_tpu",
                         compile=True)
 

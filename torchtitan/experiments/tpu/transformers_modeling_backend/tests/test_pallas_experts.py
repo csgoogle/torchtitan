@@ -52,7 +52,7 @@ class PallasExpertsTest(base_device_test.BaseAcceleratorDeviceTest):
   def test_forward_backward(self, dim, hidden, group_sizes):
     device = self.accelerator_device
     cfg = TpuGroupedExperts.Config(dim=dim, hidden_dim=hidden, num_experts=len(group_sizes))
-    hf_model._enable_pallas_experts(_ExpertsOnly(cfg))
+    hf_model._use_pallas_grouped_mm(_ExpertsOnly(cfg))
     experts = TpuGroupedExperts(cfg)
     gen = torch.Generator().manual_seed(0)
     with torch.no_grad():
