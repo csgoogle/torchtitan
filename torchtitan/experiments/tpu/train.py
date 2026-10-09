@@ -226,13 +226,13 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
   workarounds.raise_dynamo_recompile_limits(train_config.model_spec.model)
   profiler_workaround.init(train_config)
 
+  # Align the HSDP replicate axis with the slice boundary before ParallelDims is
+  # built from this config. No-op on a single slice.
+  cloud_distributed_utils.maybe_configure_multislice_parallelism(
+      train_config.parallelism
+  )
   if cloud_distributed_utils.is_multi_slice():
-    # Align the HSDP replicate axis with the slice boundary before ParallelDims
-    # is built from this config, and keep the data pipeline off pinned host
-    # memory, which the MegaScale PJRT client cannot serve.
-    cloud_distributed_utils.apply_multislice_parallelism_defaults(
-        train_config.parallelism
-    )
+    # The MegaScale PJRT client cannot serve pinned host memory.
     workarounds.disable_pinned_host_memory()
 
   trainer: Optional[torchtitan.trainer.Trainer] = None

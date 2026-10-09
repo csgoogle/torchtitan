@@ -388,8 +388,13 @@ def _maybe_init_distributed_on_tpu_vm() -> bool:
   return True
 
 
-def apply_multislice_parallelism_defaults(parallelism_config) -> None:
+def maybe_configure_multislice_parallelism(parallelism_config) -> None:
   """Points the HSDP replicate axis at the slice boundary, in place.
+
+  Both sets and checks: it fills in ``data_parallel_replicate_degree`` when the
+  recipe left it at 1, and rejects an explicit value that the slice count does
+  not divide. "maybe" because it returns immediately on a single-slice job, so
+  it is safe to call unconditionally.
 
   On a multi-slice job the whole point of HSDP is that gradients are
   reduce-scattered inside a slice over ICI and only all-reduced between slices

@@ -193,25 +193,25 @@ class ReplicateAxisDefaultTest(unittest.TestCase):
   def test_defaults_replicate_to_slice_count(self):
     with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "2"}):
       config = ParallelismConfig()
-      cdu.apply_multislice_parallelism_defaults(config)
+      cdu.maybe_configure_multislice_parallelism(config)
       self.assertEqual(config.data_parallel_replicate_degree, 2)
 
   def test_keeps_an_explicit_multiple(self):
     with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "2"}):
       config = ParallelismConfig(data_parallel_replicate_degree=4)
-      cdu.apply_multislice_parallelism_defaults(config)
+      cdu.maybe_configure_multislice_parallelism(config)
       self.assertEqual(config.data_parallel_replicate_degree, 4)
 
   def test_rejects_a_replicate_degree_that_straddles_dcn(self):
     with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "2"}):
       config = ParallelismConfig(data_parallel_replicate_degree=3)
       with self.assertRaisesRegex(ValueError, "not a multiple"):
-        cdu.apply_multislice_parallelism_defaults(config)
+        cdu.maybe_configure_multislice_parallelism(config)
 
   def test_noop_on_single_slice(self):
     with mock.patch.dict("os.environ", {"MEGASCALE_NUM_SLICES": "1"}):
       config = ParallelismConfig()
-      cdu.apply_multislice_parallelism_defaults(config)
+      cdu.maybe_configure_multislice_parallelism(config)
       self.assertEqual(config.data_parallel_replicate_degree, 1)
 
 
