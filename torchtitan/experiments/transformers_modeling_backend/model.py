@@ -438,6 +438,20 @@ class HFTransformerModel(BaseModel):
                     if cls_name:
                         hf_model_config.architectures = [cls_name]
 
+            # Heterogeneous configs (transformers >= 5.19; e.g. Gemma-4's global
+            # layers use head_dim 512 and 2 KV heads) keep per-layer values
+            # out of the public attributes, and reading one from the global
+            # config raises. Read the global values here and carry the
+            # per-layer overrides onto this config below; copying only the
+            # global values would build every layer with one shape.
+            per_layer_overrides = None
+            if getattr(hf_model_config, "is_heterogeneous", False):
+                per_layer_overrides = {
+                    int(i): o
+                    for i, o in hf_model_config.to_dict()["per_layer_config"].items()
+                }
+                hf_model_config.allow_global_per_layer_attribute_access = True
+
             # Explicitly update attributes based on mappings
             for titan_name, hf_name in self._tt_to_hf_attribute_map.items():
                 if hasattr(hf_model_config, hf_name):
@@ -462,6 +476,16 @@ class HFTransformerModel(BaseModel):
                 # (e.g., DeepSeek V3 uses n_routed_experts, GLM uses num_local_experts)
                 if key == "num_experts" and hasattr(self, "n_routed_experts"):
                     self.n_routed_experts = value
+
+            if per_layer_overrides is not None:
+                # Global reads (head_dim, n_kv_heads below and in FLOP
+                # counting) see the default layer; the model reads each
+                # layer's own config. A flavor may have cut the layer count.
+                self.allow_global_per_layer_attribute_access = True
+                self.per_layer_config = {
+                    i: o for i, o in per_layer_overrides.items()
+                    if i < self.num_hidden_layers
+                }
 
             self.max_seq_len = training.max_context_length
 
