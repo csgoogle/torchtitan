@@ -267,6 +267,7 @@ jobs:
       image: ${{ needs.build-and-push-image.outputs.candidate_ref }}
     secrets:
       GAR_JSON_KEY: ${{ secrets.GAR_JSON_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   promote-latest:
     name: Promote nightly image to :latest

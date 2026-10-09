@@ -16,6 +16,9 @@ on:
       GAR_JSON_KEY:
         description: 'Service account key used to pull the test image from GAR'
         required: true
+      HF_TOKEN:
+        description: 'Hugging Face token (required for parity tests on gated models)'
+        required: false
 
 concurrency:  # Cancel older jobs for the same PR
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -142,6 +145,7 @@ jobs:
 
     env:
       PYTHONDONTWRITEBYTECODE: 1
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -178,6 +182,7 @@ jobs:
 
     env:
       PYTHONDONTWRITEBYTECODE: 1
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
       - name: Checkout repository
