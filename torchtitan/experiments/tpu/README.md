@@ -598,15 +598,24 @@ gcluster job submit \
 
 Differences from the single-slice command:
 
-* **The three `MEGASCALE_*` variables.** libtpu joins several slices into one device mesh through
-  its MegaScale PJRT client, and builds that client from `MEGASCALE_NUM_SLICES`,
-  `MEGASCALE_COORDINATOR_ADDRESS` and `MEGASCALE_SLICE_ID`. The command above passes the first two:
-  the coordinator address is what makes libtpu create the client at all, and without it each slice
-  numbers its devices from zero and the mesh cannot be built. The third you do **not** pass --
-  TorchTitan recovers the slice index from `TPU_WORKER_HOSTNAMES` and exports
-  `MEGASCALE_SLICE_ID` before the first device is used, logging
-  `Exporting MEGASCALE_SLICE_ID=...`. Setting it yourself still works and is cross-checked against
-  that host list, so a wrong value raises instead of building a broken mesh.
+* Multi-slice needs three environment variables. libtpu joins the slices into one device mesh
+  through its MegaScale PJRT client, and builds that client from:
+
+  ```
+  MEGASCALE_NUM_SLICES           how many slices there are
+  MEGASCALE_COORDINATOR_ADDRESS  where slice 0's first worker listens
+  MEGASCALE_SLICE_ID             which slice this pod is
+  ```
+
+  The command passes the first two with `--env`. The coordinator address is the one that makes
+  libtpu create the client at all; without it every slice numbers its devices from zero and the
+  mesh cannot be built.
+
+  The third is different, because its value changes from slice to slice -- one `--env` cannot say
+  two things. TorchTitan fills it in: it reads the slice index out of `TPU_WORKER_HOSTNAMES` and
+  exports `MEGASCALE_SLICE_ID` before the first device is used, logging
+  `Exporting MEGASCALE_SLICE_ID=...`. You can still set it yourself, and it is cross-checked
+  against that host list, so a wrong value raises instead of building a broken mesh.
 
 * `--parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES` is **required**. The
   replicate axis is the one split across DCN, so the slice count has to divide it -- that is what
