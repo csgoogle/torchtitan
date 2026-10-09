@@ -42,7 +42,7 @@ from torchtitan.models.common.attention import (
     ScaledDotProductInnerAttention,
 )
 from torchtitan.models.common.param_init import skip_param_init
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import Linear, RouterGateLinear
 from torchtitan.models.common.nn_modules import RMSNorm
 import transformers
 
@@ -100,6 +100,7 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
         inner_experts = layer.moe.routed_experts.inner_experts
         self.assertIsInstance(inner_experts, TpuGroupedExperts.Config)
         self.assertEqual(inner_experts.activation, "gelu_tanh")
+        self.assertIsInstance(layer.moe.router.gate, RouterGateLinear.Config)
 
   def test_config_registry_valid(self):
     for fn in (
@@ -133,6 +134,21 @@ class TestTpuGroupedExpertsActivation(BaseDeviceTest):
     )
     self.assertEqual(
         untied.tok_embeddings.param_init["weight"].keywords["std"], 0.02
+    )
+
+    # Verify factory-backed flavors (debugmodel, 31B, etc.) return isolated
+    # sub-config instances so building one config does not mutate another.
+    dbg_tied = _build_flavor_config("debugmodel", enable_weight_tying=True)
+    init_tied = dbg_tied.tok_embeddings.param_init
+    dbg_untied = _build_flavor_config(
+        "debugmodel", enable_weight_tying=False, enable_sp=False
+    )
+    self.assertIsNot(dbg_tied.tok_embeddings, dbg_untied.tok_embeddings)
+    self.assertIsNot(dbg_tied.norm, dbg_untied.norm)
+    self.assertIsNot(dbg_tied.lm_head, dbg_untied.lm_head)
+    self.assertIs(dbg_tied.tok_embeddings.param_init, init_tied)
+    self.assertIs(
+        dbg_tied.tok_embeddings.param_init["weight"], skip_param_init
     )
 
   def test_silu_delegates_to_super_and_gelu_uses_grouped_mm_seam(self):
@@ -297,6 +313,13 @@ class TestGemma4StateDictAdapter(absltest.TestCase):
     self.assertEqual(set(roundtrip_sd.keys()), set(tt_sd.keys()))
     for k in tt_sd:
       torch.testing.assert_close(roundtrip_sd[k], tt_sd[k])
+
+  def test_fused_qkv_rejected(self):
+    config = _build_flavor_config("debugmodel", use_fused_qkv=True)
+    with self.assertRaisesRegex(
+        NotImplementedError, "does not support FusedQKVLinear"
+    ):
+      Gemma4StateDictAdapter(config, hf_assets_path=None)
 
 
 class TestGemma4SdpaSlidingWindow(absltest.TestCase):

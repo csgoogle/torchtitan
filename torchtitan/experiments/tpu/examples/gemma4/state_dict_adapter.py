@@ -4,6 +4,7 @@ from typing import Any
 import torch
 
 from torchtitan.experiments.tpu.examples.gemma4.model import Gemma4Model
+from torchtitan.models.common.attention import FusedQKVLinear
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
 # Non-text towers of the multimodal checkpoint, with any leading "model." removed.
@@ -38,6 +39,12 @@ class Gemma4StateDictAdapter(StateDictAdapter):
         self, model_config: Gemma4Model.Config, hf_assets_path: str | None
     ) -> None:
         super().__init__(model_config, hf_assets_path)
+        for idx, layer in enumerate(model_config.layers):
+            if isinstance(layer.attention.qkv_linear, FusedQKVLinear.Config):
+                raise NotImplementedError(
+                    f"Gemma4StateDictAdapter does not support FusedQKVLinear "
+                    f"(layer {idx} has use_fused_qkv=True)."
+                )
 
         self.from_hf_map = {
             "model.language_model.embed_tokens.weight": "tok_embeddings.weight",

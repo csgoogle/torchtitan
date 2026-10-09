@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import copy
 from functools import partial
 
 import torch.nn as nn
@@ -17,7 +18,7 @@ from torchtitan.models.common.config_utils import (
     get_attention_config,
     make_token_dispatcher_config,
 )
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import Linear, RouterGateLinear
 from torchtitan.models.common.moe import MoELoadBalanceAuxLoss, RoutedExperts
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.param_init import skip_param_init
@@ -124,7 +125,7 @@ def _make_moe_config(
                 eps=norm_eps,
                 elementwise_affine=False,
             ),
-            gate=Linear.Config(
+            gate=RouterGateLinear.Config(
                 in_features=dim,
                 out_features=num_experts,
                 param_init=param_init["linear_out"],
@@ -576,7 +577,7 @@ def _build_flavor_config(
             extra_kw["non_blocking_capacity_factor"] = (
                 non_blocking_capacity_factor
             )
-        config = factory(layers=layers_partial(**extra_kw))
+        config = copy.deepcopy(factory(layers=layers_partial(**extra_kw)))
 
     _set_weight_tying(config, enable_weight_tying)
     set_gemma4_sharding_config(
