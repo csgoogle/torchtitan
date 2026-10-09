@@ -607,14 +607,28 @@ Differences from the single-slice command:
 * `node_rank` is **global**, and must be handed out in slice order -- `slice_index * VMS +
   TPU_WORKER_ID`. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects; the slice
   index has to come from the JobSet, because the launcher needs it before torchrun has assigned
-  any rank. Expose the JobSet's own `job-index` label through the downward API -- `--num-slices N`
-  renders one replicated job with `replicas: N`, so that label *is* the slice index:
+  any rank. `--num-slices N` renders one replicated job with `replicas: N`, so the JobSet's own
+  `job-index` label *is* the slice index -- expose it through the downward API:
 
 ```yaml
 - name: MEGASCALE_SLICE_ID
   valueFrom:
     fieldRef:
       fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+```
+
+  **`gcluster job submit --env` cannot express this**: it renders literal `value:` pairs, and the
+  normal TPU template sets no per-slice index of its own (only the `--pathways` template does). Two
+  ways to get the stanza in:
+
+```bash
+# (a) emit the manifest, add the stanza, apply it yourself
+gcluster job submit ... -o job.yaml      # --dry-run-out: generate instead of apply
+# insert the MEGASCALE_SLICE_ID block above into the container's env, then:
+kubectl apply -f job.yaml
+
+# (b) or override the template once, for every job
+gcluster job submit ... --gke-custom-templates-path ./my-templates
 ```
 
   Do **not** try to read the slice index out of the pod hostname. TPU workloads run with
