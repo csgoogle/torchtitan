@@ -598,33 +598,15 @@ gcluster job submit \
 
 Differences from the single-slice command:
 
-* `--num-slices 2`, and `--nnodes` is slices x VMs-per-slice. Both of those are **derived, not
-  hardcoded**: `TPU_WORKER_HOSTNAMES` is the slice's own host list, so its length is the VM count
-  for this slice, whatever the topology or the chips-per-host of the generation you are on.
-  `WORLD_SIZE` spans the whole job; each slice still builds its own SliceBuilder mesh from its own
-  hosts. (`--nproc_per_node` is chips per VM -- 4 on v6e, 8 on v7x, which has two TensorCores per
-  chip.)
-* `MEGASCALE_NUM_SLICES` and `MEGASCALE_COORDINATOR_ADDRESS`. The coordinator address is what makes
-  libtpu create the MegaScale PJRT client; without it each slice numbers its devices from zero and
-  the mesh cannot be built.
-
-  libtpu reads a third variable, `MEGASCALE_SLICE_ID`, which you do **not** pass: TorchTitan
-  recovers the slice index from `TPU_WORKER_HOSTNAMES` and exports it before the first device is
-  used, logging `Exporting MEGASCALE_SLICE_ID=...`. Setting it yourself still works and is
-  cross-checked against that host list, so a wrong value raises instead of building a broken mesh.
-* `node_rank` is **global**, and must be handed out in slice order -- `slice_index * VMS +
-  TPU_WORKER_ID`. `TPU_WORKER_ID` is the within-slice worker index, which GKE injects; the slice
-  index is recovered from `TPU_WORKER_HOSTNAMES`, whose entries are this slice's own pod DNS names
-  (`<jobset>-<replicated-job>-<job-index>-<pod-index>`), and one replicated job is rendered per
-  slice -- so the job index is the slice index. Slice order is not cosmetic:
-  the per-slice task id handed to each slice's PJRT client is `RANK % per_slice_world_size`, so
-  ranks that are not slice-major mis-number the devices. That is also why `--rdzv_backend=static`
-  matters -- a dynamically-assigned rank carries no slice information.
-
-* If the mesh fails to build with a complaint about devices having no `slice_index`, or about
-  duplicate PJRT device ids, the MegaScale client was not installed. torch_tpu's own message names
-  the inputs: `--megascale_port` must be >= 0 and `SKIP_MEGASCALE_PJRT_CLIENT` must be unset, on
-  top of the three `MEGASCALE_*` variables.
+* **The three `MEGASCALE_*` variables.** libtpu joins several slices into one device mesh through
+  its MegaScale PJRT client, and builds that client from `MEGASCALE_NUM_SLICES`,
+  `MEGASCALE_COORDINATOR_ADDRESS` and `MEGASCALE_SLICE_ID`. The command above passes the first two:
+  the coordinator address is what makes libtpu create the client at all, and without it each slice
+  numbers its devices from zero and the mesh cannot be built. The third you do **not** pass --
+  TorchTitan recovers the slice index from `TPU_WORKER_HOSTNAMES` and exports
+  `MEGASCALE_SLICE_ID` before the first device is used, logging
+  `Exporting MEGASCALE_SLICE_ID=...`. Setting it yourself still works and is cross-checked against
+  that host list, so a wrong value raises instead of building a broken mesh.
 
 * `--parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES` is **required**. The
   replicate axis is the one split across DCN, so the slice count has to divide it -- that is what
