@@ -23,7 +23,7 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu.activation_checkpoint import AttentionSavingSelectiveAC
 from . import attention as _tpu_attention  # noqa: F401  (registers splash_tpu
                                             #  before the backend builds its
@@ -193,6 +193,7 @@ def _tpu_hf_config(
     attn_mask_type: str = "block_causal",
     save_attention: bool = False,
     moe_kernels: bool = False,
+    full_ac: bool = False,
 ) -> TPUTransformersBackendConfig:
   """Build a TPU job config around one of the backend's model flavors."""
   model_spec = _model_registry(flavor, seq_len=seq_len)
@@ -264,7 +265,8 @@ def _tpu_hf_config(
       # attention output, as upstream's default set already does for every
       # attention implementation it knows about (SDPA variants, flex).
       activation_checkpoint=(
-          AttentionSavingSelectiveAC.Config() if save_attention
+          FullAC.Config() if full_ac
+          else AttentionSavingSelectiveAC.Config() if save_attention
           else SelectiveAC.Config()
       ),
   )
@@ -316,6 +318,18 @@ def hf_full_max_plain_ce() -> TPUTransformersBackendConfig:
   """``hf_full_max`` with the model's own head and plain cross entropy."""
   return _tpu_hf_config("full", _DEFAULT_HF_MODEL, compile=True,
                         attn="splash_tpu", save_attention=True)
+
+
+def hf_full_kernels_full_ac() -> TPUTransformersBackendConfig:
+  """Splash attention + fused CE, eager, full activation checkpointing.
+
+  For models that keep HF's own MoE block (Gemma-4-26B-A4B): its router
+  divides the top-k weights in place, and selective AC saves top-k outputs,
+  so the recompute would reuse the already-normalized tensor (torch raises
+  "Tensor cached during selective activation checkpoint has been mutated").
+  """
+  return _tpu_hf_config("full", _DEFAULT_HF_MODEL, attn="splash_tpu", fused_loss=True,
+                        full_ac=True)
 
 
 def hf_moe_auto() -> TPUTransformersBackendConfig:

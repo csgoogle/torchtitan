@@ -170,10 +170,13 @@ def build_and_swap_native_moe(
         # forward boundary; an nn.Module wrapper would add another name level.
         native_moe.__class__ = _HFBatchedMoE
 
-        # Materialize meta params to real tensors, then initialize values.
-        # This mirrors the trainer's flow: to_empty → init_states.
-        native_moe.to_empty(device=torch.device("cpu"))
-        native_moe.init_states(buffer_device=torch.device("cpu"))
+        # Match the rest of the layer. The trainer builds on meta and
+        # materializes + initializes after parallelize; materializing here
+        # would hold every expert unsharded in host memory.
+        device = next(layer.parameters()).device
+        if device.type != "meta":
+            native_moe.to_empty(device=device)
+            native_moe.init_states(buffer_device=device)
 
         # Swap the Titan MoE into the layer's original ``mlp`` attribute.
         moe_attr = _get_moe_attr_name(layer)
