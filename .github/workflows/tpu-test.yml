@@ -130,7 +130,8 @@ jobs:
       matrix:
         test_shard: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).distributed_shards }}
     runs-on: linux-x86-tpu7x-224-4tpu
-    timeout-minutes: 30
+    # ~6 min of tests plus headroom for TPU-init retries (~8 min each).
+    timeout-minutes: 45
 
     container:
       image: ${{ needs.resolve-image.outputs.image }} # zizmor: ignore[unpinned-images]
@@ -154,25 +155,9 @@ jobs:
           ln -sfn /tmp/torch_tpu_cache /dev/shm/torch_tpu_cache
 
       - name: Run Sharded Tests
-        run: |
-          set -e
-          ulimit -n 65536
-          failed=""
-          for module in ${{ matrix.test_shard.modules }}; do
-            echo "=================================================="
-            echo "Running test module: $module"
-            echo "=================================================="
-            timeout 900 python -m $module --device=tpu || failed="$failed $module"
-          done
-
-          if [ -n "$failed" ]; then
-            echo "=================================================="
-            echo "Failed test target(s):"
-            for target in $failed; do
-              echo "::error::$target failed"
-            done
-            exit 1
-          fi
+        env:
+          MAX_ATTEMPTS: 3
+        run: bash .ci/run_tpu_test_modules.sh ${{ matrix.test_shard.modules }}
 
   single-tpu-tests:
     if: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).single_tpu_shards[0] != null }}
@@ -206,25 +191,9 @@ jobs:
           ln -sfn /tmp/torch_tpu_cache /dev/shm/torch_tpu_cache
 
       - name: Run Sharded Tests
-        run: |
-          set -e
-          ulimit -n 65536
-          failed=""
-          for module in ${{ matrix.test_shard.modules }}; do
-            echo "=================================================="
-            echo "Running test module: $module"
-            echo "=================================================="
-            timeout 900 python -m $module --device=tpu || failed="$failed $module"
-          done
-
-          if [ -n "$failed" ]; then
-            echo "=================================================="
-            echo "Failed test target(s):"
-            for target in $failed; do
-              echo "::error::$target failed"
-            done
-            exit 1
-          fi
+        env:
+          MAX_ATTEMPTS: 3
+        run: bash .ci/run_tpu_test_modules.sh ${{ matrix.test_shard.modules }}
 
   cpu-tests:
     if: ${{ fromJson(needs.setup-matrix.outputs.test_matrix).cpu_shards[0] != null }}
