@@ -107,7 +107,12 @@ def one_step_vs_reference(config_args: list[str], device: torch.device) -> dict:
 
   # The reference: the same HF class on CPU with the portable attention.
   ref_config = copy.deepcopy(hf.config)
-  TPUHFTransformerModel._set_attn_everywhere(ref_config, "sdpa")
+  # HF's SDPA integration silently ignores an attention-logit soft-cap
+  # (Gemma-2), so a model with one is referenced against HF's eager attention,
+  # which applies it.
+  text_ref = ref_config.get_text_config() if hasattr(ref_config, "get_text_config") else ref_config
+  reference_attn = "eager" if getattr(text_ref, "attn_logit_softcapping", None) else "sdpa"
+  TPUHFTransformerModel._set_attn_everywhere(ref_config, reference_attn)
   reference = type(hf)(config=ref_config)
   missing, unexpected = reference.load_state_dict(
       {k: v.detach().float().cpu() for k, v in hf.state_dict().items()}, strict=False
@@ -171,6 +176,31 @@ class HFReferenceParityTest(base_device_test.BaseAcceleratorDeviceTest):
            hf_model="Qwen/Qwen3-0.6B", args=["--loss.b_block_size=256"]),
       dict(testcase_name="llama3", config="hf_debugmodel_max",
            hf_model="unsloth/Llama-3.2-1B-Instruct", args=["--loss.b_block_size=256"]),
+      # A soft-capped head on the fused CE: the model hands the cap to the loss,
+      # which re-applies it in-kernel, so loss and gradients must match HF's own
+      # capped logits. The checkpoint's cap (30) is overridden to 0.5 on BOTH
+      # sides: at random init logits are small and 30 * tanh(x / 30) ~= x, so a
+      # cap of 30 would let a dropped cap pass unnoticed.
+      # Gemma-2 caps both the attention logits (checkpoint: 50) and the final
+      # logits (30). At random init both caps are near-identity (logits are
+      # small and cap * tanh(x / cap) ~= x), which would let a dropped cap pass:
+      # so on both sides the caps are tightened AND query_pre_attn_scalar is
+      # shrunk (Gemma-2 scales q by its -1/2 power: 0.01 -> x10) to push the
+      # attention logits far into the capped range. The attention cap reaches
+      # the kernel through HF's `softcap` kwarg.
+      dict(testcase_name="gemma2_attn_and_final_softcap", config="hf_debugmodel_max",
+           hf_model="google/gemma-2-2b",
+           args=["--loss.b_block_size=256",
+                 '--hf_config_overrides={"attn_logit_softcapping": 2.0, "final_logit_softcapping": 0.5, "query_pre_attn_scalar": 0.01}'],
+           # bf16 attention through a deliberately saturated cap moves the tied
+           # embedding's gradient by ~1.7e-2 (the kernel-level soft-cap test pins
+           # the arithmetic itself in fp32). Detection does not rest on grads:
+           # with the cap dropped the LOSS is off by 6.2e-2 (tolerance 1e-2).
+           grad_atol=2e-2, grad_rtol=5e-2),
+      dict(testcase_name="gemma3_softcap_fused", config="hf_debugmodel_max",
+           hf_model="google/gemma-3-1b-it",
+           args=["--loss.b_block_size=256",
+                 '--hf_config_overrides={"final_logit_softcapping": 0.5}']),
       # GPT-2 at full size: learned positions, tied head, `attn` block naming.
       dict(testcase_name="distilgpt2", config="hf_full_max_plain_ce",
            hf_model="distilbert/distilgpt2",

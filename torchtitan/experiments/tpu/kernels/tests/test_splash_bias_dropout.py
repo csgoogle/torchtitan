@@ -228,6 +228,95 @@ class SplashBiasDropoutTest(base_device_test.BaseAcceleratorDeviceTest):
     # Dropout is active: a different seed gives a different output.
     self.assertGreater(float((out0 - out1).abs().max()), 1e-3, "seeds gave identical masks")
 
+  # -------- attention-logit soft-cap (Gemma-2) --------
+
+  @parameterized.named_parameters(("cap50", 50.0), ("cap2", 2.0), ("cap0p5", 0.5))
+  def test_attn_logits_soft_cap(self, cap):
+    """cap * tanh(scaled logits / cap), forward and backward, vs a math reference.
+
+    The adapter hands HF's `softcap` kwarg to the kernel through
+    SbdConfig.attn_logits_soft_cap. A cap of 0.5 on N(0, 1)-ish logits is far
+    from the identity, so a cap that is silently skipped fails this test.
+    """
+    device = self.accelerator_device
+    b, s, h, d = 1, 512, 4, 64
+    q, k, v = self._qkv(b, s, h, h, d, device, seed=79)
+    scale = d ** -0.5
+    q_ref, k_ref, v_ref = (t.cpu().clone().requires_grad_(True) for t in (q, k, v))
+    scores = torch.einsum("bqhd,bkhd->bhqk", q_ref, k_ref) * scale
+    scores = cap * torch.tanh(scores / cap)
+    scores = scores.masked_fill(~torch.ones(s, s, dtype=torch.bool).tril(), float("-inf"))
+    out_ref = torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, -1), v_ref)
+    out_ref.sum().backward()
+    splash_bias_dropout.SbdConfig.attn_logits_soft_cap = cap
+    try:
+      q_t, k_t, v_t = (t.clone().requires_grad_(True) for t in (q, k, v))
+      out = splash_bias_dropout.sbd_splash_attention(q_t, k_t, v_t, is_causal=True, scale=scale)
+      out.sum().backward()
+    finally:
+      splash_bias_dropout.SbdConfig.attn_logits_soft_cap = None
+    torch.testing.assert_close(out.cpu(), out_ref, rtol=5e-2, atol=5e-2)
+    for name, got, want in (("dq", q_t.grad, q_ref.grad), ("dk", k_t.grad, k_ref.grad),
+                            ("dv", v_t.grad, v_ref.grad)):
+      torch.testing.assert_close(got.cpu(), want, rtol=8e-2, atol=8e-2, msg=name)
+    # Guard against a vacuous pass: the uncapped output must differ.
+    uncapped = splash_bias_dropout.sbd_splash_attention(q, k, v, is_causal=True, scale=scale)
+    if cap <= 2.0:
+      self.assertGreater(float((uncapped.cpu() - out.cpu()).abs().max()), 1e-2, "cap had no effect")
+
+  # -------- Gemma-4 attention shapes --------
+
+  @parameterized.named_parameters(
+      # Global (full-attention) layers: head_dim 512 with very few KV heads --
+      # 2 on Gemma-4-26B, 1 (MQA) on Gemma-4-12B. No other model in the lane
+      # reaches head_dim 512, so these are the shapes most likely to hit a
+      # VMEM or tiling limit.
+      ("global_hd512_gqa", 512, 2, None),
+      ("global_hd512_mqa", 512, 1, None),
+      # Sliding layers: head_dim 256 under a window shorter than the sequence.
+      ("sliding_hd256_window", 256, 4, 256),
+  )
+  def test_gemma4_shapes(self, head_dim, h_kv, window):
+    device = self.accelerator_device
+    b, s, h = 1, 1024, 8
+    q, k, v = self._qkv(b, s, h, h_kv, head_dim, device, seed=71)
+    segment_ids = torch.zeros(b, s, dtype=torch.int32)
+    segment_ids[:, 640:] = 1
+    allowed = (segment_ids[:, :, None] == segment_ids[:, None, :]) & torch.tril(
+        torch.ones(s, s, dtype=torch.bool))[None]
+    if window is not None:
+      i = torch.arange(s)
+      allowed &= (i[:, None] - i[None, :]) <= window
+    mask = torch.zeros(b, 1, s, s, dtype=torch.float32)
+    mask.masked_fill_(~allowed[:, None], float("-inf"))
+    scale = 1.0  # Gemma-4 attention runs with scaling=1.0 (QK-norm upstream)
+
+    def reference(q_, k_, v_):
+      k_e, v_e = self._expand_kv(k_, v_, h)
+      with attention.sdpa_kernel([attention.SDPBackend.MATH]):
+        out = F.scaled_dot_product_attention(
+            q_.transpose(1, 2), k_e.transpose(1, 2), v_e.transpose(1, 2),
+            attn_mask=mask, scale=scale)
+      return out.transpose(1, 2)
+
+    # Inputs scaled down so scale=1.0 logits stay in a range bf16-free fp32
+    # comparisons can resolve (QK-norm keeps real Gemma activations O(1)).
+    q, k = q * 0.1, k * 0.1
+    q_ref, k_ref, v_ref = (t.cpu().clone().requires_grad_(True) for t in (q, k, v))
+    out_ref = reference(q_ref, k_ref, v_ref)
+    out_ref.sum().backward()
+
+    q_t, k_t, v_t = (t.clone().requires_grad_(True) for t in (q, k, v))
+    out = splash_bias_dropout.sbd_splash_attention(
+        q_t, k_t, v_t, segment_ids=segment_ids.to(device), is_causal=True,
+        scale=scale, local_window_size=window,
+    )
+    out.sum().backward()
+    torch.testing.assert_close(out.cpu(), out_ref.cpu(), rtol=5e-2, atol=5e-2)
+    for name, got, want in (("dq", q_t.grad, q_ref.grad), ("dk", k_t.grad, k_ref.grad),
+                            ("dv", v_t.grad, v_ref.grad)):
+      torch.testing.assert_close(got.cpu(), want.cpu(), rtol=8e-2, atol=8e-2, msg=name)
+
   # -------- layouts --------
 
   @parameterized.named_parameters(
