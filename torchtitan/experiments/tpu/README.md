@@ -578,8 +578,10 @@ gcluster job submit \
     --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
     --command '
         VMS=$(echo "$TPU_WORKER_HOSTNAMES" | awk -F, "{print NF}");
-        POD_DNS=${TPU_WORKER_HOSTNAMES%%,*}; POD=${POD_DNS%%.*};
-        JOB=${POD%-*}; SLICE=${JOB##*-};
+        POD_DNS=${TPU_WORKER_HOSTNAMES%%,*};
+        POD=${POD_DNS%%.*};
+        JOB=${POD%-*};
+        SLICE=${JOB##*-};
         torchrun \
         --nnodes=$(( MEGASCALE_NUM_SLICES * VMS )) \
         --nproc_per_node=4 \
@@ -613,13 +615,6 @@ Differences from the single-slice command:
   the per-slice task id handed to each slice's PJRT client is `RANK % per_slice_world_size`, so
   ranks that are not slice-major mis-number the devices. That is also why `--rdzv_backend=static`
   matters -- a dynamically-assigned rank carries no slice information.
-
-  Do **not** read the slice index out of the pod hostname. TPU workloads run with
-  `hostNetwork: true` (both Cluster Toolkit and XPK set it), so the container sees the *node's*
-  name -- every slice would come out as 0. `TPU_WORKER_HOSTNAMES` is a different thing: pod DNS
-  names, which do carry the index. If you launch from Python rather than a shell,
-  `cloud_distributed_utils.get_global_node_rank()` computes the whole value and returns `None`
-  rather than guessing when nothing in the environment carries a slice index.
 
 * If the mesh fails to build with a complaint about devices having no `slice_index`, or about
   duplicate PJRT device ids, the MegaScale client was not installed. torch_tpu's own message names
