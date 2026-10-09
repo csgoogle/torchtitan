@@ -138,11 +138,11 @@ class KernelArgumentsTest(parameterized.TestCase):
     # A stand-in query on "tpu" so the device check passes and the window
     # check is what decides.
     reason = attention._unsupported(
-        SimpleNamespace(shape=(1, 1, 256, 8), device=SimpleNamespace(type="tpu")),
+        _module(), SimpleNamespace(shape=(1, 1, 256, 8), device=SimpleNamespace(type="tpu")),
         SimpleNamespace(shape=(1, 1, 256, 8)), None, 0.0, False, 128)
     self.assertIn("bidirectional sliding window", reason)
     self.assertIsNone(attention._unsupported(
-        SimpleNamespace(shape=(1, 1, 256, 8), device=SimpleNamespace(type="tpu")),
+        _module(), SimpleNamespace(shape=(1, 1, 256, 8), device=SimpleNamespace(type="tpu")),
         SimpleNamespace(shape=(1, 1, 256, 8)), None, 0.0, True, 128))
 
   @parameterized.parameters((2048, 2048, 1024, 1024), (1536, 1536, 1024, 512),
