@@ -11,9 +11,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
-import functools
-import os
-
 import torch
 
 from torchtitan.components.data.dataset import TextSequence
@@ -33,27 +30,7 @@ TrainerBatch: TypeAlias = dict[str, Any]
 # out of pageable memory is synchronous whatever ``non_blocking`` says. There has
 # to be an accelerator to pin for -- allocating with ``pin_memory=True`` raises
 # without one -- so CPU-only runs fall back to ordinary pageable memory.
-# ``TORCHTITAN_PIN_HOST_MEMORY=0`` forces pageable batches even when an
-# accelerator is present. Needed when the accelerator's runtime exposes no host
-# memory allocator: multi-slice TPU runs use the MegaScale PJRT client, which
-# does not implement one, and the pinned allocation then aborts the process from
-# inside the PJRT C API ("HostMemoryAllocator not implemented for client") --
-# an absl FATAL, so it cannot be caught and retried in Python. The TPU
-# multi-slice setup in experiments/tpu/cloud_distributed_utils.py sets this
-# automatically; it is exposed as an env var so any runtime with the same gap
-# can opt out without a code change.
-@functools.cache
-def pin_host_memory() -> bool:
-  """Whether to allocate page-locked batches.
-
-  Read lazily, not at import: the TPU multi-slice setup decides this when the
-  worker initializes its distributed environment, which happens after this
-  module is imported. A module-level constant would latch the wrong value.
-  """
-  return (
-      torch.accelerator.is_available()
-      and os.environ.get("TORCHTITAN_PIN_HOST_MEMORY", "1") != "0"
-  )
+HAS_PIN_MEMORY = torch.accelerator.is_available()
 
 
 class Collator(Configurable, ABC):
@@ -90,12 +67,12 @@ class TextCollator(Collator):
             raise ValueError("text rows exceed the configured token batch")
 
         size = self._num_tokens_per_batch
-        input_ids = torch.zeros(size, dtype=torch.int64, pin_memory=pin_host_memory())
-        positions = torch.zeros(size, dtype=torch.int64, pin_memory=pin_host_memory())
+        input_ids = torch.zeros(size, dtype=torch.int64, pin_memory=HAS_PIN_MEMORY)
+        positions = torch.zeros(size, dtype=torch.int64, pin_memory=HAS_PIN_MEMORY)
         labels = torch.full(
-            (size,), IGNORE_INDEX, dtype=torch.int64, pin_memory=pin_host_memory()
+            (size,), IGNORE_INDEX, dtype=torch.int64, pin_memory=HAS_PIN_MEMORY
         )
-        padding_mask = torch.ones(size, dtype=torch.bool, pin_memory=pin_host_memory())
+        padding_mask = torch.ones(size, dtype=torch.bool, pin_memory=HAS_PIN_MEMORY)
 
         torch.cat(
             [torch.as_tensor(row.input_ids) for row in rows],

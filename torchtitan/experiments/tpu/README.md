@@ -530,114 +530,121 @@ For more information, see [`gcluster job cancel`](https://docs.cloud.google.com/
 
 ## Multi-slice model training on GKE
 
-A multi-slice job spans several TPU slices: each slice is its own ICI fabric, and
-MegaScale joins the slices over DCN, which is far slower than ICI. The layout that
-makes this pay off is HSDP -- shard inside a slice, replicate between slices -- so
-that only the much smaller replicated gradient crosses DCN.
+A multi-slice job spans several TPU slices. Each slice is its own ICI fabric and MegaScale joins
+them over DCN, which is much slower than ICI, so the layout that pays off is HSDP: shard inside a
+slice, replicate between slices, and only the replicated gradient crosses DCN. TorchTitan arranges
+that for you.
 
-### What you set, and what is automatic
+Everything below is the single-slice flow from the previous section with `num_slices` raised and
+two environment variables added.
 
-Point the launcher at N slices and the rest follows:
+### Create a multi-slice cluster
 
-| Variable | Who sets it | Purpose |
-| :------- | :---------- | :------ |
-| `MEGASCALE_NUM_SLICES` | you, per pod | Number of slices the job spans. |
-| `MEGASCALE_SLICE_ID` | you, per slice | This slice's index, `0..N-1`. |
-| `MEGASCALE_COORDINATOR_ADDRESS` | you, per pod | Rendezvous address, same on every pod. Required: it is what makes libtpu create the MegaScale PJRT client. |
-| `TPU_WORKER_HOSTNAMES`, `TPU_*_BOUNDS` | GKE | Per-slice topology. |
-| `TORCH_TPU_SLICEBUILDER_ADDRESSES`, `TORCH_TPU_TOPOLOGY`, `CLOUD_TPU_TASK_ID` | `cloud_distributed_utils.maybe_init_distributed()` | Derived per slice. Do **not** set these by hand. |
-
-Two things happen automatically once `MEGASCALE_NUM_SLICES > 1`:
-
-* **`data_parallel_replicate_degree` defaults to the slice count**, so every FSDP
-  shard group stays inside one slice. An explicit value is respected but must be a
-  multiple of the slice count, otherwise a shard group would straddle DCN.
-* **The mesh is split across slices on the replicate axis.** With
-  `--parallelism.enable_tpu_topo_mesh`, `torch_tpu.topology_aware_mesh` reads the
-  slice count off the devices and splits the outermost non-trivial axis itself.
-  Override it with `--parallelism.dcn_mesh_shape` only if you need a different split.
-
-`torchrun` must span the **whole** job: `--nnodes` is slices x VMs-per-slice, and
-`WORLD_SIZE` covers every slice. Each slice still builds its own SliceBuilder mesh
-from its own hosts -- that part is per-slice by design.
-
-### Launching
-
-Give each slice its own `replicatedJob` in the JobSet, pinned so a slice's pods
-cannot be split across node pools, and set the three MegaScale variables per slice:
-
-```yaml
-apiVersion: jobset.x-k8s.io/v1alpha2
-kind: JobSet
-metadata:
-  name: my-multislice-job
-  # Keeps each replicatedJob's pods within one node pool. Without this, pods can
-  # scatter across physical slices and libtpu aborts with a slice error while the
-  # environment, rendezvous and logs all still look correct.
-  annotations: {alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool}
-  # Gang admission: a JobSet with no queue label is scheduled slice-by-slice, so one
-  # slice can take the last free chips and deadlock while the other never starts.
-  labels: {kueue.x-k8s.io/queue-name: multislice-queue}
-spec:
-  replicatedJobs:
-  - name: slice-0      # one replicatedJob PER SLICE, each with replicas: 1
-    replicas: 1
-    template:
-      spec:
-        parallelism: 8
-        completions: 8
-        template:
-          spec:
-            nodeSelector:
-              # Topology only -- do NOT also pin gke-nodepool here, or Kueue's
-              # ResourceFlavors (which declare accelerator + topology) cannot match.
-              cloud.google.com/gke-tpu-accelerator: tpu7x
-              cloud.google.com/gke-tpu-topology: 2x4x4
-            containers:
-            - name: tpu-container
-              env:
-              - {name: MEGASCALE_NUM_SLICES, value: "2"}
-              - {name: MEGASCALE_SLICE_ID, value: "0"}      # "1" in slice-1
-              - {name: MEGASCALE_COORDINATOR_ADDRESS, value: "my-multislice-job-slice-0-0-0.my-multislice-job:8080"}
-```
-
-Then launch with a `torchrun` that spans every slice:
+The same blueprint provisions several slices -- pass the slice count instead of `num_slices=1`:
 
 ```bash
-# 2 slices x 8 VMs x 8 processes = 128 ranks. NODE_RANK must be global:
-#   NODE_RANK = MEGASCALE_SLICE_ID * VMS_PER_SLICE + JOB_COMPLETION_INDEX
-python3 -m torch.distributed.run \
-  --nnodes=16 --node_rank="${NODE_RANK}" --nproc_per_node=8 \
-  --master_addr="${MEGASCALE_COORDINATOR_ADDRESS%:*}" --master_port=29501 \
-  -m torchtitan.experiments.tpu.train \
-    --module=torchtitan.experiments.tpu.muse_glimmer \
-    --config=muse_glimmer_30b_full_logits \
-    --parallelism.enable_tpu_topo_mesh \
-    --parallelism.enable_min_cost_redistribute
+gcluster deploy examples/gke-tpu-v6e/gke-tpu-v6e.yaml \
+    --vars project_id=${PROJECT_ID},deployment_name=${CLUSTER_NAME} \
+    --vars region=${REGION},zone=${ZONE} \
+    --vars machine_type=${COMPUTE_TYPE},tpu_topology=${TOPOLOGY},num_slices=2 \
+    --vars authorized_cidr=${AUTHORIZED_CIDR},enable_gcsfuse_csi=true
+
 ```
 
-`--parallelism.enable_min_cost_redistribute` matters on multi-slice: the default
-greedy DTensor planner all-reduces the **full** gradient on the replicate axis --
-the axis that crosses DCN -- before the reduce-scatter. The min-cost planner
-reduce-scatters first, shrinking the DCN payload by the shard degree.
+This creates one node pool per slice. The blueprint installs Kueue and JobSet, which matters here:
+a multi-slice workload must be admitted all-or-nothing, or one slice can take the last free chips
+and sit holding them while the other never starts.
 
-A pod's hostname is `<jobset>-<replicatedJob>-<jobIndex>-<podIndex>`, and
-`jobIndex` is `0` because each slice is a `replicatedJob` with `replicas: 1`.
-Deriving that last component from `MEGASCALE_SLICE_ID` happens to work for slice 0
-and addresses a non-existent host for every other slice, which hangs the job with
-no error.
+### Deploy the training workload
+
+Raise `--num-slices`, declare the slice count and a rendezvous address, and make `node_rank` global
+across slices. The following runs Muse Glimmer 30B on two `v6e-32` slices:
+
+```bash
+gcluster job submit \
+    --name $WORKLOAD_NAME \
+    --cluster $CLUSTER_NAME \
+    --location $REGION \
+    --project $PROJECT_ID \
+    --compute-type $COMPUTE_TYPE \
+    --topology $TOPOLOGY \
+    --num-slices 2 \
+    --image "us-central1-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/torchtitan-container:latest" \
+    --service-account workload-identity-k8s-sa \
+    --mount "$BUCKET_NAME;/data;rw" \
+    --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
+    --env MEGASCALE_NUM_SLICES=2 \
+    --env MEGASCALE_COORDINATOR_ADDRESS="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME:8080" \
+    --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
+    --command 'torchrun \
+        --nnodes=16 \
+        --nproc_per_node=4 \
+        --rdzv_backend=static \
+        --rdzv_endpoint=$WORKERS_0_HOSTNAME:29501 \
+        --node_rank=$(( MEGASCALE_SLICE_ID * 8 + TPU_WORKER_ID )) \
+        -m torchtitan.experiments.tpu.train \
+        --module=torchtitan.experiments.tpu.muse_glimmer \
+        --config=muse_glimmer_30b_full_logits \
+        --parallelism.enable_min_cost_redistribute \
+        --training.steps=30'
+
+```
+
+Three differences from the single-slice command:
+
+* `--num-slices 2`, and `--nnodes` is slices x VMs-per-slice (2 x 8 = 16). `WORLD_SIZE` spans the
+  whole job; each slice still builds its own SliceBuilder mesh from its own hosts.
+* `MEGASCALE_NUM_SLICES` and `MEGASCALE_COORDINATOR_ADDRESS`. The coordinator address is what makes
+  libtpu create the MegaScale PJRT client; without it each slice numbers its devices from zero and
+  the mesh cannot be built.
+* `node_rank` is **global**. Ranks must be handed out in slice order, which is what lets TorchTitan
+  derive the rest. `MEGASCALE_SLICE_ID` here is the per-slice index the platform provides; if your
+  job template does not set it, expose the JobSet label instead:
+
+```yaml
+- name: MEGASCALE_SLICE_ID
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+```
+
+* `--parallelism.enable_min_cost_redistribute` is worth setting on multi-slice. The default greedy
+  DTensor planner all-reduces the **full** gradient on the replicate axis -- the axis that crosses
+  DCN -- before the reduce-scatter; the min-cost planner reduce-scatters first, shrinking the DCN
+  payload by the shard degree.
+
+### What TorchTitan derives for you
+
+You set the slice count, a coordinator address and a global `node_rank`. Everything else follows:
+
+| Derived | How |
+| :------ | :-- |
+| Slice index | From the rank: the first `WORLD_SIZE / num_slices` ranks are slice 0, and so on. `MEGASCALE_SLICE_ID` is optional for TorchTitan, and when set it is cross-checked against the rank -- a mismatch raises instead of hanging. |
+| `data_parallel_replicate_degree` | Defaults to the slice count, so no FSDP shard group straddles DCN. An explicit value is kept when it is a multiple of the slice count and rejected otherwise. |
+| The inter-slice mesh split | `torch_tpu.topology_aware_mesh` reads the slice count off the devices and splits the outermost non-trivial axis, which is the replicate axis for an HSDP shape. |
+| `TORCH_TPU_SLICEBUILDER_ADDRESSES`, `TORCH_TPU_TOPOLOGY`, `CLOUD_TPU_TASK_ID` | Per slice, from the `TPU_*` variables GKE injects. Do **not** set these by hand. |
+| Pageable instead of page-locked batches | The MegaScale PJRT client implements no host memory allocator, so a pinned allocation would abort the process. Costs the async host-to-device copy. |
 
 ### Checking that it worked
 
-On a healthy multi-slice start, rank 0 logs the slice summary:
+On a healthy start, each slice logs a summary:
 
 ```
 Multi-slice TPU: 2 slices, this is slice 0. Per-slice world size 64 (global 128),
   within-slice task id 0, per-slice topology 2,4,4,2.
 Multi-slice: defaulting data_parallel_replicate_degree to the slice count (2) so
   every FSDP shard group stays inside one slice.
+Multi-slice: allocating pageable batches. The MegaScale PJRT client implements no
+  host memory allocator, ...
 ```
 
-If `topology_aware_mesh` reports *duplicate pjrt device ids across torch ranks*,
-the MegaScale PJRT client is not active: check `MEGASCALE_COORDINATOR_ADDRESS` is
-set and identical on every pod. Each slice otherwise numbers its devices from zero.
+Troubleshooting:
+
+* *duplicate pjrt device ids across torch ranks* -- the MegaScale PJRT client is not active. Check
+  that `MEGASCALE_COORDINATOR_ADDRESS` is set and identical on every pod.
+* *`MEGASCALE_SLICE_ID` disagrees with the slice implied by RANK* -- the launcher is computing slice
+  ids and node ranks inconsistently. `node_rank` must be
+  `slice_id * vms_per_slice + worker_id`.
+* A hang with no error during startup usually means a worker is addressing a host that does not
+  exist. Pod names are `<jobset>-<replicatedJob>-<jobIndex>-<podIndex>`.
+

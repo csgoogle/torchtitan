@@ -61,7 +61,28 @@ class SliceCountTest(unittest.TestCase):
 
   def test_slice_id_defaults_to_zero(self):
     self.assertEqual(cdu.get_slice_id({}), 0)
-    self.assertEqual(cdu.get_slice_id({"MEGASCALE_SLICE_ID": "3"}), 3)
+
+  def test_slice_id_is_derived_from_the_rank(self):
+    """Ranks are handed out in slice order, so MEGASCALE_SLICE_ID is optional."""
+    base = {"MEGASCALE_NUM_SLICES": "2", "WORLD_SIZE": "128"}
+    for rank, expected in ((0, 0), (63, 0), (64, 1), (127, 1)):
+      with self.subTest(rank=rank):
+        self.assertEqual(cdu.get_slice_id({**base, "RANK": str(rank)}), expected)
+
+  def test_slice_id_derivation_handles_four_slices(self):
+    self.assertEqual(
+        cdu.get_slice_id(
+            {"MEGASCALE_NUM_SLICES": "4", "WORLD_SIZE": "128", "RANK": "90"}
+        ),
+        2,
+    )
+
+  def test_explicit_slice_id_is_cross_checked_against_the_rank(self):
+    """A launcher computing slice ids and node ranks differently would hang."""
+    env = {"MEGASCALE_NUM_SLICES": "2", "WORLD_SIZE": "128", "RANK": "64"}
+    self.assertEqual(cdu.get_slice_id({**env, "MEGASCALE_SLICE_ID": "1"}), 1)
+    with self.assertRaisesRegex(ValueError, "disagrees with the slice implied"):
+      cdu.get_slice_id({**env, "MEGASCALE_SLICE_ID": "0"})
 
   def test_rejects_non_positive_and_garbage(self):
     for bad in ("0", "-1", "two", ""):
@@ -113,6 +134,12 @@ class GkeMultiSliceInitTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "MEGASCALE_COORDINATOR_ADDRESS"):
       cdu._maybe_init_distributed_on_gke(environ=env)
 
+  def test_slice_id_is_not_required_in_the_environment(self):
+    """It is derived from the rank; only the coordinator address is mandatory."""
+    env = _gke_env(num_slices=2, slice_id=1, vms=2)
+    del env["MEGASCALE_SLICE_ID"]
+    self.assertTrue(cdu._maybe_init_distributed_on_gke(environ=env))
+
   def test_rejects_world_size_not_divisible_by_slices(self):
     with self.assertRaisesRegex(ValueError, "not divisible"):
       cdu._maybe_init_distributed_on_gke(environ=_gke_env(num_slices=2, world=31))
@@ -156,35 +183,24 @@ class PinnedHostMemoryTest(unittest.TestCase):
 
   The MegaScale PJRT client implements no HostMemoryAllocator, and the pinned
   allocation aborts the process from inside the PJRT C API rather than raising,
-  so the decision has to be made before the first batch is built.
+  so the decision has to be made before the first batch is built. ``collators``
+  is left untouched: ``TextCollator`` reads ``HAS_PIN_MEMORY`` as a module
+  global on every call, so rebinding it is enough.
   """
 
-  def test_multi_slice_disables_pinning(self):
-    env = _gke_env(num_slices=2)
-    cdu._maybe_init_distributed_on_gke(environ=env)
-    self.assertEqual(env["TORCHTITAN_PIN_HOST_MEMORY"], "0")
-
-  def test_single_slice_leaves_pinning_alone(self):
-    env = _gke_env(num_slices=1, vms=2)
-    for k in (
-        "MEGASCALE_NUM_SLICES",
-        "MEGASCALE_SLICE_ID",
-        "MEGASCALE_COORDINATOR_ADDRESS",
-    ):
-      del env[k]
-    cdu._maybe_init_distributed_on_gke(environ=env)
-    self.assertNotIn("TORCHTITAN_PIN_HOST_MEMORY", env)
-
-  def test_collator_reads_the_flag_lazily(self):
-    """A module-level constant would latch the value before the setup runs."""
+  def test_disables_pinning_and_is_idempotent(self):
     from torchtitan.components.data import collators
+    from torchtitan.experiments.tpu import workarounds
 
-    collators.pin_host_memory.cache_clear()
+    original = collators.HAS_PIN_MEMORY
     try:
-      with mock.patch.dict("os.environ", {"TORCHTITAN_PIN_HOST_MEMORY": "0"}):
-        self.assertFalse(collators.pin_host_memory())
+      collators.HAS_PIN_MEMORY = True
+      workarounds.disable_pinned_host_memory()
+      self.assertFalse(collators.HAS_PIN_MEMORY)
+      workarounds.disable_pinned_host_memory()  # no-op the second time
+      self.assertFalse(collators.HAS_PIN_MEMORY)
     finally:
-      collators.pin_host_memory.cache_clear()
+      collators.HAS_PIN_MEMORY = original
 
 
 if __name__ == "__main__":

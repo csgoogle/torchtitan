@@ -72,10 +72,51 @@ def get_num_slices(environ: dict[str, str] | None = None) -> int:
 
 
 def get_slice_id(environ: dict[str, str] | None = None) -> int:
-  """Returns this process's slice index, 0 on a single-slice job."""
+  """Returns this process's slice index, 0 on a single-slice job.
+
+  Derived from the rank when it is not set explicitly. Global ranks are handed
+  out in slice order -- a worker's node rank is
+  ``slice_id * vms_per_slice + job_completion_index`` -- so the first
+  ``WORLD_SIZE / num_slices`` ranks belong to slice 0, the next to slice 1, and
+  so on. That makes ``MEGASCALE_SLICE_ID`` optional in the launcher: the
+  slice count and a rendezvous address are enough.
+
+  When the variable *is* set, it is cross-checked against the rank and a
+  mismatch raises. That catches a launcher computing slice ids one way and
+  node ranks another, which otherwise shows up as a silent rendezvous hang.
+
+  Args:
+    environ: Environment to read. Defaults to ``os.environ``.
+
+  Returns:
+    The slice index.
+
+  Raises:
+    ValueError: If an explicit ``MEGASCALE_SLICE_ID`` disagrees with the rank.
+  """
   if environ is None:
     environ = os.environ
-  return int(environ.get("MEGASCALE_SLICE_ID", "0"))
+
+  num_slices = get_num_slices(environ)
+  derived = None
+  if num_slices > 1 and "RANK" in environ and "WORLD_SIZE" in environ:
+    world_size = int(environ["WORLD_SIZE"])
+    if world_size % num_slices == 0:
+      derived = int(environ["RANK"]) // (world_size // num_slices)
+
+  if "MEGASCALE_SLICE_ID" not in environ:
+    return derived if derived is not None else 0
+
+  declared = int(environ["MEGASCALE_SLICE_ID"])
+  if derived is not None and declared != derived:
+    raise ValueError(
+        f"MEGASCALE_SLICE_ID={declared} disagrees with the slice implied by"
+        f" RANK={environ['RANK']} of WORLD_SIZE={environ['WORLD_SIZE']} across"
+        f" {num_slices} slices, which is {derived}. Global ranks must be handed"
+        " out in slice order: node_rank = slice_id * vms_per_slice +"
+        " job_completion_index."
+    )
+  return declared
 
 
 def is_multi_slice(environ: dict[str, str] | None = None) -> bool:
@@ -202,27 +243,17 @@ def _maybe_init_distributed_on_gke(
     # globally unique id; without it every slice numbers its devices from zero
     # and torch_tpu's topology_aware_mesh rejects the job with "duplicate pjrt
     # device ids across torch ranks".
+    # MEGASCALE_SLICE_ID is optional -- get_slice_id() derives it from the rank
+    # -- but the coordinator address is what makes libtpu create the MegaScale
+    # PJRT client, so it cannot be inferred.
     missing = [
-        v
-        for v in ("MEGASCALE_COORDINATOR_ADDRESS", "MEGASCALE_SLICE_ID")
-        if v not in environ
+        v for v in ("MEGASCALE_COORDINATOR_ADDRESS",) if v not in environ
     ]
     if missing:
       raise ValueError(
           f"MEGASCALE_NUM_SLICES={num_slices} requires {missing} to be set so "
           "libtpu creates the MegaScale PJRT client. Without it each slice "
           "numbers its devices from zero and the mesh cannot be built."
-      )
-    # The MegaScale PJRT client exposes no HostMemoryAllocator, so any pinned
-    # host allocation aborts the process from inside the PJRT C API. Opt the
-    # data path out of page-locked batches before the first one is built.
-    environ.setdefault("TORCHTITAN_PIN_HOST_MEMORY", "0")
-    if environ["TORCHTITAN_PIN_HOST_MEMORY"] != "0":
-      logger.warning(
-          "TORCHTITAN_PIN_HOST_MEMORY=%s was set explicitly on a multi-slice"
-          " job; pinned host allocations abort under the MegaScale PJRT"
-          " client, which implements no host memory allocator.",
-          environ["TORCHTITAN_PIN_HOST_MEMORY"],
       )
     logger.info(
         "Multi-slice TPU: %d slices, this is slice %d. Per-slice world size"

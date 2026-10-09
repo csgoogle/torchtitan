@@ -129,17 +129,6 @@ class ParallelismConfig:
     Whether to use the topology-aware mesh for TPU devices.
     """
 
-    dcn_mesh_shape: tuple[int, ...] | None = None
-    """
-    Multi-slice only: which logical mesh axes are split across slices, as a
-    shape with the same rank as the world mesh whose product is the slice
-    count. Leave as None -- the default -- to let torch_tpu infer the split
-    from the observed slice count, which picks the outermost non-trivial axis
-    (the replicate axis for an HSDP shape) so that no shard group straddles
-    DCN. Set it only to override that choice deliberately; requires
-    `enable_tpu_topo_mesh`.
-    """
-
     enable_min_cost_redistribute: bool = False
     """
     Whether to use DTensor's min-cost (graph-based, Dijkstra) redistribution
