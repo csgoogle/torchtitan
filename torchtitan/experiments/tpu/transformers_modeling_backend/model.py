@@ -952,7 +952,7 @@ def as_tpu_model_config(
 
 
 def substitute_tpu_experts(model: nn.Module) -> None:
-  """Swap the TPU grouped-expert implementation into each probed MoE config.
+  """Swap the TPU grouped experts and token dispatcher into each probed MoE config.
 
   ``moe_replacement`` works in two phases: at construction it probes every HF
   MoE block into a Titan MoE config stored on the layer as
@@ -963,27 +963,36 @@ def substitute_tpu_experts(model: nn.Module) -> None:
   shared parallelize. Expert parallelism is deliberately not involved:
   experts stay replicated and SimpleFSDP shards them, as the qwen3 TPU lane
   does.
+
+  The dispatcher matters more than the experts. The standard one combines with
+  ``scatter_add`` over a ``(rows, dim)``-expanded index, whose backward is an
+  element-wise ``gather`` of rows x dim values; XLA runs that on TPU at a few
+  percent of HBM bandwidth (Qwen3-30B-A3B on v6e-32: 9.2 ms per call, 83% of
+  the step). The TPU dispatcher's VJPs gather whole rows (``index_select``),
+  as the native qwen3 and gemma4 MoE recipes already use.
   """
   from torchtitan.tools import utils  # pylint: disable=g-import-not-at-top
 
   if utils.device_type != "tpu":
     return
   from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
+  from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
 
   converter = TpuGroupedExpertsConverter(TpuGroupedExpertsConverter.Config())
+  dispatcher = TpuTokenDispatcherConverter(TpuTokenDispatcherConverter.Config())
   use_pallas = bool(getattr(model, "_use_pallas_grouped_mm", False))
   n = 0
   for layer in model.layers.values():
     cfg = getattr(layer, "_native_moe_config", None)
     if cfg is not None:
-      cfg = converter.convert(cfg)
+      cfg = dispatcher.convert(converter.convert(cfg))
       if use_pallas:
         _use_pallas_grouped_mm(cfg)
       layer._native_moe_config = cfg
       n += 1
   if n:
     logger.info(
-        "Substituted the TPU grouped-expert implementation in %d MoE layer(s)%s.",
+        "Substituted the TPU grouped experts and token dispatcher in %d MoE layer(s)%s.",
         n, " (use_pallas_grouped_mm)" if use_pallas else "",
     )
 
