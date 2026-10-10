@@ -15,6 +15,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.nn import init
 from torch.nn.attention.flex_attention import and_masks
 from transformers import AutoConfig
@@ -633,6 +634,10 @@ class HFTransformerModel(BaseModel):
 
             attention_op_flops = 0
             unsupported_layer_types = set()
+            # Attention-free models (Mamba) have no attention heads and so no
+            # attention term; their matmuls are counted in 6 * active_nparams.
+            if not getattr(self, "n_heads", None):
+                layer_types = []
             for layer_type in layer_types:
                 if layer_type in ("attention", "full_attention"):
                     sliding_window_size = None
@@ -941,14 +946,12 @@ class HFTransformerModel(BaseModel):
             layer_idx_classes = tuple(layer_idx_classes)
 
             if isinstance(module, layer_idx_classes):
-                if not hasattr(module, "layer_idx"):
-                    raise ValueError(
-                        f"Module {module} does not have a layer_idx attribute"
-                    )
+                # layer_idx only matters for depth_init. Some architectures'
+                # MLP classes (LFM2, Falcon-H1, GraniteMoeHybrid) do not carry
+                # it; they take the depth-free std.
+                layer_idx = getattr(module, "layer_idx", None)
 
-                layer_idx = module.layer_idx
-
-                if hasattr(config, "depth_init") and config.depth_init:
+                if getattr(config, "depth_init", False) and layer_idx is not None:
                     init_std = 0.02 / (2 * (layer_idx + 1)) ** 0.5
                 else:
                     init_std = 0.02 / (2 * config.num_hidden_layers) ** 0.5
@@ -1399,7 +1402,28 @@ class HFTransformerModel(BaseModel):
             else:
                 logger.info("Skipping nn.Identity module during weight initialization.")
 
-        self.model.apply(selective_init)
+        # Some HF inits build a value as a plain tensor and copy it into the
+        # parameter (Mamba / Gated DeltaNet A_log in Qwen3-Next, Qwen3.5,
+        # Nemotron-H, Jamba, Zamba2). Under FSDP / TP the parameter is a
+        # DTensor, so give the value the parameter's placements first.
+        from transformers import initialization as hf_init
+
+        hf_copy = hf_init.copy_
+
+        def copy_into_dtensor(tensor, other):
+            if isinstance(tensor, DTensor) and not isinstance(other, DTensor):
+                other = distribute_tensor(
+                    other.to(tensor.to_local().device),
+                    tensor.device_mesh,
+                    tensor.placements,
+                )
+            return hf_copy(tensor, other)
+
+        hf_init.copy_ = copy_into_dtensor
+        try:
+            self.model.apply(selective_init)
+        finally:
+            hf_init.copy_ = hf_copy
 
         # HF rotary embeddings compute their `inv_freq` buffer in __init__, not in
         # `_init_weights`. With meta-device init + `to_empty()`, that buffer is
