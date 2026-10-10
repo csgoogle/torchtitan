@@ -105,65 +105,6 @@ def create_sharded_weights(model, mesh, sharding_map):
   return res
 
 
-class redactedScannedModule(torch.nn.Module):
-  """A PyTorch module wrapper that executes a sequence of identical layers using jax.lax.scan.
-
-  This class takes a list of structurally identical PyTorch modules (e.g., Transformer layers),
-  stacks their weights into single tensors with an added leading dimension, and executes them
-  iteratively during the forward pass using jax.lax.scan through torchax interop.
-  This significantly reduces XLA compilation time and HLO size for large models.
-
-  Args:
-    module_list: A list of structurally identical PyTorch modules to be scanned.
-    checkpoint_policy: An optional jax.checkpoint_policies policy to control activation
-      rematerialization during the backward pass (e.g., nothing_saveable).
-  """
-
-  def __init__(self, module_list, checkpoint_policy=None):
-    super().__init__()
-    assert module_list
-    self.c = torchax.train.Container()
-    self.c.one_mod = module_list[0]  # pyrefly: ignore[missing-attribute]
-    self.checkpoint_policy = checkpoint_policy
-    weights = self._stack_layer_weights(module_list)
-    self.layer_weights_keys = list(self.c.one_mod.state_dict().keys())  # pyrefly: ignore[missing-attribute]
-    self.params = torch.nn.ParameterDict(
-        {self._param_name_new(k): v for k, v in weights.items()}
-    )
-
-  def _stack_layer_weights(self, module_list):
-
-    temp = collections.defaultdict(list)
-    for m in module_list:
-      for k, v in m.state_dict().items():
-        temp[k].append(v)
-    return {k: torch.stack(v) for k, v in temp.items()}
-
-  def _param_name_new(self, old):
-    return '___'.join(old.split('.'))
-
-  def forward(self, input_tensor, **kwargs):
-    weights = {
-        k: self.params[self._param_name_new(k)] for k in self.layer_weights_keys
-    }
-    scan = torchax.interop.torch_view(jax.lax.scan)
-
-    def eval_one_layer(args, weight):
-      (h,) = args
-      newh = torch.func.functional_call(self.c.one_mod, weight, (h,), kwargs)  # pyrefly: ignore[missing-attribute]
-      return (newh,), None
-
-    if self.checkpoint_policy is None:
-      _eval_one_layer = eval_one_layer
-    else:
-      _eval_one_layer = torchax.interop.gradient_checkpoint(
-          eval_one_layer,
-          kwargs={'policy': self.checkpoint_policy},
-      )
-    (result,), _ = scan(_eval_one_layer, (input_tensor,), weights)
-    return result
-
-
 class ConformerScannedModule(torch.nn.Module):
   """A PyTorch module wrapper that runs Conformer layers in a JAX loop (scan).
 
@@ -245,30 +186,6 @@ class ConformerScannedModule(torch.nn.Module):
         getattr(self, new_name).copy_(v)
 
     return result
-
-
-class SegmentWithScanWrapper(torch.nn.Module):
-  """A wrapper that combines a scanned segment of layers with an optional final layer.
-
-  This is useful when a sequence of layers cannot be fully scanned because the final
-  layer has a different structure or output shape. It smoothly executes the scanned
-  layers followed immediately by the unscanned final layer.
-
-  Args:
-    scanned_layers: A module (e.g., redactedScannedModule) representing the scanned layers.
-    last_layer: An optional PyTorch module to execute after the scanned layers.
-  """
-
-  def __init__(self, scanned_layers, last_layer=None):
-    super().__init__()
-    self.scanned = scanned_layers
-    self.last = last_layer
-
-  def forward(self, input_tensor, **kwargs):
-    out = self.scanned(input_tensor, **kwargs)
-    if self.last is not None:
-      out = self.last(out, **kwargs)
-    return out
 
 
 class ModelWithScan(torch.nn.Module):

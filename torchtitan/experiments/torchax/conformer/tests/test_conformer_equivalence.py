@@ -1,6 +1,6 @@
 """Equivalence test: JAX Conformer (Torchax) vs. PyTorch Conformer on TPU.
 
-Methodology & Strategy (mirrors ``jax/redacted/tests/test_redacted_equivalence.py``):
+Methodology & Strategy:
   1. **Golden Reference Baseline**: We instantiate a native PyTorch Conformer
      model on CPU eager mode, running in full float32. This serves as our
      mathematically exact mathematical benchmark.
@@ -23,7 +23,7 @@ Methodology & Strategy (mirrors ``jax/redacted/tests/test_redacted_equivalence.p
      and layer gradients are returned from both lanes and validated on CPU.
      Due to the physical TPU MXU's automatic downcasting of float32 matmuls to
      bfloat16 compute under the hood, a minor drift up to 5e-2 is expected and
-     tolerated (matching redacted test relaxed tolerances).
+     tolerated.
 """
 
 from absl import logging

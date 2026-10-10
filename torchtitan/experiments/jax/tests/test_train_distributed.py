@@ -23,24 +23,6 @@ class TestJaxDistributed(parameterized.TestCase):
           config="llama3_debugmodel",
           use_scan=False,
       ),
-      dict(
-          testcase_name="redacted_debug_scan",
-          module="torchtitan.experiments.jax.redacted",
-          config="redacted_debugmodel",
-          use_scan=True,
-      ),
-      dict(
-          testcase_name="redacted_debug_no_scan",
-          module="torchtitan.experiments.jax.redacted",
-          config="redacted_debugmodel",
-          use_scan=False,
-      ),
-      dict(
-          testcase_name="redacted_debug_no_scan",
-          module="torchtitan.experiments.jax.redacted",
-          config="redacted_debugmodel",
-          use_scan=False,
-      ),
   ])
   def test_train_jax(self, module, config, use_scan):
     scan_flag = (
@@ -48,14 +30,13 @@ class TestJaxDistributed(parameterized.TestCase):
         if use_scan
         else "--jax_config.no-use-scan"
     )
-    # redacted needs >=2 layers (one local + one global rope cycle); other
-    # models tolerate a single layer.
-    layer_override = 2 if "redacted" in module else 1
     args = [
-        "--module", module,
-        "--config", config,
+        "--module",
+        module,
+        "--config",
+        config,
         scan_flag,
-        f"--jax_config.model_layer_override={layer_override}",
+        "--jax_config.model_layer_override=1",
         "--dataloader.dataset_path=tests/assets/c4_test",
         "--hf_assets_path=tests/assets/tokenizer",
         "--training.max_context_length=128",

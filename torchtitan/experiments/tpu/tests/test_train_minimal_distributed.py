@@ -1,12 +1,10 @@
-"""Tests for the minimal distributed training setup (includes parity checks for generic minimal trainer and standard execution checks for custom trainers like redacted)."""
+"""Tests for the minimal distributed training setup (includes parity checks for generic minimal trainer)."""
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch.multiprocessing as mp
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_distributed_device_test
-
-
 
 
 class TrainMinimalDistributedTest(

@@ -42,65 +42,63 @@ def build_splash_attention_callable(
     attn_logits_soft_cap: float | None = None,
     local_window: int | None = None,
 ):
-    """Return a jitted, sharded splash-attention callable.
+  """Return a jitted, sharded splash-attention callable.
 
-    Signature of the returned callable:
-        attn_fn(query, key, value, segment_ids) -> jax.Array
-    where tensors are [batch, n_heads, seq, head_dim].
+  Signature of the returned callable:
+      attn_fn(query, key, value, segment_ids) -> jax.Array
+  where tensors are [batch, n_heads, seq, head_dim].
 
-    When ``local_window`` is None the mask is full causal. When it is an int
-    ``W``, the mask is causal-with-sliding-window: each query at position q can
-    attend to keys at positions [q-W+1, q]. Models like REDACTED PT MoE that mix
-    local + global attention need separate callables (one per mask) by calling
-    ``make_splash_attention_fn`` twice.
-    """
+  When ``local_window`` is None the mask is full causal. When it is an int
+  ``W``, the mask is causal-with-sliding-window: each query at position q can
+  attend to keys at positions [q-W+1, q]. Models that mix local + global
+  attention need separate callables (one per mask) by calling
+  ``make_splash_attention_fn`` twice.
+  """
 
-    def _wrap_flash_attention(query, key, value, segment_ids):
-        if segment_ids is not None:
-            segment_ids = splash_attention_kernel.SegmentIds(
-                segment_ids, segment_ids
-            )
-            assert query.shape[2] == segment_ids.q.shape[1], (
-                'Sharding along sequence dimension not allowed in tpu kernel attention'
-            )
-        block_sizes = _build_block_sizes(config, query.shape, key.shape)
-        if local_window is not None:
-            # Causal local-window: each q at position p attends to keys in
-            # [p - local_window + 1, p]. Splash's LocalMask uses the
-            # ``window_size = (left, right)`` convention with offset=0:
-            # ``left = local_window - 1`` past tokens included on the left,
-            # ``right = 0`` no future tokens. ``shape = (S, S)``.
-            mask = splash_attention_mask.LocalMask(
-                shape=(query.shape[2], query.shape[2]),
-                window_size=(local_window - 1, 0),
-                offset=0,
-            )
-        else:
-            mask = splash_attention_mask.CausalMask(
-                shape=(query.shape[2], query.shape[2])
-            )
-        multi_head_mask = splash_attention_mask.MultiHeadMask(
-            masks=(mask,) * query.shape[1]
-        )
-        kernel = splash_attention_kernel.make_splash_mha(
-            mask=multi_head_mask,
-            head_shards=1,
-            q_seq_shards=1,
-            block_sizes=block_sizes,
-            attn_logits_soft_cap=attn_logits_soft_cap,
-        )
-        return jax.vmap(kernel)(query, key, value, segment_ids=segment_ids)
+  def _wrap_flash_attention(query, key, value, segment_ids):
+    if segment_ids is not None:
+      segment_ids = splash_attention_kernel.SegmentIds(segment_ids, segment_ids)
+      assert (
+          query.shape[2] == segment_ids.q.shape[1]
+      ), 'Sharding along sequence dimension not allowed in tpu kernel attention'
+    block_sizes = _build_block_sizes(config, query.shape, key.shape)
+    if local_window is not None:
+      # Causal local-window: each q at position p attends to keys in
+      # [p - local_window + 1, p]. Splash's LocalMask uses the
+      # ``window_size = (left, right)`` convention with offset=0:
+      # ``left = local_window - 1`` past tokens included on the left,
+      # ``right = 0`` no future tokens. ``shape = (S, S)``.
+      mask = splash_attention_mask.LocalMask(
+          shape=(query.shape[2], query.shape[2]),
+          window_size=(local_window - 1, 0),
+          offset=0,
+      )
+    else:
+      mask = splash_attention_mask.CausalMask(
+          shape=(query.shape[2], query.shape[2])
+      )
+    multi_head_mask = splash_attention_mask.MultiHeadMask(
+        masks=(mask,) * query.shape[1]
+    )
+    kernel = splash_attention_kernel.make_splash_mha(
+        mask=multi_head_mask,
+        head_shards=1,
+        q_seq_shards=1,
+        block_sizes=block_sizes,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+    )
+    return jax.vmap(kernel)(query, key, value, segment_ids=segment_ids)
 
-    fn = _wrap_flash_attention
-    if apply_shard_map:
-        fn = jax.experimental.shard_map.shard_map(
-            fn,
-            mesh=mesh,
-            in_specs=(q_sharding, q_sharding, q_sharding, None),
-            out_specs=q_sharding,
-            check_rep=False,
-        )
-    return jax.jit(fn)
+  fn = _wrap_flash_attention
+  if apply_shard_map:
+    fn = jax.experimental.shard_map.shard_map(
+        fn,
+        mesh=mesh,
+        in_specs=(q_sharding, q_sharding, q_sharding, None),
+        out_specs=q_sharding,
+        check_rep=False,
+    )
+  return jax.jit(fn)
 
 
 def make_splash_attention_fn(

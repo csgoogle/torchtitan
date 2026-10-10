@@ -14,7 +14,7 @@ models) with a torchax execution backend. Key features:
 - **Splash attention**: Pallas-based fused attention kernel for TPU.
 - **FSDP + TP**: Parameters sharded via JAX named mesh (`fsdp`, `tp` axes).
 - **CPU offload**: Optionally offload decoder layer inputs to host memory.
-- **Models**: Llama3, Qwen3, DeepSeek-V3, redacted (full fine-tune and LoRA).
+- **Models**: Llama3, Qwen3, DeepSeek-V3, Conformer.
 
 ## File layout
 
@@ -32,8 +32,7 @@ torchax/
 ├── jit_utils.py            # JIT helpers
 ├── llama3/                 # Llama3 model + sharding maps
 ├── qwen3/                  # Qwen3 model + sharding maps
-├── deepseek_v3/            # DeepSeek-V3 model + sharding maps
-└── redacted/                  # redacted model (wraps tpu/redacted) + sharding maps
+└── deepseek_v3/            # DeepSeek-V3 model + sharding maps
 ```
 
 ## Quick start

@@ -101,20 +101,9 @@ class BaseModel(Module):
                 failures.append((fqn, type(mod).__name__))
         if failures:
             details = ", ".join(f"'{fqn}' ({cls})" for fqn, cls in failures)
-            # Upstream models require Module protocol, but internal experimental models
-            # (e.g., redacted, redacted) use native nn.Module submodules. Log a warning instead of failing.
-            if type(self).__name__ in ("redactedWrapper", "redactedWrapper"):
-                from torchtitan.tools.logging import logger
-
-                logger.warning(
-                    "The following modules do not satisfy the Module protocol:"
-                    f" {details}"
-                )
-            else:
-                raise RuntimeError(
-                    "The following modules do not satisfy the Module protocol:"
-                    f" {details}"
-                )
+            raise RuntimeError(
+                f"The following modules do not satisfy the Module protocol: {details}"
+            )
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):

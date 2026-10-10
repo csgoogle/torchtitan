@@ -19,48 +19,6 @@ class TrainDistributedTest(
   """Tests the distributed training setup."""
 
   @parameterized.named_parameters([
-      # redacted_tpu
-      dict(
-          testcase_name="redacted_fsdp",
-          module="torchtitan.experiments.tpu.redacted",
-          config="redacted_debugmodel",
-          data_parallel_shard_degree=-1,
-          tensor_parallel_degree=1,
-          skip_devices=[
-              # b/510378879 - Hanging on Cloud VM.
-              device_type.AcceleratorDeviceType.TPU,
-          ],
-      ),
-      # redacted
-      dict(
-          testcase_name="redacted_ddp",
-          module="torchtitan.experiments.tpu.redacted",
-          config="redacted_debugmodel",
-          data_parallel_shard_degree=1,
-          tensor_parallel_degree=1,
-          data_parallel_replicate_degree=-1,
-      ),
-      dict(
-          testcase_name="redacted_fsdp",
-          module="torchtitan.experiments.tpu.redacted",
-          config="redacted_debugmodel",
-          data_parallel_shard_degree=-1,
-          tensor_parallel_degree=1,
-      ),
-      dict(
-          testcase_name="redacted_fsdp_compile",
-          module="torchtitan.experiments.tpu.redacted",
-          config="redacted_debugmodel",
-          data_parallel_shard_degree=-1,
-          tensor_parallel_degree=1,
-          enable_compile=True,
-          skip_devices=[
-              # b/501466433 - Bug with torch.compile
-              device_type.AcceleratorDeviceType.TPU,
-              device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.CUDA,
-          ],
-      ),
       # deepseek_v3
       dict(
           testcase_name="deepseek_v3_tp",

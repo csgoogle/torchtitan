@@ -22,24 +22,6 @@ class TrainTorchaxTest(parameterized.TestCase):
 
   @parameterized.named_parameters([
       dict(
-          testcase_name="redacted_scan",
-          module="torchtitan.experiments.torchax.redacted",
-          config="redacted_debugmodel",
-          use_scan=True,
-      ),
-      dict(
-          testcase_name="redacted_no_scan",
-          module="torchtitan.experiments.torchax.redacted",
-          config="redacted_debugmodel",
-          use_scan=False,
-      ),
-      dict(
-          testcase_name="redacted_no_scan",
-          module="torchtitan.experiments.torchax.redacted",
-          config="redacted_debugmodel",
-          use_scan=False,
-      ),
-      dict(
           testcase_name="conformer",
           module="torchtitan.experiments.torchax.conformer",
           config="conformer_debugmodel",

@@ -15,8 +15,8 @@ class TorchaxConfig(JaxConfig):
   offload_keys: str | None = 'decoder_layer_input'
   # For LoRA flavors: replicate the *base model* weights on every chip
   # instead of sharding them on the fsdp axis. This removes the per-layer
-  # all-gather (~5% of step on redacted 3B on v6e-4) at the cost of holding
-  # the full base model in each chip's HBM (6 GB for redacted 3B at bf16).
+  # all-gather at the cost of holding the full base model in each chip's
+  # HBM.
   # LoRA adapters are already replicated (see sharding_map_scan_lora);
   # this flag extends the "DDP" treatment to the base model as well.
   use_ddp_sharding: bool = False

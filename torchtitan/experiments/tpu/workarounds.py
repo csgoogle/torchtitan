@@ -86,23 +86,18 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     # Transpose back to (B, S, H, D) so the rest of the TorchTitan model receives its expected format
     return out.transpose(1, 2)
 
-  def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
-    """Replaces [redacted]'s native SDPA with splash_sdpa.
+  def _splash_sdpa_native(self, *, query, key, value, scale=None, **kwargs):
+    """Replaces a module's ``_sdpa_native_torch`` method with splash_sdpa.
 
-    This function replaces ScaledDotProductAttention._sdpa_native_torch with
-    `splash_sdpa`. Like TorchTitan's wrapper, [redacted] operates on inputs of shape
-    (B, S, H, D) and requires transposing to (B, H, S, D) for splash_sdpa.
-    However, [redacted] requires special handling because it handles GQA by tiling
-    k/v heads before invoking SDPA. This wrapper aligns with [redacted]'s GQA
-    mechanics, transposes inputs for splash_sdpa, and transposes the output
-    back to (B, S, H, D).
+    For attention modules that compute SDPA through an overridable
+    ``_sdpa_native_torch(query=, key=, value=, scale=)`` method on (B, S, H, D)
+    inputs, and tile k/v heads for GQA (``_maybe_tile_qkv_for_gqa``) before
+    invoking it. This wrapper applies the same GQA tiling, transposes inputs to
+    (B, H, S, D) for splash_sdpa, and transposes the output back.
 
-    For mixed local/global attention models (e.g. REDACTED PT MoE with
-    ``attention_layer_pattern=[local_rope, local_rope, local_rope, global_nope]``
-    and ``local_attention_window_size=N``), reads
+    For mixed local/global attention models, reads
     ``self.sliding_window_size`` per-layer:
-      * None  → full causal (CausalMask) — same as before, identical to the
-                old redacted path where every layer is global causal.
+      * None  → full causal (CausalMask).
       * int N → causal sliding-window (LocalMask with window_size=(N, 0)).
                 The splash kernel's per-window cache means each unique window
                 size compiles its own kernel; mixing windowed and non-windowed
@@ -121,10 +116,9 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     key = key.contiguous()
     value = value.contiguous()
 
-    # Per-layer mask selection. [redacted]'s ScaledDotProductAttention sets
-    # `sliding_window_size` from the layer config (None for global, int for
-    # local). Models without local layers don't set the attribute at all;
-    # default to None ⇒ same behavior as before this change.
+    # Per-layer mask selection: `sliding_window_size` is None for global and
+    # an int for local layers. Models without local layers don't set the
+    # attribute at all; default to None (full causal).
     local_window_size = getattr(self, "sliding_window_size", None)
 
     # splash_sdpa expects enable_gqa=False as heads are already tiled.
@@ -138,13 +132,12 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
         enable_gqa=False,
         **sa_kwargs,
     )
-    # Transpose back to match [redacted]'s expected layout
+    # Transpose back to the caller's (B, S, H, D) layout
     return out.transpose(-3, -2).contiguous()
 
-  # Patch all attention modules in the model. For [redacted] modules, also note
-  # whether each layer has a local sliding-window — useful for mixed
-  # local/global models (REDACTED PT MoE) so the kernel cache shows the expected
-  # mix of CausalMask and LocalMask compiled ops.
+  # Patch all attention modules in the model, noting whether each layer has a
+  # local sliding-window — useful for mixed local/global models so the kernel
+  # cache shows the expected mix of CausalMask and LocalMask compiled ops.
   from torchtitan.experiments.tpu.kernels.splash_attention import SplashAttention  # pylint: disable=g-import-not-at-top
 
   replacements = []
@@ -158,15 +151,15 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
     for child_name, child_module in parent_module.named_children():
       cls_name = type(child_module).__name__
 
-      # NOTE: matches both [redacted]'s ScaledDotProductAttention and
-      # torchtitan's ScaledDotProductInnerAttention (renamed upstream
-      # in d771abb0); the latter does not contain the old name as a
-      # substring, so the old check silently matched nothing.
+      # NOTE: matches both ScaledDotProductAttention and torchtitan's
+      # ScaledDotProductInnerAttention (renamed upstream in d771abb0); the
+      # latter does not contain the old name as a substring, so the old check
+      # silently matched nothing.
       if "ScaledDotProduct" in cls_name:
-        if "[redacted]" in type(child_module).__module__:
-          # [redacted] patching (in-place method replacement)
+        if hasattr(child_module, "_sdpa_native_torch"):
+          # In-place method replacement
           child_module._sdpa_native_torch = types.MethodType(
-              _splash_sdpa_redacted, child_module
+              _splash_sdpa_native, child_module
           )
           _patched += 1
           if getattr(child_module, "sliding_window_size", None) is not None:
@@ -176,8 +169,7 @@ def use_splash_attention_patch(model: nn.Module, sa_config: Any = None) -> None:
         else:
           replacements.append((parent_module, child_name, child_module))
       elif "FlexAttention" in cls_name:
-        if "[redacted]" not in type(child_module).__module__:
-          replacements.append((parent_module, child_name, child_module))
+        replacements.append((parent_module, child_name, child_module))
 
   # Apply replacements
   for parent_module, child_name, child_module in replacements:
@@ -257,7 +249,7 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
       v_layout=_sa("v_layout"),
   )
   # Guard the bug above, without rejecting a caller that deliberately passes an empty
-  # config to mean "just use the kernel's defaults" (redacted's parity test does exactly
+  # config to mean "just use the kernel's defaults" (some parity tests do exactly
   # that). The two are distinguishable: a real SplashAttentionKernelConfig exposes
   # sa_-prefixed attributes, so if those exist and still nothing resolved, the reader
   # is broken; if none exist, the caller genuinely wants defaults - log it so the
@@ -327,8 +319,8 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     k = unflatten_tensor(k, expected_flat_ndim=3)
     v = unflatten_tensor(v, expected_flat_ndim=3)
     for kw, val in extra_args.items():
-        if isinstance(val, torch.Tensor) and kw in ("positions", "segment_ids"):
-            extra_args[kw] = unflatten_tensor(val, expected_flat_ndim=1)
+      if isinstance(val, torch.Tensor) and kw in ("positions", "segment_ids"):
+        extra_args[kw] = unflatten_tensor(val, expected_flat_ndim=1)
 
     if extra_args.get("attention_masks") is not None:
       raise ValueError(
@@ -374,10 +366,10 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
       return out
     return flatten_tensor(out, original_flat_ndim=3)
 
-  def _splash_sdpa_redacted(self, *, query, key, value, scale=None, **kwargs):
+  def _splash_sdpa_native(self, *, query, key, value, scale=None, **kwargs):
     # K/V stay at num_kv_heads: the kernel groups q head h onto kv head
-    # h // (num_heads // num_kv_heads), the same mapping [redacted]'s GQA tiling
-    # builds, without materializing num_heads copies of K/V.
+    # h // (num_heads // num_kv_heads), the same mapping as GQA tiling,
+    # without materializing num_heads copies of K/V.
     local_window_size = getattr(self, "sliding_window_size", None)
 
     query = query.contiguous()
@@ -398,21 +390,23 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
     return out
 
   _patched = 0
-  _patched_non_redacted = 0
+  _patched_forward = 0
   _windowed = 0
   _causal = 0
   for _, module in model.named_modules():
     cls_name = type(module).__name__
-    # NOTE: matches both [redacted]'s ScaledDotProductAttention and
-    # torchtitan's ScaledDotProductInnerAttention (renamed upstream
-    # in d771abb0); the latter does not contain the old name as a
-    # substring, so the old check silently matched nothing.
+    # NOTE: matches both ScaledDotProductAttention and torchtitan's
+    # ScaledDotProductInnerAttention (renamed upstream in d771abb0); the
+    # latter does not contain the old name as a substring, so the old check
+    # silently matched nothing.
     if "ScaledDotProduct" in cls_name:
-      if "[redacted]" in type(module).__module__:
-        module._sdpa_native_torch = types.MethodType(_splash_sdpa_redacted, module)
+      if hasattr(module, "_sdpa_native_torch"):
+        module._sdpa_native_torch = types.MethodType(
+            _splash_sdpa_native, module
+        )
       else:
         module.forward = types.MethodType(_splash_forward, module)
-        _patched_non_redacted += 1
+        _patched_forward += 1
       _patched += 1
       if getattr(module, "sliding_window_size", None) is not None:
         _windowed += 1
@@ -432,9 +426,10 @@ def use_tokamax_splash_attention_patch(model: nn.Module, sa_config: Any) -> None
         _patched, _causal, _windowed,
     )
 
-  # Only non-[redacted] modules receive segment_ids, so only they are affected. [redacted]
-  # (e.g. redacted) runs with the field at its default and must not warn.
-  if _patched_non_redacted and sa_kwargs.get("use_document_aware_block_skipping"):
+  # Only modules patched via forward receive segment_ids, so only they are
+  # affected. `_sdpa_native_torch` modules run with the field at its default and
+  # must not warn.
+  if _patched_forward and sa_kwargs.get("use_document_aware_block_skipping"):
     logger.warning(
         "Tokamax splash: use_document_aware_block_skipping=True is not"
         " supported; packed documents are still masked exactly via segment_ids,"
@@ -524,7 +519,7 @@ def use_output_projection_patch(
     model.output = PallasLossLinear(model.output)
     logger.info("Patched model.output to return (x, weight) for Pallas loss")
   elif hasattr(model, "output_transform") and isinstance(model.output_transform, nn.Linear):
-    # redacted uses output_transform as output projection layer
+    # Some models name their output projection layer output_transform
     model.output_transform = PallasLossLinear(model.output_transform)
     logger.info(
         "Patched model.output_transform to return (x, weight) for Pallas loss"

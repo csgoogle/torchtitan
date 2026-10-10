@@ -3,17 +3,16 @@
 The matcher is used by both jax/ and torchax/ experiments. These tests
 exercise it against both style conventions:
   - jax: '/' separator, `*` in map keys (post-integer-replacement form)
-  - torchax: '.' separator, regex patterns (e.g. ``r'.*foo\\.weight'``)
+  - torchax: '.' separator
 """
 
 from absl.testing import absltest
 from absl.testing import parameterized
-
 from torchtitan.experiments.jax.distributed import _match_path
 from torchtitan.experiments.jax.distributed import _process_sharding_name
 from torchtitan.experiments.jax.llama3.sharding import sharding_map_original as jax_llama3_original
 from torchtitan.experiments.jax.llama3.sharding import sharding_map_scan as jax_llama3_scan
-from torchtitan.experiments.torchax.redacted.sharding import sharding_map_original as torchax_redacted_original
+from torchtitan.experiments.torchax.llama3.sharding import sharding_map_original as torchax_llama3_original
 
 
 class ProcessShardingNameTest(parameterized.TestCase):
@@ -150,24 +149,17 @@ class RealShardingMapTest(absltest.TestCase):
     )
     self.assertEqual(_match_path('freqs_cis', jax_llama3_scan), ())
 
-  def test_torchax_redacted(self):
+  def test_torchax_llama3(self):
     self.assertEqual(
-        _match_path(
-            'model.layers.0.attention.qkv_transform.wrapped.fused_linear.weight',
-            torchax_redacted_original,
-        ),
+        _match_path('layers.0.attention.wq.weight', torchax_llama3_original),
         ('tp', 'fsdp'),
     )
     self.assertEqual(
-        _match_path('model.embedding.weight', torchax_redacted_original),
+        _match_path('tok_embeddings.weight', torchax_llama3_original),
         ('fsdp', 'tp'),
     )
     self.assertEqual(
-        _match_path('model.output_transform.weight', torchax_redacted_original),
-        ('tp', 'fsdp'),
-    )
-    self.assertEqual(
-        _match_path('layer.norm.weight', torchax_redacted_original), ('fsdp',)
+        _match_path('norm.weight', torchax_llama3_original), ('fsdp',)
     )
 
 

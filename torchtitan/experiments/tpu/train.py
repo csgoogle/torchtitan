@@ -23,8 +23,6 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.tpu import gmain
 from torchtitan.experiments.tpu.grad_norm import CompiledGradNorm
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
-import torchtitan.experiments.tpu.redacted  # trigger model registration
-import torchtitan.experiments.tpu.redacted  # trigger model registration
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 from torchtitan.experiments.tpu.graph_trainer.config import (
@@ -311,7 +309,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
         gt_cfg.model_spec.parallelize_fn = _bld_then_parallelize
 
     splash_obj = cast(Any, getattr(train_config, "splash_attention_kernel", None))
-    moe_obj = cast(Any, getattr(train_config, "moe", getattr(train_config, "redacted", None)))
+    moe_obj = cast(Any, getattr(train_config, "moe", None))
     tpu_extra = TpuGraphTrainerConfig(
         device="tpu",
         attention_backend=getattr(
@@ -402,14 +400,6 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
           kwargs.pop("tpu_compile_mode", None)
         else:
           kwargs["tpu_compile_mode"] = train_config.tpu_config.compile_mode
-    if model_spec.name in (
-        "redacted",
-        "redacted_tpu",
-        "redacted",
-        "redacted_tpu",
-    ):
-      parallel_dims = kwargs.get("parallel_dims")
-      return orig_parallelize(model, parallel_dims, train_config)
     return orig_parallelize(model, *args, **kwargs)
 
   model_spec.parallelize_fn = patched_parallelize

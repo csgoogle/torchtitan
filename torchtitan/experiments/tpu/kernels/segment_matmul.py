@@ -1,7 +1,8 @@
-"""Tokamax-backed grouped/ragged matmul kernel for the [redacted] segment_matmul path.
+"""Tokamax-backed grouped/ragged matmul (segment_matmul) kernel for TPU.
 
-This kernel is the TPU replacement for `[redacted]._ops.segment_matmul.torch`'s stock
-implementation, which calls `group_sizes.tolist()` (a D2H sync) and deadlocks.
+Unlike segment_matmul implementations that call `group_sizes.tolist()` (a D2H
+sync, which deadlocks on TPU), this kernel takes `group_sizes` as a runtime
+tensor.
 """
 
 from typing import Tuple, cast
@@ -26,7 +27,7 @@ def _build_ragged_dot_kernels():
   """
   with jax.default_device(jax.local_devices()[0]):
 
-    @pallas.jax_op("tt_redacted::ragged_dot_fwd")
+    @pallas.jax_op("tt_segment_matmul::ragged_dot_fwd")
     def fwd_op(
         lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array
     ) -> jax.Array:
@@ -34,7 +35,7 @@ def _build_ragged_dot_kernels():
           lhs, rhs, group_sizes=group_sizes, implementation="mosaic"
       )
 
-    @pallas.jax_op("tt_redacted::ragged_dot_bwd")
+    @pallas.jax_op("tt_segment_matmul::ragged_dot_bwd")
     def bwd_op(
         dout: jax.Array,
         lhs: jax.Array,

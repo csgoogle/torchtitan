@@ -67,8 +67,6 @@ DISABLED_TESTS = {
     "torchtitan.experiments.tpu.tests.test_profiler",
     # TODO: add copybara handling for this test
     "torchtitan.experiments.tpu.kernels.tests.test_kernel_name_determinism_distributed",
-    # TODO: SyntaxError: invalid syntax (from jaxtyping)
-    "torchtitan.experiments.tpu.redacted.tests.test_train_minimal_distributed",
     # TODO: RuntimeError: create_process_group(): PjRtClient is not initialized.
     "torchtitan.experiments.tpu.graph_trainer.tests.test_layer_stack_distributed",
     # TODO: imports torchtitan.scripts; this fork keeps scripts/ at the repo root.

@@ -3,11 +3,11 @@ r"""Pure JAX training for LLM models on TPU.
 Parallel to torchtitan/experiments/torchax/train_minimal.py but uses pure
 JAX / Flax NNX instead of torchax (the PyTorch-on-JAX wrapper).
 
-Run redacted debugmodel on v6e-4:
+Run llama3 debugmodel on v6e-4:
 ```
 python -m torchtitan.experiments.jax.train_minimal \
-    --module=torchtitan.experiments.jax.redacted \
-    --config=redacted_debugmodel
+    --module=torchtitan.experiments.jax.llama3 \
+    --config=llama3_debugmodel
 ```
 """
 

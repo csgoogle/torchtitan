@@ -16,7 +16,6 @@ class WorkaroundsTest(parameterized.TestCase):
   # advanced indexing over the folded `[T]` token stream, so there is no longer
   # a patched-vs-original pair to compare.
 
-
   def test_wrapper_conversion_positions_to_segment_ids(self):
     """Patched splash attention converts positions to segment ids."""
     import unittest.mock
@@ -100,7 +99,6 @@ class WorkaroundsTest(parameterized.TestCase):
           torch.ones(64, dtype=torch.int32),
       ]).unsqueeze(0).to("cpu")
       torch.testing.assert_close(segment_ids, expected_segment_ids)
-
 
   def test_pallas_loss_linear_preserves_state_dict_keys(self):
     """The loss-kernel wrapper must not rename the output-projection parameter.
@@ -245,7 +243,6 @@ class WorkaroundsTest(parameterized.TestCase):
           sorted(model.state_dict().keys()), before, f"{attr} was renamed"
       )
 
-
   def test_loss_kernel_patch_keeps_hf_state_dict_adapter_working(self):
     """A patched model must still convert through the HF state dict adapter.
 
@@ -273,7 +270,6 @@ class WorkaroundsTest(parameterized.TestCase):
     # Must not raise, and must produce the HF-side name.
     hf_state_dict = adapter.to_hf(dict(model.state_dict()))
     self.assertIn("lm_head.weight", hf_state_dict)
-
 
   def test_loss_kernel_patch_preserves_weight_initialization(self):
     """A patched model must still have its output projection initialized.
@@ -314,7 +310,6 @@ class WorkaroundsTest(parameterized.TestCase):
         patched.float().std().item(), 0.0, "lm_head weight was never initialized"
     )
     torch.testing.assert_close(patched, baseline)
-
 
   def _tokamax_patch_fixture(self):
     """A module with one ScaledDotProductInnerAttention, and a populated splash config."""
@@ -386,8 +381,10 @@ class WorkaroundsTest(parameterized.TestCase):
   def test_tokamax_patch_accepts_a_config_with_no_splash_fields(self):
     """An empty config means "use the kernel defaults" and must not raise.
 
-    redacted's parity test passes a bare `class MockConfig: pass`. The guard above has to
-    distinguish that from a real splash config read incorrectly - the discriminator is
+    Some parity tests pass a bare `class MockConfig: pass`. The guard above has
+    to
+    distinguish that from a real splash config read incorrectly - the
+    discriminator is
     whether sa_-prefixed attributes exist at all. Caught by CI, not by me.
     """
     model, _ = self._tokamax_patch_fixture()

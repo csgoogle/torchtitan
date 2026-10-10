@@ -152,29 +152,6 @@ class TPUConfig:
 
 
 @dataclasses.dataclass
-class redactedConfig:
-  # Chunked linear → softmax → CE loss that avoids materialising the full
-  # (B, S, vocab_size) logit tensor. Mutually exclusive with use_loss_kernel.
-  # Only implemented for redacted (train_minimal.py).
-  use_chunked_loss: bool = False
-  enable_manual_ddp: bool = False
-  # When True, wrap the chunked-CE scan body in a remat (jax.checkpoint on the
-  # jax lane, torch.utils.checkpoint elsewhere) so backward recomputes per-chunk
-  # logits instead of saving ``[n_chunks, chunk_size, V]`` all at once. Required
-  # at larger batch sizes where the materialised logits would OOM (e.g. B=16
-  # S=8192 V=153600 bf16 ≈ 40 GiB). Off by default; opt in only when you hit
-  # that allocation.
-  remat_chunks: bool = False
-
-
-@dataclasses.dataclass
-class redactedConfig:
-  use_chunked_loss: bool = False
-  enable_manual_ddp: bool = False
-  use_segment_matmul_kernel: bool = False
-
-
-@dataclasses.dataclass
 class ConformerConfig:
   use_ctc_loss: bool = False
   use_jax_ctc_loss: bool = False
@@ -278,10 +255,6 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
   )
   extra_libtpu_init_flags: tpu_flags.FlagMap = dataclasses.field(
       default_factory=tpu_flags.FlagMap
-  )
-  redacted: redactedConfig = dataclasses.field(default_factory=redactedConfig)
-  redacted: redactedConfig = dataclasses.field(
-      default_factory=redactedConfig
   )
   conformer: ConformerConfig = dataclasses.field(
       default_factory=ConformerConfig

@@ -1,6 +1,5 @@
 """Minimal trainer for torch titan experiments."""
 
-import collections
 import time
 import typing
 
@@ -31,54 +30,8 @@ _TORCHAX_MODEL_MODULES = {
     'llama3': 'torchtitan.experiments.torchax.llama3',
     'qwen3': 'torchtitan.experiments.torchax.qwen3',
     'deepseek_v3': 'torchtitan.experiments.torchax.deepseek_v3',
-    'redacted': 'torchtitan.experiments.torchax.redacted',
-    'redacted': 'torchtitan.experiments.torchax.redacted',
     'conformer': 'torchtitan.experiments.torchax.conformer',
 }
-from [redacted]._ops.segment_matmul import interface as redacted_segment_matmul_interface
-from [redacted].layers import functional as redacted_functional
-
-_original_segment_matmul = redacted_segment_matmul_interface.segment_matmul
-
-
-# Custom JAX-compatible implementation of [redacted]'s segment_matmul to avoid ConcretizationTypeError
-def _custom_segment_matmul_jax(segmented_input, group_sizes, weight):
-  env = torchax.default_env()
-  if (
-      hasattr(segmented_input, "jax")
-      and hasattr(group_sizes, "jax")
-      and hasattr(weight, "jax")
-  ):
-    X = segmented_input.jax()  # [T, B, D_IN]
-    G = group_sizes.jax()  # [T, E]
-    W = weight.jax()  # [T, E, D_IN, D_OUT]
-
-    T = X.shape[0]
-    TotalTokens = X.shape[1]
-    E = G.shape[1]
-
-    borders = jax.numpy.cumsum(G, axis=-1)  # [T, E]
-    token_indices = jax.numpy.arange(TotalTokens)  # [TotalTokens]
-
-    if E > 1:
-      # Broadcasted comparison to find expert_ids per token
-      expert_ids = jax.numpy.sum(
-          token_indices[None, :, None] >= borders[:, None, :-1], axis=-1
-      )  # [T, TotalTokens]
-    else:
-      expert_ids = jax.numpy.zeros((T, TotalTokens), dtype=jax.numpy.int32)
-
-    track_indices = jax.numpy.arange(T)[:, None]  # [T, 1]
-    gathered_weights = W[
-        track_indices, expert_ids, :, :
-    ]  # [T, TotalTokens, D_IN, D_OUT]
-
-    # Batched matmul via einsum
-    res_jax = jax.numpy.einsum("tbi,tbio->tbo", X, gathered_weights)
-
-    return env.j2t_iso(res_jax)
-  else:
-    return _original_segment_matmul(segmented_input, group_sizes, weight)
 
 
 # Custom override for take_along_dim to support int32 indices on TPU
@@ -94,7 +47,6 @@ def _custom_take_along_dim(input_tensor, indices, dim, out=None):
       return torch.take_along_dim(input_tensor, indices, dim, out=out)
 
 
-
 P = jax.sharding.PartitionSpec
 logger = torchtitan.tools.logging.logger
 
@@ -106,13 +58,6 @@ def is_moe_model(job_config) -> bool:
     job_config: The job configuration object.
   """
   if job_config.model_spec.name == 'llama3':
-    return False
-  elif job_config.model_spec.name == 'redacted':
-    return False
-  elif job_config.model_spec.name == 'redacted':
-    # We use the model's own get_nparams_and_flops via the simple branch;
-    # bypassing the moe_utils path which doesn't know about [redacted]'s MoE
-    # parameter naming convention.
     return False
   elif job_config.model_spec.name == 'qwen3':
     # Naming convention for qwen3 moe model seems to be xB-AyB,
@@ -140,8 +85,6 @@ class TorchaxTrainer:
     torchax.default_env().override_op_definition(
         torch.take_along_dim, _custom_take_along_dim
     )
-    redacted_segment_matmul_interface.segment_matmul = _custom_segment_matmul_jax
-    redacted_functional.segment_matmul = _custom_segment_matmul_jax
 
     self.mesh = mesh
     self.parallel_dims = parallel_dims
@@ -265,7 +208,7 @@ class TorchaxTrainer:
       model_args.vocab_size = 128256
     if hasattr(model_args, 'max_seq_len'):
       # Some ModelArgs (llama3/qwen3) hold ``max_seq_len`` to size RoPE/attn
-      # caches; redacted/redacted handle that internally and don't expose it.
+      # caches; models that handle that internally don't expose it.
       # Only the job config side was renamed (``training.seq_len`` ->
       # ``training.max_context_length``) by upstream d771abb0.
       model_args.max_seq_len = job_config.training.max_context_length
@@ -327,13 +270,6 @@ class TorchaxTrainer:
         from torchtitan.models.common.rope import RoPE
         embedding_constants = RoPE(model_args.rope).cache
         embedding_constants_key = 'freqs_cis'
-      elif job_config.model_spec.name == 'redacted':
-        embedding_constants = None
-        embedding_constants_key = None
-      elif job_config.model_spec.name == 'redacted':
-        # REDACTED PT MoE handles RoPE internally; no precomputed embedding constants needed.
-        embedding_constants = None
-        embedding_constants_key = None
       elif job_config.model_spec.name == 'conformer':
         embedding_constants = None
         embedding_constants_key = None
@@ -366,52 +302,11 @@ class TorchaxTrainer:
         )
 
     if job_config.torchax_config.use_scan:
-      if job_config.model_spec.name == 'redacted':
-        redacted_model = model.model
-        seg0 = redacted_model.layers.segment_0
-        seg0_layers = list(seg0.layers)
-        scanned_0 = distributed.redactedScannedModule(
-            seg0_layers[:-1], checkpoint_policy
-        )
-        new_modules = collections.OrderedDict()
-        new_side_keys = collections.defaultdict(list)
-        new_output_keys = {}
-
-        new_modules['scan_0'] = scanned_0
-        new_side_keys['scan_0'] = [('**kwargs', '**kwargs')]
-
-        new_modules['last_0'] = seg0_layers[-1]
-        last_name = list(seg0._named_layers_dict.keys())[-1]
-        new_side_keys['last_0'] = seg0.side_input_keys[last_name]
-        if last_name in seg0.side_output_keys:
-          new_output_keys['last_0'] = seg0.side_output_keys[last_name]
-
-        seg0._modules = new_modules
-        seg0._side_input_keys = new_side_keys
-        seg0._side_output_keys = new_output_keys
-
-        if hasattr(redacted_model.layers, 'segment_1'):
-          seg1 = redacted_model.layers.segment_1
-          seg1_layers = list(seg1.layers)
-          scanned_1 = distributed.redactedScannedModule(
-              seg1_layers, checkpoint_policy
-          )
-
-          new_modules_1 = collections.OrderedDict()
-          new_side_keys_1 = collections.defaultdict(list)
-          new_output_keys_1 = {}
-
-          new_modules_1['scan_1'] = scanned_1
-          new_side_keys_1['scan_1'] = [('**kwargs', '**kwargs')]
-
-          seg1._modules = new_modules_1
-          seg1._side_input_keys = new_side_keys_1
-          seg1._side_output_keys = new_output_keys_1
       if job_config.model_spec.name == 'conformer':
         model = distributed.ConformerModelWithScan(
             model, checkpoint_policy
         )
-      elif job_config.model_spec.name != 'redacted':
+      else:
         model = distributed.ModelWithScan(
             model, checkpoint_policy, embedding_constants_key
         )
@@ -616,7 +511,7 @@ class TorchaxTrainer:
             )
         )
       else:
-        # Fallback if get_nparams_and_flops is not implemented (e.g., redacted)
+        # Fallback if get_nparams_and_flops is not implemented
         metrics_processor.num_flops_per_token = 0
 
     if job_config.torchax_config.split_compile:
