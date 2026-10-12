@@ -75,19 +75,36 @@ def select_route_permutations(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     """Return the expert-sort permutations that ``local_reorder`` marks.
 
     ``token_dispatcher.py`` has three argsorts, so an op or module FQN alone
-    cannot pick this one; the dispatcher computes it inside an
-    ``annotate_region`` block instead. Every node traced in that block carries
-    the hint (the reshape, the sort and its getitems), so keep the
-    one-dimensional integer value that leaves the region: the permutation
-    itself.
+    cannot pick this one. ``local_reorder`` runs only that argsort inside an
+    ``annotate_region`` block instead, so the region holds the sort and its
+    outputs. Its candidates are the region's tensor values that something
+    reads: the sort node returns a tuple, and its sorted values are never
+    read, so the permutation is the only candidate. Raises if the region marks
+    anything other than one 1-D integer value per layer, so a change to the
+    block fails loudly instead of silently saving more.
     """
-    return [
+    routes = [
         node
         for node in _forward_call_nodes(gm)
         if _in_remat_region(node, MOE_ROUTING)
-        and _is_integer_tensor(node.meta.get("val"), ndim=1)
-        and any(not _in_remat_region(user, MOE_ROUTING) for user in node.users)
+        and isinstance(node.meta.get("val"), torch.Tensor)
+        and node.users
     ]
+    layers: set[int] = set()
+    for node in routes:
+        if not _is_integer_tensor(node.meta["val"], ndim=1):
+            raise ValueError(
+                f"Save region {MOE_ROUTING!r} marks {node.name}, which is not a "
+                "1-D integer permutation; only the expert sort belongs in it."
+            )
+        layer = _get_layer_id(node)
+        if layer in layers:
+            raise ValueError(
+                f"Save region {MOE_ROUTING!r} marks more than one value in layer "
+                f"{layer}; only the expert sort belongs in it."
+            )
+        layers.add(layer)
+    return routes
 
 
 # The module that runs ``TokenChoiceTopKRouter._select_experts``.

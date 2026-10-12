@@ -386,6 +386,71 @@ class TestRoutingRegion(unittest.TestCase):
             self.assertEqual(node.meta["val"].shape, (_TOKENS * _TOP_K,))
             self.assertEqual(node.meta["custom"][REMAT_REGION], MOE_ROUTING)
 
+    def test_region_holds_only_the_sort(self) -> None:
+        # local_reorder flattens the expert ids before the marked block, so the
+        # block traces to the sort alone: the sort node and the getitems of its
+        # outputs. Only the indices (the permutation) are read by anything.
+        torch.manual_seed(0)
+        traced, _ = _trace_toy(_MoEToy())
+        marked = [
+            node
+            for node in traced.gm.graph.nodes
+            if node.op == "call_function"
+            and not _is_backward_node(node)
+            and node.meta.get("custom", {}).get(REMAT_REGION) == MOE_ROUTING
+        ]
+        sorts = [
+            node for node in marked if not isinstance(node.meta["val"], torch.Tensor)
+        ]
+
+        self.assertEqual(len(sorts), 2)
+        for node in marked:
+            if node not in sorts:
+                self.assertIs(node.target, operator.getitem)
+                self.assertIn(node.args[0], sorts)
+        self.assertEqual(
+            [node for node in marked if node not in sorts and node.users],
+            select_route_permutations(traced.gm),
+        )
+
+    def test_unexpected_value_in_region_raises(self) -> None:
+        for shape, dtype, message in (
+            ((8, 2), torch.int64, "not a 1-D integer permutation"),
+            ((16,), torch.float32, "not a 1-D integer permutation"),
+        ):
+            with self.subTest(shape=shape, dtype=dtype):
+                graph = torch.fx.Graph()
+                ids = graph.placeholder("ids")
+                node = graph.call_function(torch.ops.aten.clone.default, args=(ids,))
+                node.meta["custom"] = {
+                    "module_fqn": "layers.0.moe",
+                    REMAT_REGION: MOE_ROUTING,
+                }
+                node.meta["val"] = torch.empty(shape, dtype=dtype, device="meta")
+                graph.output(node)
+                gm = torch.fx.GraphModule(nn.Module(), graph)
+
+                with self.assertRaisesRegex(ValueError, message):
+                    select_route_permutations(gm)
+
+    def test_two_permutations_in_one_layer_raise(self) -> None:
+        graph = torch.fx.Graph()
+        ids = graph.placeholder("ids")
+        outputs = []
+        for _ in range(2):
+            node = graph.call_function(torch.ops.aten.argsort.default, args=(ids,))
+            node.meta["custom"] = {
+                "module_fqn": "layers.0.moe",
+                REMAT_REGION: MOE_ROUTING,
+            }
+            node.meta["val"] = torch.empty(16, dtype=torch.int64, device="meta")
+            outputs.append(node)
+        graph.output(tuple(outputs))
+        gm = torch.fx.GraphModule(nn.Module(), graph)
+
+        with self.assertRaisesRegex(ValueError, "more than one value in layer 0"):
+            select_route_permutations(gm)
+
     def test_selects_the_last_topk_of_each_router(self) -> None:
         for num_expert_groups, topks_per_router in ((None, 1), (2, 3)):
             with self.subTest(num_expert_groups=num_expert_groups):
