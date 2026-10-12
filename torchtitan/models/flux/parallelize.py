@@ -19,6 +19,7 @@ from torch.distributed.fsdp import (
     fully_shard,
     MixedPrecisionPolicy,
 )
+from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from torchtitan.config import (
     CompileConfig,
@@ -202,20 +203,51 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
     )
 
 
+def _is_splash_attention_fwd(func) -> bool:
+    """True for the Pallas splash-attention forward ops.
+
+    Covers all splash variants registered under the `pallas` namespace: splash_attn_fwd_<hash> (splash_attention.py),
+    tokamax_splash_attn_fwd (tokamax_splash_attention.py) and sbd_splash_attn_fwd (splash_bias_dropout.py).
+    """
+    return getattr(func, "namespace", None) == "pallas" and "splash_attn_fwd" in getattr(
+        func, "_opname", ""
+    )
+
+
+def _full_ac_save_splash_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
+    """Full activation checkpointing, except the splash-attention forward is saved.
+
+    Saving the splash forward's outputs (attention output and the residuals its backward needs) avoids re-running
+    the kernel in backward. Since torch 2.12, vanilla AC tags every op for recompute at dispatch time, which
+    recomputes the splash forward in backward and roughly doubles its cost; torch 2.11 effectively saved it.
+    """
+    if _is_splash_attention_fwd(func):
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _checkpoint_block(block: nn.Module, ac_config) -> nn.Module:
+    return ptd_checkpoint_wrapper(
+        block,
+        preserve_rng_state=ac_config.preserve_rng_state,
+        context_fn=lambda: create_selective_checkpoint_contexts(_full_ac_save_splash_policy),
+    )
+
+
 def apply_ac(model: nn.Module, ac_config: ActivationCheckpointingConfig):
     """Apply full activation checkpointing to the Flux double/single blocks."""
 
     # pyrefly: ignore [missing-attribute]
     for layer_id, block in model.double_blocks.named_children():
         # TODO(b/514461185): Set preserve_rng_state=True once bug is fixed.
-        block = ptd_checkpoint_wrapper(block, preserve_rng_state=ac_config.preserve_rng_state)
+        block = _checkpoint_block(block, ac_config)
         # pyrefly: ignore [missing-attribute]
         model.double_blocks.register_module(layer_id, block)
 
     # pyrefly: ignore [missing-attribute]
     for layer_id, block in model.single_blocks.named_children():
         # TODO(b/514461185): Set preserve_rng_state=True once bug is fixed.
-        block = ptd_checkpoint_wrapper(block, preserve_rng_state=ac_config.preserve_rng_state)
+        block = _checkpoint_block(block, ac_config)
         # pyrefly: ignore [missing-attribute]
         model.single_blocks.register_module(layer_id, block)
 
