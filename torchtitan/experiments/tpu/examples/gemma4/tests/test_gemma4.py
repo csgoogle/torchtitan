@@ -352,20 +352,9 @@ class TestGemma4StateDictAdapter(absltest.TestCase):
     missing, unexpected = model.load_state_dict(converted_sd, strict=False)
     self.assertEmpty(missing)
     self.assertEmpty(unexpected)
-
-    # Also verify the dcp._load_checkpoint flow (to_hf -> dcp.load -> from_hf)
-    # when fqn_to_index_mapping comes from a tied HF safetensors index.
-    untied_adapter.fqn_to_index_mapping = {k: 1 for k in hf_sd}
-    dcp_hf_placeholder = untied_adapter.to_hf(model.state_dict())
-    self.assertNotIn("lm_head.weight", dcp_hf_placeholder)
-    for k in dcp_hf_placeholder:
-      dcp_hf_placeholder[k] = hf_sd[k]
-    dcp_loaded_sd = untied_adapter.from_hf(dcp_hf_placeholder)
-    self.assertIn("lm_head.weight", dcp_loaded_sd)
-    torch.testing.assert_close(
-        dcp_loaded_sd["lm_head.weight"],
-        hf_sd["model.language_model.embed_tokens.weight"],
-    )
+    # The real on-disk flow (to_hf placeholder -> dcp.load -> from_hf) is
+    # covered by TestGemma4HFReferenceParity.
+    # test_tied_hf_safetensors_load_into_untied_recipe.
 
 
 class TestGemma4SoftCappedLoss(absltest.TestCase):
@@ -731,6 +720,88 @@ class TestGemma4HFReferenceParity(BaseDeviceTest):
           check_name=f"Gradient ({name})",
           **labels,
       )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="single_file", max_shard_size=None),
+      # Force two shards so save_pretrained writes model.safetensors.index.json.
+      dict(testcase_name="sharded_with_index", max_shard_size="1MB"),
+  )
+  def test_tied_hf_safetensors_load_into_untied_recipe(self, max_shard_size):
+    """Real initial_load_in_hf path: tied HF safetensors -> untied Gemma4Model.
+
+    Mirrors ``CheckpointManager._load_checkpoint(from_hf=True)``:
+    ``to_hf`` builds the placeholder, ``dcp.load`` fills it from disk via
+    ``HuggingFaceStorageReader``, and ``from_hf`` maps back. Gemma 4 HF
+    checkpoints are tied, so ``lm_head.weight`` is absent on disk and the
+    adapter must neither request it from DCP nor leave it unset.
+    """
+    import os
+    import shutil
+    import tempfile
+    from safetensors import safe_open
+    import torch.distributed.checkpoint as dcp
+
+    torch.manual_seed(0)
+    hf_model = self._build_hf_reference(enable_moe=False, sliding_window=8)
+    tmp_dir = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+    save_kwargs = {"safe_serialization": True}
+    if max_shard_size is not None:
+      save_kwargs["max_shard_size"] = max_shard_size
+    hf_model.save_pretrained(tmp_dir, **save_kwargs)
+
+    has_index = os.path.exists(
+        os.path.join(tmp_dir, "model.safetensors.index.json")
+    )
+    self.assertEqual(has_index, max_shard_size is not None)
+    # Sanity: the on-disk checkpoint really has no lm_head.weight.
+    on_disk_keys = set()
+    for fname in os.listdir(tmp_dir):
+      if fname.endswith(".safetensors"):
+        with safe_open(os.path.join(tmp_dir, fname), framework="pt") as f:
+          on_disk_keys.update(f.keys())
+    self.assertNotIn("lm_head.weight", on_disk_keys)
+
+    tt_config: Gemma4Model.Config = _build_flavor_config(
+        "testmodel", enable_weight_tying=False
+    )
+    tt_config.sliding_window_size = 8
+    for layer_cfg in tt_config.layers:
+      if layer_cfg.attention.is_sliding:
+        layer_cfg.attention.sliding_window_size = 8
+    tt_model = tt_config.build()
+    tt_model.init_states()
+    self.assertIsNot(tt_model.tok_embeddings.weight, tt_model.lm_head.weight)
+
+    adapter = Gemma4StateDictAdapter(tt_config, hf_assets_path=tmp_dir)
+    state_dict = {k: v.detach().clone() for k, v in tt_model.state_dict().items()}
+    hf_placeholder = adapter.to_hf(state_dict)
+    # The placeholder must match the on-disk layout exactly (DCP is strict):
+    # text-only Gemma4ForCausalLM keys, and no lm_head.weight.
+    self.assertEqual(set(hf_placeholder), on_disk_keys)
+    dcp.load(
+        hf_placeholder,
+        storage_reader=adapter.get_hf_storage_reader(tmp_dir),
+    )
+    loaded = adapter.from_hf(hf_placeholder)
+    missing, unexpected = tt_model.load_state_dict(loaded, strict=True)
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+
+    hf_embed = hf_model.model.embed_tokens.weight.detach()
+    torch.testing.assert_close(tt_model.tok_embeddings.weight.detach(), hf_embed)
+    torch.testing.assert_close(tt_model.lm_head.weight.detach(), hf_embed)
+
+    # Loaded untied model must produce the same logits as the tied HF model.
+    batch_size, seq_len = 2, 16
+    tokens = torch.randint(0, tt_config.vocab_size, (batch_size, seq_len))
+    positions = torch.arange(seq_len).repeat(batch_size)
+    with torch.no_grad(), set_unflatten_seq_len(seq_len):
+      tt_logits = tt_model(tokens.view(-1), positions=positions).view(
+          batch_size, seq_len, -1
+      )
+      hf_logits = hf_model(input_ids=tokens).logits
+    torch.testing.assert_close(tt_logits, hf_logits, atol=5e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

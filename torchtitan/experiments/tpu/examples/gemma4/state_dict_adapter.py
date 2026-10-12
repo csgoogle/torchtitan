@@ -1,4 +1,7 @@
+import json
+import os
 import re
+import struct
 from typing import Any
 
 import torch
@@ -32,6 +35,21 @@ def _normalize_hf_key(key: str) -> str | None:
     return key
 
 
+def _single_file_safetensors_keys(hf_assets_path: str) -> set[str] | None:
+    """Tensor names in a single-file ``model.safetensors``, or None if absent.
+
+    Reads only the header (8-byte little-endian length + JSON), so this is
+    cheap even for multi-GB checkpoints.
+    """
+    path = os.path.join(hf_assets_path, "model.safetensors")
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    return {k for k in header if k != "__metadata__"}
+
+
 class Gemma4StateDictAdapter(StateDictAdapter):
     """Converts state dicts between TorchTitan Gemma4Model and HuggingFace Gemma4 format."""
 
@@ -45,6 +63,31 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                     f"Gemma4StateDictAdapter does not support FusedQKVLinear "
                     f"(layer {idx} has use_fused_qkv=True)."
                 )
+
+        # ``to_hf`` builds the placeholder that ``dcp.load`` fills from disk, and
+        # DCP is strict: every placeholder key must exist in the checkpoint. Two
+        # things about Gemma 4 HF checkpoints therefore have to be known up
+        # front, from the safetensors index (sharded) or the single-file header:
+        #  * They are tied (tie_word_embeddings=True) and omit lm_head.weight,
+        #    while the TPU recipes build an untied model. ``to_hf`` must then not
+        #    request lm_head.weight and ``from_hf`` fills it from embed_tokens.
+        #  * Multimodal Gemma4ForConditionalGeneration checkpoints (the released
+        #    31B / 26B-A4B) use ``model.language_model.*``; text-only
+        #    Gemma4ForCausalLM checkpoints use ``model.*``. ``from_hf`` accepts
+        #    both; ``to_hf`` has to emit the layout that is on disk.
+        # Unknown (no hf_assets_path / no safetensors there) keeps the defaults:
+        # emit lm_head.weight and the multimodal layout.
+        hf_keys: set[str] | None = None
+        if self.fqn_to_index_mapping is not None:
+            hf_keys = set(self.fqn_to_index_mapping)
+        elif hf_assets_path:
+            hf_keys = _single_file_safetensors_keys(hf_assets_path)
+        self._hf_has_lm_head: bool | None = (
+            "lm_head.weight" in hf_keys if hf_keys is not None else None
+        )
+        self._hf_text_only_layout: bool = bool(hf_keys) and not any(
+            k.startswith("model.language_model.") for k in hf_keys
+        )
 
         self.from_hf_map = {
             "model.language_model.embed_tokens.weight": "tok_embeddings.weight",
@@ -125,10 +168,7 @@ class Gemma4StateDictAdapter(StateDictAdapter):
             else:
                 if key == "lm_head.weight" and (
                     self.model_config.enable_weight_tying
-                    or (
-                        self.fqn_to_index_mapping is not None
-                        and "lm_head.weight" not in self.fqn_to_index_mapping
-                    )
+                    or self._hf_has_lm_head is False
                 ):
                     if self.fqn_to_index_mapping:
                         self.fqn_to_index_mapping.pop("lm_head.weight", None)
@@ -136,6 +176,11 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                 if key in to_hf_map:
                     hf_state_dict[to_hf_map[key]] = value
 
+        if self._hf_text_only_layout:
+            hf_state_dict = {
+                k.replace("model.language_model.", "model.", 1): v
+                for k, v in hf_state_dict.items()
+            }
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
