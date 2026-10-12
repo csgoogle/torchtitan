@@ -13,7 +13,8 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchtitan.experiments.tpu.kernels import mamba2_pallas
+from torchtitan.experiments.tpu import unflatten_shim
+from torchtitan.experiments.tpu.examples.mamba2.kernels import mamba2_pallas
 from torchtitan.protocols import model as model_protocol
 from torchtitan.protocols import module
 
@@ -227,17 +228,16 @@ class Mamba2LM(model_protocol.BaseModel):
 
   def forward(self, input_ids: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     # TT-UNFLATTEN-SHIM:
-    from torchtitan.experiments.tpu.unflatten_shim import unflatten_tensor, flatten_tensor
-    input_ids = unflatten_tensor(input_ids, expected_flat_ndim=1)
-    
+    input_ids = unflatten_shim.unflatten_tensor(input_ids, expected_flat_ndim=1)
+
     h = self.tok_embeddings(input_ids)
     for layer in self.layers.values():
       h = layer(h)
     h = self.norm(h)
     out = self.lm_head(h)
-    
+
     # TT-UNFLATTEN-SHIM:
-    return flatten_tensor(out, original_flat_ndim=2)
+    return unflatten_shim.flatten_tensor(out, original_flat_ndim=2)
 
 
 # Aliases for backwards compatibility

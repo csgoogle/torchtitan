@@ -14,9 +14,9 @@
 # below are unchanged.
 from torchtitan.components import checkpointer as checkpoint
 from torchtitan.components import loss
-from torchtitan.components.optimizer import lr_scheduler
 from torchtitan.components import metrics
 from torchtitan.components import optimizer
+from torchtitan.components.optimizer import lr_scheduler
 from torchtitan.config import configs
 from torchtitan.distributed import activation_checkpoint
 from torchtitan.experiments.tpu import tpu_job_config
@@ -161,7 +161,9 @@ def mamba2_debug() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          num_tokens_per_microbatch_per_dp_rank=8 * 512, max_context_length=512, steps=10
+          num_tokens_per_microbatch_per_dp_rank=8 * 512,
+          max_context_length=512,
+          steps=10,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -186,7 +188,9 @@ def mamba2_130m() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          num_tokens_per_microbatch_per_dp_rank=16 * 2048, max_context_length=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=16 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -211,7 +215,9 @@ def mamba2_370m() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          num_tokens_per_microbatch_per_dp_rank=8 * 2048, max_context_length=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=8 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -236,7 +242,9 @@ def mamba2_780m() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          num_tokens_per_microbatch_per_dp_rank=4 * 2048, max_context_length=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=4 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -261,7 +269,9 @@ def mamba2_1_3b() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          num_tokens_per_microbatch_per_dp_rank=2 * 2048, max_context_length=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=2 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -286,7 +296,9 @@ def mamba2_2_7b() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          num_tokens_per_microbatch_per_dp_rank=2 * 2048, max_context_length=2048, steps=10000
+          num_tokens_per_microbatch_per_dp_rank=2 * 2048,
+          max_context_length=2048,
+          steps=10000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(
@@ -311,7 +323,9 @@ def mamba2_2_7b_256k() -> tpu_job_config.TPUTrainerConfig:
           min_lr_factor=0.0,
       ),
       training=configs.TrainingConfig(
-          num_tokens_per_microbatch_per_dp_rank=8 * 262144, max_context_length=262144, steps=1000
+          num_tokens_per_microbatch_per_dp_rank=8 * 262144,
+          max_context_length=262144,
+          steps=1000,
       ),
       parallelism=configs.ParallelismConfig(expert_parallel_degree=1),
       checkpoint=checkpoint.CheckpointManager.Config(

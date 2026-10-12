@@ -8,8 +8,8 @@
 
 from absl.testing import absltest
 import torch
-from torchtitan.experiments.tpu import mamba2
-from torchtitan.experiments.tpu.mamba2 import model
+from torchtitan.experiments.tpu.examples import mamba2
+from torchtitan.experiments.tpu.examples.mamba2 import model
 
 
 class Mamba2ModelTest(absltest.TestCase):

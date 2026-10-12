@@ -9,7 +9,7 @@ Ironwood cluster (`2x2x1` topology, 8 TensorCores) using Cluster Toolkit
 <!-- disableFinding(LINK_RELATIVE_G3DOC) -->
 For Cluster Toolkit (`gcluster`) installation, cluster set up, docker image
 build, and multi-host setup instructions please consult the main
-[README.md](../../../../README.md).
+[README.md](../../../../../../README.md).
 
 After setting up your cluster, set the following environment variables:
 
@@ -22,7 +22,7 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 
 ## Software Environment & Dependencies
 
-This recipe runs in the standard TorchTitan TPU container (`torchtitan-container:latest`) built per [experiments/tpu/README.md](../../../../README.md):
+This recipe runs in the standard TorchTitan TPU container (`torchtitan-container:latest`) built per [experiments/tpu/README.md](../../../../../../README.md):
 
 - **torch**: `2.12.0`
 - **torch_tpu**: `0.1.1`
@@ -99,7 +99,7 @@ gcluster job submit \
     --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
-    --module=torchtitan.experiments.tpu.mamba2 \
+    --module=torchtitan.experiments.tpu.examples.mamba2 \
     --config=mamba2_2_7b_256k \
     --hf_assets_path=tests/assets/tokenizer \
     --dataloader.dataset=c4_test \
@@ -134,7 +134,7 @@ gcluster job submit \
     --rdzv_endpoint=\$WORKERS_0_HOSTNAME:29501 \
     --node_rank=\$TPU_WORKER_ID \
     -m torchtitan.experiments.tpu.train \
-    --module=torchtitan.experiments.tpu.mamba2 \
+    --module=torchtitan.experiments.tpu.examples.mamba2 \
     --config=mamba2_2_7b_256k \
     --hf_assets_path=tests/assets/tokenizer \
     --dataloader.dataset=c4_test \

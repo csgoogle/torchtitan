@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import torch
 import torch.nn.functional as F
 from torchtitan.experiments.tpu import base_device_test
-from torchtitan.experiments.tpu.kernels import mamba2_pallas
+from torchtitan.experiments.tpu.examples.mamba2.kernels import mamba2_pallas
 
 
 def reference_sequential_ssd(

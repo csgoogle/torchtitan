@@ -4,6 +4,8 @@ This package contains TPU-specific training infrastructure, model variants
 (conformer, flux, qwen3, ...), and the gmain entry point.
 """
 
+# pylint: disable=g-statement-before-imports,g-import-not-at-top
+
 # ---------------------------------------------------------------------------
 # typeguard 2.x <-> tyro 1.x compatibility shim
 # ---------------------------------------------------------------------------
@@ -31,11 +33,14 @@ This package contains TPU-specific training infrastructure, model variants
 #   - tyro stops dereferencing ``typeguard.TypeCheckError`` at import time
 #     (use ``getattr`` with a TypeError fallback in tyro's compat layer), or
 #   - tokamax supports typeguard >= 3.x (jaxtyping needs to follow).
-import typeguard as _typeguard
+try:
+  import typeguard as _typeguard
 
-if not hasattr(_typeguard, "TypeCheckError"):
+  if not hasattr(_typeguard, "TypeCheckError"):
     _typeguard.TypeCheckError = TypeError
 
-del _typeguard
+  del _typeguard
+except ImportError:
+  pass
 
 from torchtitan.experiments.tpu import utils as _tpu_utils
