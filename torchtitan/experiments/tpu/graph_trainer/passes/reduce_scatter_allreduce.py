@@ -185,8 +185,16 @@ def apply_selected_reduce_scatter_allreduce_pass(
             all_reduce.meta.update(input_node.meta)
             all_reduce_wait = graph.call_function(_WAIT_TENSOR, args=(all_reduce,))
             all_reduce_wait.meta.update(input_node.meta)
+            # The shard is the parameter gradient that the compiled step
+            # returns, so emit a copy rather than a slice view. TorchTPU keeps
+            # a returned view's layout, so a view at row offset
+            # group_rank * local_rows came back as a view into a buffer of
+            # group_rank + 1 shards. Programs traced from those gradients (the
+            # compiled gradient norm) then differed across ranks, and their
+            # all-reduce returned different values on different ranks. XLA
+            # emits the same slice either way.
             local_shard = graph.call_function(
-                torch.ops.aten.slice.Tensor,
+                torch.ops.aten.slice_copy.Tensor,
                 args=(
                     all_reduce_wait,
                     0,

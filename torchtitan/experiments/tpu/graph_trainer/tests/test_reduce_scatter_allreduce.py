@@ -25,6 +25,17 @@ _O_PATTERN = "layers.*.attention.wo.weight"
 _MAX_INPUT_BYTES = 40 * 1024**2
 
 
+def _identity_all_reduce(
+    tensor: torch.Tensor, reduce_op: str, group_name: str
+) -> torch.Tensor:
+    del reduce_op, group_name
+    return tensor.clone()
+
+
+def _identity_wait(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor
+
+
 class TestReduceScatterAllReduce(unittest.TestCase):
     def _make_graph(
         self,
@@ -90,7 +101,7 @@ class TestReduceScatterAllReduce(unittest.TestCase):
         )
         output = next(node for node in gm.graph.nodes if node.op == "output")
         local_shard = output.args[0]
-        self.assertEqual(local_shard.target, torch.ops.aten.slice.Tensor)
+        self.assertEqual(local_shard.target, torch.ops.aten.slice_copy.Tensor)
         self.assertEqual(local_shard.args[2:4], (120, 160))
         self.assertEqual(tuple(local_shard.meta["val"].shape), (40, 2048))
         resolve_process_group.assert_called_once_with("world")
@@ -118,6 +129,40 @@ class TestReduceScatterAllReduce(unittest.TestCase):
         targets = [node.target for node in gm.graph.nodes if node.op == "call_function"]
         self.assertEqual(
             targets.count(torch.ops._c10d_functional.all_reduce.default), 1
+        )
+
+    @mock.patch("torch.distributed.get_rank", return_value=3)
+    @mock.patch("torch.distributed.get_world_size", return_value=128)
+    @mock.patch(
+        "torch.distributed.distributed_c10d._resolve_process_group",
+        return_value=mock.sentinel.process_group,
+    )
+    def test_local_shard_is_not_a_view_of_the_full_result(self, *_):
+        # The shard is a graph output (the parameter gradient). On a rank other
+        # than 0, a slice view would carry a nonzero storage offset into the
+        # full all-reduce result.
+        gm = self._make_graph((5120, 2048))
+        apply_selected_reduce_scatter_allreduce_pass(
+            gm,
+            (),
+            parameter_patterns=(_QKV_PATTERN,),
+            max_input_bytes=_MAX_INPUT_BYTES,
+        )
+        # Run the rewritten graph on CPU with the collectives as identities.
+        for node in gm.graph.nodes:
+            if node.target is torch.ops._c10d_functional.all_reduce.default:
+                node.target = _identity_all_reduce
+            elif node.target is torch.ops._c10d_functional.wait_tensor.default:
+                node.target = _identity_wait
+        gm.recompile()
+
+        full = torch.randn(5120, 2048)
+        shard = gm(full)
+
+        torch.testing.assert_close(shard, full[120:160])
+        self.assertEqual(shard.storage_offset(), 0)
+        self.assertEqual(
+            shard.untyped_storage().nbytes(), shard.numel() * shard.element_size()
         )
 
     @mock.patch("torch.distributed.get_rank", return_value=0)
