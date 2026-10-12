@@ -8,8 +8,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchtitan.components.loss import cross_entropy_loss
+from torchtitan.components.loss import (
+    ChunkedLossWrapper,
+    CrossEntropyLoss,
+    cross_entropy_loss,
+)
 from torchtitan.experiments.tpu import test_utils
+from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest as BaseDeviceTest
 from torchtitan.experiments.tpu.examples.gemma4 import (
     _build_flavor_config,
@@ -44,6 +49,7 @@ from torchtitan.models.common.attention import (
 from torchtitan.models.common.param_init import skip_param_init
 from torchtitan.models.common.linear import Linear, RouterGateLinear
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.muse_glimmer.model import SoftCappedLinear
 import transformers
 
 
@@ -320,6 +326,100 @@ class TestGemma4StateDictAdapter(absltest.TestCase):
         NotImplementedError, "does not support FusedQKVLinear"
     ):
       Gemma4StateDictAdapter(config, hf_assets_path=None)
+
+  def test_tied_hf_checkpoint_loads_into_untied_recipe(self):
+    """Tied Gemma 4 HF checkpoints (no lm_head.weight) load into untied recipes."""
+    tied_config = _build_flavor_config("testmodel", enable_weight_tying=True)
+    untied_config = _build_flavor_config("testmodel", enable_weight_tying=False)
+    model = untied_config.build()
+    model.init_states()
+
+    # Build a tied HF checkpoint (which omits lm_head.weight).
+    tied_adapter = Gemma4StateDictAdapter(tied_config, hf_assets_path=None)
+    hf_sd = tied_adapter.to_hf(
+        {k: torch.randn_like(v) for k, v in model.state_dict().items()}
+    )
+    self.assertNotIn("lm_head.weight", hf_sd)
+    self.assertIn("model.language_model.embed_tokens.weight", hf_sd)
+
+    untied_adapter = Gemma4StateDictAdapter(untied_config, hf_assets_path=None)
+    converted_sd = untied_adapter.from_hf(hf_sd)
+    self.assertIn("lm_head.weight", converted_sd)
+    torch.testing.assert_close(
+        converted_sd["lm_head.weight"],
+        hf_sd["model.language_model.embed_tokens.weight"],
+    )
+    missing, unexpected = model.load_state_dict(converted_sd, strict=False)
+    self.assertEmpty(missing)
+    self.assertEmpty(unexpected)
+
+    # Also verify the dcp._load_checkpoint flow (to_hf -> dcp.load -> from_hf)
+    # when fqn_to_index_mapping comes from a tied HF safetensors index.
+    untied_adapter.fqn_to_index_mapping = {k: 1 for k in hf_sd}
+    dcp_hf_placeholder = untied_adapter.to_hf(model.state_dict())
+    self.assertNotIn("lm_head.weight", dcp_hf_placeholder)
+    for k in dcp_hf_placeholder:
+      dcp_hf_placeholder[k] = hf_sd[k]
+    dcp_loaded_sd = untied_adapter.from_hf(dcp_hf_placeholder)
+    self.assertIn("lm_head.weight", dcp_loaded_sd)
+    torch.testing.assert_close(
+        dcp_loaded_sd["lm_head.weight"],
+        hf_sd["model.language_model.embed_tokens.weight"],
+    )
+
+
+class TestGemma4SoftCappedLoss(absltest.TestCase):
+  """Tests that Gemma 4 logit soft-capping survives the chunked-loss path."""
+
+  def test_chunked_loss_matches_full_cross_entropy_with_soft_cap(self):
+    torch.manual_seed(0)
+    config = _build_flavor_config("testmodel", enable_weight_tying=False)
+    self.assertIsInstance(config.lm_head, SoftCappedLinear.Config)
+    self.assertEqual(config.lm_head.output_soft_cap_temp, 30.0)
+
+    full_model = config.build()
+    full_model.init_states()
+    # Amplify lm_head weights so pre-cap logits exceed 30.0 and tanh is active.
+    with torch.no_grad():
+      full_model.lm_head.weight.mul_(50.0)
+    chunked_model = copy.deepcopy(full_model)
+    chunked_model._skip_lm_head = True
+
+    batch_size, seq_len = 2, 16
+    tokens = torch.randint(0, config.vocab_size, (batch_size * seq_len,))
+    positions = torch.arange(seq_len).repeat(batch_size)
+    labels = torch.randint(0, config.vocab_size, (batch_size * seq_len,))
+    valid_tokens = torch.tensor(batch_size * seq_len, dtype=torch.int64)
+
+    full_loss_fn = CrossEntropyLoss.Config().build()
+    chunked_loss_fn = ChunkedLossWrapper.Config(num_chunks=4).build()
+    chunked_loss_fn.set_lm_head(chunked_model.lm_head)
+
+    with set_unflatten_seq_len(seq_len):
+      logits = full_model(tokens, positions=positions)
+      self.assertLessEqual(logits.detach().abs().max().item(), 30.0 + 1e-5)
+      full_loss, _ = full_loss_fn(logits, labels, valid_tokens)
+      full_loss.backward()
+
+      hidden = chunked_model(tokens, positions=positions)
+      chunked_loss, _ = chunked_loss_fn(hidden, labels, valid_tokens)
+      chunked_loss.backward()
+
+    torch.testing.assert_close(chunked_loss, full_loss, atol=1e-5, rtol=1e-5)
+    for (name, p_full), (_, p_chunk) in zip(
+        full_model.named_parameters(), chunked_model.named_parameters()
+    ):
+      torch.testing.assert_close(
+          p_chunk.grad, p_full.grad, atol=1e-5, rtol=1e-5, msg=name
+      )
+
+  def test_legacy_loss_kernel_rejects_soft_capped_lm_head(self):
+    config = _build_flavor_config("testmodel")
+    model = nn.Module()
+    model.lm_head = config.lm_head.build()
+    self.assertIsInstance(model.lm_head, SoftCappedLinear)
+    with self.assertRaisesRegex(ValueError, "use_loss_kernel"):
+      workarounds.use_output_projection_patch(model)
 
 
 class TestGemma4SdpaSlidingWindow(absltest.TestCase):

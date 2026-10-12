@@ -123,7 +123,15 @@ class Gemma4StateDictAdapter(StateDictAdapter):
                     new_key = to_hf_map[abstract_key].format(layer_num)
                     hf_state_dict[new_key] = value
             else:
-                if key == "lm_head.weight" and self.model_config.enable_weight_tying:
+                if key == "lm_head.weight" and (
+                    self.model_config.enable_weight_tying
+                    or (
+                        self.fqn_to_index_mapping is not None
+                        and "lm_head.weight" not in self.fqn_to_index_mapping
+                    )
+                ):
+                    if self.fqn_to_index_mapping:
+                        self.fqn_to_index_mapping.pop("lm_head.weight", None)
                     continue
                 if key in to_hf_map:
                     hf_state_dict[to_hf_map[key]] = value
@@ -139,11 +147,10 @@ class Gemma4StateDictAdapter(StateDictAdapter):
             if "model.language_model.embed_tokens.weight" in hf_state_dict
             else hf_state_dict.get("model.embed_tokens.weight")
         )
-        if (
-            self.model_config.enable_weight_tying
-            and "lm_head.weight" not in hf_state_dict
-            and embed_weight is not None
-        ):
+        # Gemma 4 HF checkpoints tie embeddings and have no lm_head.weight key,
+        # while TPU recipes set enable_weight_tying=False. Copy embed_tokens into
+        # lm_head whenever the checkpoint has no lm_head.weight key.
+        if "lm_head.weight" not in hf_state_dict and embed_weight is not None:
             state_dict["lm_head.weight"] = embed_weight
 
         for raw_key, value in hf_state_dict.items():

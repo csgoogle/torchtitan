@@ -484,7 +484,6 @@ class Gemma4Model(Decoder):
         vocab_size: int = 262144
         enable_weight_tying: bool = True
         sliding_window_size: int = 1024
-        final_logit_softcapping: float | None = 30.0
 
         def update_from_config(
             self,
@@ -677,7 +676,6 @@ class Gemma4Model(Decoder):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self.sliding_window_size = config.sliding_window_size
-        self.final_logit_softcapping = config.final_logit_softcapping
 
     def get_attention_masks(
         self,
@@ -719,25 +717,6 @@ class Gemma4Model(Decoder):
             max_num_documents=max_num_documents,
             max_context_length=max_context_length,
         )
-
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        positions: torch.Tensor | None = None,
-        attention_masks: AttentionMasksType | None = None,
-    ) -> torch.Tensor:
-        output = super().forward(
-            tokens, positions=positions, attention_masks=attention_masks
-        )
-        if (
-            self.lm_head is not None
-            and not self._skip_lm_head
-            and self.final_logit_softcapping is not None
-        ):
-            output = torch.tanh(output / self.final_logit_softcapping) * (
-                self.final_logit_softcapping
-            )
-        return output
 
 
 __all__ = [

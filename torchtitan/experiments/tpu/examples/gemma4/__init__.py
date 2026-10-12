@@ -22,6 +22,7 @@ from torchtitan.models.common.linear import Linear, RouterGateLinear
 from torchtitan.models.common.moe import MoELoadBalanceAuxLoss, RoutedExperts
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.param_init import skip_param_init
+from torchtitan.models.muse_glimmer.model import SoftCappedLinear
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
@@ -64,6 +65,16 @@ _EMBEDDING_SKIP_INIT: dict[str, Callable] = {"weight": skip_param_init}
 _OUTPUT_INIT: dict[str, Callable] = {
     "weight": partial(nn.init.normal_, mean=0.0, std=0.02)
 }
+_LOGIT_SOFT_CAP = 30.0
+
+
+def _gemma4_lm_head(dim: int, vocab_size: int) -> SoftCappedLinear.Config:
+    return SoftCappedLinear.Config(
+        in_features=dim,
+        out_features=vocab_size,
+        param_init=_OUTPUT_INIT,
+        output_soft_cap_temp=_LOGIT_SOFT_CAP,
+    )
 
 
 def _gemma4_norm(dim: int, eps: float = 1e-6) -> RMSNorm.Config:
@@ -319,17 +330,12 @@ def _testmodel(attn_backend: str = "sdpa") -> Gemma4Model.Config:
         vocab_size=vocab_size,
         dim=dim,
         sliding_window_size=sliding_window_size,
-        final_logit_softcapping=30.0,
         norm=_gemma4_norm(dim),
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
         ),
-        lm_head=Linear.Config(
-            in_features=dim,
-            out_features=vocab_size,
-            param_init=_OUTPUT_INIT,
-        ),
+        lm_head=_gemma4_lm_head(dim, vocab_size),
         # pytype: disable=wrong-keyword-args
         layers=_build_gemma4_layers(
             n_layers=n_layers,
@@ -366,17 +372,12 @@ def _testmodel_moe(
         vocab_size=vocab_size,
         dim=dim,
         sliding_window_size=sliding_window_size,
-        final_logit_softcapping=30.0,
         norm=_gemma4_norm(dim),
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
         ),
-        lm_head=Linear.Config(
-            in_features=dim,
-            out_features=vocab_size,
-            param_init=_OUTPUT_INIT,
-        ),
+        lm_head=_gemma4_lm_head(dim, vocab_size),
         # pytype: disable=wrong-keyword-args
         layers=_build_gemma4_layers(
             n_layers=n_layers,
@@ -410,15 +411,12 @@ _gemma4_factories = {
         vocab_size=2048,
         dim=256,
         sliding_window_size=128,
-        final_logit_softcapping=30.0,
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=2048,
             embedding_dim=256,
         ),
         norm=_gemma4_norm(256, eps=1e-6),
-        lm_head=Linear.Config(
-            in_features=256, out_features=2048, param_init=_OUTPUT_INIT
-        ),
+        lm_head=_gemma4_lm_head(256, 2048),
         layers=partial(
             _build_gemma4_layers,
             n_layers=6,
@@ -440,15 +438,12 @@ _gemma4_factories = {
         vocab_size=2048,
         dim=256,
         sliding_window_size=128,
-        final_logit_softcapping=30.0,
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=2048,
             embedding_dim=256,
         ),
         norm=_gemma4_norm(256, eps=1e-6),
-        lm_head=Linear.Config(
-            in_features=256, out_features=2048, param_init=_OUTPUT_INIT
-        ),
+        lm_head=_gemma4_lm_head(256, 2048),
         layers=partial(
             _build_gemma4_layers,
             n_layers=6,
@@ -474,15 +469,12 @@ _gemma4_factories = {
         vocab_size=262144,
         dim=5376,
         sliding_window_size=1024,
-        final_logit_softcapping=30.0,
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=262144,
             embedding_dim=5376,
         ),
         norm=_gemma4_norm(5376, eps=1e-6),
-        lm_head=Linear.Config(
-            in_features=5376, out_features=262144, param_init=_OUTPUT_INIT
-        ),
+        lm_head=_gemma4_lm_head(5376, 262144),
         layers=partial(
             _build_gemma4_layers,
             n_layers=60,
@@ -504,15 +496,12 @@ _gemma4_factories = {
         vocab_size=262144,
         dim=2816,
         sliding_window_size=1024,
-        final_logit_softcapping=30.0,
         tok_embeddings=Gemma4Embedding.Config(
             num_embeddings=262144,
             embedding_dim=2816,
         ),
         norm=_gemma4_norm(2816, eps=1e-6),
-        lm_head=Linear.Config(
-            in_features=2816, out_features=262144, param_init=_OUTPUT_INIT
-        ),
+        lm_head=_gemma4_lm_head(2816, 262144),
         layers=partial(
             _build_gemma4_layers,
             n_layers=30,
