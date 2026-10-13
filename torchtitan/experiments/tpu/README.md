@@ -575,7 +575,7 @@ gcluster job submit \
     --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
     --env MEGASCALE_NUM_SLICES=2 \
     --env MEGASCALE_COORDINATOR_ADDRESS="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME:8080" \
-    --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
+    --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536 --megascale_grpc_premap_memory_bytes=4294967296 --megascale_use_numa_aware_block_allocator=false" \
     --command '
         VMS=$(echo "$TPU_WORKER_HOSTNAMES" | awk -F, "{print NF}");
         POD_DNS=${TPU_WORKER_HOSTNAMES%%,*};
@@ -584,7 +584,7 @@ gcluster job submit \
         SLICE=${JOB##*-};
         torchrun \
         --nnodes=$(( MEGASCALE_NUM_SLICES * VMS )) \
-        --nproc_per_node=4 \
+        --nproc_per_node=8 \
         --rdzv_backend=static \
         --rdzv_endpoint=$WORKERS_0_HOSTNAME:29501 \
         --node_rank=$(( SLICE * VMS + TPU_WORKER_ID )) \
@@ -631,3 +631,17 @@ Differences from the single-slice command:
   DTensor planner all-reduces the **full** gradient on the replicate axis -- the axis that crosses
   DCN -- before the reduce-scatter; the min-cost planner reduce-scatters first, shrinking the DCN
   payload by the shard degree.
+
+* On v7x, shrink the host-memory pool MegaScale reserves for DCN transfers. Multi-slice pins a pool
+  of 16 GiB per NUMA node per process by default. JAX runs one process per VM, but torch_tpu runs
+  one per TensorCore -- 8 per VM on v7x, which is why the command above uses
+  `--nproc_per_node=8` -- so the pool is paid 8 times: 16 GiB x 2 NUMA nodes x 8 processes = 256 GiB
+  per VM. That matters when anything else needs host memory, such as activation offloading:
+  Llama3-405B with activation offloading can run out of host memory on multi-slice. The two flags
+  already in the `LIBTPU_INIT_ARGS` above shrink the pool to 4 GiB per process, 32 GiB per VM, and
+  both are needed:
+
+  ```bash
+  --megascale_grpc_premap_memory_bytes=4294967296    # 4 GiB per process
+  --megascale_use_numa_aware_block_allocator=false   # one pool per process, not one per NUMA node
+  ```
