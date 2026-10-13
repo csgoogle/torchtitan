@@ -65,6 +65,21 @@ first line is the symptom; the second is the cause and the check.
 - Build images locally; check the base image's pip pins before reusing it.
 - `pgrep -f` / `pkill -f` match their own shell; assemble the pattern at runtime.
 
+## Tests that pass for the wrong reason
+
+- **A device test that never ran.** `.ci/discover_tpu_tests.py` puts a module
+  in a TPU shard only if a class subclasses `BaseAcceleratorDeviceTest` or
+  `BaseDistributedDeviceTest`. A plain `TestCase` with
+  `@skipUnless(<detect tpu>)` lands in the CPU shard and skips forever, green.
+  And `torch.tpu.device_count()` raises from user code, so a `try/except`
+  detector skips on a TPU host too. Take the device from the base class.
+- **`Module.to(device)` unties tied weights.** It re-creates each module's
+  Parameters, so a test that ties `out.weight = emb.weight` and then moves the
+  model is testing an untied model. Re-tie after the move and assert `is`.
+- **absl flags under pytest.** Device-test modules read `--device`; under bare
+  pytest the flags are unparsed and `setUp` raises. CI runs them with
+  `python -m <module> --device=tpu`; do the same locally.
+
 ## Process
 
 - "Got further than before" is not working; 2-4 steps is not a verdict; wait
