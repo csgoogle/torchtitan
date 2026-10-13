@@ -224,11 +224,9 @@ def local_reorder(
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Sort routes by expert while keeping all gathers row-indexed."""
-  expert_ids_N = expert_ids_TK.reshape(-1)
-  # Only the sort is marked, so the region's one tensor value is the sort
-  # order that a selective memory policy saves.
+  # Marked so that a selective memory policy can save the sort order.
   with annotate_region(MOE_ROUTING):
-    permutation_N = torch.argsort(expert_ids_N, stable=True)
+    permutation_N = torch.argsort(expert_ids_TK.reshape(-1), stable=True)
   return _LocalReorder.apply(x_TD, scores_TK, permutation_N, top_k)
 
 

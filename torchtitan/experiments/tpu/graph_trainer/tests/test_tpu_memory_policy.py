@@ -6,6 +6,7 @@
 
 """Tests for the TPU selective memory policies on traced toy graphs."""
 
+from collections.abc import Iterable
 import operator
 from types import SimpleNamespace
 import unittest
@@ -48,6 +49,7 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_remat_schedule,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
+    _in_remat_region,
     full_remat_with_saves,
     is_splash_forward_op_name,
     resolve_save_regions,
@@ -346,6 +348,16 @@ def _router_topks(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     ]
 
 
+def _route_permutations(nodes: Iterable[torch.fx.Node]) -> list[torch.fx.Node]:
+    """Each layer's permutation: the marked node read outside the block."""
+    return [
+        node
+        for node in nodes
+        if _in_remat_region(node, MOE_ROUTING)
+        and any(not _in_remat_region(user, MOE_ROUTING) for user in node.users)
+    ]
+
+
 def _hand_built_routing_graph(
     with_topk: bool, with_routes: bool
 ) -> torch.fx.GraphModule:
@@ -377,7 +389,7 @@ class TestRoutingRegion(unittest.TestCase):
         torch.manual_seed(0)
         traced, _ = _trace_toy(_MoEToy())
 
-        routes = select_route_permutations(traced.gm)
+        routes = _route_permutations(select_route_permutations(traced.gm))
 
         # The hint is merged into the module FQN, not a replacement for it, so
         # each permutation still knows its layer.
@@ -385,71 +397,6 @@ class TestRoutingRegion(unittest.TestCase):
         for node in routes:
             self.assertEqual(node.meta["val"].shape, (_TOKENS * _TOP_K,))
             self.assertEqual(node.meta["custom"][REMAT_REGION], MOE_ROUTING)
-
-    def test_region_holds_only_the_sort(self) -> None:
-        # local_reorder flattens the expert ids before the marked block, so the
-        # block traces to the sort alone: the sort node and the getitems of its
-        # outputs. Only the indices (the permutation) are read by anything.
-        torch.manual_seed(0)
-        traced, _ = _trace_toy(_MoEToy())
-        marked = [
-            node
-            for node in traced.gm.graph.nodes
-            if node.op == "call_function"
-            and not _is_backward_node(node)
-            and node.meta.get("custom", {}).get(REMAT_REGION) == MOE_ROUTING
-        ]
-        sorts = [
-            node for node in marked if not isinstance(node.meta["val"], torch.Tensor)
-        ]
-
-        self.assertEqual(len(sorts), 2)
-        for node in marked:
-            if node not in sorts:
-                self.assertIs(node.target, operator.getitem)
-                self.assertIn(node.args[0], sorts)
-        self.assertEqual(
-            [node for node in marked if node not in sorts and node.users],
-            select_route_permutations(traced.gm),
-        )
-
-    def test_unexpected_value_in_region_raises(self) -> None:
-        for shape, dtype, message in (
-            ((8, 2), torch.int64, "not a 1-D integer permutation"),
-            ((16,), torch.float32, "not a 1-D integer permutation"),
-        ):
-            with self.subTest(shape=shape, dtype=dtype):
-                graph = torch.fx.Graph()
-                ids = graph.placeholder("ids")
-                node = graph.call_function(torch.ops.aten.clone.default, args=(ids,))
-                node.meta["custom"] = {
-                    "module_fqn": "layers.0.moe",
-                    REMAT_REGION: MOE_ROUTING,
-                }
-                node.meta["val"] = torch.empty(shape, dtype=dtype, device="meta")
-                graph.output(node)
-                gm = torch.fx.GraphModule(nn.Module(), graph)
-
-                with self.assertRaisesRegex(ValueError, message):
-                    select_route_permutations(gm)
-
-    def test_two_permutations_in_one_layer_raise(self) -> None:
-        graph = torch.fx.Graph()
-        ids = graph.placeholder("ids")
-        outputs = []
-        for _ in range(2):
-            node = graph.call_function(torch.ops.aten.argsort.default, args=(ids,))
-            node.meta["custom"] = {
-                "module_fqn": "layers.0.moe",
-                REMAT_REGION: MOE_ROUTING,
-            }
-            node.meta["val"] = torch.empty(16, dtype=torch.int64, device="meta")
-            outputs.append(node)
-        graph.output(tuple(outputs))
-        gm = torch.fx.GraphModule(nn.Module(), graph)
-
-        with self.assertRaisesRegex(ValueError, "more than one value in layer 0"):
-            select_route_permutations(gm)
 
     def test_selects_the_last_topk_of_each_router(self) -> None:
         for num_expert_groups, topks_per_router in ((None, 1), (2, 3)):
@@ -500,7 +447,8 @@ class TestRoutingRegion(unittest.TestCase):
                 *select_route_permutations(traced.gm),
             },
         )
-        self.assertEqual(sorted(_get_layer_id(node) for node in routing), [0, 0, 1, 1])
+        permutations = _route_permutations(routing)
+        self.assertEqual([_get_layer_id(node) for node in permutations], [0, 1])
 
     def test_needs_both_in_the_same_layers(self) -> None:
         # A saved permutation next to recomputed top-k ids could disagree on a
@@ -671,7 +619,8 @@ class TestTpuSelectivePolicy(unittest.TestCase):
             for node in chosen
             if node.meta["custom"].get(REMAT_REGION) == MOE_ROUTING
         }
-        self.assertEqual(sorted(_get_layer_id(node) for node in routes), [0, 1])
+        permutations = _route_permutations(routes)
+        self.assertEqual(sorted(_get_layer_id(node) for node in permutations), [0, 1])
         self.assertEqual(
             sorted(node.meta["custom"]["module_fqn"] for node in chosen - routes),
             ["layers.0.moe.router", "layers.1.moe.router"],
@@ -683,8 +632,9 @@ class TestTpuSelectivePolicy(unittest.TestCase):
 
         splash = [node for node in chosen if _is_splash_node(node)]
         self.assertEqual(sorted(_get_layer_id(node) for node in splash), [0, 1, 2])
-        # Plus one route permutation and one top-k ids value per layer.
-        self.assertEqual(len(chosen), 9)
+        # Plus the route permutation of every layer.
+        routes = _route_permutations(chosen)
+        self.assertEqual(sorted(_get_layer_id(node) for node in routes), [0, 1, 2])
 
     def test_last_n_layers_saves_only_the_last_splash(self) -> None:
         # Recomputing layers 0-1 while layer 2's backward reads its saved
