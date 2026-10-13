@@ -40,7 +40,7 @@ Most of this guide is **general TorchTPU** optimization (true of any model); a f
 | §6 Precision, layout | General |
 | §7 The dispatch ceiling | General |
 | §8 Whole-step capture with GraphTrainer | General |
-| §9 Large models: scan, graph split, CPU offload | General |
+| §9 Large models: scan, graph splitter, CPU offload | General |
 | §10 Mixture-of-Experts | MoE |
 
 ---
@@ -439,7 +439,7 @@ in `graph_trainer_save_regions` / `graph_trainer_save_last_n_layers`) saves thos
   Python control flow is not supported.
 - **Use it only with `compile_mode="aot_fx_trace"`.** GraphTrainer combined with `layer` compile
   mode causes severe HBM fragmentation and OOMs; `train.py` warns about this.
-- **One unrolled step graph stops compiling or fitting at large sizes.** Use scan or graph split
+- **One unrolled step graph stops compiling or fitting at large sizes.** Use scan or the graph splitter
   (§9).
 - **`optimizer_in_graph` costs HBM.** Step inputs are not donated today, so the graph holds both
   the input and the updated copies of parameters and optimizer state. Budget for it, or keep the
@@ -450,12 +450,12 @@ in `graph_trainer_save_regions` / `graph_trainer_save_last_n_layers`) saves thos
 
 **When it pays.** The gain is largest where the step is dispatch-bound: small models, small batch.
 On a well-sized model where per-block compile already leaves little device idle, it can roughly
-tie. At the largest sizes, combined with scan or graph split (§9), it is the path that compiles at
+tie. At the largest sizes, combined with scan or the graph splitter (§9), it is the path that compiles at
 all. Measure on your own setup.
 
 ---
 
-## 9. Large models: scan, graph split and CPU offload  *(general)*
+## 9. Large models: scan, graph splitter and CPU offload  *(general)*
 
 GraphTrainer (§8) compiles the step as one program with every layer unrolled. That stops working
 as the model grows, for three reasons:
@@ -468,16 +468,16 @@ as the model grows, for three reasons:
 - **Saved activations.** Even with full recompute, each layer saves its input, and all N of them
   are live at the end of the forward pass.
 
-Scan and graph split are two ways to give the step a structure that fixes the first two. CPU
+Scan and the graph splitter are two ways to give the step a structure that fixes the first two. CPU
 offload fixes the third and works with either. The large recipes combine ZeRO-3, full recompute,
-offload, and one of scan or graph split.
+offload, and one of scan or the graph splitter.
 
-| | Scan (`use_scan_layers`) | Graph split (`use_graph_split`) |
+| | Scan (`use_scan_layers`) | Graph splitter (`use_graph_split`) |
 |---|---|---|
 | Step runs as | one program, the layers as one loop | many programs, one per layer group |
 | Compiler sees | one layer body | each child separately |
 | Parameters | stacked `[n_layers, ...]`; per-layer names are gone | unchanged, per-layer |
-| Parallelism | 1-D data parallel only | not restricted by the config; the recipes are FSDP and HSDP |
+| Parallelism | data-parallel meshes: FSDP and HSDP (2-D shard x replicate) are tested; TP, CP, PP, EP rejected | not restricted by the config; the recipes are FSDP and HSDP |
 | In-graph optimizer | not rejected, but no recipe uses it | rejected |
 | Offload policy | `full_and_scan_offload` | `full_and_offload` |
 | Reference recipes | `llama3_*_scan()`, `qwen3_moe_235b_scan()` | `qwen3_moe_235b_fsdp_activation_offload_*()` |
@@ -515,8 +515,8 @@ Constraints:
 
 - It needs GraphTrainer (the config rejects it otherwise), traced with
   `compile_mode="aot_fx_trace"`: an eager `scan` does not run on TPU.
-- It supports 1-D data parallelism only. Tensor, context, pipeline and expert parallelism are
-  rejected.
+- Not every parallelism is supported. Data-parallel meshes work, FSDP and HSDP (the 2-D shard x
+  replicate mesh) are tested; tensor, context, pipeline and expert parallelism are rejected.
 - The layer body must not mutate its inputs or module state; `scan` raises at trace time. MoE
   models hit this through load-balancing counters and routing metrics. `qwen3_moe_235b_scan()`
   shows the workarounds (an override for the counter, `metrics.enable_moe_routing = False`).
@@ -532,7 +532,7 @@ Constraints:
   reduce-scatters land at the end of the loop body with little compute left to hide them, and the
   scan step runs measurably slower without the recipe's flags.
 
-### Graph split
+### Graph splitter
 
 `use_graph_split=True` keeps the layers unrolled but cuts the traced step into separately compiled
 programs ([`graph_trainer/graph_split.py`](graph_trainer/graph_split.py)). It first splits the
@@ -597,8 +597,8 @@ Select it through the memory policy:
 
 | Policy | Use with | What is offloaded |
 |---|---|---|
-| `sac_and_offload` | unrolled graph or graph split | activations that selective recompute still saves |
-| `full_and_offload` | unrolled graph or graph split | saved layer boundaries under full recompute |
+| `sac_and_offload` | unrolled graph or graph splitter | activations that selective recompute still saves |
+| `full_and_offload` | unrolled graph or graph splitter | saved layer boundaries under full recompute |
 | `full_and_scan_offload` | scan | the one stacked layer-input tensor |
 
 `graph_trainer_cpu_offload_budget_gb` (default 100) caps the host memory used per rank. Tensors
@@ -614,7 +614,7 @@ forward body and one reload in the backward body, so the device holds one layer'
 The value carried to the next layer stays on device, so no iteration waits on a host round trip.
 The Llama3 scan recipes above 8B need this policy to run at all.
 
-**With graph split, prefetch the reload.** By default each reload sits in the same program as the
+**With the graph splitter, prefetch the reload.** By default each reload sits in the same program as the
 backward that consumes it, so the transfer is exposed.
 `graph_split.cpu_offload_prefetch_executables = 1` issues it one backward program earlier, where
 the previous layer's compute hides it. The cost is carrying one completed activation across one
@@ -627,7 +627,7 @@ it costs. It requires a split backward (`backward_partition_mode` other than `no
   they would contend with the FSDP collectives. The measured effect on its own is small.
 - `xla_tpu_copy_insertion_use_region_analysis=True` (with
   `xla_tpu_copy_insertion_use_region_analysis_limit=1000`) lets XLA prove the copy ordering instead
-  of taking a defensive snapshot of each activation. On the 235B graph-split recipe it removed the
+  of taking a defensive snapshot of each activation. On the 235B graph-splitter recipe it removed the
   device-to-host waits and gave a clear MFU gain.
 
 **Check it in the profile.** After enabling offload, look for exposed host-to-device and
@@ -647,7 +647,7 @@ part.
 
 Reference recipes, all in [`qwen3/config_registry.py`](qwen3/config_registry.py):
 `qwen3_moe_30b_fsdp_only_full_ac_benchmark()` (30B), `qwen3_moe_235b_fsdp_activation_offload_*()`
-(235B, graph split) and `qwen3_moe_235b_scan()` (235B, scan).
+(235B, graph splitter) and `qwen3_moe_235b_scan()` (235B, scan).
 
 ### Which kernels to enable
 
@@ -785,8 +785,8 @@ below assumes a compiled model.
 7. Re-profile. If matmuls are near peak and the only idle left is the training-step glue, you're at
    the torch_tpu eager ceiling (§7) — raise it by shrinking the eager surface, not by more tuning,
    or remove that surface by capturing the whole step with GraphTrainer (§8).
-8. If the step no longer compiles or fits as one unrolled graph, run the layers as a scan or split
-   the graph, and offload saved activations to host memory (§9).
+8. If the step no longer compiles or fits as one unrolled graph, run the layers as a scan or let the graph splitter cut
+   the graph into programs, and offload saved activations to host memory (§9).
 
 ---
 
