@@ -13,7 +13,6 @@ Flavor / config checks                 | same file                              
 Mask semantics, if the arch has one    | same file                                    | PR #491 TestGemma4SdpaSlidingWindow
 End-to-end training cases              | tpu/tests/test_train_distributed.py          | muse_glimmer_fsdp / muse_glimmer_simplefsdp
                                        | tpu/tests/test_train_minimal_distributed.py  | qwen3_fsdp / qwen3_simplefsdp
-FLOP accounting, if a Config subclass  | tpu/tests/test_mfu_flops.py                  | MaxTextQwen3FlopsTest
 ```
 
 Do not add per-component CPU-vs-device ladders (embedding, attention, norm,
