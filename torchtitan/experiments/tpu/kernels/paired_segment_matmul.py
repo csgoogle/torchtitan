@@ -23,6 +23,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox import ops as gmm_ops
 from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm as megablox_gmm
 from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.kernels.pallas_naming import call_named
 
 
 # Keep the paired kernel on MegaBlox's exact metadata and boundary-mask
@@ -159,6 +160,7 @@ def _paired_forward(lhs, rhs1, rhs3, group_sizes, *, tile_m):
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary", "arbitrary")
         ),
+        name="moe_gmm_w13_fwd",
     )(group_metadata, group_offset, lhs, rhs1, rhs3)
 
 
@@ -245,6 +247,7 @@ def _accumulate_dinput(dout, rhs, existing, group_sizes, *, tile_m):
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary", "arbitrary")
         ),
+        name="moe_gmm_w3_dgrad_accum",
     )(group_metadata, group_offset, dout, rhs, existing)
 
 
@@ -255,7 +258,9 @@ def _dinput(dout1, dout3, rhs1, rhs3, group_sizes, *, tile_m):
     GMMs produced them and XLA added the outputs, so the result is bit-identical.
     """
     k, n = rhs1.shape[1:]
-    grad_lhs = megablox_gmm(
+    grad_lhs = call_named(
+        megablox_gmm,
+        "moe_gmm_w1_dgrad",
         dout1,
         rhs1,
         group_sizes=group_sizes,
@@ -420,6 +425,7 @@ def _paired_dweight(lhs, dout1, dout3, group_sizes, *, tile_m, tile_k=0):
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary", "arbitrary")
         ),
+        name="moe_tgmm_w13_wgrad",
     )(group_metadata, group_offset, lhs, dout1, dout3)
 
 

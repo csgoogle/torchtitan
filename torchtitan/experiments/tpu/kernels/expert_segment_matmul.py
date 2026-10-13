@@ -20,6 +20,7 @@ from jax.experimental.pallas.ops.tpu.megablox.gmm import (
     tgmm as megablox_tgmm,
 )
 from torch_tpu._internal import pallas
+from torchtitan.experiments.tpu.kernels.pallas_naming import call_named
 
 
 def _tiling(
@@ -51,7 +52,9 @@ def _grouped_mm_fwd(
 ) -> jax.Array:
     del tgmm_tile_m, tgmm_tile_k, tgmm_tile_n
     _, k_dim, n_dim = rhs.shape
-    return megablox_gmm(
+    return call_named(
+        megablox_gmm,
+        "moe_gmm_fwd",
         lhs,
         rhs,
         group_sizes=group_sizes,
@@ -74,7 +77,9 @@ def _grouped_mm_bwd(
     tgmm_tile_n: int,
 ) -> tuple[jax.Array, jax.Array]:
     _, k_dim, n_dim = rhs.shape
-    grad_lhs = megablox_gmm(
+    grad_lhs = call_named(
+        megablox_gmm,
+        "moe_gmm_dgrad",
         dout,
         rhs,
         group_sizes=group_sizes,
@@ -88,7 +93,9 @@ def _grouped_mm_bwd(
         ),
         transpose_rhs=True,
     )
-    grad_rhs = megablox_tgmm(
+    grad_rhs = call_named(
+        megablox_tgmm,
+        "moe_tgmm_wgrad",
         jnp.swapaxes(lhs, 0, 1),
         dout,
         group_sizes=group_sizes,
