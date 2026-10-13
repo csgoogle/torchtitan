@@ -216,6 +216,35 @@ class TpuGraphTrainerDistributedTest(
     for (step, scan), (_, loop) in zip(losses["scan"], losses["loop"]):
       self.assertAlmostEqual(scan, loop, delta=abs(loop) * 1e-5, msg=f"step {step}")
 
+  # Both models for the reason given above. The in-graph optimizer donates
+  # the stacks and their moments; a broken donation index or rebind fails at
+  # step 2 in PJRT or drifts the loss, so every step is compared.
+  @parameterized.named_parameters(_MODELS)
+  def test_scan_with_optimizer_in_graph_matches_the_layer_loop(self, module, config):
+    tempdir = self.create_tempdir().full_path
+    losses = {}
+    for arm, extra in (("loop", []), ("scan", ["--tpu_config.use_scan_layers"])):
+      path = os.path.join(tempdir, f"{arm}.json")
+      self._test_train_distributed(
+          config_args=_train_args(module, config)
+          + [
+              "--tpu_config.use_simple_fsdp",
+              "--tpu_config.optimizer_in_graph",
+              "--training.steps=4",
+          ]
+          + extra,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        losses[arm] = json.load(f)
+
+    self.assertLen(losses["scan"], 4)
+    for (step, scan), (_, loop) in zip(losses["scan"], losses["loop"]):
+      self.assertAlmostEqual(scan, loop, delta=abs(loop) * 1e-5, msg=f"step {step}")
+
 
 if __name__ == "__main__":
   mp.set_start_method("spawn")  # pyrefly: ignore[missing-attribute]

@@ -23,8 +23,15 @@ Three things have to hold, each checked here on its own:
    with the lr changed in between, is bit-identical with and without donation,
    including a tied parameter, which is passed in two argument slots and must
    therefore not be donated (PJRT rejects ``f(donate(a), a)``).
+5. The same on a decoder whose layers are stacked and run as one ``scan``
+   (``use_scan_layers``): the stacks are donated with their moments and the
+   donated program trains bit-identically to the undonated one.
 """
 
+import contextlib
+import dataclasses
+import functools
+import itertools
 import re
 import unittest
 
@@ -36,6 +43,9 @@ from torch.fx.experimental.proxy_tensor import make_fx
 # Imported as a module so pytest does not collect the base class itself.
 from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.graph_trainer.remove_noop_passes import (
+    remove_parameter_gradient_markers_pass,
+)
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     SubclassLayout,
     minimal_fx_tracer,
@@ -322,63 +332,77 @@ def _mse(pred, labels, global_valid_tokens=None):
     return ((pred.float() - labels) ** 2).mean()
 
 
+def _run_in_graph_adamw(
+    model, tokens, labels, valid, *, loss_fn, donate, lrs, context=contextlib.nullcontext
+):
+    """Traces ``_make_fwd_bwd_adamw_fn`` and runs it the way ``_fwd_bwd_adamw_step`` does."""
+    from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+        _make_fwd_bwd_adamw_fn,
+    )
+
+    fqns, fqn_to_canonical = _register_adamw_buffers(model, lrs[0])
+    opt = torch.optim.AdamW(
+        [(n, p) for n, p in model.named_parameters()], lr=lrs[0], weight_decay=0.1
+    )
+    step_fn = _make_fwd_bwd_adamw_fn(
+        model, loss_fn=loss_fn, param_fqns=fqns,
+        beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.1, max_norm=1.0,
+    )
+    with context():
+        traced = minimal_fx_tracer(step_fn, module=model)(tokens, labels, valid, {})
+    tied = {c for f, c in fqn_to_canonical.items() if f != c}
+    donated = (
+        adamw_donated_input_indices(traced.state_fqns, traced.input_subclass_layouts, tied_fqns=tied)
+        if donate else []
+    )
+    # The head of the trainer's "tpu" pipeline; the rest is remat and
+    # scheduling, which neither model here asks for.
+    gm = remove_parameter_gradient_markers_pass(traced.gm, traced.example_inputs)
+    traced.gm = tpu_backend_compile_pass(
+        gm, tuple(traced.example_inputs), donated_input_positions=tuple(donated)
+    )
+
+    losses = []
+    step_inputs = []
+    n = len(fqns)
+    for lr in lrs:
+        step_inputs.append({f: dict(model.named_parameters())[f] for f in fqns})
+        model._optstate_lr.fill_(lr)
+        with context():
+            outs = run_traced(traced, module=model)(tokens, labels, valid, {})
+        losses.append(float(outs[0].cpu()))
+        new_p, new_ea, new_eas = outs[1 : 1 + n], outs[1 + n : 1 + 2 * n], outs[1 + 2 * n : 1 + 3 * n]
+        if donate:
+            rebind_model_and_optstate_buffers(
+                model, fqns, new_p, new_ea, new_eas,
+                fqn_to_canonical=fqn_to_canonical, optimizers=[opt],
+            )
+        else:
+            update_model_and_optstate_buffers(model, fqns, new_p, new_ea, new_eas)
+        model._optstate_step.copy_(outs[1 + 3 * n])
+
+    state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    return losses, state, step_inputs, donated, opt, model, traced
+
+
 class InGraphAdamWStepOnDeviceTest(_OnDeviceTest):
     """Runs ``_make_fwd_bwd_adamw_fn`` the way ``_fwd_bwd_adamw_step`` does."""
 
     def _train(self, *, donate: bool, tie: bool, lrs=(1e-2, 3e-2, 1e-2)):
-        from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
-            _make_fwd_bwd_adamw_fn,
-        )
-
         torch.manual_seed(0)
         model = _Tiny(tie=tie).to(self.device)
         if tie:
             model.out.weight = model.emb.weight  # Module.to() re-creates Parameters and unties
-        fqns, fqn_to_canonical = _register_adamw_buffers(model, lrs[0])
-        opt = torch.optim.AdamW(
-            [(n, p) for n, p in model.named_parameters()], lr=lrs[0], weight_decay=0.1
-        )
         tokens = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], device=self.device)
         labels = torch.full((2, 4, 16), 0.5, device=self.device)
-        valid = torch.tensor(8.0, device=self.device)
-
-        step_fn = _make_fwd_bwd_adamw_fn(
-            model, loss_fn=_mse, param_fqns=fqns,
-            beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.1, max_norm=1.0,
+        return _run_in_graph_adamw(
+            model, tokens, labels, torch.tensor(8.0, device=self.device),
+            loss_fn=_mse, donate=donate, lrs=lrs,
         )
-        traced = minimal_fx_tracer(step_fn, module=model)(tokens, labels, valid, {})
-        tied = {c for f, c in fqn_to_canonical.items() if f != c}
-        donated = (
-            adamw_donated_input_indices(traced.state_fqns, traced.input_subclass_layouts, tied_fqns=tied)
-            if donate else []
-        )
-        traced.gm = tpu_backend_compile_pass(
-            traced.gm, tuple(traced.example_inputs), donated_input_positions=tuple(donated)
-        )
-
-        losses = []
-        first_inputs = [dict(model.named_parameters())[f] for f in fqns]
-        n = len(fqns)
-        for lr in lrs:
-            model._optstate_lr.fill_(lr)
-            outs = run_traced(traced, module=model)(tokens, labels, valid, {})
-            losses.append(float(outs[0].cpu()))
-            new_p, new_ea, new_eas = outs[1 : 1 + n], outs[1 + n : 1 + 2 * n], outs[1 + 2 * n : 1 + 3 * n]
-            if donate:
-                rebind_model_and_optstate_buffers(
-                    model, fqns, new_p, new_ea, new_eas,
-                    fqn_to_canonical=fqn_to_canonical, optimizers=[opt],
-                )
-            else:
-                update_model_and_optstate_buffers(model, fqns, new_p, new_ea, new_eas)
-            model._optstate_step.copy_(outs[1 + 3 * n])
-
-        state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-        return losses, state, first_inputs, donated, opt, model
 
     def test_three_donated_steps_match_the_undonated_program(self):
-        ref_losses, ref_state, _, _, _, _ = self._train(donate=False, tie=False)
-        losses, state, first_inputs, donated, opt, model = self._train(donate=True, tie=False)
+        ref_losses, ref_state, *_ = self._train(donate=False, tie=False)
+        losses, state, step_inputs, donated, opt, model, _ = self._train(donate=True, tie=False)
 
         self.assertTrue(donated, "nothing was donated")
         self.assertEqual(losses, ref_losses)
@@ -388,21 +412,149 @@ class InGraphAdamWStepOnDeviceTest(_OnDeviceTest):
         self.assertEqual(float(state["_optstate_step"]), 3.0)
         # The step-1 inputs were consumed; the optimizer follows the live Parameters.
         with self.assertRaisesRegex(RuntimeError, "deleted or donated"):
-            first_inputs[0].cpu()
+            next(iter(step_inputs[0].values())).cpu()
         live = {id(p) for p in model.parameters()}
         self.assertTrue(all(id(p) in live for g in opt.param_groups for p in g["params"]))
 
     def test_tied_parameter_trains_with_donation(self):
         # Before the tied exclusion this died in PJRT: "attempt to use a buffer
         # that was previously donated in the same call to Execute()".
-        ref_losses, ref_state, _, _, _, _ = self._train(donate=False, tie=True)
-        losses, state, _, donated, _, model = self._train(donate=True, tie=True)
+        ref_losses, ref_state, *_ = self._train(donate=False, tie=True)
+        losses, state, _, donated, _, model, _ = self._train(donate=True, tie=True)
 
         self.assertTrue(donated)
         self.assertEqual(losses, ref_losses)
         for key in ref_state:
             torch.testing.assert_close(state[key], ref_state[key], rtol=0, atol=0, msg=key)
         self.assertIs(model.out.weight, model.emb.weight)
+
+
+# --- 5. the same step on a scanned, stacked decoder ------------------------
+
+_SCAN_SEQ_LEN = 32
+_SCAN_TOKENS = 2 * _SCAN_SEQ_LEN
+
+
+def _scanned_qwen3(device):
+    """qwen3's debug model with its layers stacked and run as one ``scan``.
+
+    Built the way the trainer builds it (meta, ``to_empty``, ``init_weights``),
+    without SimpleFSDP: one chip, so the stacks are plain tensors and the scan
+    body's gather is the identity. The FSDP path is covered by
+    ``test_tpu_graph_trainer_distributed``.
+    """
+    from torchtitan.experiments.tpu.graph_trainer.layer_stack import (
+        with_tpu_stacked_layers,
+    )
+    from torchtitan.models.qwen3 import model_registry
+
+    config = dataclasses.replace(
+        model_registry("debugmodel", attn_backend="sdpa").model,
+        enable_weight_tying=False,
+    )
+    for layer in config.layers:
+        layer.attention.rope = dataclasses.replace(
+            layer.attention.rope, max_context_length=_SCAN_TOKENS
+        )
+    with torch.device("meta"):
+        model = with_tpu_stacked_layers(config, use_scan=True).build()
+    model.to_empty(device=device)
+    with torch.no_grad():
+        for t in itertools.chain(model.parameters(), model.buffers()):
+            t.zero_()
+    torch.manual_seed(0)
+    model.init_weights()
+    # With tying off, init_weights leaves the embedding as to_empty left it.
+    with torch.no_grad():
+        nn.init.normal_(model.tok_embeddings.weight)
+    return model
+
+
+def _cross_entropy(pred, labels, global_valid_tokens):
+    return (
+        nn.functional.cross_entropy(
+            pred.reshape(-1, pred.shape[-1]).float(), labels.reshape(-1), reduction="sum"
+        )
+        / global_valid_tokens
+    )
+
+
+class ScannedInGraphAdamWStepOnDeviceTest(_OnDeviceTest):
+    """``use_scan_layers`` with ``optimizer_in_graph``: the layer stacks reach
+    the scan HOP as ordinary state leaves, so the donation index walk and the
+    rebind are the same as for an unstacked model."""
+
+    def setUp(self):
+        super().setUp()
+        # A differently shaped scan body traced earlier in the process leaves
+        # an unbacked symbol behind (see test_layer_stack).
+        torch._dynamo.reset()
+
+    def _train(self, *, donate: bool):
+        from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+
+        model = _scanned_qwen3(self.device)
+        torch.manual_seed(1)
+        tokens = torch.randint(0, model.config.vocab_size, (_SCAN_TOKENS,))
+        labels = torch.roll(tokens, -1)
+        return _run_in_graph_adamw(
+            model, tokens.to(self.device), labels.to(self.device),
+            torch.tensor(float(_SCAN_TOKENS), device=self.device),
+            loss_fn=_cross_entropy, donate=donate, lrs=(1e-3, 3e-3, 1e-3),
+            context=functools.partial(set_unflatten_seq_len, _SCAN_SEQ_LEN),
+        )
+
+    def test_three_donated_scan_steps_match_the_undonated_program(self):
+        ref_losses, ref_state, *_ = self._train(donate=False)
+        losses, state, step_inputs, donated, _, model, traced = self._train(donate=True)
+
+        # Every stack and both of its moments are donated: the stacks are
+        # state leaves of their own, not views, so the index walk is the same
+        # as for an unstacked model.
+        stacks = [n for n, _ in model.named_parameters() if n.startswith("layer_stacks.")]
+        self.assertTrue(stacks)
+        donated_fqns = {traced.state_fqns[i] for i in donated}
+        for fqn in stacks:
+            parent, _, leaf = fqn.rpartition(".")
+            for name in (fqn, f"{parent}._optstate_{leaf}_exp_avg", f"{parent}._optstate_{leaf}_exp_avg_sq"):
+                self.assertIn(name, donated_fqns)
+        self.assertEqual(len(donated), 3 * len(list(model.parameters())))
+
+        self.assertLess(ref_losses[2], ref_losses[0], "the optimizer did not step")
+        self.assertEqual(losses, ref_losses)
+        self.assertEqual(set(state), set(ref_state))
+        for key in ref_state:
+            torch.testing.assert_close(state[key], ref_state[key], rtol=0, atol=0, msg=key)
+        # From step 2 on every parameter input, stacks included, is consumed.
+        # Step 1 is not checked: there the runtime copies the scan's inputs
+        # instead of donating them (input_output_alias is present, and step 1
+        # of the layer loop does donate). Known gap, see the PR.
+        for step in (1, 2):
+            for fqn, tensor in step_inputs[step].items():
+                with self.assertRaisesRegex(RuntimeError, "deleted or donated", msg=f"step {step + 1} {fqn}"):
+                    tensor.cpu()
+
+
+class OptimizerInGraphSupportTest(unittest.TestCase):
+
+    def test_rejects_gradient_accumulation(self):
+        from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+            _check_optimizer_in_graph_supported,
+        )
+
+        opt = torch.optim.AdamW([nn.Parameter(torch.zeros(2))])
+        _check_optimizer_in_graph_supported([opt], 1)
+        with self.assertRaisesRegex(ValueError, "does not support gradient accumulation"):
+            _check_optimizer_in_graph_supported([opt], 2)
+
+    def test_rejects_non_adamw(self):
+        from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+            _check_optimizer_in_graph_supported,
+        )
+
+        opt = torch.optim.Adam([nn.Parameter(torch.zeros(2))])
+        with self.assertRaisesRegex(ValueError, "only supports torch.optim.AdamW"):
+            _check_optimizer_in_graph_supported([opt], 1)
 
 
 if __name__ == "__main__":

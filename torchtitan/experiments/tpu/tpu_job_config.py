@@ -328,15 +328,6 @@ class TPUTrainerConfig(BaseTPUTrainerConfig):
             "optimizer_in_graph traces an AdamW step and only supports "
             f"optimizer_name='AdamW'; got {other}"
         )
-      # Scan stacks the per-layer parameters and routes them through a HOP; the
-      # in-graph optimizer's state ordering and input donation have not been
-      # made to agree with that (the one attempt died at step 2 on "Donation
-      # requested for invalid buffer"). Reject it until a test covers it.
-      if self.tpu_config.use_scan_layers:
-        raise ValueError(
-            "optimizer_in_graph is not supported with use_scan_layers; keep "
-            "the optimizer as a separate graph (compile_optimizer=True)"
-        )
     if self.tpu_config.compile_grad_norm:
       if self.tpu_config.optimizer_in_graph:
         raise ValueError(

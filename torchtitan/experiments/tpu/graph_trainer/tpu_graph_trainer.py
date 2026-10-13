@@ -82,6 +82,30 @@ def _optimizer_in_graph_enabled(config, tpu_extra) -> bool:
     return bool(getattr(config.compile, "optimizer_in_graph", False))
 
 
+def _check_optimizer_in_graph_supported(
+    optimizers, gradient_accumulation_steps: int
+) -> None:
+    """Rejects setups the traced fwd+bwd+AdamW step would silently change."""
+    # The config already rejects other optimizer names; this catches a
+    # factory or post-build hook that swapped the class underneath.
+    for opt in optimizers:
+        if not isinstance(opt, torch.optim.AdamW):
+            raise ValueError(
+                "optimizer_in_graph traces an AdamW step and only "
+                f"supports torch.optim.AdamW, got {type(opt).__name__}"
+            )
+    # Every call of the traced step applies AdamW, so accumulating over N
+    # microbatches would step the optimizer N times on 1/N-weighted gradients.
+    if gradient_accumulation_steps > 1:
+        raise ValueError(
+            "optimizer_in_graph steps the optimizer on every microbatch and "
+            "does not support gradient accumulation (got "
+            f"{gradient_accumulation_steps} microbatches per step); set "
+            "training.num_tokens_per_train_step to "
+            "num_tokens_per_microbatch_per_dp_rank x the DP degree"
+        )
+
+
 def _optimizer_compile_enabled(config, tpu_extra) -> bool:
     if tpu_extra is not None and getattr(tpu_extra, "optimizer_compile", False):
         return True
@@ -150,14 +174,9 @@ class TpuGraphTrainer(GraphTrainer):
             _dump_weight_stats(self.model_parts)
 
         if self._optimizer_in_graph:
-            # The config already rejects other optimizer names; this catches a
-            # factory or post-build hook that swapped the class underneath.
-            for opt in self.optimizers.optimizers:
-                if not isinstance(opt, torch.optim.AdamW):
-                    raise ValueError(
-                        "optimizer_in_graph traces an AdamW step and only "
-                        f"supports torch.optim.AdamW, got {type(opt).__name__}"
-                    )
+            _check_optimizer_in_graph_supported(
+                self.optimizers.optimizers, self.gradient_accumulation_steps
+            )
             self._opt_state_registered = False
 
         self._optimizer_compile = (

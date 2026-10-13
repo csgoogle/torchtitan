@@ -423,7 +423,12 @@ def tpu_backend_compile_pass(
         # Added in TorchTPU PR #2800. Keep this keyword conditional so the
         # default no-donation path also works with older TorchTPU builds.
         compiler_kwargs["donated_inputs"] = donated_inputs
-    executable = StaticCompiler()(gm, list(example_inputs), **compiler_kwargs)
+    # The graph already holds the backward. Lowering replays it, and with grad
+    # on a `scan` HOP whose inputs require grad (plain-tensor parameters, not
+    # FSDP's local shards) dispatches to scan's autograd and tries to
+    # differentiate the joint graph again.
+    with torch.no_grad():
+        executable = StaticCompiler()(gm, list(example_inputs), **compiler_kwargs)
     elapsed = time.time() - t0
     logger.info(
         f"[tpu_backend_pass] StaticCompiler ready in {elapsed:.1f}s "

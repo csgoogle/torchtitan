@@ -125,8 +125,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     """
     config = qwen3_8b()
     config.tpu_config.use_scan_layers = scanned
-    # The recipe folds AdamW into the step; scan excludes that.
-    config.tpu_config.optimizer_in_graph = False
     graph_config = self._qwen3_graph_config(config)
 
     plain = self._qwen3_graph_config(qwen3_8b()).model_spec.model
@@ -163,7 +161,6 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_scanning_refuses_expert_parallelism(self) -> None:
     config = qwen3_8b()
     config.tpu_config.use_scan_layers = True
-    config.tpu_config.optimizer_in_graph = False
     config.parallelism.expert_parallel_degree = 2
 
     with self.assertRaisesRegex(ValueError, "expert-parallel-degree"):
@@ -525,7 +522,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config.tpu_config.use_graph_split = use_graph_split
     config.tpu_config.use_scan_layers = use_scan_layers
     config.tpu_config.graph_trainer_fsdp_schedule = fsdp_schedule
-    # Neither graph split nor scan takes the in-graph optimizer.
+    # Graph split does not take the in-graph optimizer.
     config.tpu_config.optimizer_in_graph = False
 
     self._qwen3_graph_config(config)
@@ -1351,7 +1348,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         ]),
     )
 
-  def test_optimizer_in_graph_rejects_scan(self) -> None:
+  def test_optimizer_in_graph_accepts_scan(self) -> None:
+    # Covered end to end by test_optimizer_in_graph_donation (one chip) and
+    # test_tpu_graph_trainer_distributed (SimpleFSDP).
     config = self._debugmodel_config()
     tpu_config = dataclasses.replace(
         config.tpu_config,
@@ -1360,10 +1359,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         optimizer_in_graph=True,
         use_scan_layers=True,
     )
-    with self.assertRaisesRegex(
-        ValueError, "optimizer_in_graph is not supported with use_scan_layers"
-    ):
-      dataclasses.replace(config, tpu_config=tpu_config)
+    accepted = dataclasses.replace(config, tpu_config=tpu_config)
+    self.assertTrue(accepted.tpu_config.optimizer_in_graph)
+    self.assertTrue(accepted.tpu_config.use_scan_layers)
 
   def test_optimizer_in_graph_requires_adamw(self) -> None:
     config = self._debugmodel_config()
