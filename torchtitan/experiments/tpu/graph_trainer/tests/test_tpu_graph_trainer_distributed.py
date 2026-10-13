@@ -184,9 +184,15 @@ class TpuGraphTrainerDistributedTest(
 
   # Both models, because the flag reaches them through a config rewrite with no
   # model-specific code, and running it end to end on two models is what holds
-  # that true. qwen3 is also the MoE arm.
-  @parameterized.named_parameters(_MODELS)
-  def test_scan_matches_the_layer_loop(self, module, config):
+  # that true. qwen3 is also the MoE arm. Both optimizer placements: in-graph
+  # AdamW donates the stacks and their moments, and a broken donation index or
+  # rebind fails at step 2 in PJRT or drifts the loss from there on.
+  @parameterized.named_parameters([
+      dict(m, testcase_name=f"{m['testcase_name']}_{placement}", optimizer_in_graph=in_graph)
+      for m in _MODELS
+      for placement, in_graph in (("separate_optimizer", False), ("optimizer_in_graph", True))
+  ])
+  def test_scan_matches_the_layer_loop(self, module, config, optimizer_in_graph):
     """The scan must train to the same losses as the layer loop it replaces.
 
     Every step, not just the first: a scan that drops the gradient on its init
@@ -200,6 +206,7 @@ class TpuGraphTrainerDistributedTest(
       self._test_train_distributed(
           config_args=_train_args(module, config)
           + ["--tpu_config.use_simple_fsdp"]
+          + (["--tpu_config.optimizer_in_graph"] if optimizer_in_graph else [])
           + extra,
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
@@ -210,38 +217,10 @@ class TpuGraphTrainerDistributedTest(
         losses[arm] = json.load(f)
 
     self.assertNotEmpty(losses["loop"])
+    self.assertLen(losses["scan"], len(losses["loop"]))
     # Bit-identical on llama3. qwen3's MoE reorders its accumulation between the
     # arms, so the last mantissa bits drift once the optimizer has stepped; a
     # severed carry moves the loss by percent, far outside this.
-    for (step, scan), (_, loop) in zip(losses["scan"], losses["loop"]):
-      self.assertAlmostEqual(scan, loop, delta=abs(loop) * 1e-5, msg=f"step {step}")
-
-  # Both models for the reason given above. The in-graph optimizer donates
-  # the stacks and their moments; a broken donation index or rebind fails at
-  # step 2 in PJRT or drifts the loss, so every step is compared.
-  @parameterized.named_parameters(_MODELS)
-  def test_scan_with_optimizer_in_graph_matches_the_layer_loop(self, module, config):
-    tempdir = self.create_tempdir().full_path
-    losses = {}
-    for arm, extra in (("loop", []), ("scan", ["--tpu_config.use_scan_layers"])):
-      path = os.path.join(tempdir, f"{arm}.json")
-      self._test_train_distributed(
-          config_args=_train_args(module, config)
-          + [
-              "--tpu_config.use_simple_fsdp",
-              "--tpu_config.optimizer_in_graph",
-              "--training.steps=4",
-          ]
-          + extra,
-          data_parallel_shard_degree=-1,
-          tensor_parallel_degree=1,
-          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
-          enable_compile=True,
-      )
-      with open(path) as f:
-        losses[arm] = json.load(f)
-
-    self.assertLen(losses["scan"], 4)
     for (step, scan), (_, loop) in zip(losses["scan"], losses["loop"]):
       self.assertAlmostEqual(scan, loop, delta=abs(loop) * 1e-5, msg=f"step {step}")
 

@@ -1349,8 +1349,9 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
   def test_optimizer_in_graph_accepts_scan(self) -> None:
-    # Covered end to end by test_optimizer_in_graph_donation (one chip) and
-    # test_tpu_graph_trainer_distributed (SimpleFSDP).
+    # The donation walk over the scanned step is checked in
+    # test_optimizer_in_graph_donation; the step itself runs end to end in
+    # test_tpu_graph_trainer_distributed (SimpleFSDP, both models).
     config = self._debugmodel_config()
     tpu_config = dataclasses.replace(
         config.tpu_config,
