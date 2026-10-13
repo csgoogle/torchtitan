@@ -1,107 +1,55 @@
-# PR description as the onboarding record
+# The PR description is the onboarding record
 
-The merged Muse Glimmer PRs (#521, #529, #530, #532) are the standard: the
-description states what changed and why, which tests prove it, the measured
-bounds next to the asserted ones, and what is deliberately left for later.
-No handover file is committed; the description is updated on every push and
-the wiki (if the project keeps one) links to the PR.
+It is the only state that survives between sessions: whoever resumes (a later
+agent session, a reviewer, you next week) reads the ladder table first. Update
+it on every push, not at the end. The merged Muse Glimmer PRs (#521, #529,
+#530, #532) are the standard: what changed and why, which tests prove it, the
+measured bounds next to the asserted ones, what is deliberately left for later.
 
-The record is also the only state that survives between sessions. Whoever
-resumes an onboarding (a later agent session, a reviewer, you next week)
-reads the `## Ladder` table first, so it is updated after every rung, not at
-the end.
-
-## Ladder table (in the PR description, from Step 1 on)
+## Ladder table (from Step 1 on; execution target and dispatch budget above it)
 
 ```
-Rung | Feature / flag                 | Commit    | Parity test (bounds, measured)      | Numerics class | Run (target, steps, result)          | Status
------|--------------------------------|-----------|-------------------------------------|----------------|--------------------------------------|---------
-1    | SDPA + per-block compile       | <sha>     | Test<Model>ReferenceParity <...>    | oracle         | A, v6e-4, 10 steps, loss a->b, det OK | merged
-2    | GraphTrainer (use_graph_trainer)| <sha>    | 3-step loss vs compile <...>        | bit-identical  | A, v6e-4, 10 steps                   | done
-3    | splash (use_splash_attention)  | <sha>     | vs SDPA packed <...>                | rounding-order | A, v6e-4                             | in progress: <what is open>
-...  |                                |           |                                     |                |                                      | blocked on: <chip / reference dump>
+Rung | Feature / flag                  | Commit | Parity test (bounds, measured) | Numerics class | Run (target, steps, result)   | Status
+-----|---------------------------------|--------|--------------------------------|----------------|-------------------------------|---------------------
+1    | SDPA + per-block compile        | <sha>  | Test<Model>ReferenceParity ... | oracle         | A, v6e-4, 10 steps, det OK    | merged
+2    | GraphTrainer (use_graph_trainer)| <sha>  | 3-step loss vs compile ...     | bit-identical  | A, v6e-4, 10 steps            | done
+3    | splash (use_splash_attention)   | <sha>  | vs SDPA packed ...             | rounding-order | A, v6e-4                      | in progress: <open item>
 ```
 
-Execution target (Step 0 answer) and the dispatch budget used / remaining go
-above the table.
-
-## PR 1 template
+## PR 1
 
 ```
-<Model> on the TorchTitan TPU lane (<style A: wraps torchtitan/models/<name> |
-style B: ported from <reference: HF id | Megatron checkpoint | MaxText config | ...>,
-under experiments/tpu/examples/<name>>).
+<Model> on the TorchTitan TPU lane (<wraps torchtitan/models/<name> | ported from
+<reference> under experiments/tpu/examples/<name>>). Execution target: <A | B <tpu, zone> | C <cluster>>.
 
-Execution target: <A: this VM | B: <tpu name, zone> | C: <cluster>>.
+Architecture (source: <file:line per constant>): layers <N>, pattern <...>;
+attention <GQA heads/kv, head_dim, QK-norm, window, softcap>; norms <...>;
+RoPE <theta, partial factor, real/complex>; FFN/MoE <act, experts, top-k, router,
+balancer>; embeddings <tied, scaled>; forward side effects <none | X behind flags>.
 
-Architecture (source: <reference file:line, e.g. HF config.json / modeling_<x>.py,
-Megatron model_config, paper>):
-- layers: <N>, pattern <homogeneous | k sliding + 1 global | ...>
-- attention: <GQA heads/kv>, head_dim <d> (<d_global> on global layers), QK-norm <y/n>,
-  sliding window <W>, softcap <attn/final>
-- norms: <RMSNorm, eps 1e-6, (1+w) | w>
-- RoPE: theta <t>, partial factor <f>, <complex | real>
-- FFN / MoE: <gated act>, experts <E> top-k <k>, router <details>, balancer <details>
-- embeddings: tied <y/n>, scaled by sqrt(dim) <y/n>
-- forward side effects (scan blockers): <none | counters X, metrics Y behind flags>
-Every constant above is taken from <file:line>.
+Code: <file: one line each>; deviations from models/common and why; registration.
 
-Code:
-- <file>: <one line each>
-- Deviations from torchtitan/models/common and why: <...>
-- Registration: train.py import + model_spec.name route; train_minimal.py
+Tests: Test<Model>ReferenceParity (<in-process HF | golden dump from <ref, commit>>,
+tiny config <dims>, <variants>; logits / loss / all grads; bounds <...>, measured <...>);
+state-dict round trip; flavor checks; <mask test>; test_train_distributed <cases>.
 
-Tests:
-- test_<name>.py::Test<Model>ReferenceParity: <HF <class> (CPU, fp32) in-process |
-  golden dump from <reference, commit>> vs <Model>Model (<device>), tiny config
-  <dims>, <variants>; logits / loss / all grads. Bounds <...>; measured <...>
-  on v6e, <...> on v7x.
-- state-dict round trip; flavor checks; <mask semantics test>
-- test_train_distributed: <name>_fsdp, <name>_simplefsdp (3 steps, context <L>
-  because <reason>)
+Runs (<VM type>, torch_tpu <sha>, libtpu <ver>): <name>_debugmodel 10 steps, loss
+<l0> -> <l10>; determinism bit-identical; step-1 oracle loss <x> grad_norm <y>;
+eager / compile / (GraphTrainer) agree to <...>.
 
-Runs (TPU VM <type>, image <tag>, torch_tpu <sha>, libtpu <ver>):
-- <name>_debugmodel, 10 steps: loss <l0> -> <l10>, grad_norm <...>
-- determinism: two runs --debug.seed=42 --debug.deterministic bit-identical
-- step-1 oracle: loss <x>, grad_norm <y>
-- eager / per-block / (GraphTrainer): <losses agree to ...>
-
-Not in this PR (follow-ups): GraphTrainer wrapper, splash/tokamax, fused CE,
-<MoE kernels>, <size> recipe.
+Not in this PR: GraphTrainer wrapper, splash/tokamax, fused CE, <MoE kernels>, <size> recipe.
 ```
 
-## Rung commit message (Step 2)
-
-One commit per rung; the same text, condensed, goes into the Ladder table row.
+## Rung commit (Step 2); the same text, condensed, is the table row
 
 ```
 <Feature> for <Model> on TPU.
 
-What: <one paragraph: what it replaces, how it is enabled, default off>.
-Why: <profile evidence: bucket, exposed time>.
-
-Numerics class: <bit-identical | rounding-order | semantic (then: why this is
-a separate recipe)>. Step-1 oracle: <same | delta>.
-
-Tests:
-- <parity test>: <inputs geometry>; bounds <...>, measured <...>
-- control: <what was disabled and how much the metric moved>
-- test_train_distributed: <case name> (<flags>)
-
-Measurement (<recipe>, <chips>, >= 10 steps past warmup):
-  before <step time / TPS / MFU / HBM>, after <...>.
-HLO evidence: <custom_call name present N times; segment ids in operands>.
-```
-
-## Step 3 template
-
-```
-<Model> <size> recipe on <generation> <topology>.
-
-Recipe: <fn name>; flags with reasons in the README.
-Features on by default: <list, each with numerics class and the PR that added it>.
-Trajectory check: <reference>, 200 steps, post-warmup median |diff| <x> nats,
-offset <y> (<accepted because ... | open>).
-Benchmark Results table: in recipes/<...>/README.md.
-Known gaps: <EP, TP, PP, scan for heterogeneous layers, ...>.
+What: <what it replaces, how it is enabled, default off>. Why: <profile evidence>.
+Numerics class: <bit-identical | rounding-order | semantic (why a separate recipe)>;
+step-1 oracle <same | delta>.
+Tests: <parity test, inputs, bounds, measured>; control: <what was disabled, how much
+the metric moved>; test_train_distributed <case>.
+Measurement (<recipe>, <chips>, >= 10 steps past warmup): before <...>, after <...>.
+HLO: <custom_call present N times; segment ids in operands>.
 ```
