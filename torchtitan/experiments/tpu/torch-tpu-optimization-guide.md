@@ -145,8 +145,10 @@ genuinely are fixed (they should be for training), `dynamic=False` is always cor
 failure modes on TorchTPU, and no TorchTitan TPU recipe uses it:
 
 - Without activation checkpointing inside the graph, all layers' activations are live at once →
-  **compile-time / runtime OOM** at any real depth. (You cannot easily put `checkpoint()` inside a
-  single compiled TorchTPU graph — the RNG-state save/restore does not trace cleanly.)
+  **compile-time / runtime OOM** at any real depth. (Dynamo can capture non-reentrant
+  `checkpoint()`, but on TorchTPU the RNG-state fork and restore that `preserve_rng_state=True`
+  (the default) performs does not trace cleanly; the conformer recipe sets `preserve_rng_state=False`
+  for that reason, and no TPU recipe puts `checkpoint()` inside a whole-model compile.)
 - The token-embedding backward can bind incorrectly when compiled — leave the **embedding eager**.
 - Lazily-created buffers (e.g. RoPE cos/sin) must be **materialized before tracing**, or the
   graph's input set shifts and recompilation/errors follow.
@@ -377,8 +379,9 @@ running as separate eager programs (§7). **GraphTrainer** removes that surface.
 `TpuGraphTrainer` ([`graph_trainer/tpu_graph_trainer.py`](graph_trainer/tpu_graph_trainer.py)),
 the TPU subclass of TorchTitan's [GraphTrainer](../graph_trainer/README.md), traces the whole
 training step (forward, loss, backward and optionally the optimizer step) with `make_fx` into a
-single FX graph. It then runs graph passes over it and compiles the result for TPU, so each step
-runs as one XLA program.
+single FX graph. It then runs graph passes over it and compiles the result for TPU, so the
+forward, loss and backward run as one XLA program (the optimizer step too, with
+`optimizer_in_graph`; otherwise it and the compiled gradient norm are separate programs).
 
 How it differs from whole-model `torch.compile` (§4):
 
@@ -386,7 +389,7 @@ How it differs from whole-model `torch.compile` (§4):
 |---|---|---|
 | Tracer | Dynamo: guards, graph breaks | `make_fx`: the whole step is traced ahead of time |
 | Covers | model forward + backward | forward + loss + backward, plus the optimizer with `optimizer_in_graph` |
-| Activation memory | `checkpoint()` does not trace | a memory-policy pass on the graph decides per tensor: save, recompute or offload to host |
+| Activation memory | `checkpoint()` inside the compiled region, if it traces at all on TorchTPU (§4: `preserve_rng_state` is the known problem; no TPU recipe does it) | a memory-policy pass on the graph decides per tensor: save, recompute or offload to host |
 | FSDP | SimpleFSDP | SimpleFSDP collectives in the same graph, with passes that schedule all-gather prefetch |
 
 **How to enable it:**
@@ -408,8 +411,16 @@ the `llama3_*_scan()` recipes in [`llama3/config_registry.py`](llama3/config_reg
 **Memory policy.** GraphTrainer ignores the eager `activation_checkpoint` config. Activation memory
 is set by `graph_trainer_memory_policy`:
 
-- `default`: selective recompute. Saves compute-heavy ops and FSDP all-gathers, recomputes the rest.
-- `full`: full recompute, saving only layer outputs.
+- `default`: selective recompute. Saves compute-heavy ops (matmuls, attention), recomputes the rest.
+- `full`: full recompute, saving layer outputs.
+
+Both have the same exceptions, which matter for the memory budget: FSDP all-gather outputs are
+force-saved only under ZeRO-2 (`fsdp_reshard_after_forward="never"`), because that is what "do not
+reshard" means; under ZeRO-3 the policy may recompute them. RNG ops (dropout) are always saved,
+because the graph path cannot replay their random state. `full` additionally saves the ops named in
+`compile.full_recompute_save_ops`; the `tpu_selective` policy (full recompute plus the regions named
+in `graph_trainer_save_regions` / `graph_trainer_save_last_n_layers`) saves those regions. Under scan, the MoE expert-count all-reduces are saved as well
+(`scan_remat_policy.py`), so backward reuses the forward's counts instead of recomputing a collective.
 - `eager`: alternates matmuls between save and recompute, matching TorchTitan's eager selective AC.
 - `sac_and_offload`, `full_and_offload`, `full_and_scan_offload`: one of the above, plus offload of
   saved activations to host memory (§9).
@@ -484,9 +495,9 @@ config.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
 What it changes:
 
 - **One loop body.** Each kind of weight is stored as one tensor with a row per layer, and the
-  compiler sees one layer instead of N. Compile time and compile-time memory stop growing with
-  depth. `llama3_405b_scan()` is the 405B recipe because the per-layer path does not compile at
-  that size.
+  compiler sees one layer instead of N. The layer body is compiled once, so the part of compile
+  time and compile-time memory that scaled with depth no longer does. `llama3_405b_scan()` is the
+  405B recipe because the per-layer path does not compile at that size.
 - **FSDP gathers one layer at a time.** The all-gather runs inside the loop body on one layer's
   shard, next to the compute that needs it, so the full stack of weights is never resident.
 - **The body is fully recomputed in backward**, including its all-gather. The only per-layer save
@@ -541,8 +552,11 @@ The knobs, in [`GraphSplitterConfig` (`tpu_job_config.py`)](tpu_job_config.py):
     stages where communication overlaps the neighbouring layer's compute.
 - `backward_layers_per_executable`: complete layers per backward program.
 
-A layer and its collective chain are never divided across programs. Each layer keeps its own saved
-input and is recomputed just before its own backward, whatever the grouping.
+A collective is never divided across programs: its launch and its wait stay in the same program.
+Whether a layer's collectives stay with the layer's compute depends on the mode: `by_layer` keeps
+them together; `fsdp_pipeline` deliberately puts a layer's all-gather in the preceding program and
+its reduce-scatter in the following one, so the chain spans three programs by design. Each layer
+keeps its own saved input and is recomputed just before its own backward, whatever the grouping.
 
 The tradeoff is program size against scheduling scope. Small programs compile fast and bound
 compile-time memory, but the compiler can only overlap communication with compute inside one
@@ -684,8 +698,12 @@ Notes on the switches:
   weight gradients on TPU (torch_tpu issue 2668). The recipes use the Pallas path for that reason.
 - **The paired kernel and the kernel-native layout both require `use_pallas_grouped_mm`.** Model
   construction fails otherwise.
-- **Checkpoints are unaffected by the kernel-native layout.** Weights are stored in the order the
-  kernel reads, and state-dict hooks translate to and from the standard keys on save and load.
+- **Model checkpoints are unaffected by the kernel-native layout; optimizer state is not.** Weights
+  are stored in the order the kernel reads, and the module's state-dict hooks translate to and from
+  the standard keys (`w1_EFD` etc.) on save and load. The optimizer state dict has no such hook: it
+  is keyed by the live parameter names (`state.w1_EDF.exp_avg` vs `state.w1_EFD.exp_avg`) with the
+  live shapes, so resuming optimizer state across a layout change needs a conversion; a plain load
+  fails on the missing key.
 - **Expert compute runs in bf16** whatever the surrounding dtype. The weight-gradient kernels
   accumulate in fp32 and return bf16.
 - **Route-score fusion keeps the fp32 multiply and reduction** of native autograd. Only the
