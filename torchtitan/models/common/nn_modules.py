@@ -18,6 +18,7 @@ add more if a new callsite needs them.
 
 from dataclasses import dataclass
 
+import torch
 import torch.nn as nn
 
 from torchtitan.protocols.module import Module
@@ -76,14 +77,22 @@ class Conv2d(nn.Conv2d, Module):
 
 
 class GELU(nn.GELU, Module):
-    """Configurable nn.GELU."""
+    """Configurable nn.GELU. ``activation_in_fp32`` evaluates it in fp32 and casts
+    back (TPU v7x numerics, see FeedForward.Config.activation_in_fp32)."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         approximate: str = "none"
+        activation_in_fp32: bool = False
 
     def __init__(self, config: Config):
         super().__init__(approximate=config.approximate)
+        self.activation_in_fp32 = config.activation_in_fp32
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation_in_fp32 and x.dtype != torch.float32:
+            return super().forward(x.float()).to(x.dtype)
+        return super().forward(x)
 
 
 class GroupNorm(nn.GroupNorm, Module):
@@ -149,14 +158,21 @@ class RMSNorm(nn.RMSNorm, Module):
 
 
 class SiLU(nn.SiLU, Module):
-    """Configurable nn.SiLU."""
+    """Configurable nn.SiLU. ``activation_in_fp32`` evaluates it in fp32 and casts
+    back (TPU v7x numerics, see FeedForward.Config.activation_in_fp32)."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        pass
+        activation_in_fp32: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
+        self.activation_in_fp32 = config.activation_in_fp32
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation_in_fp32 and x.dtype != torch.float32:
+            return super().forward(x.float()).to(x.dtype)
+        return super().forward(x)
 
 
 __all__ = [

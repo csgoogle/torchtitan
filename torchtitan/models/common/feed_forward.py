@@ -43,15 +43,29 @@ class FeedForward(Module):
         w1: Linear.Config
         w2: Linear.Config
         w3: Linear.Config
+        # Compute SiLU(w1 x) * w3 x in fp32 and cast the product back to the
+        # activation dtype; the matmuls keep their dtype. Needed on accelerators
+        # that evaluate bf16 SiLU natively in bf16 (TPU v7x): with Qwen3-4B's
+        # large early-layer activations the bf16 evaluation raises the
+        # hidden-state error of the forward ~3x and the logits error ~5x against
+        # an fp32 reference.
+        activation_in_fp32: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
         self.w1 = config.w1.build()
         self.w2 = config.w2.build()
         self.w3 = config.w3.build()
+        self.activation_in_fp32 = config.activation_in_fp32
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(self.swiglu(self.w1(x), self.w3(x)))
+
+    def swiglu(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """``SiLU(gate) * up``, in fp32 when ``activation_in_fp32`` is set."""
+        if self.activation_in_fp32:
+            return (F.silu(gate.float()) * up.float()).to(gate.dtype)
+        return F.silu(gate) * up
 
 
 class SigmoidGatedFeedForward(FeedForward):

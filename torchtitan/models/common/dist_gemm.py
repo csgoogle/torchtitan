@@ -30,7 +30,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
 from torchtitan.distributed.linear import (
     AllGatherLinear,
@@ -221,7 +220,7 @@ class DistGEMMFeedForward(FeedForward):
             tp_group.group_name,
         )
         # Elementwise on feature-sharded activations: no collective.
-        h = F.silu(h1) * h3
+        h = self.swiglu(h1, h3)
         return LinearReduceScatter.apply(
             h,
             self.w2.weight,
