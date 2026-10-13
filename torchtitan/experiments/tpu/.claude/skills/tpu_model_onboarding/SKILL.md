@@ -22,9 +22,11 @@ Templates in the tree; read them instead of expecting this skill to restate them
   of writing); its `TestGemma4HFReferenceParity` is the parity-test template
 - recipe README: `experiments/tpu/recipes/ironwood/qwen3-30b-a3b/tpu7x-4x4x4/README.md`
 
-References: [tests.md](references/tests.md) (which tests to write, the
-parity-test contract, CI rules), [run.md](references/run.md) (execution
-targets, what closes on which tier, reading a run),
+References: [model.md](references/model.md) (port layout, the weight
+mapping and how it is checked, registration), [tests.md](references/tests.md)
+(which tests to write, the parity-test contract, CI rules),
+[run.md](references/run.md) (execution targets, what closes on which tier,
+reading a run),
 [pr_template.md](references/pr_template.md) (the onboarding record),
 [gotchas.md](references/gotchas.md).
 
@@ -70,7 +72,13 @@ scan). Every constant gets a source line.
 
 - Model code, plain SDPA, no Pallas kernels, no GraphTrainer. `debugmodel`
   flavor plus the real sizes; a `<name>_debugmodel` recipe. Register in
-  `experiments/tpu/train.py` and `train_minimal.py`.
+  `experiments/tpu/train.py` and `train_minimal.py` (`model.md`).
+- For a port, the weight mapping: a `StateDictAdapter` subclass with
+  `from_hf` / `to_hf` (`model.md`), which is what `--checkpoint.initial_load_in_hf`
+  and the parity test both go through. Write the key table into the PR before
+  the code; the parity test proves it (no missing or unexpected keys, then the
+  numbers), a round-trip test keeps it honest, and the KL check on the real
+  checkpoint closes it before Step 3.
 - Decide the large-size path now and write the layers for it. Homogeneous
   layers: keep the stock `Decoder.forward` loop and make
   `check_layers_are_stackable` pass, so scan (rung 7) stays open.
