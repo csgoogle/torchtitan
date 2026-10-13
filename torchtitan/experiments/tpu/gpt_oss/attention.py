@@ -86,8 +86,11 @@ class SinkSDPA(ScaledDotProductInnerAttention):
             )
         # Match upstream Flex/Varlen's natural-log LSE, in [T, H] order.
         lse_k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
-        scores = (q.float() @ lse_k.float().transpose(-2, -1)) * scale
-        lse = scores.masked_fill(~mask, float("-inf")).logsumexp(-1)
+        # Explicit casts alone do not prevent autocast from rounding QK back
+        # to bf16. The sink normalizer must retain the fp32 score accumulator.
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            scores = (q.float() @ lse_k.float().transpose(-2, -1)) * scale
+            lse = scores.masked_fill(~mask, float("-inf")).logsumexp(-1)
         out = out.transpose(1, 2)
         lse = lse.transpose(1, 2)
         if folded:

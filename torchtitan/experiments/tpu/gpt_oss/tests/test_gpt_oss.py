@@ -213,8 +213,13 @@ class TestGptOssConfig(absltest.TestCase):
 
 
 class TestGptOssMasks(BaseAcceleratorDeviceTest):
-    @parameterized.named_parameters(("window", 4), ("global", None))
-    def test_sink_and_packed_mask(self, window):
+    @parameterized.named_parameters(
+        ("window", 4, False),
+        ("global", None, False),
+        ("window_amp", 4, True),
+        ("global_amp", None, True),
+    )
+    def test_sink_and_packed_mask(self, window, amp):
         device = self.accelerator_device
         module = SinkSDPA.Config(window_size=window).build()
         q = torch.randn(1, 16, 4, 16, device=device, requires_grad=True)
@@ -226,11 +231,13 @@ class TestGptOssMasks(BaseAcceleratorDeviceTest):
         )
 
         def transform(out, lse):
-            return out * torch.sigmoid(lse - sinks).unsqueeze(-1)
+            self.assertEqual(lse.dtype, torch.float32)
+            return out * torch.sigmoid(lse - sinks).to(out.dtype).unsqueeze(-1)
 
-        actual = module(
-            q, k, v, positions=positions, enable_gqa=True, out_transform=transform
-        )
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
+            actual = module(
+                q, k, v, positions=positions, enable_gqa=True, out_transform=transform
+            )
         # Independent explicit sink-softmax reference, including sink gradients.
         scores = torch.einsum("blhd,bshd->bhls", q, k.repeat_interleave(2, 2)) / 4
         distance = (
@@ -246,7 +253,9 @@ class TestGptOssMasks(BaseAcceleratorDeviceTest):
             (scores, sinks[None, :, None, None].expand(1, 4, 16, 1)), -1
         ).softmax(-1)[..., :-1]
         expected = torch.einsum("bhls,bshd->blhd", probs, v.repeat_interleave(2, 2))
-        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=5e-3, rtol=1e-2)
+        torch.testing.assert_close(
+            actual.float().cpu(), expected.cpu(), atol=5e-3, rtol=1e-2
+        )
         actual_grads = torch.autograd.grad(
             actual.square().sum(), (q, k, v, sinks), retain_graph=True
         )
@@ -256,7 +265,8 @@ class TestGptOssMasks(BaseAcceleratorDeviceTest):
             dict(enumerate(actual_grads)),
             {i: g.cpu() for i, g in enumerate(expected_grads)},
         )
-        unmasked = module(q, k, v, enable_gqa=True, out_transform=transform)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
+            unmasked = module(q, k, v, enable_gqa=True, out_transform=transform)
         self.assertGreater(((unmasked - expected).norm() / expected.norm()).item(), 0.1)
 
 
