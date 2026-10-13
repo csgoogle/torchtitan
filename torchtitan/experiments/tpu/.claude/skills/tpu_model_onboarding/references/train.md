@@ -1,8 +1,8 @@
-# Running and acceptance criteria
+# Acceptance criteria and numerics classes
 
-`torchtitan/experiments/tpu/README.md` has the environment, wheel build, GKE
-cluster and image steps. This file is what to run for an onboarding and what
-counts as "it trains".
+`run.md` says where and how a run happens on each execution target and how to
+read it; `torchtitan/experiments/tpu/README.md` has the environment, wheel
+build, cluster and image steps. This file is what counts as "it trains".
 
 ## Environment, before the first run
 
@@ -50,11 +50,13 @@ the architecture (longer than any sliding window).
 
 ## Target size (GKE)
 
-Use the recipe README's launch block (`gcluster job submit` or xpk). Rules
-that bit before: xpk `--script-dir` explicit (it tars the cwd otherwise),
-single-line `--command`, workload names under 40 characters, one `--env` per
-flag, multi-host JobSets pinned to a nodepool, `torchrun --redirects=3
---tee=3` so tracebacks reach the logs.
+Use the recipe README's `gcluster job submit` block (Cluster Toolkit; the
+README links the cluster and image setup) with the pre-dispatch gate in
+`run.md`. If the cluster is driven by xpk instead, the rules that bit before:
+`--script-dir` explicit (it tars the cwd otherwise), single-line `--command`,
+workload names under 40 characters, one `--env` per flag, multi-host JobSets
+pinned to a nodepool. Either way `torchrun --redirects=3 --tee=3` so
+tracebacks reach the logs.
 
 ## Acceptance criteria for "it trains"
 
@@ -88,9 +90,11 @@ presence in the HLO dump, not the log.
 ## Reference trajectory (before Step 3 closes)
 
 A unit test on a tiny config does not prove the real size trains the same as
-the reference. Before calling the target recipe done, run a 200-step
-comparison against a reference run of the same flavor (upstream torchtitan on
-GPU, or MaxText): pin optimizer and schedule, global batch in sequences,
+the reference. Before calling the target recipe done, compare 200 steps
+against a reference run of the same flavor (upstream torchtitan on GPU,
+MaxText, or the reference framework's own trainer). The reference run is an
+input: ask for it, or for its event files, with the settings below pinned; it
+is not something the TPU side produces. Pin optimizer and schedule, global batch in sequences,
 gradient-reduce dtype, seed, dataset and tokenizer, MoE balancer flavor. Compare
 post-warmup medians of the per-step loss (step >= 40), not means and not early
 steps. Qwen3-235B: median |diff| 0.06 nats vs 64 B200 eager was accepted; a
