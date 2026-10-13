@@ -30,6 +30,7 @@ from torchtitan.experiments.tpu.graph_trainer.config import (
 )
 from torchtitan.experiments.tpu.graph_trainer.scan_guards import check_scan_was_applied
 import torchtitan.experiments.tpu.llama3  # trigger model registration
+import torchtitan.experiments.tpu.gpt_oss  # trigger model registration
 import torchtitan.experiments.tpu.muse_glimmer  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
@@ -392,7 +393,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
 
     workarounds.apply_patches(model, train_config)
     if isinstance(train_config, tpu_job_config_module.TPUTrainerConfig):
-      if model_spec.name in ("llama3", "muse_glimmer", "qwen3"):
+      if model_spec.name in ("gpt_oss", "llama3", "muse_glimmer", "qwen3"):
         if (
             train_config.tpu_config.use_graph_trainer
             or train_config.tpu_config.compile_mode == "aot_fx_trace"

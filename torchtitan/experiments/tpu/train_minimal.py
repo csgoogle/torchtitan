@@ -24,6 +24,7 @@ import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
 import torchtitan.experiments.tpu.profiler_workaround as profiler_workaround
+import torchtitan.experiments.tpu.gpt_oss  # trigger model registration
 import torchtitan.experiments.tpu.qwen3   # trigger model registration
 import torchtitan.experiments.tpu.tpu_job_config
 import torchtitan.experiments.tpu.workarounds as workarounds
