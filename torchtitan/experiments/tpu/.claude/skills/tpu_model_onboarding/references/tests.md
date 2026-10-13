@@ -7,7 +7,7 @@ What to write, what not to write, and the one template that matters.
 ```
 Test                                  | File                                           | Template
 --------------------------------------|------------------------------------------------|-----------------------------------------------
-HF reference parity (single chip)     | tpu/<path>/tests/test_<name>.py                | PR #491 TestGemma4HFReferenceParity
+Reference parity (single chip)        | tpu/<path>/tests/test_<name>.py                | PR #491 TestGemma4HFReferenceParity (HF, in-process)
 State-dict round trip                 | same file                                      | PR #491 TestGemma4StateDictAdapter
 Flavor / config checks                | same file                                      | PR #491 TestGemma4Flavors, muse test_muse_glimmer_config
 Architecture-specific mask semantics  | same file, only if the arch has one            | PR #491 TestGemma4SdpaSlidingWindow
@@ -22,10 +22,21 @@ FFN one by one), `test_dtensor_parallelize_distributed.py`,
 DTensor itself was unproven; they are no longer required (PR #491 review). Add a
 component test only when it guards a specific thing the parity test cannot see.
 
-## The HF reference-parity test
+## The reference-parity test
+
+The contract is the same for every reference (Step 0, question 2): identical
+weights and identical inputs through the reference implementation and the
+TorchTitan model, one forward and one backward, logits, loss and every
+parameter gradient compared with stated tolerances, and the weight mapping
+checked both ways (no missing, no unexpected keys). What changes with the
+reference is where its half of the computation runs.
 
 One test class, `BaseAcceleratorDeviceTest` from `tpu/base_device_test.py`, so
-CI runs it on CPU and on a single TPU chip. Shape, from PR #491:
+CI runs it on CPU and on a single TPU chip.
+
+### In-process shape (HF transformers, upstream torchtitan; the worked example)
+
+Shape, from PR #491:
 
 1. **Reference**: build `transformers.<Model>ForCausalLM` from a tiny
    `<Model>TextConfig` in fp32, `.eval()`. Tiny means hidden 128, 2 layers that
@@ -65,9 +76,39 @@ gradients  | atol 8e-2 rtol 2e-2 | atol 8e-2 rtol 2e-2
 Start there; tighten if the model passes with margin, and record the measured
 error in the PR description next to the bound.
 
-## Feature parity tests (Step 2 PRs)
+### Golden-tensor shape (Megatron / NeMo, MaxText, custom code)
 
-Each kernel or optimization PR adds a test against the path it replaces, on
+When the reference cannot run in the test process (CUDA-only kernels, its own
+launcher, a different framework fighting for the chip), the reference side
+produces a dump and the test consumes it. Same seven steps, with these
+substitutions:
+
+- **A dump script lives next to the test** (`tests/dump_<name>_reference.py`)
+  and is the only thing that runs on the reference side. It builds the same
+  tiny config, perturbs the unit-initialized scales with a fixed seed, runs
+  one forward and backward on fixed tokens, and writes one file with: the
+  config values, the seed, the tokens and positions, the reference state dict
+  (in the reference's own key names and layouts), logits, loss, and every
+  parameter gradient keyed by reference name, plus provenance: reference
+  repository and commit, framework version, device, dtype policy.
+- **The test loads the dump**, maps weights and gradients through your
+  adapter, asserts the key sets match both ways, runs the TorchTitan model on
+  `self.accelerator_device`, and compares the same three quantities with the
+  same tolerance table. Nothing in the test imports the reference framework.
+- **Fixture size**: keep it under a few MB (tiny config, fp32) so it can live
+  in the repo; otherwise pin it in GCS with the provenance in a sidecar and
+  skip with a reason when it is unreachable.
+- **Regenerate** when the reference moves, and say so in the commit.
+- **Sharded sources** (Megatron TP/PP): the dump script gathers to a single
+  unsharded state dict on the reference side; the adapter handles layout
+  (`model.md`), never sharding.
+
+This skill has no verified Megatron or NeMo adapter; the first one written
+becomes the template here, the way #491 is for HF.
+
+## Feature parity tests (Step 2 rungs)
+
+Each kernel or optimization rung adds a test against the path it replaces, on
 the same packed batch, comparing outputs and gradients:
 
 - splash / tokamax attention vs SDPA (PR #530): context 4x the sliding
@@ -106,20 +147,33 @@ independent so a failed loss check does not skip the gradient checks.
 
 ## CI discovery rules (`.ci/discover_tpu_tests.py`)
 
-- Any `test_*.py` is collected. Hardware comes from the base class:
-  `BaseAcceleratorDeviceTest` runs on CPU and single TPU; distributed tests
-  subclass `base_distributed_device_test` and the file name must end in
-  `_distributed.py`.
-- Files with an `absltest.main()` block run as `python -m <module> --device=...`
-  (900 s timeout); files without one run under pytest.
+- Any `test_*.py` is collected and classified by the base classes its
+  TestCases inherit (an AST match on the class name): a class deriving from
+  `BaseDistributedDeviceTest` puts the module in the multi-chip shard (and the
+  file name must end in `_distributed.py`); `BaseAcceleratorDeviceTest` puts it
+  in the single-TPU shard; anything else is the CPU shard, which runs on a
+  host with no chip. A device test written as a plain `TestCase` with a
+  `skipUnless(<detect tpu>)` therefore lands in the CPU shard and skips on
+  every run, green. Never self-detect the device in a test: take it from the
+  base class (`self.accelerator_device`, resolved from `--device`; omitted
+  means the detected accelerator) and `self.skipTest("<reason>")` when the
+  resolved device cannot run the case.
+- Modules with an `absltest.main()` block run as `python -m <module>`
+  (`--device=tpu` on the TPU shards, 900 s timeout, retried once on
+  "TPU initialization failed"); files without one run under pytest, CPU only.
 - CPU runs set `TORCH_DEVICE_BACKEND_AUTOLOAD=0`; a test that imports
-  `torch_tpu` unconditionally breaks the CPU shard.
+  `torch_tpu` unconditionally breaks the CPU shard. `torch.tpu.device_count()`
+  is TorchTPU-internal and raises from user code; use `torch.accelerator`.
 - Use `@parameterized.named_parameters`; `testcase_name` is what CI reports.
+- There is no lint job and no pre-commit config; "CI green" means the shards
+  in `.github/workflows/tpu-test.yml`. Run the touched modules the same way
+  before pushing.
 
 ## Reference checks outside CI
 
 - `scripts/checkpoint_conversion/numerical_tests_*.py` compares logits by KL
   against an HF model on real weights; run it on the full checkpoint before
-  Step 3 and quote the KL in the PR.
+  Step 3 and quote the KL in the PR. For a non-HF reference the equivalent is
+  the golden dump taken on the real weights for a handful of sequences.
 - `/numerics_debugging` when a parity test fails and the first diverging op
   is not obvious.
