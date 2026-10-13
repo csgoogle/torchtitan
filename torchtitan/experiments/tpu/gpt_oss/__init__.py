@@ -30,6 +30,17 @@ def model_registry(flavor: str, *, seq_len: int | None = None, converters=None):
     return spec
 
 
-from .config_registry import gpt_oss_debugmodel, gpt_oss_20b, gpt_oss_120b
+from .config_registry import (
+    gpt_oss_debugmodel,
+    gpt_oss_debugmodel_graphtrainer,
+    gpt_oss_20b,
+    gpt_oss_120b,
+)
 
-__all__ = ["model_registry", "gpt_oss_debugmodel", "gpt_oss_20b", "gpt_oss_120b"]
+__all__ = [
+    "model_registry",
+    "gpt_oss_debugmodel",
+    "gpt_oss_debugmodel_graphtrainer",
+    "gpt_oss_20b",
+    "gpt_oss_120b",
+]

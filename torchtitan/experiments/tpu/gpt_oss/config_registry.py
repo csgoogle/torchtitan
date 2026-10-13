@@ -34,6 +34,14 @@ def gpt_oss_debugmodel() -> TPUTrainerConfig:
     )
 
 
+def gpt_oss_debugmodel_graphtrainer() -> TPUTrainerConfig:
+    """Opt-in joint forward/backward tracing; keep the baseline recipe intact."""
+    config = gpt_oss_debugmodel()
+    config.tpu_config.use_graph_trainer = True
+    config.tpu_config.compile_mode = "aot_fx_trace"
+    return config
+
+
 def gpt_oss_20b() -> TPUTrainerConfig:
     """20B architecture on SDPA; not a benchmarked production recipe."""
     from . import model_registry

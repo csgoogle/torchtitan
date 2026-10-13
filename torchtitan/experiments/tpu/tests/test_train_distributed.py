@@ -20,6 +20,18 @@ class TrainDistributedTest(
 
   @parameterized.named_parameters([
       dict(
+          testcase_name="gpt_oss_graphtrainer",
+          module="torchtitan.experiments.tpu.gpt_oss",
+          config="gpt_oss_debugmodel_graphtrainer",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+          args=[
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=256",
+          ],
+      ),
+      dict(
           testcase_name="gpt_oss_fsdp",
           module="torchtitan.experiments.tpu.gpt_oss",
           config="gpt_oss_debugmodel",

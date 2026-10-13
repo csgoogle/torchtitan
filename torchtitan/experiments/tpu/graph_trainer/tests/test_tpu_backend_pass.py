@@ -12,6 +12,31 @@ from torchtitan.experiments.tpu.graph_trainer import tpu_backend_pass
 
 class PartitionDonationTest(absltest.TestCase):
 
+  def test_compiled_additive_buffer_updates_survive_replay(self):
+    def fn(counts, assignments):
+      counts.add_(assignments)
+      return assignments.sum(), "tag"
+
+    gm = make_fx(fn, tracing_mode="fake")(torch.zeros(3), torch.ones(3))
+
+    class ValueOnlyCompiler:
+      def __call__(self, graph, inputs, **kwargs):
+        forward = graph.forward
+        # Model a compiled executable: outputs cross its boundary, Python
+        # tensor object mutation inside compilation does not.
+        return lambda *args: forward(*(arg.clone() for arg in args))
+
+    counts = torch.zeros(3)
+    with mock.patch.object(
+        tpu_backend_pass, "_import_static_compiler", return_value=ValueOnlyCompiler
+    ):
+      tpu_backend_pass.tpu_backend_compile_pass(gm, (counts, torch.ones(3)))
+    for total in (1, 2):
+      loss, tag = gm(counts, torch.ones(3))
+      self.assertEqual(loss.item(), 3)
+      self.assertEqual(tag, "tag")
+      torch.testing.assert_close(counts, torch.full((3,), float(total)))
+
   def _split(self, fn, inputs, partition_names):
     gm = make_fx(fn, tracing_mode="fake")(*inputs)
     partition_map = {
