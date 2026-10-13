@@ -151,6 +151,36 @@ class TrainMinimalDistributedTest(
           param_atol=5e-3,
           param_rtol=1e-3,
       ),
+      # olmo2. torch_tpu runs fp32 matmuls as one bf16 pass by default: the
+      # embedding / lm_head gradients then differ from CPU by up to 3.7e-3
+      # (1.9% relative L2); at "highest" precision by 3e-7. Hence grad_atol.
+      dict(
+          testcase_name="olmo2_fsdp",
+          module="examples.olmo2",
+          config="olmo2_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=["--parallelism.no-use_simple_fsdp"],
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=5e-3,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
+      ),
+      dict(
+          testcase_name="olmo2_simplefsdp",
+          module="examples.olmo2",
+          config="olmo2_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          loss_atol=1e-3,
+          loss_rtol=1e-3,
+          grad_atol=5e-3,
+          grad_rtol=1e-3,
+          param_atol=5e-3,
+          param_rtol=1e-3,
+      ),
   ])
   def test_train_minimal_distributed_parity(
       self,
