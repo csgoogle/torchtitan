@@ -18,28 +18,45 @@ Three things have to hold, each checked here on its own:
    by the execution, so the module's parameter and moment entries must be
    replaced by the outputs (``rebind_model_and_optstate_buffers``) rather than
    written back with ``copy_``, and the next step runs on the rebound tensors.
+   The optimizer's ``param_groups`` follow, since checkpointing steps them.
+4. The trainer's own step function (``_make_fwd_bwd_adamw_fn``), three steps
+   with the lr changed in between, is bit-identical with and without donation,
+   including a tied parameter, which is passed in two argument slots and must
+   therefore not be donated (PJRT rejects ``f(donate(a), a)``).
 """
 
 import re
 import unittest
 
+from absl.testing import absltest
 import torch
 from torch import nn
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from torchtitan.experiments.graph_trainer.make_fx_tracer import SubclassLayout
+# Imported as a module so pytest does not collect the base class itself.
+from torchtitan.experiments.tpu import base_device_test
+from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    SubclassLayout,
+    minimal_fx_tracer,
+    run_traced,
+)
 from torchtitan.experiments.tpu.compiled_optimizers.functional import (
+    adamw_donated_input_indices,
     rebind_model_and_optstate_buffers,
+    update_model_and_optstate_buffers,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
-    adamw_donated_input_indices,
+    _drop_donations_sharing_storage,
     tpu_backend_compile_pass,
 )
 
 
 def _tpu_available() -> bool:
+    # `torch.tpu.device_count` became TorchTPU-internal (raises when called from
+    # user code), which made the previous check skip these tests everywhere.
     try:
-        return torch.tpu.device_count() > 0
+        accelerator = torch.accelerator.current_accelerator()
+        return accelerator is not None and accelerator.type == "tpu" and torch.accelerator.device_count() > 0
     except Exception:  # torch_tpu not loaded, or no chip visible
         return False
 
@@ -86,6 +103,37 @@ class DonatedInputIndicesTest(unittest.TestCase):
 
     def test_nothing_to_donate_without_in_graph_optimizer_state(self):
         self.assertEqual(adamw_donated_input_indices(["layers.0.w", "norm.scale"], {}), [])
+
+    def test_tied_parameter_is_not_donated_but_its_moments_are(self):
+        # The tracer keeps one graph input per FQN, so a tied parameter is the
+        # same buffer in slots 0 and 1. Names alone cannot tell; the trainer
+        # passes the canonical FQNs of its tied parameters.
+        state_fqns = [
+            "emb.weight",  # 0: canonical, owns the moments
+            "out.weight",  # 1: alias of 0, same buffer
+            "emb._optstate_weight_exp_avg",  # 2
+            "emb._optstate_weight_exp_avg_sq",  # 3
+        ]
+        self.assertEqual(adamw_donated_input_indices(state_fqns, {}), [0, 2, 3])
+        self.assertEqual(
+            adamw_donated_input_indices(state_fqns, {}, tied_fqns={"emb.weight"}), [2, 3]
+        )
+
+
+class SharedStorageGuardTest(unittest.TestCase):
+    """The compile pass never donates a buffer that is also passed in another slot."""
+
+    def test_drops_donations_whose_buffer_appears_twice(self):
+        base = torch.zeros(8)
+        inputs = (base, base.view(2, 4), torch.zeros(3), 5)  # 0 and 1 share storage
+        self.assertEqual(_drop_donations_sharing_storage(inputs, (0, 2)), {2})
+        self.assertEqual(_drop_donations_sharing_storage(inputs, (1,)), set())
+        self.assertEqual(_drop_donations_sharing_storage(inputs, (2,)), {2})
+        self.assertEqual(_drop_donations_sharing_storage(inputs, ()), set())
+
+    def test_distinct_buffers_are_kept(self):
+        inputs = (torch.zeros(4), torch.zeros(4), None)
+        self.assertEqual(_drop_donations_sharing_storage(inputs, (0, 1)), {0, 1})
 
 
 # --- 3a. rebind semantics (device independent) -----------------------------
@@ -140,6 +188,29 @@ class RebindTest(unittest.TestCase):
         self.assertIs(model.head.weight, model.leaf.weight)
         self.assertEqual(model.head.weight.data_ptr(), new_p.data_ptr())
 
+    def test_optimizer_param_groups_follow_the_rebind(self):
+        # Checkpointing runs `init_optim_state`, a zero-lr step over the
+        # optimizer's param_groups; after a donated step those must be the
+        # live Parameters, not the consumed inputs.
+        from torchtitan.components.optimizer.utils import init_optim_state
+
+        model = nn.Module()
+        model.leaf = _Leaf()
+        opt = torch.optim.AdamW([("leaf.weight", model.leaf.weight)], lr=1e-3)
+        old = model.leaf.weight
+
+        rebind_model_and_optstate_buffers(
+            model, ["leaf.weight"], [torch.ones(4)], [torch.zeros(4)], [torch.zeros(4)],
+            optimizers=[opt],
+        )
+
+        (group,) = opt.param_groups
+        self.assertIs(group["params"][0], model.leaf.weight)
+        self.assertIsNot(group["params"][0], old)
+        init_optim_state(opt)
+        self.assertIn(model.leaf.weight, opt.state)
+        self.assertNotIn(old, opt.state)
+
 
 # --- 2 + 3b. the torch_tpu contract, on a chip ------------------------------
 
@@ -151,8 +222,11 @@ def _adamw_like(p, m, g):
     return new_p, new_m
 
 
+# `BaseAcceleratorDeviceTest` is what `.ci/discover_tpu_tests.py` keys on to run
+# a module in the single-TPU shard; a plain TestCase lands in the CPU shard,
+# where these would always skip.
 @unittest.skipUnless(_tpu_available(), "needs a TPU device")
-class DonationOnDeviceTest(unittest.TestCase):
+class DonationOnDeviceTest(base_device_test.BaseAcceleratorDeviceTest):
     @classmethod
     def setUpClass(cls):
         # torch_tpu's compile passes read absl flags; the trainer runs under
@@ -161,6 +235,7 @@ class DonationOnDeviceTest(unittest.TestCase):
 
         if not flags.FLAGS.is_parsed():
             flags.FLAGS(["test"])
+        super().setUpClass()
 
     def _graph(self):
         cpu = [torch.randn(8, 16) for _ in range(3)]
@@ -213,5 +288,139 @@ class DonationOnDeviceTest(unittest.TestCase):
         torch.testing.assert_close(new_m2.cpu(), exp_m2)
 
 
+# --- 4. the trainer's own step function, three steps, with and without donation
+
+
+def _register_adamw_buffers(model: nn.Module, lr: float):
+    """What ``TpuGraphTrainer._register_optimizer_buffers`` does, on a plain module."""
+    seen: dict[int, str] = {}
+    fqns: list[str] = []
+    fqn_to_canonical: dict[str, str] = {}
+    for name, p in model.named_parameters(remove_duplicate=False):
+        if id(p) in seen:
+            fqn_to_canonical[name] = seen[id(p)]
+            continue
+        seen[id(p)] = name
+        fqn_to_canonical[name] = name
+        fqns.append(name)
+        parent_path, _, leaf = name.rpartition(".")
+        parent = model.get_submodule(parent_path) if parent_path else model
+        parent.register_buffer(f"_optstate_{leaf}_exp_avg", torch.zeros_like(p), persistent=True)
+        parent.register_buffer(f"_optstate_{leaf}_exp_avg_sq", torch.zeros_like(p), persistent=True)
+    device = next(model.parameters()).device
+    model.register_buffer("_optstate_step", torch.zeros((), dtype=torch.float32, device=device), persistent=True)
+    model.register_buffer("_optstate_lr", torch.tensor(lr, dtype=torch.float32, device=device), persistent=False)
+    return fqns, fqn_to_canonical
+
+
+class _Tiny(nn.Module):
+    def __init__(self, tie: bool = False):
+        super().__init__()
+        self.emb = nn.Embedding(16, 8)
+        self.hidden = nn.Linear(8, 8)
+        self.out = nn.Linear(8, 16, bias=False)
+        if tie:
+            self.out.weight = self.emb.weight
+
+    def forward(self, tokens):
+        return self.out(torch.relu(self.hidden(self.emb(tokens))))
+
+
+def _mse(pred, labels, global_valid_tokens=None):
+    return ((pred.float() - labels) ** 2).mean()
+
+
+@unittest.skipUnless(_tpu_available(), "needs a TPU device")
+class InGraphAdamWStepOnDeviceTest(base_device_test.BaseAcceleratorDeviceTest):
+    """Runs ``_make_fwd_bwd_adamw_fn`` the way ``_fwd_bwd_adamw_step`` does."""
+
+    @classmethod
+    def setUpClass(cls):
+        from absl import flags
+
+        if not flags.FLAGS.is_parsed():
+            flags.FLAGS(["test"])
+        super().setUpClass()
+
+    def _train(self, *, donate: bool, tie: bool, lrs=(1e-2, 3e-2, 1e-2)):
+        from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
+            _make_fwd_bwd_adamw_fn,
+        )
+
+        torch.manual_seed(0)
+        model = _Tiny(tie=tie).to("tpu")
+        if tie:
+            model.out.weight = model.emb.weight  # Module.to() re-creates Parameters and unties
+        fqns, fqn_to_canonical = _register_adamw_buffers(model, lrs[0])
+        opt = torch.optim.AdamW(
+            [(n, p) for n, p in model.named_parameters()], lr=lrs[0], weight_decay=0.1
+        )
+        tokens = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], device="tpu")
+        labels = torch.full((2, 4, 16), 0.5, device="tpu")
+        valid = torch.tensor(8.0, device="tpu")
+
+        step_fn = _make_fwd_bwd_adamw_fn(
+            model, loss_fn=_mse, param_fqns=fqns,
+            beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.1, max_norm=1.0,
+        )
+        traced = minimal_fx_tracer(step_fn, module=model)(tokens, labels, valid, {})
+        tied = {c for f, c in fqn_to_canonical.items() if f != c}
+        donated = (
+            adamw_donated_input_indices(traced.state_fqns, traced.input_subclass_layouts, tied_fqns=tied)
+            if donate else []
+        )
+        traced.gm = tpu_backend_compile_pass(
+            traced.gm, tuple(traced.example_inputs), donated_input_positions=tuple(donated)
+        )
+
+        losses = []
+        first_inputs = [dict(model.named_parameters())[f] for f in fqns]
+        n = len(fqns)
+        for lr in lrs:
+            model._optstate_lr.fill_(lr)
+            outs = run_traced(traced, module=model)(tokens, labels, valid, {})
+            losses.append(float(outs[0].cpu()))
+            new_p, new_ea, new_eas = outs[1 : 1 + n], outs[1 + n : 1 + 2 * n], outs[1 + 2 * n : 1 + 3 * n]
+            if donate:
+                rebind_model_and_optstate_buffers(
+                    model, fqns, new_p, new_ea, new_eas,
+                    fqn_to_canonical=fqn_to_canonical, optimizers=[opt],
+                )
+            else:
+                update_model_and_optstate_buffers(model, fqns, new_p, new_ea, new_eas)
+            model._optstate_step.copy_(outs[1 + 3 * n])
+
+        state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        return losses, state, first_inputs, donated, opt, model
+
+    def test_three_donated_steps_match_the_undonated_program(self):
+        ref_losses, ref_state, _, _, _, _ = self._train(donate=False, tie=False)
+        losses, state, first_inputs, donated, opt, model = self._train(donate=True, tie=False)
+
+        self.assertTrue(donated, "nothing was donated")
+        self.assertEqual(losses, ref_losses)
+        self.assertEqual(set(state), set(ref_state))
+        for key in ref_state:
+            torch.testing.assert_close(state[key], ref_state[key], rtol=0, atol=0, msg=key)
+        self.assertEqual(float(state["_optstate_step"]), 3.0)
+        # The step-1 inputs were consumed; the optimizer follows the live Parameters.
+        with self.assertRaisesRegex(RuntimeError, "deleted or donated"):
+            first_inputs[0].cpu()
+        live = {id(p) for p in model.parameters()}
+        self.assertTrue(all(id(p) in live for g in opt.param_groups for p in g["params"]))
+
+    def test_tied_parameter_trains_with_donation(self):
+        # Before the tied exclusion this died in PJRT: "attempt to use a buffer
+        # that was previously donated in the same call to Execute()".
+        ref_losses, ref_state, _, _, _, _ = self._train(donate=False, tie=True)
+        losses, state, _, donated, _, model = self._train(donate=True, tie=True)
+
+        self.assertTrue(donated)
+        self.assertEqual(losses, ref_losses)
+        for key in ref_state:
+            torch.testing.assert_close(state[key], ref_state[key], rtol=0, atol=0, msg=key)
+        self.assertIs(model.out.weight, model.emb.weight)
+
+
 if __name__ == "__main__":
-    unittest.main()
+    absltest.main()

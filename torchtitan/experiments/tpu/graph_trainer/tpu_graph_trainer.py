@@ -36,6 +36,7 @@ from torchtitan.components.optimizer.optimizer import (
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.experiments.tpu import workarounds
 from torchtitan.experiments.tpu.compiled_optimizers.functional import (
+    adamw_donated_input_indices,
     functional_adamw_step,
     rebind_model_and_optstate_buffers,
 )
@@ -149,6 +150,14 @@ class TpuGraphTrainer(GraphTrainer):
             _dump_weight_stats(self.model_parts)
 
         if self._optimizer_in_graph:
+            # The config already rejects other optimizer names; this catches a
+            # factory or post-build hook that swapped the class underneath.
+            for opt in self.optimizers.optimizers:
+                if not isinstance(opt, torch.optim.AdamW):
+                    raise ValueError(
+                        "optimizer_in_graph traces an AdamW step and only "
+                        f"supports torch.optim.AdamW, got {type(opt).__name__}"
+                    )
             self._opt_state_registered = False
 
         self._optimizer_compile = (
@@ -488,8 +497,24 @@ class TpuGraphTrainer(GraphTrainer):
                     global_valid_tokens,
                     extra_kwargs,
                 )
+            # Donate the parameter and moment inputs to their outputs; a tied
+            # parameter sits in two argument slots and cannot be donated.
+            tied_fqns = {
+                canonical
+                for fqn, canonical in self._optstate_fqn_to_canonical.items()
+                if fqn != canonical
+            }
+            donated = adamw_donated_input_indices(
+                self._traced_step.state_fqns,
+                self._traced_step.input_subclass_layouts,
+                tied_fqns=tied_fqns,
+            )
             pipeline_fn = PASS_PIPELINE_REGISTRY["tpu"]
-            passes = pipeline_fn(self._traced_step, self.config)
+            passes = pipeline_fn(
+                self._traced_step,
+                self.config,
+                donated_input_positions=tuple(donated),
+            )
             self._traced_step.gm = apply_graph_passes(
                 self._traced_step.gm,
                 self._traced_step.example_inputs,
@@ -517,8 +542,9 @@ class TpuGraphTrainer(GraphTrainer):
             )
 
         # The step program donates the parameter / moment inputs to its outputs
-        # (tpu_backend_pass.adamw_donated_input_indices), so the inputs are consumed
-        # and the outputs replace them instead of being copied back.
+        # (adamw_donated_input_indices), so the inputs are consumed and the
+        # outputs replace them instead of being copied back; the optimizer's
+        # param_groups follow so checkpointing never touches a consumed buffer.
         rebind_model_and_optstate_buffers(
             model,
             self._optstate_param_fqns,
@@ -526,6 +552,7 @@ class TpuGraphTrainer(GraphTrainer):
             new_exp_avgs,
             new_exp_avg_sqs,
             fqn_to_canonical=self._optstate_fqn_to_canonical,
+            optimizers=self.optimizers.optimizers,
         )
         model._optstate_step.copy_(
             new_step.detach() if isinstance(new_step, torch.Tensor) else new_step

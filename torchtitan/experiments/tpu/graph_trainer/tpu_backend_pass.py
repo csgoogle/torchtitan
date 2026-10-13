@@ -13,10 +13,11 @@ import functools
 import logging
 import operator
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 from torch._dynamo.utils import detect_fake_mode
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.utils import _pytree
 
 from torchtitan.experiments.graph_trainer.cpu_offload import (
@@ -291,6 +292,52 @@ def _annotate_internal_donations(
     )
 
 
+def _storage_key(value: Any) -> int | None:
+    """Identity of a real device buffer, or None for anything that has none."""
+    if not isinstance(value, torch.Tensor) or isinstance(value, FakeTensor):
+        return None
+    try:
+        return value.untyped_storage().data_ptr()
+    except (RuntimeError, NotImplementedError):
+        return None
+
+
+def _drop_donations_sharing_storage(
+    example_inputs: Sequence[Any],
+    donated_input_positions: Sequence[int],
+) -> set[int]:
+    """Keep only donations whose buffer appears in a single argument slot.
+
+    A buffer that is passed in two slots, for example a tied parameter that the
+    tracer sees under two FQNs, cannot be donated through either of them: PJRT
+    rejects ``f(donate(a), a)`` at execute time ("attempt to use a buffer that
+    was previously donated in the same call"). Those donations are dropped
+    with a warning; the step still runs, it just keeps both copies.
+    """
+    donated = set(donated_input_positions)
+    if not donated:
+        return donated
+    slots_by_storage: dict[int, list[int]] = {}
+    for position, value in enumerate(example_inputs):
+        key = _storage_key(value)
+        if key is not None:
+            slots_by_storage.setdefault(key, []).append(position)
+    shared = {
+        position
+        for positions in slots_by_storage.values()
+        if len(positions) > 1
+        for position in positions
+    }
+    dropped = sorted(donated & shared)
+    if dropped:
+        logger.warning(
+            "[tpu_backend_pass] not donating inputs %s: their buffers are also "
+            "passed in another argument slot (tied parameters?)",
+            dropped,
+        )
+    return donated - shared
+
+
 def tpu_backend_compile_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple,
@@ -356,7 +403,9 @@ def tpu_backend_compile_pass(
 
     t0 = time.time()
     logger.info("[tpu_backend_pass] StaticCompiler(gm, example_inputs) ...")
-    donated_positions = set(donated_input_positions)
+    donated_positions = _drop_donations_sharing_storage(
+        example_inputs, donated_input_positions
+    )
     donated_inputs = []
     tensor_index = 0
     for position, value in enumerate(example_inputs):
@@ -520,52 +569,6 @@ def tpu_backend_compile_partitioned_pass(
     return gm
 
 
-def adamw_donated_input_indices(
-    state_fqns: Sequence[str],
-    input_subclass_layouts: Mapping[int, Any],
-) -> list[int]:
-    """Graph-input indices of the parameters and AdamW moments updated in-graph.
-
-    Only supported for Adam/AdamW: ownership is decided by the presence of an
-    ``exp_avg`` sibling and the donated set is exactly the two moments AdamW
-    keeps per parameter. An optimizer with a different state shape donates
-    nothing here rather than donating the wrong buffers.
-
-    The in-graph optimizer returns a fresh tensor for every parameter,
-    ``exp_avg`` and ``exp_avg_sq`` it owns. Without donation XLA keeps the input
-    and the output copies of all three resident at once; donating the inputs
-    lets it alias them (``jax.buffer_donor`` -> ``input_output_alias``).
-
-    A parameter is optimizer-owned iff ``_register_optimizer_buffers`` gave it a
-    sibling ``_optstate_<leaf>_exp_avg`` buffer; the moments are the
-    ``_optstate_*_exp_avg`` / ``_optstate_*_exp_avg_sq`` buffers themselves
-    (``_optstate_step`` / ``_optstate_lr`` are not donated). ``state_fqns`` are
-    the leading graph inputs in order; a wrapper-subclass state leaf (a DTensor
-    parameter) occupies ``input_subclass_layouts[i].num_tensors`` consecutive
-    plain graph inputs, all of which are donated.
-    """
-    names = set(state_fqns)
-
-    def _optstate_sibling(fqn: str, kind: str) -> str:
-        parent, _, leaf = fqn.rpartition(".")
-        return f"{parent}._optstate_{leaf}_{kind}" if parent else f"_optstate_{leaf}_{kind}"
-
-    donated: list[int] = []
-    flat_index = 0
-    for i, fqn in enumerate(state_fqns):
-        leaf = fqn.rpartition(".")[2]
-        is_moment = leaf.startswith("_optstate_") and (
-            leaf.endswith("_exp_avg") or leaf.endswith("_exp_avg_sq")
-        )
-        is_owned_param = _optstate_sibling(fqn, "exp_avg") in names
-        layout = input_subclass_layouts.get(i)
-        width = layout.num_tensors if layout is not None else 1
-        if is_moment or is_owned_param:
-            donated.extend(range(flat_index, flat_index + width))
-        flat_index += width
-    return donated
-
-
 def construct_tpu_transform_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
@@ -697,26 +700,38 @@ def construct_tpu_transform_passes(
 def construct_tpu_pass_pipeline(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
+    *,
+    donated_input_positions: Sequence[int] | None = None,
 ) -> list[Callable]:
     """Build the normal unsplit pipeline: joint transforms, then compilation.
 
     With ``optimizer_in_graph`` the step program returns updated parameters and
     AdamW moments; their inputs are donated so XLA aliases them instead of
-    holding both copies (``_fwd_bwd_adamw_step`` rebinds the outputs).
+    holding both copies (``_fwd_bwd_adamw_step`` rebinds the outputs). The
+    trainer passes ``donated_input_positions`` it computed with
+    ``adamw_donated_input_indices`` (it knows which parameters are tied); when
+    a caller does not, the positions are derived from the traced state names
+    alone.
     """
     compile_pass: Callable = tpu_backend_compile_pass
-    # `state_fqns` is only present on a real `TracedResult`; pipeline-shape
-    # tests build the pipeline from a stub without it and expect no donation.
-    state_fqns = getattr(traced_result, "state_fqns", None)
-    if config.tpu_config.optimizer_in_graph and state_fqns is not None:
+    if donated_input_positions is None:
+        # `state_fqns` is only present on a real `TracedResult`; pipeline-shape
+        # tests build the pipeline from a stub without it and expect no donation.
+        state_fqns = getattr(traced_result, "state_fqns", None)
+        if config.tpu_config.optimizer_in_graph and state_fqns is not None:
+            from torchtitan.experiments.tpu.compiled_optimizers.functional import (
+                adamw_donated_input_indices,
+            )
+
+            donated_input_positions = tuple(
+                adamw_donated_input_indices(
+                    state_fqns, traced_result.input_subclass_layouts
+                )
+            )
+    if donated_input_positions:
         compile_pass = functools.partial(
             tpu_backend_compile_pass,
-            donated_input_positions=tuple(
-                adamw_donated_input_indices(
-                    state_fqns,
-                    traced_result.input_subclass_layouts,
-                )
-            ),
+            donated_input_positions=tuple(donated_input_positions),
         )
     return [
         *construct_tpu_transform_passes(traced_result, config),
@@ -739,7 +754,6 @@ __all__ = [
     "tpu_backend_compile_pass",
     "tpu_backend_compile_partitioned_pass",
     "construct_tpu_transform_passes",
-    "adamw_donated_input_indices",
     "construct_tpu_pass_pipeline",
     "register",
     "PASS_PIPELINE_REGISTRY",

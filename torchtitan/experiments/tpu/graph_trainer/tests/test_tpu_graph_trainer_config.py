@@ -125,6 +125,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     """
     config = qwen3_8b()
     config.tpu_config.use_scan_layers = scanned
+    # The recipe folds AdamW into the step; scan excludes that.
+    config.tpu_config.optimizer_in_graph = False
     graph_config = self._qwen3_graph_config(config)
 
     plain = self._qwen3_graph_config(qwen3_8b()).model_spec.model
@@ -161,6 +163,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   def test_scanning_refuses_expert_parallelism(self) -> None:
     config = qwen3_8b()
     config.tpu_config.use_scan_layers = True
+    config.tpu_config.optimizer_in_graph = False
     config.parallelism.expert_parallel_degree = 2
 
     with self.assertRaisesRegex(ValueError, "expert-parallel-degree"):
@@ -522,6 +525,8 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     config.tpu_config.use_graph_split = use_graph_split
     config.tpu_config.use_scan_layers = use_scan_layers
     config.tpu_config.graph_trainer_fsdp_schedule = fsdp_schedule
+    # Neither graph split nor scan takes the in-graph optimizer.
+    config.tpu_config.optimizer_in_graph = False
 
     self._qwen3_graph_config(config)
 
@@ -1336,6 +1341,74 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(m.layer_stacks.flattened_for, 512)
     self.assertEqual(getattr(m.layer_stacks, "_fsdp_shard_dim", None), {"w": 1})
     self.assertTrue(m.layer_stacks.split_meshes_built)
+
+  def _debugmodel_config(self) -> TPUTrainerConfig:
+    return typing.cast(
+        TPUTrainerConfig,
+        ConfigManager().parse_args([
+            "--module=torchtitan.experiments.tpu.qwen3",
+            "--config=qwen3_debugmodel",
+        ]),
+    )
+
+  def test_optimizer_in_graph_rejects_scan(self) -> None:
+    config = self._debugmodel_config()
+    tpu_config = dataclasses.replace(
+        config.tpu_config,
+        use_graph_trainer=True,
+        compile_mode="aot_fx_trace",
+        optimizer_in_graph=True,
+        use_scan_layers=True,
+    )
+    with self.assertRaisesRegex(
+        ValueError, "optimizer_in_graph is not supported with use_scan_layers"
+    ):
+      dataclasses.replace(config, tpu_config=tpu_config)
+
+  def test_optimizer_in_graph_requires_adamw(self) -> None:
+    config = self._debugmodel_config()
+    tpu_config = dataclasses.replace(
+        config.tpu_config,
+        use_graph_trainer=True,
+        compile_mode="aot_fx_trace",
+        optimizer_in_graph=True,
+    )
+    adam = dataclasses.replace(
+        config.optimizer,
+        param_groups=[
+            dataclasses.replace(group, optimizer_name="Adam")
+            for group in config.optimizer.param_groups
+        ],
+    )
+    with self.assertRaisesRegex(ValueError, "only supports optimizer_name='AdamW'"):
+      dataclasses.replace(config, tpu_config=tpu_config, optimizer=adam)
+    # The AdamW form of the same config is accepted.
+    accepted = dataclasses.replace(config, tpu_config=tpu_config)
+    self.assertTrue(accepted.tpu_config.optimizer_in_graph)
+
+  def test_pipeline_donates_only_when_optimizer_in_graph(self) -> None:
+    config = self._debugmodel_config()
+    graph_config = to_tpu_graph_trainer_config(
+        config,
+        qwen3_gt.model_registry,
+        target_cls=TpuGraphTrainer.Config,
+    )
+    traced = SimpleNamespace(
+        num_static_inputs=0,
+        state_fqns=["w", "_optstate_w_exp_avg", "_optstate_w_exp_avg_sq", "_optstate_step"],
+        input_subclass_layouts={},
+    )
+
+    passes = construct_tpu_pass_pipeline(typing.cast(typing.Any, traced), graph_config)
+    self.assertFalse(hasattr(passes[-1], "keywords"))
+
+    graph_config.tpu_config.optimizer_in_graph = True
+    passes = construct_tpu_pass_pipeline(typing.cast(typing.Any, traced), graph_config)
+    self.assertEqual(passes[-1].keywords["donated_input_positions"], (0, 1, 2))
+    passes = construct_tpu_pass_pipeline(
+        typing.cast(typing.Any, traced), graph_config, donated_input_positions=(1, 2)
+    )
+    self.assertEqual(passes[-1].keywords["donated_input_positions"], (1, 2))
 
 
 if __name__ == "__main__":
