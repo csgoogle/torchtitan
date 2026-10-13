@@ -20,6 +20,11 @@ class TrainMinimalDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=False,
+          # Three-step CPU/TPU training uses native bf16 expert arithmetic and
+          # medium matmul precision (v6e max gradient delta: 0.00951). The
+          # single-device reference test separately bounds every gradient by
+          # relative L2 <= 0.02 and checks identical routing.
+          grad_atol=1e-2,
           args=[
               "--parallelism.no-use_simple_fsdp",
               "--training.max_context_length=256",
@@ -34,6 +39,7 @@ class TrainMinimalDistributedTest(
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           enable_compile=False,
+          grad_atol=1e-2,  # Same bf16 trajectory bound as the FSDP2 case.
           args=[
               "--parallelism.use_simple_fsdp",
               "--training.max_context_length=256",
