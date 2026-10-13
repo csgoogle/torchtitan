@@ -43,6 +43,19 @@ read, then `from_hf` of what was read. Saving in HF format
 (`--checkpoint.last_save_in_hf`) is `to_hf` alone. The parity test calls
 `from_hf` directly on the reference's state dict.
 
+Examples in the tree, by what they show (`torchtitan/models/<name>/state_dict_adapter.py`):
+
+```
+qwen3          the from_hf_map pattern; per-expert HF weights stacked into w1_EFD / w2_EDF /
+               w3_EFD; tied lm_head handled in both directions
+llama3         dense; the q/k permutation between HF's and the native RoPE layout
+               (_permute / _reverse_permute), the case the KL test in the conversion
+               README was written for
+muse_glimmer   the most recent; a vision tower mapped or dropped alongside the text
+               decoder, and a module docstring that states the mapping and its decisions
+               (the form to copy for the PR's key table)
+```
+
 How to write it, from `torchtitan/models/qwen3/state_dict_adapter.py`:
 
 - A `from_hf_map` dict of abstract keys with `{}` for the layer index (and
