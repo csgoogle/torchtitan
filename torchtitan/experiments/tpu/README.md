@@ -636,10 +636,9 @@ Differences from the single-slice command:
   of 16 GiB per NUMA node per process by default. JAX runs one process per VM, but torch_tpu runs
   one per TensorCore -- 8 per VM on v7x, which is why the command above uses
   `--nproc_per_node=8` -- so the pool is paid 8 times: 16 GiB x 2 NUMA nodes x 8 processes = 256 GiB
-  per VM. That matters when anything else needs host memory, such as activation offloading:
-  Llama3-405B with activation offloading can run out of host memory on multi-slice. The two flags
-  already in the `LIBTPU_INIT_ARGS` above shrink the pool to 4 GiB per process, 32 GiB per VM, and
-  both are needed:
+  per VM. That matters when anything else needs host memory, such as activation offloading. The
+  two flags already in the `LIBTPU_INIT_ARGS` above shrink the pool to 4 GiB per process, 32 GiB per
+  VM, and both are needed:
 
   ```bash
   --megascale_grpc_premap_memory_bytes=4294967296    # 4 GiB per process
