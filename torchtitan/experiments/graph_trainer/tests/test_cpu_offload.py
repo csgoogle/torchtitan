@@ -616,6 +616,23 @@ class TestCpuOffloadPass(TestCase):
         # bwd_mm should reference the replayed view (backward), not the original
         self.assertIn(replayed_views[0], bwd_mm[0].args)
 
+    def test_saved_view_boundary_offloads_its_base(self):
+        """A saved view consumed by the next layer is recomputed from its offloaded base."""
+        from torchtitan.experiments.graph_trainer.cpu_offload import (
+            tag_all_offloadable_activations,
+        )
+
+        gm = self._build_view_chain_graph()
+        mm, view, relu, mm2 = [n for n in gm.graph.nodes if n.op == "call_function"][:4]
+        mm2.args = (view, relu)
+        mm.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        view.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+
+        tag_all_offloadable_activations(gm)
+
+        self.assertEqual(view.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
+        self.assertEqual(mm.meta["recompute"], CheckpointPolicy.MUST_CPU_OFFLOAD)
+
     def test_wait_dep_points_to_last_forward_consumer(self):
         """Forward wait_tensor dep arg should reference the last forward consumer."""
         from torchtitan.experiments.graph_trainer.cpu_offload import (

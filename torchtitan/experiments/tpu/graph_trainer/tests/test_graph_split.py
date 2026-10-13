@@ -15,6 +15,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import (
     apply_cpu_offload_pass,
+    tag_all_offloadable_activations,
 )
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
@@ -83,6 +84,17 @@ class _OffloadToyTransformer(nn.Module):
     for layer in self.layers:
       inputs = layer(inputs)
     return inputs
+
+
+class _ViewOutputLayer(nn.Module):
+  """Ends in a view, like the TPU [B, L] block wrapper's ``.view(T, D)``."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.linear = nn.Linear(8, 8, bias=False)
+
+  def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    return torch.relu(self.linear(inputs.view(4, -1, 8))).view(-1, 8)
 
 
 class GraphSplitTest(absltest.TestCase):
@@ -491,6 +503,37 @@ class GraphSplitTest(absltest.TestCase):
         and node.args[1] in child_donors
     ]
     self.assertLen(donor_waits, 1)
+
+  def test_view_layer_boundaries_offload_and_split_by_layer(self):
+    """Saved view boundaries offload their bases and stay with their consumers."""
+    model = _OffloadToyTransformer(n_layers=3)
+    model.layers = nn.ModuleList(_ViewOutputLayer() for _ in range(3))
+    annotate_module_fqns(model)
+    traced = self._trace_toy_model(
+        model=model, inputs=torch.randn(512, 8, requires_grad=True)
+    )
+    _full_memory_policy_pass(
+        traced.gm,
+        config=SimpleNamespace(
+            compile=SimpleNamespace(full_recompute_save_ops=""),
+            parallelism=SimpleNamespace(
+                fsdp_reshard_after_forward="always",
+                pipeline_parallel_degree=1,
+            ),
+        ),
+    )
+    tag_all_offloadable_activations(traced.gm)
+    apply_cpu_offload_pass(traced.gm, prefetch_lookahead=0, defer_n_layers=0)
+    selective_activation_remat_pass(traced.gm)
+    split = split_forward_backward_graph(traced.gm, traced.example_inputs)
+    split_backward_graph_by_layer(split.backward_graph, n_layers=3)
+
+    offloads = [
+        node
+        for node in split.forward_graph.graph.nodes
+        if node.target is torch.ops.ao.offload.default
+    ]
+    self.assertLen(offloads, 2)
 
   def test_cpu_reload_prefetch_distance_counts_executables(self):
     """Zero uses the consumer child; one uses its immediate predecessor."""

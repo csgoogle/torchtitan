@@ -699,7 +699,7 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
 
     apply_bld_layout(
         model,
-        skip_reason=bld_skip_reason(job_config.parallelism, tpu_config),
+        skip_reason=bld_skip_reason(job_config.parallelism),
     )
 
 

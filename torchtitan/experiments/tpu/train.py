@@ -300,9 +300,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
 
           apply_bld_layout(
               model,
-              skip_reason=bld_skip_reason(
-                  train_config.parallelism, train_config.tpu_config
-              ),
+              skip_reason=bld_skip_reason(train_config.parallelism),
           )
           return gt_parallelize(model, *args, **kwargs)
 

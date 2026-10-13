@@ -340,6 +340,34 @@ def tag_all_offloadable_activations(
             all_layer_ids.add(lid)
     last_layer_id = max(all_layer_ids) if len(all_layer_ids) > 1 else _NOT_IN_LAYERS
 
+    # A saved layer boundary that is a view cannot be offloaded, and saving it
+    # keeps its base alive; save the base instead and recompute the view.
+    for node in gm.graph.nodes:
+        if (
+            node not in forward_nodes
+            or not _is_view(node)
+            or node.meta.get("recompute") != CheckpointPolicy.MUST_SAVE
+        ):
+            continue
+        layer_id = _get_layer_id(node)
+        if not any(
+            user in forward_nodes and _get_layer_id(user) != layer_id
+            for user in node.users
+        ):
+            continue
+        base = node
+        while (
+            _is_view(base)
+            and isinstance(base.args[0], Node)
+            and _get_layer_id(base.args[0]) == layer_id
+            and base.args[0].meta.get("recompute")
+            in (CheckpointPolicy.MUST_RECOMPUTE, CheckpointPolicy.PREFER_RECOMPUTE)
+        ):
+            base = base.args[0]
+        if base is not node and _can_offload_node(base):
+            node.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+            base.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+
     # Collect candidates with sizes for budget filtering.
     candidates: list[tuple[Node, int]] = []
 

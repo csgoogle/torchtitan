@@ -201,46 +201,17 @@ class BLDLayoutTest(parameterized.TestCase):
 class BLDSkipReasonTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
-      ("default_policy", {}, {}, False),
-      (
-          "scan_offload",
-          {},
-          {"graph_trainer_memory_policy": "full_and_scan_offload"},
-          False,
-      ),
-      (
-          "generic_offload_outside_graph_trainer",
-          {},
-          {
-              "use_graph_trainer": False,
-              "graph_trainer_memory_policy": "full_and_offload",
-          },
-          False,
-      ),
-      (
-          "generic_offload",
-          {},
-          {"graph_trainer_memory_policy": "full_and_offload"},
-          True,
-      ),
-      ("graph_split", {}, {"use_graph_split": True}, True),
-      ("context_parallel", {"context_parallel_degree": 2}, {}, True),
-      ("tensor_parallel", {"tensor_parallel_degree": 2}, {}, True),
+      ("default", {}, False),
+      ("context_parallel", {"context_parallel_degree": 2}, True),
+      ("tensor_parallel", {"tensor_parallel_degree": 2}, True),
   )
-  def test_skip_reason(self, parallelism_overrides, tpu_overrides, skipped):
+  def test_skip_reason(self, parallelism_overrides, skipped):
     parallelism = types.SimpleNamespace(
         context_parallel_degree=1, tensor_parallel_degree=1
     )
     vars(parallelism).update(parallelism_overrides)
-    tpu_config = types.SimpleNamespace(
-        use_graph_trainer=True,
-        compile_mode="layer",
-        use_graph_split=False,
-        graph_trainer_memory_policy="full",
-    )
-    vars(tpu_config).update(tpu_overrides)
 
-    reason = bld_skip_reason(parallelism, tpu_config)
+    reason = bld_skip_reason(parallelism)
 
     self.assertEqual(reason is not None, skipped, reason)
 
