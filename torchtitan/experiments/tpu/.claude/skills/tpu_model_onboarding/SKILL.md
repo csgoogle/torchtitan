@@ -22,9 +22,15 @@ Templates in the tree; read them instead of expecting this skill to restate them
   of writing); its `TestGemma4HFReferenceParity` is the parity-test template
 - recipe README: `experiments/tpu/recipes/ironwood/qwen3-30b-a3b/tpu7x-4x4x4/README.md`
 
+References: [tests.md](references/tests.md) (which tests to write, the
+parity-test contract, CI rules), [run.md](references/run.md) (execution
+targets, what closes on which tier, reading a run),
+[pr_template.md](references/pr_template.md) (the onboarding record),
+[gotchas.md](references/gotchas.md).
+
 ## Step 0: three questions before any code
 
-1. **Where does it run?**
+1. **Where does it run?** (`run.md` has the full table.)
    - A. this machine is the TPU VM: run directly; check the chips with
      `torch.accelerator.device_count()` (not `torch.tpu.*`, which raises) first.
    - B. a TPU VM over ssh: `gcloud compute tpus tpu-vm ssh <name> --zone=<z>
@@ -70,20 +76,13 @@ scan). Every constant gets a source line.
   writes in the layer forward (MoE counters and routing metrics behind config);
   no complex ops (real-arithmetic RoPE); heterogeneous layers compiled per
   block with `dynamic=False`.
-- The reference-parity test, the one test that matters: tiny config covering
-  every layer type; unit-initialized scales perturbed (`1 + 0.1 * randn`, or a
-  dropped multiply is invisible); geometry that exercises the architecture
-  (window shorter than the sequence, more experts than top-k, tying if the
-  real model ties); weights through the adapter with no missing or unexpected
-  keys; one forward and backward; logits, loss and every parameter gradient
-  compared. `BaseAcceleratorDeviceTest`, so CI runs it on CPU and on one chip.
-  Start from #491's bounds, tighten if there is margin, record the measured
-  error next to the bound. Do not pad the PR with per-component ladders or
-  sharding tests.
-- State-dict round trip, flavor checks, and a mask-semantics test if the
-  architecture has one (sliding window against the reference's definition).
-- End-to-end cases in `experiments/tpu/tests/test_train_distributed.py`
-  (FSDP2 and SimpleFSDP, 3 steps on `c4_test`, context longer than any window).
+- The tests in `tests.md`: the reference-parity test (the one that matters:
+  tiny config covering every layer type, perturbed scales, weights through the
+  adapter with keys checked both ways, logits + loss + every gradient
+  compared, on `BaseAcceleratorDeviceTest`), state-dict round trip, flavor
+  checks, a mask-semantics test if the architecture has one, and the
+  end-to-end cases in `experiments/tpu/tests/test_train_distributed.py`. Do
+  not pad the PR with per-component ladders or sharding tests.
 - A run on the Step 0 target that meets the bar below.
 
 ## The bar for "it trains" (every rung; recorded in the PR with its command)
@@ -166,10 +165,8 @@ forgotten). When the budget is spent, write the ladder table and stop.
 
 - Run touched test modules the way CI does before pushing: `python -m <module>
   --device=tpu` on a chip, `--device=cpu` for the CPU shard. CI classifies a
-  module by its base class: `BaseAcceleratorDeviceTest` -> single chip,
-  `BaseDistributedDeviceTest` in a `*_distributed.py` -> multi-chip, anything
-  else -> the CPU shard, where a `skipUnless(tpu)` test skips forever, green.
-  Take the device from the base class; never detect it yourself.
+  module by its base class (`tests.md`); take the device from the base class,
+  never detect it yourself.
 - No core edits for the model. No Meta copyright headers on new files.
 - No performance claim from fewer than 10 steps, from a single run, or before
   the numerics class is known.
