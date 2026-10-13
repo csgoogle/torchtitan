@@ -34,6 +34,7 @@ from torch import nn
 from torch.fx.experimental.proxy_tensor import make_fx
 
 # Imported as a module so pytest does not collect the base class itself.
+from torchtitan.experiments.tpu import accelerator_device_type as device_type
 from torchtitan.experiments.tpu import base_device_test
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     SubclassLayout,
@@ -50,15 +51,6 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     tpu_backend_compile_pass,
 )
 
-
-def _tpu_available() -> bool:
-    # `torch.tpu.device_count` became TorchTPU-internal (raises when called from
-    # user code), which made the previous check skip these tests everywhere.
-    try:
-        accelerator = torch.accelerator.current_accelerator()
-        return accelerator is not None and accelerator.type == "tpu" and torch.accelerator.device_count() > 0
-    except Exception:  # torch_tpu not loaded, or no chip visible
-        return False
 
 
 # --- 1. index selection -----------------------------------------------------
@@ -222,21 +214,21 @@ def _adamw_like(p, m, g):
     return new_p, new_m
 
 
-# `BaseAcceleratorDeviceTest` is what `.ci/discover_tpu_tests.py` keys on to run
-# a module in the single-TPU shard; a plain TestCase lands in the CPU shard,
-# where these would always skip.
-@unittest.skipUnless(_tpu_available(), "needs a TPU device")
-class DonationOnDeviceTest(base_device_test.BaseAcceleratorDeviceTest):
-    @classmethod
-    def setUpClass(cls):
-        # torch_tpu's compile passes read absl flags; the trainer runs under
-        # absl.app, a pytest process does not, so mark them parsed here.
-        from absl import flags
+# Device tests follow the lane's convention: the hardware comes from the
+# `--device` flag resolved by `BaseAcceleratorDeviceTest.setUp` (omitted =
+# detected accelerator), never from detection inside the test, and the base
+# class is also what `.ci/discover_tpu_tests.py` keys on to run the module in
+# the single-TPU shard (`python -m <module> --device=tpu`). A plain TestCase
+# would land in the CPU shard and skip forever.
+class _OnDeviceTest(base_device_test.BaseAcceleratorDeviceTest):
+    def setUp(self):
+        super().setUp()
+        if self.accelerator_device_type != device_type.AcceleratorDeviceType.TPU:
+            self.skipTest("StaticCompiler lowers to TPU only")
+        self.device = self.accelerator_device
 
-        if not flags.FLAGS.is_parsed():
-            flags.FLAGS(["test"])
-        super().setUpClass()
 
+class DonationOnDeviceTest(_OnDeviceTest):
     def _graph(self):
         cpu = [torch.randn(8, 16) for _ in range(3)]
         gm = make_fx(_adamw_like)(*cpu)
@@ -246,7 +238,7 @@ class DonationOnDeviceTest(base_device_test.BaseAcceleratorDeviceTest):
         from torch_tpu._internal.compile.compiler import StaticCompiler
 
         gm, cpu = self._graph()
-        tpu = [t.to("tpu") for t in cpu]
+        tpu = [t.to(self.device) for t in cpu]
         executable = StaticCompiler(debug=True)(gm, tpu, donated_inputs=[0, 1])
 
         donors = re.findall(r"%arg(\d+): tensor<[^>]*> \{[^}]*jax\.buffer_donor = true", executable.mlir_text)
@@ -255,7 +247,7 @@ class DonationOnDeviceTest(base_device_test.BaseAcceleratorDeviceTest):
 
     def test_compile_pass_donates_and_rebound_step_stays_correct(self):
         gm, cpu = self._graph()
-        p, m, g = (t.to("tpu") for t in cpu)
+        p, m, g = (t.to(self.device) for t in cpu)
         p_in, m_in = p, m
 
         gm = tpu_backend_compile_pass(gm, (p, m, g), donated_input_positions=(0, 1))
@@ -330,17 +322,8 @@ def _mse(pred, labels, global_valid_tokens=None):
     return ((pred.float() - labels) ** 2).mean()
 
 
-@unittest.skipUnless(_tpu_available(), "needs a TPU device")
-class InGraphAdamWStepOnDeviceTest(base_device_test.BaseAcceleratorDeviceTest):
+class InGraphAdamWStepOnDeviceTest(_OnDeviceTest):
     """Runs ``_make_fwd_bwd_adamw_fn`` the way ``_fwd_bwd_adamw_step`` does."""
-
-    @classmethod
-    def setUpClass(cls):
-        from absl import flags
-
-        if not flags.FLAGS.is_parsed():
-            flags.FLAGS(["test"])
-        super().setUpClass()
 
     def _train(self, *, donate: bool, tie: bool, lrs=(1e-2, 3e-2, 1e-2)):
         from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
@@ -348,16 +331,16 @@ class InGraphAdamWStepOnDeviceTest(base_device_test.BaseAcceleratorDeviceTest):
         )
 
         torch.manual_seed(0)
-        model = _Tiny(tie=tie).to("tpu")
+        model = _Tiny(tie=tie).to(self.device)
         if tie:
             model.out.weight = model.emb.weight  # Module.to() re-creates Parameters and unties
         fqns, fqn_to_canonical = _register_adamw_buffers(model, lrs[0])
         opt = torch.optim.AdamW(
             [(n, p) for n, p in model.named_parameters()], lr=lrs[0], weight_decay=0.1
         )
-        tokens = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], device="tpu")
-        labels = torch.full((2, 4, 16), 0.5, device="tpu")
-        valid = torch.tensor(8.0, device="tpu")
+        tokens = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], device=self.device)
+        labels = torch.full((2, 4, 16), 0.5, device=self.device)
+        valid = torch.tensor(8.0, device=self.device)
 
         step_fn = _make_fwd_bwd_adamw_fn(
             model, loss_fn=_mse, param_fqns=fqns,
