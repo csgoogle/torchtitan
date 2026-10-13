@@ -20,7 +20,6 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.experiments.tpu import tpu_flags
-from torchtitan.experiments.tpu.float8_converter import TpuFloat8LinearConverter
 from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import (
     SplashAttentionKernelConfig,
@@ -487,6 +486,10 @@ def _with_float8(
   Uses `TpuFloat8LinearConverter`, which builds a TPU-compatible torchao config
   (see `float8_converter.py` for how it differs from the CUDA converter).
   """
+
+  # Imported here so that only float8 configs require torchao.
+  from torchtitan.experiments.tpu.float8_converter import TpuFloat8LinearConverter  # pylint: disable=g-import-not-at-top
+
   model_spec = model_registry(
       flavor,
       attn_backend="sdpa",

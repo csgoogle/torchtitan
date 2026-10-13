@@ -28,9 +28,6 @@ RUN pip install -r requirements-flux.txt
 COPY requirements-dev.txt .
 RUN pip install -r requirements-dev.txt
 
-# torchao for float8 training experiments (matches //third_party/py/torchao).
-RUN pip install --no-deps torchao==0.17.0
-
 COPY torchtitan /torchtitan/torchtitan
 COPY assets /torchtitan/assets
 COPY tests /torchtitan/tests
