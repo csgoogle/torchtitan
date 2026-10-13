@@ -710,7 +710,7 @@ required and not just a tuning knob. The 235B recipes show a worked case.
 
 ### Expert parallelism (EP)
 
-**Expert parallelism is not fully implemented on TorchTPU yet. Support is coming later. For now,
+**Expert parallelism is not fully implemented in TorchTitan TPU yet. Support is coming later. For now,
 run with `expert_parallel_degree = 1`,** as every tuned recipe does, and let FSDP shard the expert
 weights along with the rest of the model.
 
