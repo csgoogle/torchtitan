@@ -483,6 +483,11 @@ class HFTransformerModel(BaseModel):
                 # counting) see the default layer; the model reads each
                 # layer's own config. A flavor may have cut the layer count.
                 self.allow_global_per_layer_attribute_access = True
+                # Cut layer_types with the overrides: HF validates every listed
+                # layer type against the per-layer config.
+                layer_types = getattr(self, "layer_types", None)
+                if isinstance(layer_types, list):
+                    self.layer_types = layer_types[: self.num_hidden_layers]
                 self.per_layer_config = {
                     i: o for i, o in per_layer_overrides.items()
                     if i < self.num_hidden_layers
@@ -893,6 +898,12 @@ class HFTransformerModel(BaseModel):
                     shared = getattr(self.mlp, shared_name, None)
                     if shared is not None:
                         shared.layer_idx = layer_idx
+            # Some architectures keep the MLP under another name (LFM2 and
+            # Falcon-H1: `feed_forward`; GraniteMoeHybrid: `shared_mlp`).
+            if mlp_cls is not None:
+                for module in self.modules():
+                    if isinstance(module, mlp_cls):
+                        module.layer_idx = layer_idx
 
         def _initialize_weights_patched(self, module, is_remote_code: bool = False):
             # NOTE(3outeille): monkey-patch PreTrainedModel to handle meta device initialization correctly
@@ -946,12 +957,14 @@ class HFTransformerModel(BaseModel):
             layer_idx_classes = tuple(layer_idx_classes)
 
             if isinstance(module, layer_idx_classes):
-                # layer_idx only matters for depth_init. Some architectures'
-                # MLP classes (LFM2, Falcon-H1, GraniteMoeHybrid) do not carry
-                # it; they take the depth-free std.
                 layer_idx = getattr(module, "layer_idx", None)
+                depth_init = getattr(config, "depth_init", False)
+                if depth_init and layer_idx is None:
+                    raise ValueError(
+                        f"Module {module} does not have a layer_idx attribute"
+                    )
 
-                if getattr(config, "depth_init", False) and layer_idx is not None:
+                if depth_init:
                     init_std = 0.02 / (2 * (layer_idx + 1)) ** 0.5
                 else:
                     init_std = 0.02 / (2 * config.num_hidden_layers) ** 0.5
