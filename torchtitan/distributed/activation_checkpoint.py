@@ -18,6 +18,7 @@ import torch_remat as remat
 import tyro
 from torch._functorch.partitioners import get_default_op_list
 # from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import offload_wrapper
 from torchtitan.experiments.tpu.utils import ptd_checkpoint_wrapper_with_early_stop as ptd_checkpoint_wrapper
 from torch.utils.checkpoint import (
     CheckpointPolicy,
@@ -170,18 +171,21 @@ class FullAC(ActivationCheckpointing):
 
     @dataclass(kw_only=True, slots=True)
     class Config(ActivationCheckpointing.Config):
-        pass
+        offload_to_cpu: bool = False
 
     def _wrap_block(
         self, module: nn.Module, *, base_fqn: str | None = None
     ) -> nn.Module:
-        return ptd_checkpoint_wrapper(
+        wrapped = ptd_checkpoint_wrapper(
             module,
             preserve_rng_state=self.config.preserve_rng_state,
             determinism_check=self.config.determinism_check,
             early_stop=False,
             debug=self.config.debug,
         )
+        if cast("FullAC.Config", self.config).offload_to_cpu:
+            wrapped = offload_wrapper(wrapped)
+        return wrapped
 
 
 class SelectiveAC(ActivationCheckpointing):

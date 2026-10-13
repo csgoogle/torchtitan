@@ -414,6 +414,70 @@ def qwen3_32b(seq_len: int | None = None) -> Trainer.Config:
     )
 
 
+def qwen3_235b_a22b(seq_len: int | None = None) -> Trainer.Config:
+    model_spec = model_registry("235B-A22B", seq_len=seq_len)
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./assets/hf/Qwen3-235B-A22B",
+        model_spec=model_spec,
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
+        ),
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=600),
+        training=TrainingConfig(
+            num_tokens_per_microbatch_per_dp_rank=2 * model_spec.max_context_length,
+            max_context_length=model_spec.max_context_length,
+            steps=3000,
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=-1,
+            tensor_parallel_degree=1,
+            context_parallel_degree=1,
+            pipeline_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(
+            interval=500,
+            last_save_model_only=False,
+            export_dtype="float16",
+        ),
+        activation_checkpoint=FullAC.Config(),
+    )
+
+
+def qwen3_235b_a22b_global_aux(seq_len: int | None = None) -> Trainer.Config:
+    """Qwen3 235B-A22B with a globally-normalized MoE auxiliary loss."""
+    seq_len = 4096 if seq_len is None else seq_len
+    config = qwen3_235b_a22b(seq_len=seq_len)
+    config.model_spec = model_registry("235B-A22B-global-aux", seq_len=seq_len)
+    config.dataloader = GrainDataLoader.Config(
+        dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
+        shuffle=False,
+    )
+    config.metrics = MetricsProcessor.Config(log_freq=1, enable_moe_routing=True)
+    config.optimizer = default_adamw(lr=3e-4)
+    config.lr_scheduler = LRSchedulersContainer.Config(
+        warmup_steps=200,
+        total_steps=40000,
+        decay_type="linear",
+        min_lr_factor=0.0,
+    )
+    # 16 sequences per DP rank and 2048 sequences per train step (128 DP ranks
+    # with 1 microbatch per step, matching the 4x4x4 TPU recipe).
+    config.training.max_context_length = seq_len
+    config.training.num_tokens_per_microbatch_per_dp_rank = 16 * seq_len
+    config.training.num_tokens_per_train_step = 2048 * seq_len
+    config.training.steps = 1000
+    config.training.disable_cuda_graphs = True
+    config.parallelism.fsdp_reshard_after_forward = "always"
+    config.activation_checkpoint = FullAC.Config(offload_to_cpu=True)
+    return config
+
+
 def qwen3_debugmodel_non_fused_qkv(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:

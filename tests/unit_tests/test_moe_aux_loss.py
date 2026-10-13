@@ -726,3 +726,25 @@ def test_tensorboard_logs_scalar_and_text_metrics(tmp_path):
             0
         ].tensor_proto.string_val[0].decode()
     ) == [[3, 3, 2]]
+
+
+def test_qwen3_235b_a22b_global_aux_recipe_uses_global_batch_aux_loss():
+    from torchtitan.models.qwen3.config_registry import qwen3_235b_a22b_global_aux
+
+    config = qwen3_235b_a22b_global_aux()
+    assert config.model_spec is not None
+    assert config.model_spec.flavor == "235B-A22B-global-aux"
+    assert config.metrics.enable_moe_routing
+    assert config.training.max_context_length == 4096
+    assert config.training.num_tokens_per_microbatch_per_dp_rank == 16 * 4096
+    assert config.training.num_tokens_per_train_step == 2048 * 4096
+    moes = list(config.model_spec.model.traverse(MoE.Config))
+    assert len(moes) == 94
+    for _, moe, _, _ in moes:
+        assert moe.load_balance_coeff is None
+        aux_loss = moe.router.aux_loss
+        assert isinstance(aux_loss, MoELoadBalanceAuxLoss.Config)
+        assert aux_loss.type == "batch_wise"
+        assert aux_loss.coeff == 1e-3
+        assert aux_loss.top_k == moe.router.top_k
+
