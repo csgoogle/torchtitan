@@ -36,7 +36,8 @@ Template: PR #491, `tpu/examples/gemma4/`. Follow `torchtitan/models/README.md`:
 tpu/examples/<name>/
   __init__.py            flavors dict {str: Model.Config} + model_registry(flavor, ...) -> ModelSpec
   model.py               Model(Decoder) + nested Model.Config; get_nparams_and_flops()
-  state_dict_adapter.py  BaseStateDictAdapter subclass: to_hf / from_hf, ignore non-text towers
+  state_dict_adapter.py  BaseStateDictAdapter subclass: to_hf / from_hf (HF-named protocol; see
+                         "The weight mapping" below for other sources), ignore non-text towers
   sharding.py            set_<name>_sharding_config(...) using decoder_sharding helpers
   infra/parallelize.py   model.parallelize(parallel_dims) -> MoE fsdp -> AC -> compile -> FSDP
   config_registry.py
@@ -56,7 +57,36 @@ tpu/examples/<name>/
 - Control flow stays in `forward`.
 - Weight tying is a config field, handled in one place.
 - `state_dict_adapter.py` keeps the canonical checkpoint keys; if kernels want
-  another layout, translate in load/save hooks (see `TpuGroupedExperts`).
+  another layout, translate in load/save hooks (see `TpuGroupedExperts`). Note
+  those hooks cover the model state dict only; optimizer state is keyed by
+  live parameter names and shapes, so a layout switch is not
+  checkpoint-compatible for a resumed optimizer.
+
+## The weight mapping (any reference)
+
+`BaseStateDictAdapter` (`torchtitan/protocols/state_dict_adapter.py`) is
+HF-named (`to_hf`, `from_hf`, `get_hf_storage_reader`) and the conversion
+scripts under `scripts/checkpoint_conversion/` are HF-only, but what the
+adapter does is a key-and-layout translation, and that is the same job for
+every source. Implement it under the same protocol (the names are legacy) or
+as a one-off converter script, and have the parity test count keys both ways.
+What it has to handle, by source:
+
+- **HF transformers**: key renames, fused vs separate QKV, tied `lm_head`,
+  per-model RoPE conventions (`_validate_hf_rope_config`), non-text towers
+  dropped.
+- **Megatron-LM / NeMo**: TP shard concatenation order per tensor (column vs
+  row parallel), PP stage offsets into layer indices, fused QKV interleave
+  (per-head-grouped vs contiguous), fused gate/up, norm naming and bias
+  presence, the master-weight dtype. Gather to one unsharded state dict on
+  the reference side first (`tests.md`, golden-tensor shape); the adapter
+  never deals with sharding.
+- **MaxText / JAX**: pytree paths to module names, transposed kernel layouts
+  (`[in, out]` vs `[out, in]`), scanned-layer stacks split per layer.
+- **custom code**: write the table down in the PR before writing the adapter.
+
+No Megatron or MaxText adapter exists in this tree yet; the first one is the
+template for the next.
 
 ## Config and registration
 
