@@ -28,8 +28,10 @@ Contract, for any reference: identical weights and inputs through the
 reference and the TorchTitan model, one forward and one backward, logits,
 loss and every parameter gradient compared with stated tolerances, and the
 weight mapping checked both ways (no missing, no unexpected keys). One class
-on `BaseAcceleratorDeviceTest` (`tpu/base_device_test.py`), so CI runs it on
-CPU and on one chip. What changes with the reference is where its half runs.
+on `BaseAcceleratorDeviceTest` (`tpu/base_device_test.py`): CI runs it on one
+chip; it also runs on CPU with `--device=cpu`, but only when you invoke it
+that way (CI has no CPU copy of single-TPU modules). What changes with the
+reference is where its half runs.
 
 In-process (HF transformers, upstream torchtitan), the shape from #491:
 
@@ -48,11 +50,18 @@ In-process (HF transformers, upstream torchtitan), the shape from #491:
 5. One forward and backward on the same tokens, model on
    `self.accelerator_device`, reference on CPU, in the trainer's `[T]` token
    layout (`set_unflatten_seq_len`, explicit `positions`).
-6. Compare logits, loss and every parameter gradient with
-   `test_utils.check_equivalence`; map reference gradients through the
-   adapter too, drop the duplicate tied-head gradient, assert equal key sets
-   before comparing values.
-7. Parameterize over flavors and converters (dense; MoE; MoE with
+6. Compare logits, loss and every parameter gradient; map reference gradients
+   through the adapter too, drop the duplicate tied-head gradient, assert
+   equal key sets before comparing values. Logits and loss go through
+   `test_utils.check_equivalence` (elementwise `allclose`). Gradients do not:
+   they span orders of magnitude, and an absolute tolerance that fits the
+   large ones accepts a zeroed or sign-flipped small one. Bound each gradient
+   tensor by relative L2 error, `||g - g_ref|| / ||g_ref||`, with a floor only
+   for tensors whose reference norm is itself ~0.
+7. The negative control, in the same test: feed the comparison the reference
+   gradients zeroed, and again sign-flipped, and assert it fails both times.
+   A bound that cannot reject those is not a bound.
+8. Parameterize over flavors and converters (dense; MoE; MoE with
    `TpuGroupedExpertsConverter`, Pallas off so it runs on CPU).
 
 Golden-tensor shape (Megatron/NeMo, MaxText, custom code; the reference cannot
@@ -64,7 +73,7 @@ reference state dict in its own key names and layouts, logits, loss, every
 gradient keyed by reference name, and provenance (repo, commit, framework
 version, device, dtype policy). Sharded sources are gathered to one unsharded
 state dict on the reference side; the adapter handles layout, never sharding.
-The test loads the dump and runs steps 4-7; nothing in it imports the
+The test loads the dump and runs steps 4-8; nothing in it imports the
 reference framework. Keep the fixture under a few MB so it lives in the repo,
 else pin it in GCS with the provenance in a sidecar and skip with a reason when
 unreachable. Regenerate when the reference moves and say so in the commit.
@@ -73,12 +82,15 @@ Starting tolerances (fp32 reference, bf16-free model, default TPU matmul
 precision; passed on v6e and v7x for Gemma 4):
 
 ```
-            dense                MoE
-logits      atol 5e-2 rtol 1e-2  atol 1e-1 rtol 2e-2
-loss        atol 5e-3 rtol 1e-3  atol 5e-3 rtol 2e-3
-gradients   atol 8e-2 rtol 2e-2  atol 8e-2 rtol 2e-2
+            dense                      MoE
+logits      atol 5e-2 rtol 1e-2        atol 1e-1 rtol 2e-2
+loss        atol 5e-3 rtol 1e-3        atol 5e-3 rtol 2e-3
+gradients   relative L2 <= 2e-2 per tensor (both); absolute floor 1e-6 only
+            where ||g_ref|| < 1e-4
 ```
 
+(#491 shipped `atol 8e-2 rtol 2e-2` elementwise for gradients; that bound
+passes a zeroed gradient whose entries are all below 0.08, so do not copy it.)
 Tighten if the model passes with margin; record the measured error next to
 the bound in the PR.
 
