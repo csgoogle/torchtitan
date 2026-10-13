@@ -97,6 +97,10 @@ _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
         # removed the defensive activation snapshot, moved all 93 measured D2H
         # waits to zero, and improved MFU from 18.528% to 19.490% in the A/B.
         "xla_tpu_copy_insertion_use_region_analysis": True,
+        # Preserve eligible all-gathers as asynchronous all-gathers instead of
+        # rewriting them to all-reduce-plus-slice. The native non-leading-axis
+        # FSDP path relies on this to avoid the slower rewrite.
+        "xla_tpu_prefer_async_allgather_to_allreduce": True,
         # Use the tested search budget for the large Q235 layer regions. This
         # value was evaluated together with region analysis, not in isolation.
         "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
@@ -790,6 +794,9 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
     experts.pallas_grouped_mm_tgmm_tiling = (512, 2048, 0)
     # A K tile that does not divide F leaves a masked remainder tile.
     experts.pallas_grouped_mm_w2_tgmm_tiling = (256, 768, 0)
+    # With W2 sharded on its trailing axis (FSDP wider than the expert count),
+    # the transposed-RHS dWeight is stored [E, D, F]: tile D and keep F whole.
+    experts.pallas_grouped_mm_w2_transposed_tgmm_tiling = (256, 0, 2048)
     experts.use_kernel_native_weight_layout = True
   # Upstream d771abb0 replaced local_batch_size/global_batch_size/seq_len with
   # token budgets.
