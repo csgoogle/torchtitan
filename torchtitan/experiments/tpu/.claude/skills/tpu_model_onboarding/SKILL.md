@@ -11,6 +11,17 @@ measured against it. Each later rung is one feature behind one flag, with one
 parity test and one end-to-end case, as one commit. Muse Glimmer is the worked
 example: #521 (rung 1), then #529, #530, #532, #534.
 
+Where changes go: under `torchtitan/experiments/tpu/`, for the model, its
+recipes, parallelize code, converters, overrides and tests alike. A change
+outside it (`torchtitan/models/`, `torchtitan/components/`, `torchtitan/
+distributed/`, `torchtitan/experiments/graph_trainer/`) is the exception, not
+the default: it needs a one-line reason in the PR saying why the TPU lane's
+extension points (converters, `override.imports`, `workarounds.py`, a TPU
+subclass via `derive`) could not carry it, it is kept to the minimum that
+unblocks the lane, and it is a candidate for its own PR so the core reviewers
+see it on its own. `.claude/rules/experiments.md` is the repo-wide version of
+this rule.
+
 Read before starting: `torchtitan/experiments/tpu/README.md` (environment,
 VM and cluster setup, launch commands), `torch-tpu-optimization-guide.md`
 (the levers, in order), `.claude/rules/models.md`, `.claude/rules/experiments.md`.
@@ -200,7 +211,9 @@ When the budget is spent, write the ladder table and stop.
   --device=tpu` on a chip, `--device=cpu` for the CPU shard. CI classifies a
   module by its base class (`tests.md`); take the device from the base class,
   never detect it yourself.
-- No core edits for the model. No Meta copyright headers on new files.
+- Changes live under `experiments/tpu/`; anything outside it is an exception
+  with its reason in the PR (see the top of this file). No Meta copyright
+  headers on new files.
 - No performance claim from fewer than 10 steps, from a single run, or before
   the numerics class is known.
 - The PR description is the onboarding record and the only state that
