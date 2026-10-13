@@ -6,13 +6,36 @@ bounds next to the asserted ones, and what is deliberately left for later.
 No handover file is committed; the description is updated on every push and
 the wiki (if the project keeps one) links to the PR.
 
+The record is also the only state that survives between sessions. Whoever
+resumes an onboarding (a later agent session, a reviewer, you next week)
+reads the `## Ladder` table first, so it is updated after every rung, not at
+the end.
+
+## Ladder table (in the PR description, from Step 1 on)
+
+```
+Rung | Feature / flag                 | Commit    | Parity test (bounds, measured)      | Numerics class | Run (target, steps, result)          | Status
+-----|--------------------------------|-----------|-------------------------------------|----------------|--------------------------------------|---------
+1    | SDPA + per-block compile       | <sha>     | Test<Model>ReferenceParity <...>    | oracle         | A, v6e-4, 10 steps, loss a->b, det OK | merged
+2    | GraphTrainer (use_graph_trainer)| <sha>    | 3-step loss vs compile <...>        | bit-identical  | A, v6e-4, 10 steps                   | done
+3    | splash (use_splash_attention)  | <sha>     | vs SDPA packed <...>                | rounding-order | A, v6e-4                             | in progress: <what is open>
+...  |                                |           |                                     |                |                                      | blocked on: <chip / reference dump>
+```
+
+Execution target (Step 0 answer) and the dispatch budget used / remaining go
+above the table.
+
 ## PR 1 template
 
 ```
 <Model> on the TorchTitan TPU lane (<style A: wraps torchtitan/models/<name> |
-style B: ported from <HF id / reference>, under experiments/tpu/examples/<name>>).
+style B: ported from <reference: HF id | Megatron checkpoint | MaxText config | ...>,
+under experiments/tpu/examples/<name>>).
 
-Architecture (source: <HF config.json / modeling_<x>.py / paper>):
+Execution target: <A: this VM | B: <tpu name, zone> | C: <cluster>>.
+
+Architecture (source: <reference file:line, e.g. HF config.json / modeling_<x>.py,
+Megatron model_config, paper>):
 - layers: <N>, pattern <homogeneous | k sliding + 1 global | ...>
 - attention: <GQA heads/kv>, head_dim <d> (<d_global> on global layers), QK-norm <y/n>,
   sliding window <W>, softcap <attn/final>
@@ -29,9 +52,10 @@ Code:
 - Registration: train.py import + model_spec.name route; train_minimal.py
 
 Tests:
-- test_<name>.py::Test<Model>HFReferenceParity: HF <class> (CPU, fp32) vs
-  <Model>Model (<device>), tiny config <dims>, <variants>; logits / loss / all
-  grads. Bounds <...>; measured <...> on v6e, <...> on v7x.
+- test_<name>.py::Test<Model>ReferenceParity: <HF <class> (CPU, fp32) in-process |
+  golden dump from <reference, commit>> vs <Model>Model (<device>), tiny config
+  <dims>, <variants>; logits / loss / all grads. Bounds <...>; measured <...>
+  on v6e, <...> on v7x.
 - state-dict round trip; flavor checks; <mask semantics test>
 - test_train_distributed: <name>_fsdp, <name>_simplefsdp (3 steps, context <L>
   because <reason>)
@@ -46,7 +70,9 @@ Not in this PR (follow-ups): GraphTrainer wrapper, splash/tokamax, fused CE,
 <MoE kernels>, <size> recipe.
 ```
 
-## Feature PR template (Step 2)
+## Rung commit message (Step 2)
+
+One commit per rung; the same text, condensed, goes into the Ladder table row.
 
 ```
 <Feature> for <Model> on TPU.
