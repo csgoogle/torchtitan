@@ -5,6 +5,8 @@ replaced by explicit scores/softmax; its architecture, routing, experts, RoPE,
 sink callback and checkpoint hooks are the upstream implementation.
 """
 
+import copy
+
 from absl.testing import absltest, parameterized
 import torch
 import torch.nn.functional as F
@@ -180,6 +182,41 @@ class TestGptOssReferenceParity(BaseAcceleratorDeviceTest):
                     {n: g * multiplier for n, g in expected_grads.items()},
                     expected_grads,
                 )
+
+
+class TestGptOssCompile(BaseAcceleratorDeviceTest):
+    def test_bf16_eager_compile(self):
+        if self.accelerator_device.type != "tpu":
+            self.skipTest("Validates TPU compiler fusion with bf16 parameters")
+        torch.manual_seed(42)
+        eager = tiny_config().build().eval()
+        eager.init_states(buffer_device=torch.device("cpu"))
+        # Match FSDP's parameter policy without casting the RoPE buffers.
+        for parameter in eager.parameters():
+            parameter.data = parameter.data.to(torch.bfloat16)
+        compiled = copy.deepcopy(eager).to(self.accelerator_device)
+        eager = eager.to(self.accelerator_device)
+        torch._dynamo.config.capture_scalar_outputs = True
+        for layer in compiled.layers.values():
+            layer.compile(backend="tpu", fullgraph=True, dynamic=False)
+        tokens = torch.randint(0, 2048, (32,)).to(self.accelerator_device)
+        labels = torch.randint(0, 2048, (32,)).to(self.accelerator_device)
+        positions = (
+            torch.tensor(list(range(6)) + list(range(3)) + list(range(7)))
+            .repeat(2)
+            .to(self.accelerator_device)
+        )
+        with set_unflatten_seq_len(16):
+            expected = eager(tokens, positions)
+            actual = compiled(tokens, positions)
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+        F.cross_entropy(expected.float(), labels).backward()
+        F.cross_entropy(actual.float(), labels).backward()
+        assert_gradients(
+            self,
+            {n: p.grad for n, p in compiled.named_parameters()},
+            {n: p.grad.cpu() for n, p in eager.named_parameters()},
+        )
 
 
 class TestGptOssConfig(absltest.TestCase):

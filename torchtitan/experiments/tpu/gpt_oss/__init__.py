@@ -4,7 +4,7 @@ import torchtitan.models.gpt_oss as upstream
 from torchtitan.config.override import derive
 
 from .attention import SinkSDPA
-from .experts import TpuGptOssGroupedExperts
+from .experts import TpuGptOssGroupedExperts, TpuGptOssMoE
 from .infra.parallelize import parallelize_gptoss
 
 
@@ -12,6 +12,7 @@ def model_registry(flavor: str, *, seq_len: int | None = None, converters=None):
     """Build the SDPA baseline; production shapes remain upstream's shapes."""
     spec = upstream.model_registry(flavor, seq_len=seq_len, attn_backend="sdpa")
     for layer in spec.model.layers:
+        layer.moe = derive(layer.moe, TpuGptOssMoE.Config)
         layer.attention.inner_attention = SinkSDPA.Config(
             window_size=layer.attention.sliding_window_size
         )
