@@ -8,7 +8,7 @@ this file is the part the README does not cover.
 ```
 Target                        | Commands run                 | Chips                      | Artifacts come back as      | You need from the user
 ------------------------------|------------------------------|----------------------------|-----------------------------|----------------------------------
-A. this machine is the TPU VM | directly                     | torch.accelerator          | files in --job.dump_folder  | nothing; verify the chips
+A. this machine is the TPU VM | directly                     | torch.accelerator          | files in --dump_folder      | nothing; verify the chips
                               |                              | .device_count()            |                             |
 B. a TPU VM over ssh          | gcloud compute tpus tpu-vm   | the VM's, detected over    | scp of dump_folder, or the  | TPU name, zone, project, checkout
                               | ssh <name> --zone=<z>        | ssh with the same call     | remote log tail             | path on the VM
@@ -49,7 +49,7 @@ CPU runs: `TORCH_DEVICE_BACKEND_AUTOLOAD=0 JAX_PLATFORMS=cpu`.
 
 ## Reading a run
 
-Everything the bar in SKILL.md asks for is in `--job.dump_folder`; bring it
+Everything the bar in SKILL.md asks for is in `--dump_folder`; bring it
 back to where you work (A: it is there; B: scp; C: `gsutil -m cp -r`) so all
 three targets end in the same procedure.
 
@@ -62,9 +62,10 @@ per-step loss, grad_norm      | <dump_folder>/tb/*/events.out.tfevents.*       |
                               |                                                | never compare runs from stdout
 peak HBM, step time, TPS, MFU | metrics log lines; --tpu_config.enable_mfu_    | "memory:" is the XLA temp region, not the
                               | benchmark past warmup                          | heap; heap peak from buffer-assignment.txt
-HLO                           | --extra-libtpu-init-flags=xla_dump_to=<dir>;   | grep custom_call names for enabled kernels,
-                              | after-optimizations .txt per program           | input_output_alias for donation; an exported
-                              |                                                | LIBTPU_INIT_ARGS overrides recipe flags per key
+HLO                           | --extra-xla-flags=xla_dump_to=<dir> (an XLA    | grep custom_call names for enabled kernels,
+                              | flag: libtpu init flags reject it); after-     | input_output_alias for donation; an exported
+                              | optimizations .txt per program                 | XLA_FLAGS / LIBTPU_INIT_ARGS overrides recipe
+                              |                                                | flags per key
 structure                     | startup log                                    | patch / replacement counts == layer count;
                               |                                                | heads / kv_heads / vocab == checkpoint
 ```

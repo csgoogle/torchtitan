@@ -48,7 +48,7 @@ reading a run),
      `torch.accelerator.device_count()` (not `torch.tpu.*`, which raises) first.
    - B. a TPU VM over ssh: `gcloud compute tpus tpu-vm ssh <name> --zone=<z>
      --command='...'`; you need name, zone, project and the checkout path, and
-     you sync code and fetch `--job.dump_folder` yourself.
+     you sync code and fetch `--dump_folder` yourself.
    - C. GKE via Cluster Toolkit (`gcluster`): submit per the recipe README;
      you need project, cluster, image registry, whether you may build images,
      and a dispatch budget agreed before the first job.
@@ -122,8 +122,8 @@ Determinism    two runs with --debug.seed=42 --debug.deterministic
 Oracle         record the deterministic per-step loss and grad_norm; step 1 is
                the smoke check every later rung compares against first
 Structure      per-layer patch counts == layer count; heads / kv_heads / vocab ==
-               the checkpoint; the HLO dump (--extra-libtpu-init-flags=
-               xla_dump_to=<dir>) contains the custom_calls of enabled kernels.
+               the checkpoint; the HLO dump (--extra-xla-flags=xla_dump_to=
+               <dir>) contains the custom_calls of enabled kernels.
                Eager log lines do not fire under compile; trust the HLO.
 Modes          eager / per-block compile / GraphTrainer losses within ~1e-4 on
                debugmodel

@@ -435,8 +435,9 @@ Taking [`qwen3_8b_tpu7x`](qwen3/config_registry.py#L534), which declares five fl
 `xla_tpu_dvfs_p_state=7`:
 
 ```bash
-# 1. Add a flag the config does not set.
---extra-libtpu-init-flags=xla_dump_to=/tmp/hlo
+# 1. Add a flag the config does not set. xla_dump_to is an XLA flag, not a
+#    libtpu one: libtpu rejects it as an unknown flag.
+--extra-xla-flags=xla_dump_to=/tmp/hlo
 
 # 2. Override a flag the config sets.
 --extra-libtpu-init-flags=xla_tpu_dvfs_p_state=5
@@ -445,7 +446,7 @@ Taking [`qwen3_8b_tpu7x`](qwen3/config_registry.py#L534), which declares five fl
 --extra-libtpu-init-flags='!xla_tpu_enable_latency_hiding_layer_scheduler'
 
 # 4. Add or override several flags at once -- quote the whole value.
---extra-libtpu-init-flags='xla_tpu_dvfs_p_state=5 xla_dump_to=/tmp/hlo'
+--extra-libtpu-init-flags='xla_tpu_dvfs_p_state=5 xla_tpu_scoped_vmem_limit_kib=65472'
 
 # 5a. Drop the recipe's flags entirely -- set to the empty string.
 --libtpu-init-flags=''
@@ -489,7 +490,7 @@ This also enables the `--debug.print-config` option to print the full configurat
 
 TorchTitan on TorchTPU integrates with a profiler to export profiling data for trained models. Use the `--profiling.enable-profiling` flag to enable profiling and the `--profiling...` flags for configuration.
 
-Profiling data is exported to the directory specified by `--job.dump_folder` + `profile_trace` for each process. In the example above, this is mapped to an external Cloud Storage bucket via Cloud Storage FUSE and can be loaded directly into TensorBoard.
+Profiling data is exported to the directory specified by `--dump_folder` + `profile_trace` for each process. In the example above, this is mapped to an external Cloud Storage bucket via Cloud Storage FUSE and can be loaded directly into TensorBoard.
 
 For more information, see [Profile your TPU VM workload using TensorBoard](https://docs.cloud.google.com/tpu/docs/profile-tpu-vm).
 
