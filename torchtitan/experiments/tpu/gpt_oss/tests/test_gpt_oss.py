@@ -8,6 +8,7 @@ sink callback and checkpoint hooks are the upstream implementation.
 from absl.testing import absltest, parameterized
 import torch
 import torch.nn.functional as F
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
 from torchtitan.experiments.tpu.gpt_oss import model_registry
@@ -74,7 +75,34 @@ def assert_gradients(test, actual, reference):
     print("worst gradient relative L2:", worst)
 
 
+class _Bf16GroupedMmPrecision(TorchDispatchMode):
+    """Keep native bf16 expert arithmetic during fp32 reference validation.
+
+    libtpu 0.0.48 rejects bf16 ragged-dot operands with HIGHEST precision.
+    Scope DEFAULT to those operations (including their backward); ordinary
+    fp32 matmuls still use HIGHEST. No operators or dtypes are replaced.
+    """
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if (
+            func == torch.ops.aten._grouped_mm.default
+            and args[0].device.type == "tpu"
+            and args[0].dtype == torch.bfloat16
+        ):
+            with torch.tpu.precision(torch.tpu.Precision.DEFAULT):
+                return func(*args, **(kwargs or {}))
+        return func(*args, **(kwargs or {}))
+
+
 class TestGptOssReferenceParity(BaseAcceleratorDeviceTest):
+    def setUp(self):
+        super().setUp()
+        # Medium's single bf16 pass can change near-tied MoE routing choices.
+        previous = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("highest")
+        self.addCleanup(torch.set_float32_matmul_precision, previous)
+        self.enter_context(_Bf16GroupedMmPrecision())
+
     def test_upstream_reference(self):
         reference_cfg = tiny_config(upstream_registry, attn_backend="flex")
         reference = reference_cfg.build().eval()
@@ -106,6 +134,17 @@ class TestGptOssReferenceParity(BaseAcceleratorDeviceTest):
         self.assertEmpty(missing)
         self.assertEmpty(unexpected)
         self.assertEqual(set(source), set(target_adapter.to_hf(model.state_dict())))
+        routes = ({}, {})
+
+        def record_route(destination, name):
+            def hook(module, inputs, output):
+                destination[name] = output[1].detach().cpu()
+
+            return hook
+
+        for network, destination in zip((reference, model), routes):
+            for name, layer in network.layers.items():
+                layer.moe.router.register_forward_hook(record_route(destination, name))
         tokens = torch.randint(0, 2048, (32,))
         labels = torch.randint(0, 2048, (32,))
         # Two rows, each with three documents and boundaries inside the window.
@@ -118,6 +157,9 @@ class TestGptOssReferenceParity(BaseAcceleratorDeviceTest):
                 tokens.to(self.accelerator_device),
                 positions.to(self.accelerator_device),
             )
+        for name in routes[0]:
+            torch.testing.assert_close(routes[1][name], routes[0][name], atol=0, rtol=0)
+            self.assertEqual(routes[0][name].unique().numel(), 8)
         torch.testing.assert_close(actual.cpu(), expected, atol=1e-1, rtol=2e-2)
         expected_loss = F.cross_entropy(expected.float(), labels)
         actual_loss = F.cross_entropy(
