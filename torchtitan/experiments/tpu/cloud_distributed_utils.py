@@ -471,19 +471,27 @@ def _maybe_init_distributed_on_tpu_vm() -> bool:
 
 
 def maybe_validate_multislice_parallelism(parallelism_config) -> None:
-  """Checks that the HSDP replicate axis lands on the slice boundary.
+  """Rejects the one multi-slice layout torch_tpu cannot detect.
 
-  On a multi-slice job the replicate axis is the one that crosses DCN, so the
-  slice count has to divide ``data_parallel_replicate_degree``: that is what
-  keeps every FSDP shard group -- and so every all-gather and reduce-scatter --
-  inside a single slice, leaving only the replicated gradient on the slow link.
+  ``torch.tpu.topology_aware_mesh`` puts the slice split on the outermost mesh
+  axis whose extent is above 1. torchtitan passes it a bare shape ordered
+  ``(pp, dp_replicate, dp_shard, cp, tp)``, so it has to skip extent-1 axes --
+  ``pp`` is 1 on every non-pipelined run -- and without axis names it cannot
+  tell an unused ``pp`` from an unset ``dp_replicate``. With
+  ``pipeline_parallel_degree`` and ``data_parallel_replicate_degree`` both at
+  their default of 1, the split therefore lands on ``dp_shard``: FSDP shard
+  groups straddle the inter-slice link and every weight all-gather and gradient
+  reduce-scatter crosses DCN. torch_tpu only logs that at INFO; the job trains
+  correctly at a fraction of the throughput.
 
-  Checks rather than fixes. Quietly rewriting the degree would mean the config a
-  recipe declares is not the config that ran, and the failure this guards
-  against is not a crash but a job that trains correctly at a fraction of the
-  throughput -- which is far more expensive to notice later than a launch that
-  refuses to start. The check runs before ``ParallelDims`` is built, so it costs
-  seconds, not a slice-hours-long run.
+  Every other case is left to torch_tpu, which raises when the axis taking the
+  split is not divisible by the slice count (a replicate degree of 3 over 2
+  slices, say) and handles pipeline stages placed across slices.
+
+  Checks rather than fixes. Quietly setting the degree would mean the config a
+  recipe declares is not the config that ran, and a job that is merely slow is
+  far more expensive to notice than one that refuses to start. The check runs
+  before ``ParallelDims`` is built, so it costs seconds.
 
   "maybe" because it returns immediately on a single-slice job, so it is safe to
   call unconditionally.
@@ -492,27 +500,31 @@ def maybe_validate_multislice_parallelism(parallelism_config) -> None:
     parallelism_config: The run's ``ParallelismConfig``. Not modified.
 
   Raises:
-    ValueError: If the slice count does not divide the replicate degree.
+    ValueError: On a multi-slice job with neither pipeline nor replicate
+      parallelism, where the slice split would fall on ``dp_shard``.
   """
   num_slices = get_num_slices()
   if num_slices == 1:
     return
 
+  pipeline = parallelism_config.pipeline_parallel_degree
   replicate = parallelism_config.data_parallel_replicate_degree
-  if replicate % num_slices:
+  if pipeline == 1 and replicate == 1:
     raise ValueError(
-        f"data_parallel_replicate_degree={replicate} is not a multiple of the"
-        f" slice count {num_slices}. The replicate axis is the one split across"
-        " DCN, so an indivisible value puts FSDP shard groups on both sides of"
-        " the inter-slice link and every weight all-gather crosses it. Pass"
+        f"A {num_slices}-slice job with data_parallel_replicate_degree=1 and"
+        " pipeline_parallel_degree=1 has no axis for the slice split but"
+        " dp_shard, so torch_tpu would place FSDP shard groups across the"
+        " inter-slice link and every weight all-gather would cross DCN. Pass"
         " --parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES"
-        " (or any multiple of the slice count)."
+        " so the replicate axis takes the split."
     )
   logger.info(
-      "Multi-slice: data_parallel_replicate_degree=%d over %d slices, so each"
-      " FSDP shard group stays inside one slice.",
-      replicate,
+      "Multi-slice: %d slices, pipeline_parallel_degree=%d,"
+      " data_parallel_replicate_degree=%d; topology_aware_mesh splits the"
+      " outermost of these above 1 across slices.",
       num_slices,
+      pipeline,
+      replicate,
   )
 
 

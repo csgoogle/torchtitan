@@ -618,13 +618,14 @@ Differences from the single-slice command:
   against that host list, so a wrong value raises instead of building a broken mesh.
 
 * `--parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES` is **required**. The
-  replicate axis is the one split across DCN, so the slice count has to divide it -- that is what
-  keeps every FSDP shard group, and so every weight all-gather and gradient reduce-scatter, inside
-  a single slice. TorchTitan checks this before building the mesh and refuses to start otherwise,
-  rather than correcting it for you: the default of 1 would put one shard group across both slices,
-  which trains correctly at a fraction of the throughput, and a job that is merely slow is far
-  harder to notice than one that will not launch. Writing it as the variable rather than a literal
-  cannot drift when you change `--num-slices`; any multiple of the slice count is accepted.
+  replicate axis is the one split across DCN, which keeps every FSDP shard group, and so every
+  weight all-gather and gradient reduce-scatter, inside a single slice. With the default of 1 the
+  only axis left for the split is `dp_shard`, so shard groups would straddle the slices: the job
+  trains correctly at a fraction of the throughput, and torch_tpu notes it only at INFO. TorchTitan
+  refuses to start in that case rather than correcting it for you, since a job that is merely slow
+  is far harder to notice than one that will not launch. A degree the slice count does not divide
+  is rejected by torch_tpu when it builds the mesh; any multiple of the slice count works. Writing it
+  as the variable rather than a literal cannot drift when you change `--num-slices`.
 
 * `--parallelism.enable_min_cost_redistribute` is worth setting on multi-slice. The default greedy
   DTensor planner all-reduces the **full** gradient on the replicate axis -- the axis that crosses
