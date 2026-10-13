@@ -30,8 +30,7 @@ xla_tpu_enable_latency_hiding_layer_scheduler=true \
 xla_tpu_use_single_sparse_core_for_reduce_scatter_offload=false \
 xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true \
 xla_tpu_enable_sparse_core_hierarchical_reduce_scatter=true \
-xla_tpu_dvfs_p_state=7 \
-xla_tpu_enable_diagnostic_coordinator=false"
+xla_tpu_dvfs_p_state=7"
 
 gcluster job submit \
   --name "$WORKLOAD_NAME" \
