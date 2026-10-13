@@ -1,9 +1,8 @@
-"""Splash Attention kernel setup shared by jax/ and torchax/."""
+"""Tokamax Splash Attention kernel setup."""
 
 import jax
-from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
-from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
-
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask
 import torchtitan.tools.logging
 
 logger = torchtitan.tools.logging.logger
@@ -11,26 +10,27 @@ logger = torchtitan.tools.logging.logger
 P = jax.sharding.PartitionSpec
 
 
-def _build_block_sizes(config, query_shape, key_shape):
-    return splash_attention_kernel.BlockSizes(
-        block_q=min(config.sa_block_q, query_shape[2]),
-        block_kv=min(config.sa_block_kv, key_shape[2]),
-        block_kv_compute=min(config.sa_block_kv_compute, key_shape[2]),
-        block_q_dkv=min(config.sa_block_q_dkv, query_shape[2]),
-        block_kv_dkv=min(config.sa_block_kv_dkv, key_shape[2]),
-        block_kv_dkv_compute=min(config.sa_block_kv_dkv_compute,
-                                 query_shape[2]),
-        block_q_dq=None if config.sa_use_fused_bwd_kernel else min(
-            config.sa_block_q_dq, query_shape[2]
-        ),
-        block_kv_dq=None if config.sa_use_fused_bwd_kernel else min(
-            config.sa_block_kv_dq, query_shape[2]
-        ),
-        use_fused_bwd_kernel=config.sa_use_fused_bwd_kernel,
-        q_layout=splash_attention_kernel.QKVLayout[config.sa_q_layout],
-        k_layout=splash_attention_kernel.QKVLayout[config.sa_k_layout],
-        v_layout=splash_attention_kernel.QKVLayout[config.sa_v_layout],
-    )
+def _build_splash_config(config, query_shape, key_shape, attn_logits_soft_cap):
+  return splash_attention_kernel.SplashConfig(
+      block_q=min(config.sa_block_q, query_shape[2]),
+      block_kv=min(config.sa_block_kv, key_shape[2]),
+      block_kv_compute=min(config.sa_block_kv_compute, key_shape[2]),
+      block_q_dkv=min(config.sa_block_q_dkv, query_shape[2]),
+      block_kv_dkv=min(config.sa_block_kv_dkv, key_shape[2]),
+      block_kv_dkv_compute=min(config.sa_block_kv_dkv_compute, query_shape[2]),
+      block_q_dq=None
+      if config.sa_use_fused_bwd_kernel
+      else min(config.sa_block_q_dq, query_shape[2]),
+      block_kv_dq=None
+      if config.sa_use_fused_bwd_kernel
+      else min(config.sa_block_kv_dq, query_shape[2]),
+      use_fused_bwd_kernel=config.sa_use_fused_bwd_kernel,
+      q_layout=splash_attention_kernel.QKVLayout[config.sa_q_layout],
+      k_layout=splash_attention_kernel.QKVLayout[config.sa_k_layout],
+      v_layout=splash_attention_kernel.QKVLayout[config.sa_v_layout],
+      attn_logits_soft_cap=attn_logits_soft_cap,
+      use_base2_exp=False,
+  )
 
 
 def build_splash_attention_callable(
@@ -61,7 +61,9 @@ def build_splash_attention_callable(
       assert (
           query.shape[2] == segment_ids.q.shape[1]
       ), 'Sharding along sequence dimension not allowed in tpu kernel attention'
-    block_sizes = _build_block_sizes(config, query.shape, key.shape)
+    splash_config = _build_splash_config(
+        config, query.shape, key.shape, attn_logits_soft_cap
+    )
     if local_window is not None:
       # Causal local-window: each q at position p attends to keys in
       # [p - local_window + 1, p]. Splash's LocalMask uses the
@@ -77,15 +79,10 @@ def build_splash_attention_callable(
       mask = splash_attention_mask.CausalMask(
           shape=(query.shape[2], query.shape[2])
       )
-    multi_head_mask = splash_attention_mask.MultiHeadMask(
-        masks=(mask,) * query.shape[1]
-    )
     kernel = splash_attention_kernel.make_splash_mha(
-        mask=multi_head_mask,
-        head_shards=1,
+        mask=mask,
         q_seq_shards=1,
-        block_sizes=block_sizes,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        config=splash_config,
     )
     return jax.vmap(kernel)(query, key, value, segment_ids=segment_ids)
 
