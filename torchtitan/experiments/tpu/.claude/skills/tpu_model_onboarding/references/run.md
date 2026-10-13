@@ -56,8 +56,10 @@ three targets end in the same procedure.
 ```
 Evidence                      | Where                                          | Note
 ------------------------------|------------------------------------------------|----------------------------------------------
-per-step loss, grad_norm      | <dump_folder>/tb/*/events.out.tfevents.*       | full precision; stdout prints 5 digits, never
-                              |                                                | compare runs from stdout
+per-step loss, grad_norm      | <dump_folder>/tb/*/events.out.tfevents.*       | only with --metrics.enable_tensorboard
+                              |                                                | --metrics.log_freq=1 (defaults: off, 10);
+                              |                                                | full precision. stdout prints 5 digits,
+                              |                                                | never compare runs from stdout
 peak HBM, step time, TPS, MFU | metrics log lines; --tpu_config.enable_mfu_    | "memory:" is the XLA temp region, not the
                               | benchmark past warmup                          | heap; heap peak from buffer-assignment.txt
 HLO                           | --extra-libtpu-init-flags=xla_dump_to=<dir>;   | grep custom_call names for enabled kernels,
@@ -67,7 +69,8 @@ structure                     | startup log                                    |
                               |                                                | heads / kv_heads / vocab == checkpoint
 ```
 
-Comparing two runs step by step at full precision:
+Comparing two runs step by step at full precision (both launched with
+`--metrics.enable_tensorboard --metrics.log_freq=1 --training.steps=N`):
 
 ```python
 from tensorboard.backend.event_processing import event_accumulator as ea
@@ -75,10 +78,14 @@ def series(folder, tag="loss_metrics/global_avg_loss"):
     acc = ea.EventAccumulator(folder); acc.Reload()
     return {e.step: e.value for e in acc.Scalars(tag)}
 a, b = series("<run1>/tb/<subdir>"), series("<run2>/tb/<subdir>")
-for s in sorted(a):
-    print(s, a[s], b.get(s), None if b.get(s) is None else a[s] - b[s])
+N = <training.steps>
+assert set(a) == set(b) == set(range(1, N + 1)), (sorted(a), sorted(b))
+for s in range(1, N + 1):
+    print(s, a[s], b[s], a[s] - b[s])
 ```
 
+The step-set assertion is part of the check: a run that logged every 10th
+step, or stopped early, compares equal on the steps it has and proves nothing.
 Determinism means every step equal, not close; trainer-mode agreement is
 ~1e-4 on `debugmodel`; "no spikes" means no step-to-step increase larger than
 the largest decrease seen so far after warmup. Verdicts come from steps past

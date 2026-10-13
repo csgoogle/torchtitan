@@ -71,11 +71,15 @@ scan). Every constant gets a source line.
 - Model code, plain SDPA, no Pallas kernels, no GraphTrainer. `debugmodel`
   flavor plus the real sizes; a `<name>_debugmodel` recipe. Register in
   `experiments/tpu/train.py` and `train_minimal.py`.
-- Write it scan-ready even if scan ships later: stock `Decoder.forward` loop
-  (`check_layers_are_stackable` passes); no module-attribute or in-place
-  writes in the layer forward (MoE counters and routing metrics behind config);
-  no complex ops (real-arithmetic RoPE); heterogeneous layers compiled per
-  block with `dynamic=False`.
+- Decide the large-size path now and write the layers for it. Homogeneous
+  layers: keep the stock `Decoder.forward` loop and make
+  `check_layers_are_stackable` pass, so scan (rung 7) stays open.
+  Heterogeneous layers (sliding / global with different head dims): compile
+  per block with `dynamic=False`, and the large-size path is graph split, not
+  scan; do not bend the architecture to stack. Either way, no module-attribute
+  or in-place writes in the layer forward (MoE counters and routing metrics
+  behind config) and no complex ops (real-arithmetic RoPE); both also matter
+  for compile.
 - The tests in `tests.md`: the reference-parity test (the one that matters:
   tiny config covering every layer type, perturbed scales, weights through the
   adapter with keys checked both ways, logits + loss + every gradient
@@ -90,11 +94,14 @@ scan). Every constant gets a source line.
 ```
 Steps          >= 10; judge from steps past warmup. 2-4 steps is not a verdict.
 Loss           decreasing, no NaN/inf, no spikes
-Determinism    two runs with --debug.seed=42 --debug.deterministic give
-               bit-identical loss and grad_norm, read from the TensorBoard event
-               file (tag loss_metrics/global_avg_loss); stdout prints 5 digits
-Oracle         record the deterministic step-1 loss and grad_norm; every later
-               rung compares against it
+Determinism    two runs with --debug.seed=42 --debug.deterministic
+               --metrics.enable_tensorboard --metrics.log_freq=1 give equal loss
+               and grad_norm at every step, read from the TensorBoard event
+               file (tag loss_metrics/global_avg_loss; TensorBoard is off and
+               log_freq is 10 by default); both series must contain steps 1..N.
+               stdout prints 5 digits and is not evidence
+Oracle         record the deterministic per-step loss and grad_norm; step 1 is
+               the smoke check every later rung compares against first
 Structure      per-layer patch counts == layer count; heads / kv_heads / vocab ==
                the checkpoint; the HLO dump (--extra-libtpu-init-flags=
                xla_dump_to=<dir>) contains the custom_calls of enabled kernels.
@@ -103,8 +110,11 @@ Modes          eager / per-block compile / GraphTrainer losses within ~1e-4 on
                debugmodel
 ```
 
-Every change after PR 1 gets a numerics class: **bit-identical** (step-1
-oracle equal); **rounding-order** (fp32 round-off from tiles, fusion or
+Every change after PR 1 gets a numerics class: **bit-identical** (loss and
+grad_norm equal to the oracle at every logged step of a >= 10-step run; two
+scalars at step 1 do not pin the gradient tensors, a differing gradient shows
+in step 2 after the optimizer applies it; for a frontier claim also compare
+the final state dict); **rounding-order** (fp32 round-off from tiles, fusion or
 reduction order; fine for speed, but a frontier recipe needs the 200-step
 reference trajectory, compared on post-warmup medians); **semantic** (bf16
 gradient reduce, dropped tokens, another balancer: a separate labelled recipe,
@@ -153,13 +163,28 @@ then flip the kernels on by default. The 200-step reference run is an input
 you ask for (pinned optimizer, batch, reduce dtype, seed, data, balancer), not
 something the TPU side produces.
 
-Gate before any cluster dispatch, every time: the exact config parses
-(`ConfigManager().parse_args([...])`); it runs 3 steps on CPU or one chip; the
-image carries the commit you think it does; the optimizer path is exactly one
-of eager / `compile_optimizer` / `optimizer_in_graph`;
-`num_tokens_per_train_step == ranks x num_tokens_per_microbatch_per_dp_rank`;
-command-line flags are in the recipe (left on the command line they get
-forgotten). When the budget is spent, write the ladder table and stop.
+Gate before any cluster dispatch, every time:
+
+- the exact config parses (`ConfigManager().parse_args([...])` with the
+  launch's `--module/--config` and overrides);
+- a reduced proxy with the same flags runs 3 steps: the tiny flavor on CPU if
+  the recipe has one, else the smallest mesh that fits; say in the PR which
+  proxy it was. The exact config of a large model cannot run on one chip, so
+  this is a proxy by design, not a substitute for the multi-rank smoke that
+  the first dispatch is;
+- the image carries the commit you think it does;
+- the optimizer path is exactly one of eager / `compile_optimizer` /
+  `optimizer_in_graph`;
+- the token budget matches the trainer's formula: `num_tokens_per_train_step`
+  is `-1` (one accumulation step) or a multiple of
+  `num_tokens_per_microbatch_per_dp_rank x num_pp_microbatches x dp_degree`,
+  where `dp_degree` is the batch mesh size, not the rank count (TP, CP and PP
+  ranks do not multiply it). More than one accumulation step is fine unless an
+  enabled feature rejects it (`optimizer_in_graph`, batch-wise aux loss);
+- command-line flags are in the recipe (left on the command line they get
+  forgotten).
+
+When the budget is spent, write the ladder table and stop.
 
 ## Rules
 
