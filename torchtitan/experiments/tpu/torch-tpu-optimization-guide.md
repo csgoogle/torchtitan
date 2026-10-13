@@ -290,8 +290,16 @@ For models (or batch/sequence lengths) that don't fit one chip, shard with **Sim
 
 - `fully_shard` (ZeRO-3-like) shards params **and** optimizer state across chips — this is what
   makes large models trainable that plain DDP OOMs on.
-- `hybrid_shard` (HSDP, a 2-D mesh: replicate across groups, shard within) is the multi-host
-  choice.
+- `hybrid_shard` (HSDP, a 2-D mesh: replicate across groups, shard within) is not a multi-host
+  requirement. Full sharding spans hosts fine over ICI, and every shipped multi-host recipe on
+  v7x (`qwen3-8b`, `qwen3-32b`, `qwen3-30b-a3b`, `muse-glimmer-30b`, `flux1` at 4x4x4 and 4x8x8)
+  is plain FSDP with `data_parallel_replicate_degree=1`. HSDP buys cheaper gradient reduction
+  within a replica group at the price of replicating parameters and optimizer state across
+  groups, so per-chip memory goes up by the replicate degree; pick it when the FSDP group would
+  otherwise be wider than the collectives need (very large chip counts) or when the replicate axis
+  maps onto a slow link, as the multi-slice recipes do across DCN (replicate over slices, shard
+  within). Choose the mesh from the interconnect, the collective cost and the memory budget, not
+  from the host count.
 - SimpleFSDP composes with `torch.compile`, which lets the compiler overlap the DTensor
   collectives with compute — combining FSDP with per-block compile is meaningfully faster than
   FSDP alone.
@@ -770,7 +778,9 @@ below assumes a compiled model.
    and splash attention (long sequence). **Tune their tile sizes** (§4) — the defaults aren't
    optimal.
 5. If it doesn't fit one chip, SimpleFSDP `fully_shard` with
-   `MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32)`; use `hybrid_shard` multi-host.
+   `MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32)`, across hosts too; `hybrid_shard`
+   only when the replicate axis buys something (multi-slice over DCN, very wide FSDP groups) and
+   the memory for the replicated state is there (§5).
 6. bf16 compute / fp32 master; norm in fp32; dims multiple of 256; shape-checks off for benchmarks.
 7. Re-profile. If matmuls are near peak and the only idle left is the training-step glue, you're at
    the torch_tpu eager ceiling (§7) — raise it by shrinking the eager surface, not by more tuning,
