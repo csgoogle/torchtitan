@@ -65,7 +65,7 @@ def _convert(config):
 
 
 def _recast(config, cls):
-  """Re-class a config, the way GraphTrainer's config conversion does."""
+  """Re-class a config, the way `MaxTextQwen3Config.from_qwen3` does."""
   # Shallow: `dataclasses.asdict` would flatten the nested configs.
   fields = (f.name for f in dataclasses.fields(config) if f.init)
   return cls(**{name: getattr(config, name) for name in fields})

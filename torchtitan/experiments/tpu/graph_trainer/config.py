@@ -82,6 +82,31 @@ def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
   resolve_save_regions(save_regions, last_n_layers)
 
 
+def _keep_maxtext_flops(
+    train_config: TPUTrainerConfig, graph_config: Any
+) -> None:
+  """Carry a recipe's MaxText FLOP accounting into its GraphTrainer config.
+
+  The ``*maxtext*`` recipes put their model config in ``MaxTextQwen3Config``.
+  GraphTrainer rebuilds the model config in its own class from the field
+  values, which drops that class; this re-applies it.
+  """
+  model_spec = train_config.model_spec
+  if model_spec is None or model_spec.name != "qwen3":
+    return
+  # Imported here: importing the Qwen3 package also imports its recipes.
+  # pylint: disable=g-import-not-at-top
+  from torchtitan.experiments.tpu.graph_trainer.qwen3 import with_maxtext_flops
+  from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
+  # pylint: enable=g-import-not-at-top
+
+  if isinstance(model_spec.model, MaxTextQwen3Config):
+    graph_config.model_spec = dataclasses.replace(
+        graph_config.model_spec,
+        model=with_maxtext_flops(graph_config.model_spec.model),
+    )
+
+
 def to_tpu_graph_trainer_config(
     train_config: TPUTrainerConfig,
     model_registry: Callable[[str], ModelSpec],
@@ -119,6 +144,8 @@ def to_tpu_graph_trainer_config(
   graph_config = to_graph_trainer_config(
       train_config, model_registry, target_cls=target_cls
   )
+  # Before the scan rewrite below, which subclasses whatever class this picks.
+  _keep_maxtext_flops(train_config, graph_config)
   graph_config.compile.memory_policy = memory_policy
   graph_config.compile.cpu_offload_budget_gb = budget
   if tpu_config.use_scan_layers:

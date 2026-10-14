@@ -32,9 +32,10 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+    MaxTextTpuGraphTrainerQwen3Model,
     model_registry as tpu_qwen3_graph_registry,
 )
-from torchtitan.experiments.tpu.layer_loop import runs_layer_loop
+from torchtitan.experiments.tpu.layer_loop import builds_layer_loop, runs_layer_loop
 from torchtitan.experiments.tpu.llama3.config_registry import (
     llama3_1b,
     llama3_8b,
@@ -91,27 +92,37 @@ from torchtitan.models.llama3.config_registry import (
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
-  def test_qwen3_graph_config_reports_the_model_flops(self) -> None:
-    """GraphTrainer reports the model config's own (torchtitan) FLOPs.
-
-    MaxText FLOPs are applied to the trainer instead, by
-    ``tpu_config.maxtext_flops``, so the config conversion cannot drop them.
-    """
-    config = qwen3_moe_30b()
+  def _qwen3_graph_flops(self, config) -> int:
+    """GraphTrainer FLOPs/token at sequence length 2048."""
     graph_config = to_tpu_graph_trainer_config(
-        config,
-        tpu_qwen3_graph_registry,
-        target_cls=TpuGraphTrainer.Config,
+        config, tpu_qwen3_graph_registry, target_cls=TpuGraphTrainer.Config
     )
-
     with torch.device("meta"):
       model = graph_config.model_spec.model.build()
-
     self.assertIsInstance(model, GraphTrainerQwen3Model)
+    return graph_config.model_spec.model.get_nparams_and_flops(
+        model, seq_len=2048
+    )[1]
+
+  def test_qwen3_graph_config_reports_torchtitan_flops_by_default(
+      self,
+  ) -> None:
+    self.assertEqual(self._qwen3_graph_flops(qwen3_moe_30b()), 23_083_044_864)
+
+  def test_qwen3_graph_config_keeps_maxtext_flops(self) -> None:
+    """A ``*maxtext*`` recipe keeps MaxText FLOPs through the conversion."""
     self.assertEqual(
-        graph_config.model_spec.model.get_nparams_and_flops(model, seq_len=2048)[1],
-        23_083_044_864,
+        self._qwen3_graph_flops(qwen3_8b_maxtext_parity()), 47_220_523_008
     )
+
+  def test_qwen3_scan_graph_config_keeps_maxtext_flops(self) -> None:
+    """The scan rewrite keeps the MaxText class picked before it."""
+    graph_config = self._qwen3_graph_config(qwen3_moe_235b_scan_maxtext())
+    self.assertIsInstance(
+        graph_config.model_spec.model,
+        MaxTextTpuGraphTrainerQwen3Model.Config,
+    )
+    self.assertTrue(builds_layer_loop(graph_config.model_spec.model))
 
   def _qwen3_graph_config(self, config):
     return to_tpu_graph_trainer_config(
@@ -564,11 +575,11 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
 
   @parameterized.named_parameters(
-      ("fp32_reduce", qwen3_32b, "float32", False, False),
-      ("maxtext_parity", qwen3_32b_maxtext_parity, "bfloat16", True, True),
+      ("fp32_reduce", qwen3_32b, "float32", False),
+      ("maxtext_parity", qwen3_32b_maxtext_parity, "bfloat16", True),
   )
   def test_qwen3_32b_recipes_reuse_8b_zero3_policy(
-      self, recipe, reduce_dtype: str, bf16_rope: bool, maxtext_flops: bool
+      self, recipe, reduce_dtype: str, bf16_rope: bool
   ) -> None:
     config = recipe()
     zero3 = qwen3_8b_zero3()
@@ -590,9 +601,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(
         config.tpu_config,
         dataclasses.replace(
-            zero3.tpu_config,
-            graph_trainer_fsdp_schedule="prefetch",
-            maxtext_flops=maxtext_flops,
+            zero3.tpu_config, graph_trainer_fsdp_schedule="prefetch"
         ),
     )
     self.assertEqual(

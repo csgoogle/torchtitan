@@ -411,12 +411,6 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
           train_config.parallelism,
       )
       trainer = trainer_cls(train_config)
-      if train_config.tpu_config.maxtext_flops:
-        from torchtitan.experiments.tpu.mfu_flops import use_maxtext_flops  # pylint: disable=g-import-not-at-top
-
-        use_maxtext_flops(
-            trainer, model_spec.model, train_config.training.max_context_length
-        )
       # Asked of the built model rather than wrapped around `parallelize_fn`:
       # the graph trainer -- the only lane scan runs on -- builds its own config
       # and its own parallelize_fn, so a wrapper on the one patched above is

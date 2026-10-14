@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+from dataclasses import dataclass
 
 import torch.nn as nn
 
@@ -17,10 +18,42 @@ from torchtitan.experiments.graph_trainer.qwen3.parallelize import (
     parallelize_qwen3 as graph_trainer_parallelize_qwen3,
 )
 from torchtitan.experiments.graph_trainer.qwen3.model import GraphTrainerQwen3Model
+from torchtitan.experiments.tpu.mfu_flops import (
+    get_maxtext_decoder_nparams_and_flops,
+)
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
     configure_qwen_simple_fsdp_shard_dims,
 )
 from torchtitan.protocols.model_spec import ModelSpec
+
+
+class MaxTextTpuGraphTrainerQwen3Model(GraphTrainerQwen3Model):
+    """GraphTrainer Qwen3 that reports MaxText FLOPs.
+
+    The GraphTrainer counterpart of ``MaxTextQwen3Config``. The TPU GraphTrainer
+    config conversion switches to it when the recipe's model config is a
+    ``MaxTextQwen3Config``; see ``with_maxtext_flops``.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(GraphTrainerQwen3Model.Config):
+        def get_nparams_and_flops(
+            self, model: nn.Module, seq_len: int
+        ) -> tuple[int, int]:
+            return get_maxtext_decoder_nparams_and_flops(self, model, seq_len)
+
+
+def with_maxtext_flops(
+    config: GraphTrainerQwen3Model.Config,
+) -> MaxTextTpuGraphTrainerQwen3Model.Config:
+    """Return ``config`` unchanged except that it reports MaxText FLOPs."""
+    return MaxTextTpuGraphTrainerQwen3Model.Config(
+        **{
+            field.name: getattr(config, field.name)
+            for field in dataclasses.fields(config)
+            if field.init
+        }
+    )
 
 
 def parallelize_qwen3(

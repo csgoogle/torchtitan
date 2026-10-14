@@ -6,15 +6,12 @@
 
 """Alternative FLOP-counting conventions for TPU MFU reporting."""
 
-from typing import Any
-
 import torch.nn as nn
 
 from torchtitan.models.common.attention import GQAttention
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe import MoE
-from torchtitan.tools.logging import logger
 
 
 def get_maxtext_decoder_nparams_and_flops(
@@ -83,28 +80,3 @@ def get_maxtext_decoder_nparams_and_flops(
 
     # MaxText's training convention is one forward plus two backward FLOPs.
     return nparams, 3 * (forward_weight_flops + forward_attention_flops)
-
-
-def use_maxtext_flops(
-    trainer: Any,
-    model_config: Decoder.Config,
-    seq_len: int,
-) -> None:
-    """Make ``trainer`` report MaxText FLOPs instead of torchtitan's.
-
-    The trainer computes FLOPs per token once, from ``model_config``, and its
-    metrics read ``trainer.metrics_processor.num_flops_per_token`` from then on.
-    Replacing that value switches reported TFLOPs and MFU to MaxText's
-    convention for both TPU trainers, without a model-config subclass that
-    GraphTrainer's config conversion would drop.
-    """
-    _, flops = get_maxtext_decoder_nparams_and_flops(
-        model_config, trainer.model_parts[0], seq_len
-    )
-    logger.info(
-        "Reporting MaxText FLOPs: %.3f GFLOPs/token (torchtitan: %.3f)",
-        flops / 1e9,
-        trainer.metrics_processor.num_flops_per_token / 1e9,
-    )
-    trainer.metrics_processor.num_flops_per_token = flops
-

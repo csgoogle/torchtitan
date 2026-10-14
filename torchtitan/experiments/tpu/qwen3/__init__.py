@@ -7,7 +7,10 @@ from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
 
+from .model import MaxTextQwen3Config
+
 __all__ = [
+    "MaxTextQwen3Config",
     "parallelize_qwen3",
     "qwen3_configs",
     "model_registry",
