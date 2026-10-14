@@ -908,13 +908,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
         config.tpu_config.graph_trainer_memory_policy, "full_and_scan_offload"
     )
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
-    self.assertEqual(
-        {
-            name: config.libtpu_init_flags[name]
-            for name in tpu_flags.SELECTIVE_ICI_RS_PIPELINING
-        },
+    for group in (
         tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
-    )
+        tpu_flags.ICI_AG_PIPELINING,
+    ):
+      self.assertEqual(
+          {name: config.libtpu_init_flags[name] for name in group}, group
+      )
     self.assertEqual(
         config.libtpu_init_flags[
             "xla_tpu_layer_scheduler_min_compute_latency_for_backward_pass"

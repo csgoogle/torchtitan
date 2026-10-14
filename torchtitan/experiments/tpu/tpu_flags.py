@@ -180,6 +180,13 @@ SELECTIVE_ICI_RS_PIPELINING: FlagMap = {
     "xla_tpu_ici_rs_pipelining_threshold_kib": "1024",
 }
 
+# Start each layer's FSDP weight all-gather one scan iteration early, so it
+# overlaps the previous layer's compute instead of sitting on the critical path.
+# Costs extra HBM for the prefetched next-layer weights.
+ICI_AG_PIPELINING: FlagMap = {
+    "xla_tpu_enable_ici_ag_pipelining": "true",
+}
+
 # Unfuse elementwise ops from MXU matmuls when fusing degrades tile selection
 # (e.g. restores the 416x8 FFN backward tile on Llama3-405B scan).
 CONVOLUTION_UNFUSING: FlagMap = {
