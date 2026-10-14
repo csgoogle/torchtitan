@@ -749,6 +749,19 @@ def qwen3_moe_30b_fsdp_only_attention_parity_benchmark() -> TPUTrainerConfig:
   return cfg
 
 
+def qwen3_moe_30b_fsdp_only_maxtext_benchmark() -> TPUTrainerConfig:
+  """Q30 benchmark with MaxText's numerics and FLOP accounting.
+
+  The attention-parity benchmark (BF16 RoPE, fused route-score backward) plus
+  BF16 gradient reduction, matching the other ``*maxtext*`` recipes, and
+  MaxText FLOPs, so its MFU is comparable with MaxText's published Q30 numbers.
+  """
+  cfg = qwen3_moe_30b_fsdp_only_attention_parity_benchmark()
+  cfg.training.mixed_precision_reduce = "bfloat16"
+  _use_maxtext_flops(cfg)
+  return cfg
+
+
 def _fuse_route_score_backward(cfg: TPUTrainerConfig) -> None:
   """Compute dScore in one fusion instead of saving an FP32 expert output.
 

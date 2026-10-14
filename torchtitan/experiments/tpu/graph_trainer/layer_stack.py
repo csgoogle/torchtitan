@@ -842,8 +842,33 @@ def _stacked_model_class(config_cls: type, use_scan: bool) -> type:
         base.__init__(self, *args, **kwargs)
         _apply_stacked_layers(self, use_scan=use_scan)
 
+    def get_nparams_and_flops(
+        self, model: nn.Module, seq_len: int
+    ) -> tuple[int, int]:
+        """Count on the unstacked model this config describes.
+
+        Stacking moves each layer's weights out of the layer's modules into one
+        tensor per weight. Upstream's active-parameter count applies the top-k
+        discount to the parameters an MoE module owns, so on a stacked model it
+        would count every expert as active (7.6x the FLOPs on the Qwen3-235B
+        scan proxy). FLOPs depend on the model, not on how its weights are
+        stored, so count on an unstacked build of the same config. It is built
+        on the meta device: no memory, no initialization.
+        """
+        del model
+        unstacked_config = derive(self, base.Config)
+        with torch.device("meta"):
+            unstacked = unstacked_config.build()
+        return unstacked_config.get_nparams_and_flops(unstacked, seq_len)
+
     name = f"{'Scanned' if use_scan else 'Stacked'}{base.__name__}"
-    return model_subclass(base, base.Config, name, __init__=__init__)
+    return model_subclass(
+        base,
+        base.Config,
+        name,
+        config_body={"get_nparams_and_flops": get_nparams_and_flops},
+        __init__=__init__,
+    )
 
 
 def with_tpu_stacked_layers(

@@ -124,6 +124,27 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )
     self.assertTrue(builds_layer_loop(graph_config.model_spec.model))
 
+  @parameterized.named_parameters(
+      ("torchtitan_flops", qwen3_moe_235b_scan_proxy),
+      ("maxtext_flops", qwen3_moe_235b_scan_maxtext),
+  )
+  def test_scanned_moe_reports_the_same_flops_as_unstacked(self, recipe):
+    """Stacking the layer weights must not change the FLOP estimate.
+
+    Scan moves expert weights out of their MoE modules; upstream's active-
+    parameter count would then miss the top-k discount and count every expert.
+    """
+    config = recipe()
+    unstacked = config.model_spec.model
+    scanned = self._qwen3_graph_config(config).model_spec.model
+    self.assertTrue(builds_layer_loop(scanned))
+    with torch.device("meta"):
+      unstacked_model, scanned_model = unstacked.build(), scanned.build()
+    self.assertEqual(
+        scanned.get_nparams_and_flops(scanned_model, seq_len=4096),
+        unstacked.get_nparams_and_flops(unstacked_model, seq_len=4096),
+    )
+
   def _qwen3_graph_config(self, config):
     return to_tpu_graph_trainer_config(
         config, tpu_qwen3_graph_registry, target_cls=TpuGraphTrainer.Config

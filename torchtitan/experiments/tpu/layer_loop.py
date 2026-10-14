@@ -97,15 +97,28 @@ def builds_layer_loop(model_config: Decoder.Config) -> bool:
     return model_config._owner.forward is _forward
 
 
-def model_subclass(model_cls: type, config_cls: type, name: str, **body) -> type:
+def model_subclass(
+    model_cls: type,
+    config_cls: type,
+    name: str,
+    *,
+    config_body: dict | None = None,
+    **body,
+) -> type:
     """Subclasses ``model_cls``, giving the subclass a ``Config`` of its own.
 
     ``build()`` instantiates ``Config._owner``, so a rewrite needs both halves.
     ``config_cls`` is passed in rather than read off ``model_cls`` because the
     recipe may have substituted one (qwen3 does, for FLOP accounting).
+    ``config_body`` adds attributes, such as method overrides, to the new
+    ``Config``; ``body`` adds them to the model subclass.
     """
     subclass_config = dataclass(kw_only=True, slots=True)(
-        type("Config", (config_cls,), {"__qualname__": f"{name}.Config"})
+        type(
+            "Config",
+            (config_cls,),
+            {"__qualname__": f"{name}.Config", **(config_body or {})},
+        )
     )
     return type(name, (model_cls,), {**body, "Config": subclass_config})
 
