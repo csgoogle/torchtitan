@@ -266,8 +266,11 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
 
     if model_name == "qwen3":
       from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
-          model_registry as gt_registry,
+          model_registry_for,
       )
+
+      # Keep the recipe's FLOP convention (MaxText or torchtitan).
+      gt_registry = model_registry_for(model_spec.model)
     elif model_name == "llama3":
       from torchtitan.experiments.graph_trainer.llama3 import model_registry as gt_registry
     elif model_name == "deepseek_v3":

@@ -32,7 +32,9 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+    MaxTextTpuGraphTrainerQwen3Model,
     model_registry as tpu_qwen3_graph_registry,
+    model_registry_for as tpu_qwen3_graph_registry_for,
 )
 from torchtitan.experiments.tpu.layer_loop import runs_layer_loop
 from torchtitan.experiments.tpu.llama3.config_registry import (
@@ -91,21 +93,38 @@ from torchtitan.models.llama3.config_registry import (
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
-  def test_qwen3_graph_config_preserves_maxtext_flops(self) -> None:
-    config = qwen3_moe_30b()
+  def _qwen3_graph_flops(self, config) -> int:
+    """GraphTrainer FLOPs/token at seq 2048, via the registry train.py uses."""
     graph_config = to_tpu_graph_trainer_config(
         config,
-        tpu_qwen3_graph_registry,
+        tpu_qwen3_graph_registry_for(config.model_spec.model),
         target_cls=TpuGraphTrainer.Config,
     )
-
     with torch.device("meta"):
       model = graph_config.model_spec.model.build()
-
     self.assertIsInstance(model, GraphTrainerQwen3Model)
-    self.assertEqual(
-        graph_config.model_spec.model.get_nparams_and_flops(model, seq_len=2048)[1],
-        20_665_860_096,
+    return graph_config.model_spec.model.get_nparams_and_flops(
+        model, seq_len=2048
+    )[1]
+
+  def test_qwen3_graph_config_preserves_maxtext_flops(self) -> None:
+    config = qwen3_moe_30b()
+    self.assertEqual(self._qwen3_graph_flops(config), 20_665_860_096)
+
+  def test_qwen3_graph_config_keeps_torchtitan_flops(self) -> None:
+    """A plain Qwen3 config reports torchtitan FLOPs on GraphTrainer too."""
+    config = qwen3_moe_30b()
+    config.model_spec.model = config.model_spec.model.to_qwen3()
+    self.assertEqual(self._qwen3_graph_flops(config), 23_083_044_864)
+
+  def test_qwen3_graph_registry_defaults_to_torchtitan_flops(self) -> None:
+    self.assertNotIsInstance(
+        tpu_qwen3_graph_registry("30B-A3B").model,
+        MaxTextTpuGraphTrainerQwen3Model.Config,
+    )
+    self.assertIsInstance(
+        tpu_qwen3_graph_registry("30B-A3B", maxtext_flops=True).model,
+        MaxTextTpuGraphTrainerQwen3Model.Config,
     )
 
   def _qwen3_graph_config(self, config):

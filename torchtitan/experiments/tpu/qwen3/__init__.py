@@ -199,7 +199,15 @@ def model_registry(
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
     converters: list = None,
+    maxtext_flops: bool = True,
 ) -> ModelSpec:
+  """Build a TPU Qwen3 model spec.
+
+  ``maxtext_flops`` picks the FLOP convention used for reported FLOPs and MFU:
+  True (the default) wraps the model config in ``MaxTextQwen3Config`` for
+  MaxText FLOPs; False keeps a plain ``Qwen3Model.Config`` for upstream
+  torchtitan FLOPs. Both trainers, regular and GraphTrainer, follow the choice.
+  """
   if flavor == "8B" and attn_backend == "sdpa":
     config = _8b_tpu(attn_backend="sdpa")
     # Since we return a custom ModelSpec for 8B, apply converters here.
@@ -208,6 +216,8 @@ def model_registry(
       for c in converters:
         config = c.build().convert(config)
     config = MaxTextQwen3Config.from_qwen3(config)
+    if not maxtext_flops:
+      config = config.to_qwen3()
     # Upstream d771abb0 made ModelSpec.max_context_length required.
     return ModelSpec(
         name="qwen3",
@@ -227,7 +237,8 @@ def model_registry(
       converters=converters,
   )
   assert isinstance(model_spec.model, Qwen3Model.Config)
-  model_spec.model = MaxTextQwen3Config.from_qwen3(model_spec.model)
+  if maxtext_flops:
+    model_spec.model = MaxTextQwen3Config.from_qwen3(model_spec.model)
   return model_spec
 
 from .config_registry import *
