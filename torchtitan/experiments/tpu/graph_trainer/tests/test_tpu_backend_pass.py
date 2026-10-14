@@ -377,5 +377,97 @@ class PartitionDonationTest(absltest.TestCase):
 
     self.assertIs(gm._tpu_executable, executable)
 
+
+class _ValueOnlyCompiler:
+  """Models a compiled executable: outputs cross its boundary, input mutation does not."""
+
+  last_kwargs: dict = {}
+
+  def __call__(self, graph, inputs, **kwargs):
+    del inputs
+    _ValueOnlyCompiler.last_kwargs = kwargs
+    forward = graph.forward
+    return lambda *args: forward(
+        *(arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args)
+    )
+
+
+class GraphInputMutationTest(absltest.TestCase):
+
+  def _compile(self, fn, inputs, **kwargs):
+    gm = make_fx(fn, tracing_mode="fake")(*inputs)
+    with mock.patch.object(
+        tpu_backend_pass,
+        "_import_static_compiler",
+        return_value=_ValueOnlyCompiler,
+    ):
+      tpu_backend_pass.tpu_backend_compile_pass(gm, inputs, **kwargs)
+    return gm
+
+  def test_additive_update_survives_replay(self):
+    def fn(counts, assignments):
+      counts.add_(assignments)
+      return assignments.sum(), "tag"
+
+    counts = torch.zeros(3)
+    gm = self._compile(fn, (counts, torch.ones(3)))
+    for total in (1, 2):
+      loss, tag = gm(counts, torch.ones(3))
+      self.assertEqual(loss.item(), 3)
+      self.assertEqual(tag, "tag")
+      torch.testing.assert_close(counts, torch.full((3,), float(total)))
+
+  def test_chained_updates_write_back_the_final_value(self):
+    def fn(counts, a, b):
+      counts.add_(a)
+      counts.add_(b)
+      return (a.sum(),)
+
+    counts = torch.zeros(3)
+    gm = self._compile(fn, (counts, torch.ones(3), torch.ones(3)))
+    gm(counts, torch.ones(3), torch.full((3,), 2.0))
+    torch.testing.assert_close(counts, torch.full((3,), 3.0))
+
+  def test_other_in_place_ops_and_whole_aliases_are_written_back(self):
+    def fn(copied, scaled, detached, a):
+      copied.copy_(a)
+      copied.index_add_(0, torch.tensor([0]), a[:1])
+      scaled.mul_(2)
+      detached.detach().add_(5)
+      return (a.sum(),)
+
+    copied, scaled, detached = torch.zeros(3), torch.ones(3), torch.zeros(3)
+    gm = self._compile(fn, (copied, scaled, detached, torch.ones(3)))
+    gm(copied, scaled, detached, torch.arange(3.0))
+    torch.testing.assert_close(copied, torch.tensor([0.0, 1.0, 2.0]))
+    torch.testing.assert_close(scaled, torch.full((3,), 2.0))
+    torch.testing.assert_close(detached, torch.full((3,), 5.0))
+
+  def test_functional_graph_is_left_alone(self):
+    def fn(x):
+      return (x.view(-1) + 1, x.t().sin())
+
+    gm = make_fx(fn, tracing_mode="fake")(torch.zeros(2, 3))
+    self.assertEqual(tpu_backend_pass._graph_input_mutations(gm), {})
+
+  def test_update_through_partial_view_raises(self):
+    def fn(counts, a):
+      counts[:1].add_(a[:1])
+      return (a.sum(),)
+
+    with self.assertRaisesRegex(NotImplementedError, "partial view"):
+      self._compile(fn, (torch.zeros(3), torch.ones(3)))
+
+  def test_written_back_input_is_not_donated(self):
+    def fn(counts, a):
+      counts.add_(a)
+      return (a * 2,)
+
+    self._compile(
+        fn, (torch.zeros(3), torch.ones(3)), donated_input_positions=(0, 1)
+    )
+    self.assertEqual(_ValueOnlyCompiler.last_kwargs["donated_inputs"], [1])
+
+
 if __name__ == "__main__":
   absltest.main()

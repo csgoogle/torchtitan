@@ -291,6 +291,109 @@ def _annotate_internal_donations(
     )
 
 
+def _is_whole_alias(node: torch.fx.Node, base: torch.fx.Node) -> bool:
+    """Whether ``node`` aliases all of ``base`` with the same layout.
+
+    ``detach``, ``alias`` and same-shape views are the input itself for
+    write-back purposes; slices and reshapes are not.
+    """
+    value, base_value = node.meta.get("val"), base.meta.get("val")
+    return (
+        isinstance(value, torch.Tensor)
+        and isinstance(base_value, torch.Tensor)
+        and value.shape == base_value.shape
+        and value.stride() == base_value.stride()
+        and value.storage_offset() == base_value.storage_offset()
+    )
+
+
+def _graph_input_mutations(gm: torch.fx.GraphModule) -> dict[int, torch.fx.Node]:
+    """Find the graph inputs that the graph updates in place.
+
+    StaticCompiler lowers the graph to an executable that returns its outputs.
+    It does not write a graph input back just because the traced graph
+    mutated it in place (for example the ``tokens_per_expert_E.add_`` that
+    every MoE layer runs in training), so without help such updates are lost.
+    The caller makes each node returned here an extra executable output and
+    copies it into the input after execution.
+
+    In-place ops are followed through chains (a second ``add_`` on the same
+    buffer takes the first one's result, not the placeholder), so the node for
+    each input is the last write, holding its final value.
+
+    Returns:
+        A map from placeholder position to the node holding that input's final
+        value, in placeholder order.
+
+    Raises:
+        NotImplementedError: For an in-place update that cannot be written
+            back this way: through a partial view of an input, or by an op that
+            does not return the tensor it mutates.
+    """
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    positions = {node: i for i, node in enumerate(placeholders)}
+    # Nodes known to alias a graph input, mapped to that input's placeholder.
+    aliases: dict[torch.fx.Node, torch.fx.Node] = {p: p for p in placeholders}
+    # The subset of `aliases` that covers only part of the input.
+    partial_views: set[torch.fx.Node] = set()
+    final_writes: dict[int, torch.fx.Node] = {}
+
+    def track_view(node: torch.fx.Node, source: torch.fx.Node) -> None:
+        base = aliases[source]
+        aliases[node] = base
+        if source in partial_views or not _is_whole_alias(node, base):
+            partial_views.add(node)
+
+    for node in gm.graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target is operator.getitem:
+            if node.args[0] in aliases:
+                track_view(node, node.args[0])
+            continue
+        schema = getattr(node.target, "_schema", None)
+        if schema is None:
+            continue
+        for index, argument in enumerate(schema.arguments):
+            value = (
+                node.args[index]
+                if index < len(node.args)
+                else node.kwargs.get(argument.name)
+            )
+            alias_info = argument.alias_info
+            if (
+                not isinstance(value, torch.fx.Node)
+                or value not in aliases
+                or alias_info is None
+            ):
+                continue
+            returns_alias = len(schema.returns) == 1 and bool(
+                schema.returns[0].alias_info is not None
+                and schema.returns[0].alias_info.before_set
+                & alias_info.before_set
+            )
+            if not alias_info.is_write:
+                if returns_alias:
+                    track_view(node, value)
+                continue
+
+            base = aliases[value]
+            where = f"{node.target} ({node.name}) updates graph input {base.name}"
+            if value in partial_views:
+                raise NotImplementedError(
+                    f"{where} through a partial view; the TPU executable "
+                    "cannot write that update back."
+                )
+            if not returns_alias:
+                raise NotImplementedError(
+                    f"{where} but does not return it; the TPU executable "
+                    "cannot write that update back."
+                )
+            aliases[node] = base
+            final_writes[positions[base]] = node
+    return dict(sorted(final_writes.items()))
+
+
 def tpu_backend_compile_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple,
@@ -329,6 +432,9 @@ def tpu_backend_compile_pass(
             f"optimization_barrier nodes: {ob}"
         )
 
+    # Positions of graph inputs updated in place, mapped to their final values.
+    mutated_inputs = _graph_input_mutations(gm)
+
     output_node = next(n for n in gm.graph.nodes if n.op == "output")
     original_outs = output_node.args[0]
     tensor_outs: list = []
@@ -344,19 +450,35 @@ def tpu_backend_compile_pass(
                 non_tensor_slots.append((i, val))
         else:
             non_tensor_slots.append((i, out))
+    num_tensor_outputs = len(tensor_outs)
     if non_tensor_slots:
         logger.info(
             f"[tpu_backend_pass] filtering {len(non_tensor_slots)} non-Tensor "
             f"output(s) before TpuBackend lowering: positions "
             f"{[p for p, _ in non_tensor_slots]}"
         )
-        output_node.args = (tuple(tensor_outs),)
+    if mutated_inputs:
+        logger.info(
+            f"[tpu_backend_pass] returning {len(mutated_inputs)} in-place "
+            "graph-input update(s) as outputs and writing them back: input "
+            f"positions {list(mutated_inputs)}"
+        )
+    if non_tensor_slots or mutated_inputs:
+        output_node.args = (tuple(tensor_outs) + tuple(mutated_inputs.values()),)
         gm.graph.lint()
         gm.recompile()
 
     t0 = time.time()
     logger.info("[tpu_backend_pass] StaticCompiler(gm, example_inputs) ...")
     donated_positions = set(donated_input_positions)
+    if donated_positions & mutated_inputs.keys():
+        # A donated buffer is invalid after execution, so it cannot receive
+        # the write-back; the executable's output carries the new value.
+        logger.info(
+            "[tpu_backend_pass] not donating graph inputs that are written "
+            f"back: positions {sorted(donated_positions & mutated_inputs.keys())}"
+        )
+        donated_positions -= mutated_inputs.keys()
     donated_inputs = []
     tensor_index = 0
     for position, value in enumerate(example_inputs):
@@ -379,9 +501,16 @@ def tpu_backend_compile_pass(
 
     gm._tpu_executable = executable
 
-    if non_tensor_slots:
+    if non_tensor_slots or mutated_inputs:
         def _compiled_forward(*flat_inputs):
             outs = list(executable(*flat_inputs))
+            if mutated_inputs:
+                with torch.no_grad():
+                    for position, value in zip(
+                        mutated_inputs, outs[num_tensor_outputs:], strict=True
+                    ):
+                        flat_inputs[position].copy_(value)
+                del outs[num_tensor_outputs:]
             for pos, val in non_tensor_slots:
                 outs.insert(pos, val)
             return tuple(outs)
