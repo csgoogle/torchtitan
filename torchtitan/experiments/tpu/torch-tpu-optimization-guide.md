@@ -153,8 +153,9 @@ failure modes on TorchTPU, and no TorchTitan TPU recipe uses it:
 - Lazily-created buffers (e.g. RoPE cos/sin) must be **materialized before tracing**, or the
   graph's input set shifts and recompilation/errors follow.
 - And critically: even when whole-model compile *works*, it covers only the model's forward and
-  backward. The loss and the optimizer step remain separate eager programs, so it does **not**
-  remove the whole-step dispatch idle (see §7).
+  backward. The loss and the optimizer step remain separate programs: eager by default, or
+  separately compiled with `compile_optimizer=True` / `compile_grad_norm=True` (and `loss` in
+  `compile.components`). Either way it does **not** remove the whole-step dispatch idle (see §7).
 
 `torch.compile` is a tool for **regions**: per-block compile is the right way to use it. If you
 want the whole step as one program, use **GraphTrainer** (§8). It traces forward, loss, backward
@@ -368,6 +369,10 @@ surface:**
 - Use the fused CE kernel (§4) so the loss is a single `custom_call` instead of a chain of eager
   ops.
 - Prefer a fused kernel over an eager op sequence wherever one exists (attention, etc.).
+- Compile the glue that has its own switch: `compile_optimizer=True` (the AdamW step as one
+  graph), `compile_grad_norm=True` (the global gradient norm; the in-place clip stays eager) and
+  `loss` in `compile.components` (the loss function, when `compile.enable` is set). Each turns a
+  chain of eager ops into one program; the dispatch between programs remains.
 - Keep batch/dim large (§3) so the compiled regions dominate the step and the fixed eager glue is a
   smaller fraction of wall-clock.
 
@@ -382,14 +387,16 @@ GraphTrainer (§8).
 
 ## 8. Whole-step capture with GraphTrainer  *(general)*
 
-Per-block `torch.compile` (§4) leaves the loss, the optimizer step and everything between blocks
-running as separate eager programs (§7). **GraphTrainer** removes that surface.
+Per-block `torch.compile` (§4) leaves everything between blocks eager, and the loss and the
+optimizer step as separate programs, eager unless compiled on their own (§7). **GraphTrainer**
+removes that surface.
 `TpuGraphTrainer` ([`graph_trainer/tpu_graph_trainer.py`](graph_trainer/tpu_graph_trainer.py)),
 the TPU subclass of TorchTitan's [GraphTrainer](../graph_trainer/README.md), traces the whole
 training step (forward, loss, backward and optionally the optimizer step) with `make_fx` into a
 single FX graph. It then runs graph passes over it and compiles the result for TPU, so the
 forward, loss and backward run as one XLA program (the optimizer step too, with
-`optimizer_in_graph`; otherwise it and the compiled gradient norm are separate programs).
+`optimizer_in_graph`; otherwise the optimizer step and gradient norm run outside the step graph,
+eagerly or as their own graphs with `compile_optimizer=True` / `compile_grad_norm=True`).
 
 How it differs from whole-model `torch.compile` (§4):
 
