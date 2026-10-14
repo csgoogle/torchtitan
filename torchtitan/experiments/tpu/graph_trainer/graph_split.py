@@ -41,6 +41,7 @@ from torch._inductor.fx_passes.bucketing import (
 )
 from torch.fx.passes.split_module import split_module
 
+from torchtitan.experiments.graph_trainer.cpu_offload import _is_view
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_layer_id,
     _is_backward_node,
@@ -781,8 +782,11 @@ def split_backward_graph_by_layer(
   collective_nodes: set[torch.fx.Node] = set().union(
       *collective_chains.values()
   )
+  # A recomputed view keeps its producer layer's FQN but is consumed by the
+  # layer being differentiated; place views with their first consumer instead.
+  view_nodes = {node for node in body_nodes if _is_view(node)}
   _, layer_nodes = _group_nodes_by_layer(
-      body_nodes, excluded=collective_nodes | ao_nodes
+      body_nodes, excluded=collective_nodes | ao_nodes | view_nodes
   )
   expected_layers = set(range(n_layers))
   if set(layer_nodes) != expected_layers:
@@ -857,6 +861,13 @@ def split_backward_graph_by_layer(
         raw_layer_to_partition[layer_id],
         f"layer {layer_id}",
     )
+  for node in reversed(body_nodes):
+    if node in view_nodes and node not in partition_map:
+      user_partitions = [
+          partition_map[user] for user in node.users if user in partition_map
+      ]
+      if user_partitions:
+        partition_map[node] = min(user_partitions)
   for node in body_nodes:
     if node not in partition_map and node not in ao_nodes:
       partition_map[node] = max(
