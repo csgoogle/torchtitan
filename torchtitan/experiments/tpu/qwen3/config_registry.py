@@ -33,7 +33,6 @@ from torchtitan.experiments.tpu.qkv import TpuPackedQKVConverter
 import torchtitan.experiments.tpu.qwen3 as tpu_qwen3
 from torchtitan.experiments.tpu.qwen3 import model_registry
 from torchtitan.experiments.tpu.qwen3.infra.parallelize import parallelize_qwen3 as tpu_parallelize_qwen3
-from torchtitan.experiments.tpu.qwen3.model import MaxTextQwen3Config
 from torchtitan.experiments.tpu.token_dispatcher import (
     TpuAllToAllTokenDispatcher,
     TpuTokenDispatcherConverter,
@@ -103,19 +102,6 @@ _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
         "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
     },
 )
-
-
-def _use_maxtext_flops(config: TPUTrainerConfig) -> None:
-  """Report MaxText FLOPs and MFU instead of upstream torchtitan's.
-
-  Only the ``*maxtext*`` recipes call this, so their MFU is comparable with
-  MaxText's published numbers. MaxText halves attention FLOPs for the causal
-  mask; torchtitan does not discount causal sparsity.
-  """
-  assert config.model_spec is not None
-  config.model_spec.model = MaxTextQwen3Config.from_qwen3(
-      config.model_spec.model
-  )
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
@@ -483,7 +469,7 @@ def qwen3_8b_maxtext_parity() -> TPUTrainerConfig:
   cfg = qwen3_8b_zero3()
   cfg.training.mixed_precision_reduce = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  _use_maxtext_flops(cfg)
+  cfg.tpu_config.maxtext_flops = True
   return cfg
 
 
@@ -550,7 +536,7 @@ def qwen3_32b_maxtext_parity() -> TPUTrainerConfig:
   cfg = qwen3_32b()
   cfg.training.mixed_precision_reduce = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  _use_maxtext_flops(cfg)
+  cfg.tpu_config.maxtext_flops = True
   return cfg
 
 
@@ -855,7 +841,7 @@ def qwen3_moe_235b_fsdp_activation_offload_maxtext() -> TPUTrainerConfig:
   cfg.training.mixed_precision_reduce = "bfloat16"
   if _BF16_ROPE_OVERRIDE not in cfg.override.imports:
     cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  _use_maxtext_flops(cfg)
+  cfg.tpu_config.maxtext_flops = True
   return cfg
 
 
@@ -1050,7 +1036,7 @@ def qwen3_moe_235b_scan_maxtext() -> TPUTrainerConfig:
   cfg = qwen3_moe_235b_scan()
   cfg.training.mixed_precision_reduce = "bfloat16"
   cfg.override.imports.append(_BF16_ROPE_OVERRIDE)
-  _use_maxtext_flops(cfg)
+  cfg.tpu_config.maxtext_flops = True
   return cfg
 
 

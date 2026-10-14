@@ -7,10 +7,7 @@ from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .model import MaxTextQwen3Config
-
 __all__ = [
-    "MaxTextQwen3Config",
     "parallelize_qwen3",
     "qwen3_configs",
     "model_registry",
@@ -126,8 +123,7 @@ def _upstream_flavor(flavor: str, attn_backend: str):
   return build_config(attn_backend, seq_len=max_context_length)
 
 
-# Model configs by flavor. These report upstream torchtitan FLOPs; a recipe that
-# wants MaxText FLOPs wraps its config in `MaxTextQwen3Config.from_qwen3`.
+# Model configs by flavor.
 qwen3_configs = {
     "testmodel": _upstream_flavor("testmodel", "sdpa"),
     "testmodel_moe": _testmodel_moe("sdpa"),
@@ -148,12 +144,6 @@ def model_registry(
     moe_comm_backend: str | None = None,
     converters: list = None,
 ) -> ModelSpec:
-  """Build a TPU Qwen3 model spec.
-
-  The model config is a plain ``Qwen3Model.Config`` and reports upstream
-  torchtitan FLOPs. Recipes that compare against MaxText wrap it in
-  ``MaxTextQwen3Config.from_qwen3`` to report MaxText FLOPs instead.
-  """
   if flavor == "8B" and attn_backend == "sdpa":
     config = _8b_tpu(attn_backend="sdpa")
     # Since we return a custom ModelSpec for 8B, apply converters here.

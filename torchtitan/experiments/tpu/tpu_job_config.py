@@ -138,6 +138,11 @@ class TPUConfig:
   # through the end of training. Both boundaries must be metric log steps.
   enable_mfu_benchmark: bool = False
   mfu_benchmark_start_step: int = 5
+  # Report FLOPs (and so TFLOPs and MFU) with MaxText's formula instead of the
+  # model's own torchtitan one, to compare with MaxText's published numbers.
+  # MaxText halves attention FLOPs for the causal mask. See
+  # ``mfu_flops.use_maxtext_flops``.
+  maxtext_flops: bool = False
   # Disable Automatic Mixed Precision (AMP), so all training is done in uniform
   # precision.
   enable_amp: bool = True
