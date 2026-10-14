@@ -373,8 +373,6 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
         flags["xla_tpu_enable_sparse_core_hierarchical_reduce_scatter"],
         "true",
     )
-    # The config default must survive the merge.
-    self.assertEqual(flags["xla_tpu_enable_diagnostic_coordinator"], "false")
     self.assertTrue(config.splash_attention_kernel.use_splash_attention_kernel)
     self.assertFalse(
         config.splash_attention_kernel.use_tokamax_splash_attention_kernel

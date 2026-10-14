@@ -83,7 +83,7 @@ gcluster job submit \
     --training.steps=20 \
     --training.num_tokens_per_microbatch_per_dp_rank=16384 \
     --parallelism.enable_tpu_topo_mesh \
-    --extra-libtpu-init-flags='xla_tpu_dvfs_p_state=7 xla_tpu_scoped_vmem_limit_kib=131072 xla_tpu_enable_offloading_copy_to_sparsecore=false xla_tpu_enable_diagnostic_coordinator=false xla_enable_async_all_gather=true xla_tpu_prefer_async_allgather_to_allreduce=true xla_tpu_enable_sparse_core_collective_offload_all_gather=true xla_tpu_copy_insertion_use_region_analysis=true xla_tpu_copy_insertion_use_region_analysis_limit=1000'"
+    --extra-libtpu-init-flags='xla_tpu_dvfs_p_state=7 xla_tpu_scoped_vmem_limit_kib=131072 xla_tpu_enable_offloading_copy_to_sparsecore=false xla_enable_async_all_gather=true xla_tpu_prefer_async_allgather_to_allreduce=true xla_tpu_enable_sparse_core_collective_offload_all_gather=true xla_tpu_copy_insertion_use_region_analysis=true xla_tpu_copy_insertion_use_region_analysis_limit=1000'"
 ```
 
 ## Expected Metrics

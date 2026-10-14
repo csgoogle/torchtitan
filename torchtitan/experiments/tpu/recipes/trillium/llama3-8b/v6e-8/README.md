@@ -18,6 +18,10 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **Master weights are float32** (config_registry default). Compute runs in bf16 via `mixed_precision_param=bfloat16`.
 - VMEM tuning: `--libtpu-init-flags=xla_tpu_scoped_vmem_limit_kib=131072`, a
   libtpu init flag the config exports before PJRT initialization.
+- `tpu_program_stack_shrink_after_unload=false` keeps the TPU program stack at
+  its high-water mark. HBM is nearly full in this recipe, so letting the stack
+  shrink makes later program loads trigger HBM defragmentation stalls (~0.6%
+  slower step time on libtpu 0.0.50).
 - Dataset: `c4_test` (synthetic/test dataset).
 - Tokenizer: `tests/assets/tokenizer`.
 - Model configuration used is `llama3_8b` from `config_registry.py`.
@@ -71,7 +75,7 @@ gcluster job submit \
     --splash_attention_kernel.use_splash_attention_kernel \
     --splash_attention_kernel.sa_block_kv_compute=2048 \
     --tpu_config.eager_mode=DEFER_AND_FUSE \
-    --libtpu-init-flags=xla_tpu_scoped_vmem_limit_kib=131072"
+    --libtpu-init-flags='xla_tpu_scoped_vmem_limit_kib=131072 tpu_program_stack_shrink_after_unload=false'"
 ```
 
 ## Expected Metrics
