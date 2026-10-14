@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from torchtitan.config import ConfigManager
+from torchtitan.config.override import apply_overrides
 from torchtitan.experiments.graph_trainer.llama3.parallelize import parallelize_llama as graph_trainer_parallelize_llama
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import workarounds
@@ -20,8 +21,12 @@ from torchtitan.experiments.tpu.examples.olmo2 import model_registry
 from torchtitan.experiments.tpu.examples.olmo2 import Olmo2Attention
 from torchtitan.experiments.tpu.examples.olmo2 import Olmo2StateDictAdapter
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_1b
+from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_1b_fused_ce
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_debugmodel
+from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_debugmodel_fused_ce
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import check_layers_are_stackable
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+from torchtitan.experiments.tpu.overrides.fused_loss import FusedLossLinearWrapper
 from torchtitan.experiments.tpu.tpu_job_config import SplashAttentionKernelConfig
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 import transformers
@@ -309,6 +314,41 @@ class TestOlmo2SplashAttentionPatch(parameterized.TestCase):
       else:
         # Replaces the module with UnflattenShim(SplashAttention).
         self.assertNotIn("ScaledDotProduct", type(inner).__name__)
+
+
+class TestOlmo2FusedCrossEntropy(parameterized.TestCase):
+  """The ``*_fused_ce`` recipes put the fused linear + CE kernel in place.
+
+  The kernel's numerics are covered by
+  ``kernels/tests/test_linear_softmax_cross_entropy_loss.py``; OLMo 2's lm_head
+  is a plain ``Linear`` (no soft-cap or multiplier), so what is OLMo 2-specific
+  is that the override reaches it.
+  """
+
+  @parameterized.named_parameters(
+      dict(testcase_name="debugmodel", recipe=olmo2_debugmodel_fused_ce),
+      dict(testcase_name="1b", recipe=olmo2_1b_fused_ce),
+  )
+  def test_recipe_swaps_lm_head_for_fused_loss(self, recipe):
+    config = recipe()
+    self.assertIsInstance(config.loss, PallasCrossEntropyLoss.Config)
+    self.assertIsNone(config.loss.soft_cap)
+    self.assertEqual(config.loss.output_multiplier, 1.0)
+
+    apply_overrides(config.override, config)
+    self.assertIsInstance(
+        config.model_spec.model.lm_head, FusedLossLinearWrapper.Config
+    )
+    with torch.device("meta"):
+      model = config.model_spec.model.build()
+    self.assertIsInstance(model.lm_head, FusedLossLinearWrapper)
+    # Same checkpoint key, so plain-CE checkpoints and the HF adapter still fit.
+    self.assertEqual(
+        [k for k in model.state_dict() if k.endswith("lm_head.weight")],
+        ["lm_head.weight"],
+    )
+    # The lane's head / loss consistency check (soft-cap, multiplier).
+    workarounds._check_fused_loss_logit_transform(model, config)  # pylint: disable=protected-access
 
 
 class TestOlmo2StateDictAdapter(parameterized.TestCase):

@@ -11,15 +11,36 @@ from torchtitan.config.configs import ParallelismConfig
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
+from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
 __all__ = [
     "olmo2_debugmodel",
+    "olmo2_debugmodel_fused_ce",
     "olmo2_1b",
+    "olmo2_1b_fused_ce",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
 _1B_CONTEXT_LENGTH = 4096
+
+# Overrides are identified by the import path of the decorated factory.
+_FUSED_LOSS_OVERRIDE = (
+    "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
+)
+
+
+def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
+  """Select the fused loss and its pre-construction LM-head override together.
+
+  The override swaps the plain ``Linear`` lm_head for ``FusedLossLinearWrapper``
+  (same weight and checkpoint key), which hands ``(hidden, weight.T)`` to the
+  fused kernel, so the ``[tokens, vocab]`` logits are never materialized. OLMo 2
+  has no logit soft-cap or multiplier, so the loss keeps its defaults.
+  """
+  config.loss = PallasCrossEntropyLoss.Config()
+  if _FUSED_LOSS_OVERRIDE not in config.override.imports:
+    config.override.imports.append(_FUSED_LOSS_OVERRIDE)
 
 
 def olmo2_debugmodel() -> TPUTrainerConfig:
@@ -65,6 +86,13 @@ def olmo2_debugmodel() -> TPUTrainerConfig:
   )
 
 
+def olmo2_debugmodel_fused_ce() -> TPUTrainerConfig:
+  """``olmo2_debugmodel`` with the fused Pallas linear + cross entropy."""
+  config = olmo2_debugmodel()
+  _enable_pallas_cross_entropy(config)
+  return config
+
+
 def olmo2_1b() -> TPUTrainerConfig:
   """``allenai/OLMo-2-0425-1B``: per-block compile, SimpleFSDP, bf16 params.
 
@@ -108,3 +136,10 @@ def olmo2_1b() -> TPUTrainerConfig:
       ),
       validator=Validator.Config(enable=False),
   )
+
+
+def olmo2_1b_fused_ce() -> TPUTrainerConfig:
+  """``olmo2_1b`` with the fused Pallas linear + cross entropy."""
+  config = olmo2_1b()
+  _enable_pallas_cross_entropy(config)
+  return config
