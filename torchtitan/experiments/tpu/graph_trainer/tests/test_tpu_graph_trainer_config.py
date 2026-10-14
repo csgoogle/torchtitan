@@ -76,6 +76,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
+    qwen3_moe_30b_fsdp_only_maxtext_benchmark,
     qwen3_moe_235b_fsdp_activation_offload_4x4x4,
     qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4,
     qwen3_moe_235b_scan,
@@ -113,9 +114,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(self._qwen3_graph_flops(qwen3_moe_30b()), 23_083_044_864)
 
   def test_maxtext_recipe_reports_maxtext_flops_on_graph_trainer(self) -> None:
-    """A ``*maxtext*`` recipe keeps MaxText FLOPs through the conversion."""
+    """A ``*maxtext*`` recipe keeps MaxText FLOPs through the conversion.
+
+    Same model as the test above, so the values differ only by convention.
+    """
     self.assertEqual(
-        self._qwen3_graph_flops(qwen3_8b_maxtext_parity()), 47_220_523_008
+        self._qwen3_graph_flops(qwen3_moe_30b_fsdp_only_maxtext_benchmark()),
+        20_665_860_096,
     )
 
   def test_maxtext_scan_recipe_reports_maxtext_flops_on_graph_trainer(
