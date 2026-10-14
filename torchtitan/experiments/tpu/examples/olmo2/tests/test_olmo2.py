@@ -19,9 +19,9 @@ from torchtitan.experiments.tpu.examples.olmo2 import Olmo2Attention
 from torchtitan.experiments.tpu.examples.olmo2 import Olmo2StateDictAdapter
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_1b
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_debugmodel
-from torchtitan.experiments.tpu.examples.olmo2.graph_trainer import GraphTrainerOlmo2Model
-from torchtitan.experiments.tpu.examples.olmo2.graph_trainer import model_registry as graph_trainer_model_registry
-from torchtitan.experiments.tpu.examples.olmo2.graph_trainer import parallelize_olmo2 as graph_trainer_parallelize_olmo2
+from torchtitan.experiments.tpu.graph_trainer.olmo2 import GraphTrainerOlmo2Model
+from torchtitan.experiments.tpu.graph_trainer.olmo2 import model_registry as graph_trainer_model_registry
+from torchtitan.experiments.tpu.graph_trainer.olmo2 import parallelize_olmo2 as graph_trainer_parallelize_olmo2
 from torchtitan.experiments.tpu.examples.olmo2.infra.parallelize import parallelize_olmo2
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import check_layers_are_stackable
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len

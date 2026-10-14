@@ -278,7 +278,7 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
           model_registry as gt_registry,
       )
     elif model_name == "olmo2":
-      from torchtitan.experiments.tpu.examples.olmo2.graph_trainer import (
+      from torchtitan.experiments.tpu.graph_trainer.olmo2 import (
           model_registry as gt_registry,
       )
     else:

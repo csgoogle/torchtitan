@@ -1,15 +1,14 @@
 """OLMo 2 on the TPU GraphTrainer path (``--tpu_config.use_graph_trainer``).
 
 Upstream ``experiments/graph_trainer`` has no OLMo 2 model, so this module
-supplies the three pieces its other models have (``llama3``,
-``muse_glimmer``): a model class whose ``init_states`` runs with SimpleFSDP's
+supplies the three pieces its models have, the same way the TPU ``gpt_oss``
+wrapper does: a model class whose ``init_states`` runs with SimpleFSDP's
 parametrization disabled, a ``parallelize_fn`` that annotates module FQNs,
 applies SimpleFSDP and hands the model to GraphTrainer's compile, and a
-``model_registry``. ``train.py`` routes ``model_spec.name == "olmo2"`` here.
+``model_registry`` built on ``experiments.tpu.examples.olmo2``.
 
-Only SimpleFSDP / HSDP is supported, as for the eager path
-(``infra/parallelize.py``): the full-width q/k norms rule out TP, and CP / PP
-are not wired up for OLMo 2.
+Only SimpleFSDP / HSDP is supported, as on the eager path: the full-width q/k
+norms rule out TP, and CP / PP are not wired up for OLMo 2.
 """
 
 import dataclasses
