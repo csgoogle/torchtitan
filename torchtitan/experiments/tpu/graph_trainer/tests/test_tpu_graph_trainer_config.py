@@ -35,7 +35,10 @@ from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
     MaxTextTpuGraphTrainerQwen3Model,
     model_registry as tpu_qwen3_graph_registry,
 )
-from torchtitan.experiments.tpu.layer_loop import builds_layer_loop, runs_layer_loop
+from torchtitan.experiments.tpu.layer_loop import (
+    builds_layer_loop,
+    runs_layer_loop,
+)
 from torchtitan.experiments.tpu.llama3.config_registry import (
     llama3_1b,
     llama3_8b,
@@ -109,13 +112,15 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
   ) -> None:
     self.assertEqual(self._qwen3_graph_flops(qwen3_moe_30b()), 23_083_044_864)
 
-  def test_qwen3_graph_config_keeps_maxtext_flops(self) -> None:
+  def test_maxtext_recipe_reports_maxtext_flops_on_graph_trainer(self) -> None:
     """A ``*maxtext*`` recipe keeps MaxText FLOPs through the conversion."""
     self.assertEqual(
         self._qwen3_graph_flops(qwen3_8b_maxtext_parity()), 47_220_523_008
     )
 
-  def test_qwen3_scan_graph_config_keeps_maxtext_flops(self) -> None:
+  def test_maxtext_scan_recipe_reports_maxtext_flops_on_graph_trainer(
+      self,
+  ) -> None:
     """The scan rewrite keeps the MaxText class picked before it."""
     graph_config = self._qwen3_graph_config(qwen3_moe_235b_scan_maxtext())
     self.assertIsInstance(
