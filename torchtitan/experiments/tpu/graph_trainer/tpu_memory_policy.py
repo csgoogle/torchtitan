@@ -72,21 +72,18 @@ def _is_integer_tensor(value: object, ndim: int) -> bool:
 
 
 def select_route_permutations(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
-    """Return the expert-sort permutations that ``local_reorder`` marks.
+    """Return the nodes of the expert sort that ``local_reorder`` marks.
 
     ``token_dispatcher.py`` has three argsorts, so an op or module FQN alone
     cannot pick this one; the dispatcher computes it inside an
-    ``annotate_region`` block instead. Every node traced in that block carries
-    the hint (the reshape, the sort and its getitems), so keep the
-    one-dimensional integer value that leaves the region: the permutation
-    itself.
+    ``annotate_region`` block instead. Everything the block marks is returned.
+    ``MUST_SAVE`` only stops a node from being recomputed for backward, and
+    data dependencies decide what stays live, so a marked node that backward
+    never reads is still freed after its last forward use. Such nodes do show
+    up in the logged candidate counts and logical bytes.
     """
     return [
-        node
-        for node in _forward_call_nodes(gm)
-        if _in_remat_region(node, MOE_ROUTING)
-        and _is_integer_tensor(node.meta.get("val"), ndim=1)
-        and any(not _in_remat_region(user, MOE_ROUTING) for user in node.users)
+        node for node in _forward_call_nodes(gm) if _in_remat_region(node, MOE_ROUTING)
     ]
 
 

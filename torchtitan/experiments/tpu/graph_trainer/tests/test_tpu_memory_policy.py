@@ -6,6 +6,7 @@
 
 """Tests for the TPU selective memory policies on traced toy graphs."""
 
+from collections.abc import Iterable
 import operator
 from types import SimpleNamespace
 import unittest
@@ -48,6 +49,7 @@ from torchtitan.experiments.tpu.graph_trainer.remat_schedule import (
     apply_tpu_remat_schedule,
 )
 from torchtitan.experiments.tpu.graph_trainer.tpu_memory_policy import (
+    _in_remat_region,
     full_remat_with_saves,
     is_splash_forward_op_name,
     resolve_save_regions,
@@ -346,6 +348,16 @@ def _router_topks(gm: torch.fx.GraphModule) -> list[torch.fx.Node]:
     ]
 
 
+def _route_permutations(nodes: Iterable[torch.fx.Node]) -> list[torch.fx.Node]:
+    """Each layer's permutation: the marked node read outside the block."""
+    return [
+        node
+        for node in nodes
+        if _in_remat_region(node, MOE_ROUTING)
+        and any(not _in_remat_region(user, MOE_ROUTING) for user in node.users)
+    ]
+
+
 def _hand_built_routing_graph(
     with_topk: bool, with_routes: bool
 ) -> torch.fx.GraphModule:
@@ -377,7 +389,7 @@ class TestRoutingRegion(unittest.TestCase):
         torch.manual_seed(0)
         traced, _ = _trace_toy(_MoEToy())
 
-        routes = select_route_permutations(traced.gm)
+        routes = _route_permutations(select_route_permutations(traced.gm))
 
         # The hint is merged into the module FQN, not a replacement for it, so
         # each permutation still knows its layer.
@@ -435,7 +447,8 @@ class TestRoutingRegion(unittest.TestCase):
                 *select_route_permutations(traced.gm),
             },
         )
-        self.assertEqual(sorted(_get_layer_id(node) for node in routing), [0, 0, 1, 1])
+        permutations = _route_permutations(routing)
+        self.assertEqual([_get_layer_id(node) for node in permutations], [0, 1])
 
     def test_needs_both_in_the_same_layers(self) -> None:
         # A saved permutation next to recomputed top-k ids could disagree on a
@@ -606,7 +619,8 @@ class TestTpuSelectivePolicy(unittest.TestCase):
             for node in chosen
             if node.meta["custom"].get(REMAT_REGION) == MOE_ROUTING
         }
-        self.assertEqual(sorted(_get_layer_id(node) for node in routes), [0, 1])
+        permutations = _route_permutations(routes)
+        self.assertEqual(sorted(_get_layer_id(node) for node in permutations), [0, 1])
         self.assertEqual(
             sorted(node.meta["custom"]["module_fqn"] for node in chosen - routes),
             ["layers.0.moe.router", "layers.1.moe.router"],
@@ -618,8 +632,9 @@ class TestTpuSelectivePolicy(unittest.TestCase):
 
         splash = [node for node in chosen if _is_splash_node(node)]
         self.assertEqual(sorted(_get_layer_id(node) for node in splash), [0, 1, 2])
-        # Plus one route permutation and one top-k ids value per layer.
-        self.assertEqual(len(chosen), 9)
+        # Plus the route permutation of every layer.
+        routes = _route_permutations(chosen)
+        self.assertEqual(sorted(_get_layer_id(node) for node in routes), [0, 1, 2])
 
     def test_last_n_layers_saves_only_the_last_splash(self) -> None:
         # Recomputing layers 0-1 while layer 2's backward reads its saved
