@@ -4,24 +4,22 @@ Run as CI does: ``python -m <this module> --device=tpu`` (or ``--device=cpu``
 with ``TORCH_DEVICE_BACKEND_AUTOLOAD=0``).
 """
 
-import types
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 import torch.nn.functional as F
 
+from torchtitan.config import ConfigManager
+from torchtitan.experiments.graph_trainer.llama3.parallelize import parallelize_llama as graph_trainer_parallelize_llama
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu.base_device_test import BaseAcceleratorDeviceTest
 from torchtitan.experiments.tpu.examples.olmo2 import build_olmo2_config
+from torchtitan.experiments.tpu.examples.olmo2 import graph_trainer_model_registry
 from torchtitan.experiments.tpu.examples.olmo2 import model_registry
 from torchtitan.experiments.tpu.examples.olmo2 import Olmo2Attention
 from torchtitan.experiments.tpu.examples.olmo2 import Olmo2StateDictAdapter
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_1b
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_debugmodel
-from torchtitan.experiments.tpu.graph_trainer.olmo2 import model_registry as graph_trainer_model_registry
-from torchtitan.experiments.tpu.graph_trainer.olmo2 import parallelize_olmo2 as graph_trainer_parallelize_olmo2
-from torchtitan.experiments.tpu.examples.olmo2.infra.parallelize import parallelize_olmo2
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import check_layers_are_stackable
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 import transformers
@@ -384,33 +382,37 @@ class TestOlmo2Flavors(absltest.TestCase):
       )
 
   def test_unsupported_parallelisms_rejected(self):
-    parallelism = types.SimpleNamespace(spmd_backend="partial_dtensor")
-    for parallelize in (parallelize_olmo2, graph_trainer_parallelize_olmo2):
-      for enabled in ("tp_enabled", "cp_enabled", "pp_enabled"):
-        dims = types.SimpleNamespace(
-            tp_enabled=False, cp_enabled=False, pp_enabled=False
-        )
-        setattr(dims, enabled, True)
-        with self.assertRaises(NotImplementedError, msg=enabled):
-          parallelize(
-              torch.nn.Module(),
-              parallel_dims=dims,
-              parallelism=parallelism,
-              training=None,
-              compile_config=None,
-              dump_folder="",
-          )
+    # update_from_config is what the trainer calls before either parallelize
+    # path (eager or GraphTrainer), so rejecting there covers both.
+    base = [
+        "--module=torchtitan.experiments.tpu.examples.olmo2",
+        "--config=olmo2_debugmodel",
+    ]
+    for flag in (
+        "--parallelism.tensor_parallel_degree=2",
+        "--parallelism.pipeline_parallel_degree=2",
+        "--parallelism.spmd_backend=spmd_types",
+    ):
+      config = ConfigManager().parse_args(base + [flag])
+      with self.assertRaises(NotImplementedError, msg=flag):
+        config.model_spec.model.update_from_config(config=config)
+    # CP never reaches update_from_config: parsing rejects it, because the
+    # inner attention is not a CPInnerAttention.
+    with self.assertRaisesRegex(ValueError, "CPInnerAttention"):
+      ConfigManager().parse_args(base + [
+          "--parallelism.context_parallel_degree=2",
+          "--parallelism.spmd_backend=spmd_types",
+      ])
 
   def test_graph_trainer_registry_keeps_the_model(self):
     for flavor in ("debugmodel", "1B"):
       spec = model_registry(flavor)
       graph_spec = graph_trainer_model_registry(flavor)
       self.assertIs(type(graph_spec.model), type(spec.model))
-      self.assertIs(graph_spec.parallelize_fn, graph_trainer_parallelize_olmo2)
+      self.assertIs(graph_spec.parallelize_fn, graph_trainer_parallelize_llama)
       self.assertIsNone(graph_spec.pipelining_fn)
       self.assertEqual(graph_spec.model.layers, spec.model.layers)
       self.assertEqual(graph_spec.model.lm_head, spec.model.lm_head)
-
 
 if __name__ == "__main__":
   absltest.main()

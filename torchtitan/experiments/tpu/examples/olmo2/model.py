@@ -35,7 +35,7 @@ class FlatHeadsRMSNorm(RMSNorm):
 
   ``normalized_shape`` is ``H * K``. Under tensor parallelism the local tensor
   holds only a slice of the heads, so the statistic would be wrong;
-  ``parallelize_olmo2`` rejects TP.
+  ``Olmo2Model.Config.update_from_config`` rejects TP.
   """
 
   @dataclass(kw_only=True, slots=True)
@@ -105,6 +105,32 @@ class Olmo2Model(Decoder):
   class Config(Decoder.Config):
     dim: int = 2048
     vocab_size: int = 100352
+
+    def update_from_config(self, *, config, **kwargs) -> None:
+      """Rejects what OLMo 2 does not support on TPU, then the base update.
+
+      Runs before either parallelize path (eager or GraphTrainer), so both
+      reuse the llama3 parallelization unchanged. Context parallelism needs no
+      check here: config parsing already rejects it, since OLMo 2's inner
+      attention is not a ``CPInnerAttention``.
+      """
+      parallelism = config.parallelism
+      # The q/k norms span all heads (FlatHeadsRMSNorm); a TP shard holds only
+      # some of them, so its local statistic would be wrong.
+      if parallelism.tensor_parallel_degree > 1:
+        raise NotImplementedError(
+            "Tensor parallelism is not supported for OLMo 2 on TPU: its q/k"
+            " norms span all heads."
+        )
+      if parallelism.pipeline_parallel_degree > 1:
+        raise NotImplementedError(
+            "Pipeline parallelism is not supported for OLMo 2 on TPU yet."
+        )
+      if parallelism.spmd_backend != "partial_dtensor":
+        raise NotImplementedError(
+            "OLMo 2 on TPU supports only parallelism.spmd_backend=partial_dtensor."
+        )
+      Decoder.Config.update_from_config(self, config=config, **kwargs)
 
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int

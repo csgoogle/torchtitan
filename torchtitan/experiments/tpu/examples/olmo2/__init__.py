@@ -9,6 +9,12 @@ vocab_size 100352, rope_theta 500000, rms_norm_eps 1e-6,
 max_position_embeddings 4096, tie_word_embeddings false, hidden_act silu,
 attention_bias false.
 
+Both trainers reuse the llama3 parallelization: ``model_registry`` uses the TPU
+llama3 ``parallelize_llama`` (AC -> per-block compile -> SimpleFSDP or FSDP2)
+and ``graph_trainer_model_registry`` upstream GraphTrainer's (annotate FQNs ->
+SimpleFSDP -> GraphTrainer compile). Unsupported parallelisms are rejected in
+``Olmo2Model.Config.update_from_config``, before either runs.
+
 Every layer attends with ``SlidingWindowScaledDotProductInnerAttention``
 (window None): causal SDPA restricted to the query's packed document, the
 same masking Splash applies from ``segment_ids``. Stock
@@ -21,6 +27,8 @@ import dataclasses
 from functools import partial
 
 from torch import nn
+from torchtitan.experiments.graph_trainer.llama3.parallelize import parallelize_llama as graph_trainer_parallelize_llama
+from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama
 from torchtitan.experiments.tpu.muse_glimmer.attention import SlidingWindowScaledDotProductInnerAttention
 from torchtitan.models.common import CosSinRoPE
 from torchtitan.models.common import Embedding
@@ -32,7 +40,6 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .infra.parallelize import parallelize_olmo2
 from .model import FlatHeadsRMSNorm
 from .model import Olmo2Attention
 from .model import Olmo2Model
@@ -46,9 +53,9 @@ __all__ = [
     "Olmo2StateDictAdapter",
     "Olmo2TransformerBlock",
     "build_olmo2_config",
+    "graph_trainer_model_registry",
     "model_registry",
     "olmo2_configs",
-    "parallelize_olmo2",
 ]
 
 # HF Olmo2PreTrainedModel initializes every Linear and Embedding with
@@ -184,7 +191,8 @@ def model_registry(
     converters: Optional model-config converters.
 
   Returns:
-    The model spec, using ``parallelize_olmo2`` and ``Olmo2StateDictAdapter``.
+    The model spec, using the TPU llama3 ``parallelize_llama`` and
+    ``Olmo2StateDictAdapter``.
   """
   build_config, max_context_length = olmo2_configs[flavor]
   context_length = seq_len or max_context_length
@@ -203,11 +211,32 @@ def model_registry(
       flavor=flavor,
       model=config,
       max_context_length=context_length,
-      parallelize_fn=parallelize_olmo2,
-      # PP is not supported on TPU yet; parallelize_olmo2 rejects it.
+      parallelize_fn=parallelize_llama,
+      # PP is not supported on TPU yet; update_from_config rejects it.
       pipelining_fn=None,
       post_optimizer_build_fn=None,
       state_dict_adapter=Olmo2StateDictAdapter,
+  )
+
+
+def graph_trainer_model_registry(flavor: str) -> ModelSpec:
+  """The GraphTrainer spec (``--tpu_config.use_graph_trainer``) for a flavor.
+
+  ``train.py`` routes ``olmo2`` here. ``to_graph_trainer_config`` takes only the
+  model class, ``parallelize_fn`` and ``pipelining_fn`` from it, so the model
+  config stays the recipe's own and only upstream GraphTrainer's llama3
+  parallelization is swapped in.
+
+  Args:
+    flavor: A key of ``olmo2_configs``.
+
+  Returns:
+    ``model_registry(flavor)`` with GraphTrainer's ``parallelize_llama``.
+  """
+  return dataclasses.replace(
+      model_registry(flavor),
+      parallelize_fn=graph_trainer_parallelize_llama,
+      pipelining_fn=None,
   )
 
 
