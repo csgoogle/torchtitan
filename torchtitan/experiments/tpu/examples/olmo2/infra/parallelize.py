@@ -12,10 +12,11 @@ import torchtitan.distributed
 from torchtitan.experiments.tpu.llama3.infra.parallelize import parallelize_llama
 
 
-def _validate_supported(
+def validate_olmo2_parallelism(
     parallel_dims: torchtitan.distributed.ParallelDims,
     parallelism: torchtitan.config.ParallelismConfig,
 ) -> None:
+  """Rejects what OLMo 2 does not support on TPU (eager and GraphTrainer)."""
   # The q/k norms span all heads (FlatHeadsRMSNorm); a TP shard holds only
   # some of them, so its local statistic would be wrong.
   if parallel_dims.tp_enabled:
@@ -56,7 +57,7 @@ def parallelize_olmo2(
   Returns:
     The parallelized model.
   """
-  _validate_supported(parallel_dims, parallelism)
+  validate_olmo2_parallelism(parallel_dims, parallelism)
   return parallelize_llama(
       model, parallel_dims=parallel_dims, parallelism=parallelism, **kwargs
   )

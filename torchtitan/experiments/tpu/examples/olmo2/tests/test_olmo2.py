@@ -19,6 +19,9 @@ from torchtitan.experiments.tpu.examples.olmo2 import Olmo2Attention
 from torchtitan.experiments.tpu.examples.olmo2 import Olmo2StateDictAdapter
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_1b
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_debugmodel
+from torchtitan.experiments.tpu.examples.olmo2.graph_trainer import GraphTrainerOlmo2Model
+from torchtitan.experiments.tpu.examples.olmo2.graph_trainer import model_registry as graph_trainer_model_registry
+from torchtitan.experiments.tpu.examples.olmo2.graph_trainer import parallelize_olmo2 as graph_trainer_parallelize_olmo2
 from torchtitan.experiments.tpu.examples.olmo2.infra.parallelize import parallelize_olmo2
 from torchtitan.experiments.tpu.graph_trainer.layer_stack import check_layers_are_stackable
 from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
@@ -383,15 +386,31 @@ class TestOlmo2Flavors(absltest.TestCase):
 
   def test_unsupported_parallelisms_rejected(self):
     parallelism = types.SimpleNamespace(spmd_backend="partial_dtensor")
-    for enabled in ("tp_enabled", "cp_enabled", "pp_enabled"):
-      dims = types.SimpleNamespace(
-          tp_enabled=False, cp_enabled=False, pp_enabled=False
-      )
-      setattr(dims, enabled, True)
-      with self.assertRaises(NotImplementedError, msg=enabled):
-        parallelize_olmo2(
-            torch.nn.Module(), parallel_dims=dims, parallelism=parallelism
+    for parallelize in (parallelize_olmo2, graph_trainer_parallelize_olmo2):
+      for enabled in ("tp_enabled", "cp_enabled", "pp_enabled"):
+        dims = types.SimpleNamespace(
+            tp_enabled=False, cp_enabled=False, pp_enabled=False
         )
+        setattr(dims, enabled, True)
+        with self.assertRaises(NotImplementedError, msg=enabled):
+          parallelize(
+              torch.nn.Module(),
+              parallel_dims=dims,
+              parallelism=parallelism,
+              training=None,
+              compile_config=None,
+              dump_folder="",
+          )
+
+  def test_graph_trainer_registry_keeps_the_model(self):
+    for flavor in ("debugmodel", "1B"):
+      spec = model_registry(flavor)
+      graph_spec = graph_trainer_model_registry(flavor)
+      self.assertIs(type(graph_spec.model), GraphTrainerOlmo2Model.Config)
+      self.assertIs(graph_spec.parallelize_fn, graph_trainer_parallelize_olmo2)
+      self.assertIsNone(graph_spec.pipelining_fn)
+      self.assertEqual(graph_spec.model.layers, spec.model.layers)
+      self.assertEqual(graph_spec.model.lm_head, spec.model.lm_head)
 
 
 if __name__ == "__main__":

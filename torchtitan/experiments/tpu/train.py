@@ -277,6 +277,10 @@ def start_trainer(train_config: tpu_job_config_module.TPUTrainerConfig):
       from torchtitan.experiments.tpu.graph_trainer.muse_glimmer import (
           model_registry as gt_registry,
       )
+    elif model_name == "olmo2":
+      from torchtitan.experiments.tpu.examples.olmo2.graph_trainer import (
+          model_registry as gt_registry,
+      )
     else:
       raise ValueError(
           f"Model {model_name} is not currently supported with GraphTrainer."

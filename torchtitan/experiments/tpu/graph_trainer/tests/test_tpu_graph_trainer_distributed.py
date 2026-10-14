@@ -149,6 +149,20 @@ class TpuGraphTrainerDistributedTest(
               "--training.num_tokens_per_microbatch_per_dp_rank=1024",
           ],
       ),
+      # OLMo 2 (rung 2: GraphTrainer only). Splash is rung 3, so it is switched
+      # back off; context 256 so a packed row holds several documents.
+      dict(
+          testcase_name="olmo2_simple_fsdp",
+          module="torchtitan.experiments.tpu.examples.olmo2",
+          config="olmo2_debugmodel",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          args=[
+              "--splash_attention_kernel.no-use_splash_attention_kernel",
+              "--training.max_context_length=256",
+              "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+          ],
+      ),
   ])
   def test_graph_trainer_distributed(
       self,
@@ -215,6 +229,81 @@ class TpuGraphTrainerDistributedTest(
     # severed carry moves the loss by percent, far outside this.
     for (step, scan), (_, loop) in zip(losses["scan"], losses["loop"]):
       self.assertAlmostEqual(scan, loop, delta=abs(loop) * 1e-5, msg=f"step {step}")
+
+  def test_olmo2_graph_trainer_matches_per_block_compile(self):
+    """GraphTrainer trains OLMo 2 to the per-block-compile losses.
+
+    Same recipe, data and seed; only the trainer differs. The two compile the
+    step differently (one program vs one per block), so the match is to
+    rounding order: on v6e-4 step 1 is identical and steps 2-3 differ by at
+    most 2.9e-5 relative. The bound is 1e-4 relative.
+
+    The control arm warms the learning rate up over 3 steps instead of 2, which
+    shrinks the first two updates; it moves the loss by 1.4e-2 relative at step
+    2 and 2.7e-2 at step 3 and must land outside the bound. (A gradient-scale
+    change would not do: AdamW's update is invariant to it, so a larger
+    clipping norm leaves the losses inside the bound.)
+    """
+    tempdir = self.create_tempdir().full_path
+    olmo2_args = [
+        "--module=torchtitan.experiments.tpu.examples.olmo2",
+        "--config=olmo2_debugmodel",
+        "--dataloader.dataset_path=tests/assets/c4_test",
+        "--dataloader.dataset=c4_test",
+        "--hf_assets_path=tests/assets/tokenizer",
+        "--training.max_context_length=256",
+        "--training.num_tokens_per_microbatch_per_dp_rank=1024",
+        "--training.steps=3",
+        "--training.mixed_precision_param=float32",
+        "--training.mixed_precision_reduce=float32",
+        "--debug.seed=42",
+        "--debug.deterministic",
+    ]
+    graph_trainer = [
+        "--tpu_config.use_graph_trainer",
+        "--tpu_config.compile_mode=aot_fx_trace",
+    ]
+    losses = {}
+    for arm, extra in (
+        ("per_block_compile", []),
+        ("graph_trainer", graph_trainer),
+        ("control", graph_trainer + ["--lr_scheduler.warmup_steps=3"]),
+    ):
+      path = os.path.join(tempdir, f"{arm}.json")
+      self._test_train_distributed(
+          config_args=olmo2_args + extra,
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          start_trainer=_RecordLosses(path),  # pyrefly: ignore[bad-argument-type]
+          enable_compile=True,
+      )
+      with open(path) as f:
+        losses[arm] = dict(json.load(f))
+
+    reference = losses["per_block_compile"]
+    self.assertEqual(sorted(reference), [1, 2, 3])
+    self.assertEqual(sorted(losses["graph_trainer"]), [1, 2, 3])
+    for step, loss in reference.items():
+      self.assertAlmostEqual(
+          losses["graph_trainer"][step],
+          loss,
+          delta=abs(loss) * 1e-4,
+          msg=f"step {step}",
+      )
+    for step in (2, 3):
+      self.assertGreater(
+          abs(losses["control"][step] - reference[step]),
+          abs(reference[step]) * 1e-4,
+          msg=f"control, step {step}",
+      )
+    print(
+        "measured relative |arm - per_block_compile| at steps 1-3:",
+        {
+            arm: [abs(losses[arm][s] - reference[s]) / abs(reference[s])
+                  for s in (1, 2, 3)]
+            for arm in ("graph_trainer", "control")
+        },
+    )
 
 
 if __name__ == "__main__":
