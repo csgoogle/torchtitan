@@ -42,6 +42,15 @@ def gpt_oss_debugmodel_graphtrainer() -> TPUTrainerConfig:
     return config
 
 
+def gpt_oss_debugmodel_splash() -> TPUTrainerConfig:
+    """Opt-in GraphTrainer + sink-aware Tokamax; default recipes stay on SDPA."""
+    config = gpt_oss_debugmodel_graphtrainer()
+    config.override.imports.append(
+        "torchtitan.experiments.tpu.gpt_oss.splash_attention.use_sink_splash"
+    )
+    return config
+
+
 def gpt_oss_20b() -> TPUTrainerConfig:
     """20B architecture on SDPA; not a benchmarked production recipe."""
     from . import model_registry

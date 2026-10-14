@@ -20,6 +20,22 @@ class TrainDistributedTest(
 
   @parameterized.named_parameters([
       dict(
+          testcase_name="gpt_oss_splash",
+          module="torchtitan.experiments.tpu.gpt_oss",
+          config="gpt_oss_debugmodel_splash",
+          data_parallel_shard_degree=-1,
+          tensor_parallel_degree=1,
+          enable_compile=True,
+          args=[
+              "--training.max_context_length=512",
+              "--training.num_tokens_per_microbatch_per_dp_rank=512",
+          ],
+          skip_devices=[
+              device_type.AcceleratorDeviceType.CPU,
+              device_type.AcceleratorDeviceType.CUDA,
+          ],
+      ),
+      dict(
           testcase_name="gpt_oss_graphtrainer",
           module="torchtitan.experiments.tpu.gpt_oss",
           config="gpt_oss_debugmodel_graphtrainer",
