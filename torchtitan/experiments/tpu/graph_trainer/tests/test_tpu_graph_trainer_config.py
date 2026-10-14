@@ -108,13 +108,12 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     )[1]
 
   def test_qwen3_graph_config_preserves_maxtext_flops(self) -> None:
-    config = qwen3_moe_30b()
-    self.assertEqual(self._qwen3_graph_flops(config), 20_665_860_096)
+    """A ``*maxtext*`` recipe keeps MaxText FLOPs through the conversion."""
+    config = qwen3_8b_maxtext_parity()
+    self.assertEqual(self._qwen3_graph_flops(config), 47_220_523_008)
 
-  def test_qwen3_graph_config_keeps_torchtitan_flops(self) -> None:
-    """A plain Qwen3 config reports torchtitan FLOPs on GraphTrainer too."""
+  def test_qwen3_graph_config_reports_torchtitan_flops_by_default(self) -> None:
     config = qwen3_moe_30b()
-    config.model_spec.model = config.model_spec.model.to_qwen3()
     self.assertEqual(self._qwen3_graph_flops(config), 23_083_044_864)
 
   def test_qwen3_graph_registry_defaults_to_torchtitan_flops(self) -> None:

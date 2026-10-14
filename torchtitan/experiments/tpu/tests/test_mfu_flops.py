@@ -7,8 +7,11 @@
 from absl.testing import absltest
 import torch
 
+import inspect
+
 from torchtitan.experiments.tpu.qwen3 import (
     MaxTextQwen3Config,
+    config_registry as tpu_qwen3_config_registry,
     model_registry as tpu_qwen3_model_registry,
     qwen3_configs,
 )
@@ -17,7 +20,7 @@ from torchtitan.experiments.tpu.qwen3 import (
 class MaxTextQwen3FlopsTest(absltest.TestCase):
 
   def test_qwen3_8b_matches_maxtext(self) -> None:
-    model_config = qwen3_configs["8B"]
+    model_config = MaxTextQwen3Config.from_qwen3(qwen3_configs["8B"])
     with torch.device("meta"):
       model = model_config.build()
 
@@ -27,7 +30,7 @@ class MaxTextQwen3FlopsTest(absltest.TestCase):
     )
 
   def test_qwen3_30b_a3b_matches_maxtext(self) -> None:
-    model_config = qwen3_configs["30B-A3B"]
+    model_config = MaxTextQwen3Config.from_qwen3(qwen3_configs["30B-A3B"])
     with torch.device("meta"):
       model = model_config.build()
 
@@ -36,25 +39,40 @@ class MaxTextQwen3FlopsTest(absltest.TestCase):
         20_665_860_096,
     )
 
-  def test_qwen3_registry_can_opt_out_of_maxtext_flops(self) -> None:
+  def test_qwen3_registry_reports_torchtitan_flops(self) -> None:
     for flavor, attn_backend in (("30B-A3B", "flex"), ("8B", "sdpa")):
       with self.subTest(flavor=flavor):
-        default = tpu_qwen3_model_registry(flavor, attn_backend=attn_backend)
-        plain = tpu_qwen3_model_registry(
-            flavor, attn_backend=attn_backend, maxtext_flops=False
-        )
-        self.assertIsInstance(default.model, MaxTextQwen3Config)
-        self.assertNotIsInstance(plain.model, MaxTextQwen3Config)
+        model_config = tpu_qwen3_model_registry(
+            flavor, attn_backend=attn_backend
+        ).model
+        self.assertNotIsInstance(model_config, MaxTextQwen3Config)
 
-    model_config = tpu_qwen3_model_registry(
-        "30B-A3B", maxtext_flops=False
-    ).model
+    model_config = tpu_qwen3_model_registry("30B-A3B").model
     with torch.device("meta"):
       model = model_config.build()
     self.assertEqual(
         model_config.get_nparams_and_flops(model, seq_len=2048)[1],
         23_083_044_864,
     )
+
+  def test_only_maxtext_recipes_report_maxtext_flops(self) -> None:
+    """MaxText FLOPs belong to the ``*maxtext*`` recipes and no others."""
+    recipes = {
+        name: fn
+        for name, fn in inspect.getmembers(
+            tpu_qwen3_config_registry, inspect.isfunction
+        )
+        if fn.__module__ == tpu_qwen3_config_registry.__name__
+        and not name.startswith("_")
+        and not inspect.signature(fn).parameters
+    }
+    self.assertTrue(any("maxtext" in name for name in recipes))
+    for name, recipe in recipes.items():
+      with self.subTest(recipe=name):
+        self.assertEqual(
+            isinstance(recipe().model_spec.model, MaxTextQwen3Config),
+            "maxtext" in name,
+        )
 
 
 if __name__ == "__main__":

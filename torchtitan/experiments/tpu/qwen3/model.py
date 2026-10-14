@@ -19,10 +19,10 @@ from torchtitan.models.qwen3.model import Qwen3Model
 class MaxTextQwen3Config(Qwen3Model.Config):
     """Qwen3 config that builds the upstream model but uses MaxText FLOPs.
 
-    The class itself selects the FLOP convention: a recipe whose model config
-    is a ``MaxTextQwen3Config`` reports MaxText FLOPs (and MFU) on both the
-    regular TPU trainer and GraphTrainer; a plain ``Qwen3Model.Config`` reports
-    upstream torchtitan FLOPs on both.
+    TPU Qwen3 configs report upstream torchtitan FLOPs by default. Only recipes
+    named ``*maxtext*`` wrap their config in this class, so their FLOPs and MFU
+    are comparable with MaxText. GraphTrainer keeps the choice (see
+    ``graph_trainer.qwen3.model_registry_for``).
     """
 
     @classmethod
@@ -32,19 +32,6 @@ class MaxTextQwen3Config(Qwen3Model.Config):
         return cls(
             **{
                 field.name: getattr(config, field.name)
-                for field in dataclasses.fields(Qwen3Model.Config)
-                if field.init
-            }
-        )
-
-    def to_qwen3(self) -> Qwen3Model.Config:
-        """Return the same model as a plain ``Qwen3Model.Config``.
-
-        The result counts FLOPs with the upstream torchtitan convention.
-        """
-        return Qwen3Model.Config(
-            **{
-                field.name: getattr(self, field.name)
                 for field in dataclasses.fields(Qwen3Model.Config)
                 if field.init
             }

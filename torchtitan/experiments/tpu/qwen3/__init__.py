@@ -13,8 +13,6 @@ __all__ = [
     "MaxTextQwen3Config",
     "parallelize_qwen3",
     "qwen3_configs",
-    "qwen3_debugmodel",
-    "qwen3_debugmodel_moe",
     "model_registry",
     "TESTMODEL_MAX_CONTEXT_LENGTH",
 ]
@@ -22,61 +20,21 @@ __all__ = [
 # Context lengths of the flavors this module defines itself, named so the
 # `ModelSpec.max_context_length` that upstream d771abb0 made required can reuse
 # the exact value each flavor's RoPE config is built with.
-# `_testmodel`/`_testmodel_moe` match upstream's `("testmodel", 128)` entry;
+# `_testmodel_moe` matches upstream's `("testmodel", 128)` context length;
 # `_8b_tpu` matches upstream's `("8B", 40960)` entry.
 TESTMODEL_MAX_CONTEXT_LENGTH = 128
 _8B_MAX_CONTEXT_LENGTH = 40960
 
 
-def _testmodel(attn_backend: str = "sdpa") -> MaxTextQwen3Config:
-    dim = 128
-    head_dim = 16
-    n_layers = 3
-    vocab_size = 2048
-    return MaxTextQwen3Config(
-        vocab_size=vocab_size,
-        dim=dim,
-        norm=qwen3_models._qwen3_norm(dim),
-        enable_weight_tying=True,
-        tok_embeddings=common_models.Embedding.Config(
-            num_embeddings=vocab_size,
-            embedding_dim=dim,
-            param_init=qwen3_models._EMBEDDING_SKIP_INIT,
-        ),
-        lm_head=common_models.Linear.Config(
-            in_features=dim,
-            out_features=vocab_size,
-            param_init=qwen3_models._LINEAR_INIT,
-        ),
-
-        # pytype: disable=wrong-keyword-args
-        layers=qwen3_models._build_qwen3_layers(
-            n_layers=n_layers,
-            dim=dim,
-            n_heads=8,
-            n_kv_heads=8,
-            head_dim=head_dim,
-            hidden_dim=256,
-            attn_backend=attn_backend,
-            rope=common_models.CosSinRoPE.Config(
-                dim=head_dim,
-                max_context_length=TESTMODEL_MAX_CONTEXT_LENGTH,
-                theta=1000000.0,
-            ),
-        ),
-        # pytype: enable=wrong-keyword-args
-    )
-
-
 def _testmodel_moe(
     attn_backend: str = "sdpa",
     moe_comm_backend: str = "standard",
-) -> MaxTextQwen3Config:
+) -> Qwen3Model.Config:
     dim = 128
     head_dim = 16
     n_layers = 3
     vocab_size = 2048
-    return MaxTextQwen3Config(
+    return Qwen3Model.Config(
         vocab_size=vocab_size,
         dim=dim,
         norm=qwen3_models._qwen3_norm(dim),
@@ -111,7 +69,7 @@ def _testmodel_moe(
     )
 
 
-def _8b_tpu(attn_backend: str = "sdpa") -> MaxTextQwen3Config:
+def _8b_tpu(attn_backend: str = "sdpa") -> Qwen3Model.Config:
     """TPU-specific Qwen3 8B model configuration.
 
     Differs from the baseline models/qwen3/_8b config by setting fuse_qkv=False
@@ -121,7 +79,7 @@ def _8b_tpu(attn_backend: str = "sdpa") -> MaxTextQwen3Config:
     head_dim = 128
     n_layers = 36
     vocab_size = 151936
-    return MaxTextQwen3Config(
+    return Qwen3Model.Config(
         vocab_size=vocab_size,
         dim=dim,
         norm=qwen3_models._qwen3_norm(dim),
@@ -168,30 +126,20 @@ def _upstream_flavor(flavor: str, attn_backend: str):
   return build_config(attn_backend, seq_len=max_context_length)
 
 
+# Model configs by flavor. These report upstream torchtitan FLOPs; a recipe that
+# wants MaxText FLOPs wraps its config in `MaxTextQwen3Config.from_qwen3`.
 qwen3_configs = {
-    "testmodel": _testmodel("sdpa"),
+    "testmodel": _upstream_flavor("testmodel", "sdpa"),
     "testmodel_moe": _testmodel_moe("sdpa"),
-    "debugmodel": MaxTextQwen3Config.from_qwen3(
-        _upstream_flavor("debugmodel", "sdpa")
-    ),
-    "debugmodel_moe": MaxTextQwen3Config.from_qwen3(
-        _upstream_flavor("debugmodel_moe", "sdpa")
-    ),
-    "0.6B": MaxTextQwen3Config.from_qwen3(_upstream_flavor("0.6B", "sdpa")),
-    "1.7B": MaxTextQwen3Config.from_qwen3(_upstream_flavor("1.7B", "sdpa")),
-    "4B": MaxTextQwen3Config.from_qwen3(_upstream_flavor("4B", "sdpa")),
+    "debugmodel": _upstream_flavor("debugmodel", "sdpa"),
+    "debugmodel_moe": _upstream_flavor("debugmodel_moe", "sdpa"),
+    "0.6B": _upstream_flavor("0.6B", "sdpa"),
+    "1.7B": _upstream_flavor("1.7B", "sdpa"),
+    "4B": _upstream_flavor("4B", "sdpa"),
     "8B": _8b_tpu("sdpa"),
-    "32B": MaxTextQwen3Config.from_qwen3(_upstream_flavor("32B", "sdpa")),
-    "30B-A3B": MaxTextQwen3Config.from_qwen3(
-        _upstream_flavor("30B-A3B", "sdpa")
-    ),
+    "32B": _upstream_flavor("32B", "sdpa"),
+    "30B-A3B": _upstream_flavor("30B-A3B", "sdpa"),
 }
-
-def qwen3_debugmodel():
-    return qwen3_configs["debugmodel"]
-
-def qwen3_debugmodel_moe():
-    return qwen3_configs["debugmodel_moe"]
 
 
 def model_registry(
@@ -199,14 +147,12 @@ def model_registry(
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
     converters: list = None,
-    maxtext_flops: bool = True,
 ) -> ModelSpec:
   """Build a TPU Qwen3 model spec.
 
-  ``maxtext_flops`` picks the FLOP convention used for reported FLOPs and MFU:
-  True (the default) wraps the model config in ``MaxTextQwen3Config`` for
-  MaxText FLOPs; False keeps a plain ``Qwen3Model.Config`` for upstream
-  torchtitan FLOPs. Both trainers, regular and GraphTrainer, follow the choice.
+  The model config is a plain ``Qwen3Model.Config`` and reports upstream
+  torchtitan FLOPs. Recipes that compare against MaxText wrap it in
+  ``MaxTextQwen3Config.from_qwen3`` to report MaxText FLOPs instead.
   """
   if flavor == "8B" and attn_backend == "sdpa":
     config = _8b_tpu(attn_backend="sdpa")
@@ -215,9 +161,6 @@ def model_registry(
       qwen3_models.validate_converter_order(converters)
       for c in converters:
         config = c.build().convert(config)
-    config = MaxTextQwen3Config.from_qwen3(config)
-    if not maxtext_flops:
-      config = config.to_qwen3()
     # Upstream d771abb0 made ModelSpec.max_context_length required.
     return ModelSpec(
         name="qwen3",
@@ -229,16 +172,11 @@ def model_registry(
         post_optimizer_build_fn=qwen3_models.register_moe_load_balancing_hook,
         state_dict_adapter=Qwen3StateDictAdapter,
     )
-  # Reuse the upstream model specification and change only its FLOP accounting.
-  model_spec = qwen3_models.model_registry(
+  return qwen3_models.model_registry(
       flavor,
       attn_backend=attn_backend,
       moe_comm_backend=moe_comm_backend,
       converters=converters,
   )
-  assert isinstance(model_spec.model, Qwen3Model.Config)
-  if maxtext_flops:
-    model_spec.model = MaxTextQwen3Config.from_qwen3(model_spec.model)
-  return model_spec
 
 from .config_registry import *
