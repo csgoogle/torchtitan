@@ -32,6 +32,7 @@ def model_registry(flavor: str, *, seq_len: int | None = None, converters=None):
 
 from .config_registry import (
     gpt_oss_debugmodel,
+    gpt_oss_debugmodel_fused_ce,
     gpt_oss_debugmodel_graphtrainer,
     gpt_oss_debugmodel_splash,
     gpt_oss_20b,
@@ -41,6 +42,7 @@ from .config_registry import (
 __all__ = [
     "model_registry",
     "gpt_oss_debugmodel",
+    "gpt_oss_debugmodel_fused_ce",
     "gpt_oss_debugmodel_graphtrainer",
     "gpt_oss_debugmodel_splash",
     "gpt_oss_20b",

@@ -51,6 +51,21 @@ def gpt_oss_debugmodel_splash() -> TPUTrainerConfig:
     return config
 
 
+def gpt_oss_debugmodel_fused_ce() -> TPUTrainerConfig:
+    """Opt-in Splash + fused LM-head cross entropy on the debug architecture."""
+    from torchtitan.experiments.tpu.loss import PallasCrossEntropyLoss
+
+    config = gpt_oss_debugmodel_splash()
+    config.override.imports.append(
+        "torchtitan.experiments.tpu.overrides.fused_loss.fused_loss_lm_head"
+    )
+    # Cover the default 256-token microbatch and 256-wide hidden state exactly.
+    config.loss = PallasCrossEntropyLoss.Config(
+        b_block_size=256, h_block_size=256, v_block_size=2048
+    )
+    return config
+
+
 def gpt_oss_20b() -> TPUTrainerConfig:
     """20B architecture on SDPA; not a benchmarked production recipe."""
     from . import model_registry
