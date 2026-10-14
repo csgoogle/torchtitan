@@ -82,7 +82,7 @@ def _validate_tpu_selective(tpu_config: TPUConfig) -> None:
   resolve_save_regions(save_regions, last_n_layers)
 
 
-def _keep_maxtext_flops(
+def _maybe_use_maxtext_flops(
     train_config: TPUTrainerConfig, graph_config: Any
 ) -> None:
   """Carry a recipe's MaxText FLOP accounting into its GraphTrainer config.
@@ -145,7 +145,7 @@ def to_tpu_graph_trainer_config(
       train_config, model_registry, target_cls=target_cls
   )
   # Before the scan rewrite below, which subclasses whatever class this picks.
-  _keep_maxtext_flops(train_config, graph_config)
+  _maybe_use_maxtext_flops(train_config, graph_config)
   graph_config.compile.memory_policy = memory_policy
   graph_config.compile.cpu_offload_budget_gb = budget
   if tpu_config.use_scan_layers:
