@@ -4,8 +4,6 @@ Run as CI does: ``python -m <this module> --device=tpu`` (or ``--device=cpu``
 with ``TORCH_DEVICE_BACKEND_AUTOLOAD=0``).
 """
 
-import copy
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
@@ -278,100 +276,39 @@ class TestOlmo2HFReferenceParity(BaseAcceleratorDeviceTest):
     self.assertGreater(relative_change, 0.1)
 
 
-def _relative_l2(test: torch.Tensor, reference: torch.Tensor) -> float:
-  test = test.detach().float().cpu()
-  reference = reference.detach().float().cpu()
-  return (
-      torch.linalg.vector_norm(test - reference)
-      / torch.linalg.vector_norm(reference)
-  ).item()
+class TestOlmo2SplashAttentionPatch(parameterized.TestCase):
+  """``--splash_attention_kernel`` takes effect on every OLMo 2 layer.
 
-
-class TestOlmo2SplashAttention(BaseAcceleratorDeviceTest):
-  """Splash / tokamax attention vs the document-masked SDPA it replaces."""
+  The kernels' numerics (segment ids included) are covered by
+  ``kernels/tests``; what is OLMo 2-specific is that the patch matches its
+  document-masked SDPA inner attention. A patch that skipped a layer would
+  leave it on SDPA without failing.
+  """
 
   @parameterized.named_parameters(
       dict(testcase_name="splash", kernel="splash"),
-      dict(testcase_name="splash_batch_native", kernel="splash_batch_native"),
       dict(testcase_name="tokamax", kernel="tokamax"),
   )
-  def test_kernel_matches_sdpa_on_packed_documents(self, kernel):
-    """One OLMo 2 attention layer, Splash-patched on device vs SDPA on CPU.
-
-    Row 0 packs three documents, so the kernel must turn ``positions`` into
-    segment ids; row 1 is one document. Forward and every gradient are compared
-    by relative L2 (bounds 1e-2 forward, 2.5e-2 gradients). The control:
-    without the document mask the reference moves by more than 10%, so a
-    kernel that ignored the documents would fail the forward bound.
-
-    Args:
-      kernel: ``splash`` (document-aware block skipping),
-        ``splash_batch_native`` (batch-native masking) or ``tokamax``.
-    """
-    if self.accelerator_device.type != "tpu":
-      self.skipTest("Splash and tokamax attention are TPU-only Pallas kernels.")
-    torch.manual_seed(0)
-    batch, seq_len = 2, 512
-    config = model_registry("debugmodel", seq_len=seq_len).model
-    attention_cpu = config.layers[0].attention.build()
-    attention_cpu.init_states()
-    with torch.no_grad():
-      for norm in (attention_cpu.q_norm, attention_cpu.k_norm):
-        norm.weight.copy_(1.0 + 0.1 * torch.randn_like(norm.weight))
-    attention_device = copy.deepcopy(attention_cpu).to(self.accelerator_device)
-
-    sa_config = SplashAttentionKernelConfig(
-        sa_use_document_aware_block_skipping=(kernel == "splash")
-    )
+  def test_patch_replaces_every_layer(self, kernel):
+    with torch.device("meta"):
+      model = model_registry("debugmodel").model.build()
     if kernel == "tokamax":
       workarounds.use_tokamax_splash_attention_patch(
-          attention_device, sa_config
+          model, SplashAttentionKernelConfig()
       )
     else:
-      workarounds.use_splash_attention_patch(attention_device, sa_config)
-    # The patch must have taken: Splash replaces the inner attention module;
-    # tokamax rebinds ``forward`` on the existing instance.
-    inner = attention_device.inner_attention
-    if kernel == "tokamax":
-      self.assertIn("forward", vars(inner))
-    else:
-      self.assertNotIn("ScaledDotProduct", type(inner).__name__)
-
-    x_cpu = torch.randn(batch * seq_len, config.dim, requires_grad=True)
-    x_device = x_cpu.detach().to(self.accelerator_device).requires_grad_()
-    positions = torch.cat([
-        torch.arange(200),
-        torch.arange(180),
-        torch.arange(seq_len - 380),
-        torch.arange(seq_len),
-    ])
-    with set_unflatten_seq_len(seq_len):
-      out_cpu = attention_cpu(x_cpu, None, positions)
-      out_device = attention_device(
-          x_device, None, positions.to(self.accelerator_device)
+      workarounds.use_splash_attention_patch(
+          model, SplashAttentionKernelConfig()
       )
-      with torch.no_grad():
-        out_cpu_unpacked = attention_cpu(
-            x_cpu, None, torch.arange(seq_len).repeat(batch)
-        )
-    self.assertGreater(_relative_l2(out_cpu_unpacked, out_cpu), 0.1)
-    errors = {"forward": _relative_l2(out_device, out_cpu)}
-    self.assertLessEqual(errors["forward"], 1e-2)
-
-    grad_out = torch.randn(
-        out_cpu.shape, generator=torch.Generator().manual_seed(0)
-    )
-    out_cpu.backward(grad_out)
-    out_device.backward(grad_out.to(self.accelerator_device))
-    errors["input grad"] = _relative_l2(x_device.grad, x_cpu.grad)
-    for (name, p_cpu), (_, p_device) in zip(
-        attention_cpu.named_parameters(), attention_device.named_parameters()
-    ):
-      errors[name] = _relative_l2(p_device.grad, p_cpu.grad)
-    for name, error in errors.items():
-      if name != "forward":
-        self.assertLessEqual(error, 2.5e-2, msg=name)
-    print(f"measured {kernel} relative L2:", errors)
+    inners = [layer.attention.inner_attention for layer in model.layers.values()]
+    self.assertLen(inners, 8)
+    for inner in inners:
+      if kernel == "tokamax":
+        # Rebinds forward on the existing module.
+        self.assertIn("forward", vars(inner))
+      else:
+        # Replaces the module with UnflattenShim(SplashAttention).
+        self.assertNotIn("ScaledDotProduct", type(inner).__name__)
 
 
 class TestOlmo2StateDictAdapter(parameterized.TestCase):
