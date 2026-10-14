@@ -146,8 +146,8 @@ Order, with the guide section in parentheses:
 ```
 1  per-block compile + SimpleFSDP + mp policy (4, 5)   PR 1
 2  GraphTrainer wrapper (8)                            3-step loss vs per-block compile
-3  splash / tokamax attention (4)                      vs SDPA on a packed batch, both
-                                                       layer types, gradients too
+3  splash / tokamax attention (4)                      patch replaces every layer; vs SDPA
+                                                       only for model-specific masking
 4  fused cross entropy (4)                             vs fp32 F.cross_entropy
 5  MoE kernels, if MoE (10)                            grouped mm vs torch._grouped_mm,
                                                        empty groups included
@@ -160,7 +160,9 @@ Order, with the guide section in parentheses:
 
 Each rung: the flag stays off in the recipe until Step 3; a parity test
 against the path it replaces plus the control that proves the test can fail
-(drop the document mask, turn the cap off, watch the metric move); one
+(drop the document mask, turn the cap off, watch the metric move), or, where
+`kernels/tests` already cover the kernel's numerics and the model adds nothing
+they cannot see, a test that the kernel is patched in (`tests.md`); one
 end-to-end case with the flag on; a commit message with the numerics class,
 before/after step time and MFU on the same recipe and chip count, and the HLO
 evidence (custom_call present, segment ids among its operands). Rung k passes

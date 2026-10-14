@@ -96,11 +96,18 @@ the bound in the PR.
 ## Feature parity tests (one per rung)
 
 Each rung adds a test against the path it replaces, on the same packed batch,
-comparing outputs and gradients:
+comparing outputs and gradients, unless noted below:
 
-- splash / tokamax attention vs SDPA (#530): context 4x the sliding window,
-  three documents packed in one row with boundaries inside the window, both
-  layer types; relative L2 <= 1e-2 forward, <= 2.5e-2 gradients.
+- splash / tokamax attention: the kernels' numerics, segment ids included,
+  are `kernels/tests`' job. The model test checks the patch takes: on a
+  meta-device model, every layer's inner attention is replaced (Splash) or has
+  `forward` rebound (tokamax); fails with the patch stubbed (OLMo 2
+  `TestOlmo2SplashAttentionPatch`). Add a vs-SDPA parity test only when the
+  model brings masking the kernel tests cannot see: a sliding window (Muse W
+  -> Splash W - 1), a soft-cap, its own attention module or `positions`
+  plumbing (#530: context 4x the window, three documents packed in one row
+  with boundaries inside it, both layer types; relative L2 <= 1e-2 forward,
+  <= 2.5e-2 gradients).
 - fused cross entropy vs fp32 `F.cross_entropy` (#532): bit-identical to the
   stock kernel when the model-specific option (soft-cap) is off.
 - MoE kernels vs `torch._grouped_mm`, including empty expert groups.
