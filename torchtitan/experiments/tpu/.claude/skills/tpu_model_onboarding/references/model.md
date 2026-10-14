@@ -105,8 +105,22 @@ How it is checked, in this order:
   recipes.
 - `tpu/train.py`: import the package for side effects and add
   `model_spec.name` to the tuple that pops `tpu_compile_mode` under
-  GraphTrainer; `train_minimal.py` needs the import too. When the GraphTrainer
-  wrapper lands (rung 2), add the `elif model_name == "<name>"` route.
+  GraphTrainer; `train_minimal.py` needs the import too.
+- GraphTrainer (rung 2): `train.py` needs a GraphTrainer registry per model, so
+  add `tpu/graph_trainer/<name>.py` (next to `qwen3.py` / `muse_glimmer.py`,
+  never inside the model package) and the `elif model_name == "<name>"` route.
+  It holds a `model_registry` that reuses the model's own config and a
+  GraphTrainer `parallelize_fn` (reject unsupported parallelisms, then
+  `annotate_module_fqns` -> `apply_simple_fsdp` -> GraphTrainer
+  `apply_compile`). Do not add a `GraphTrainer<Model>` subclass whose
+  `init_states` runs under `disable_active_parametrization()`, although
+  upstream's GraphTrainer models carry one: `init_states` writes parameters
+  through `named_parameters()`, which bypasses SimpleFSDP's parametrization, so
+  the wrapper changes nothing when every parameterized module has `param_init`
+  (OLMo 2: bit-identical 20-step losses with and without it). A module that
+  falls back to `reset_parameters()` (it reads `self.weight`, which goes
+  through the parametrization) is the case where it can matter; give that
+  module a `param_init` instead.
 - `bld_layout.py` is on by default for `Decoder` models: `[T, D]` inputs are
   viewed as `[B, L, D]` inside blocks. A non-stock forward must make
   `tpu_model_class` raise rather than silently skip (`tpu/layer_loop.py`).
