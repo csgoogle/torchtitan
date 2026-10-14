@@ -1,20 +1,22 @@
 """OLMo 2 on the TPU GraphTrainer path (``--tpu_config.use_graph_trainer``).
 
-Upstream ``experiments/graph_trainer`` has no OLMo 2 model, so this module
-supplies the three pieces its models have, the same way the TPU ``gpt_oss``
-wrapper does: a model class whose ``init_states`` runs with SimpleFSDP's
-parametrization disabled, a ``parallelize_fn`` that annotates module FQNs,
-applies SimpleFSDP and hands the model to GraphTrainer's compile, and a
-``model_registry`` built on ``experiments.tpu.examples.olmo2``.
+``train.py`` needs a GraphTrainer registry per model. This one reuses
+``experiments.tpu.examples.olmo2``'s model config unchanged and swaps in a
+``parallelize_fn`` that annotates module FQNs, applies SimpleFSDP and hands the
+model to GraphTrainer's compile.
+
+There is no ``GraphTrainerOlmo2Model``: upstream's GraphTrainer models wrap
+``init_states`` in ``disable_active_parametrization()``, but every OLMo 2
+module initializes through ``param_init`` / ``named_parameters()``, which
+bypasses SimpleFSDP's parametrization (20-step losses bit-identical with and
+without the wrapper).
 
 Only SimpleFSDP / HSDP is supported, as on the eager path: the full-width q/k
 norms rule out TP, and CP / PP are not wired up for OLMo 2.
 """
 
 import dataclasses
-from dataclasses import dataclass
 
-import torch
 from torch import nn
 from torchtitan.config import CompileConfig
 from torchtitan.config import ParallelismConfig
@@ -23,30 +25,13 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import annotate_module_fqns
 from torchtitan.experiments.graph_trainer.common_utils import apply_simple_fsdp
 from torchtitan.experiments.graph_trainer.compile import apply_compile
-from torchtitan.experiments.graph_trainer.simple_fsdp import disable_active_parametrization
 from torchtitan.experiments.tpu.examples import olmo2 as tpu_olmo2
 from torchtitan.experiments.tpu.examples.olmo2.infra.parallelize import validate_olmo2_parallelism
 from torchtitan.protocols.model_spec import ModelSpec
 
 
-class GraphTrainerOlmo2Model(tpu_olmo2.Olmo2Model):
-  """``Olmo2Model`` initialized outside SimpleFSDP's parametrization."""
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(tpu_olmo2.Olmo2Model.Config):
-    pass
-
-  def init_states(
-      self,
-      *,
-      buffer_device: torch.device | None = None,
-  ) -> None:
-    with disable_active_parametrization():
-      super().init_states(buffer_device=buffer_device)
-
-
 def parallelize_olmo2(
-    model: GraphTrainerOlmo2Model,
+    model: nn.Module,
     *,
     parallel_dims: ParallelDims,
     training: TrainingConfig,
@@ -58,7 +43,7 @@ def parallelize_olmo2(
   """Annotates FQNs, applies SimpleFSDP, then GraphTrainer's compile.
 
   Args:
-    model: The ``GraphTrainerOlmo2Model`` (may be on meta device).
+    model: The ``Olmo2Model`` (may be on meta device).
     parallel_dims: Parallel dimensions for this run.
     training: Training config (mixed-precision dtypes).
     parallelism: Parallelism config.
@@ -93,16 +78,10 @@ def model_registry(flavor: str) -> ModelSpec:
     flavor: A key of ``olmo2_configs``.
 
   Returns:
-    A spec with a ``GraphTrainerOlmo2Model.Config`` model.
+    The TPU OLMo 2 spec with the GraphTrainer ``parallelize_olmo2``.
   """
-  model_spec = tpu_olmo2.model_registry(flavor)
-  model_config = GraphTrainerOlmo2Model.Config(**{
-      field.name: getattr(model_spec.model, field.name)
-      for field in dataclasses.fields(model_spec.model)
-  })
   return dataclasses.replace(
-      model_spec,
-      model=model_config,
+      tpu_olmo2.model_registry(flavor),
       parallelize_fn=parallelize_olmo2,
       pipelining_fn=None,
   )

@@ -19,7 +19,6 @@ from torchtitan.experiments.tpu.examples.olmo2 import Olmo2Attention
 from torchtitan.experiments.tpu.examples.olmo2 import Olmo2StateDictAdapter
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_1b
 from torchtitan.experiments.tpu.examples.olmo2.config_registry import olmo2_debugmodel
-from torchtitan.experiments.tpu.graph_trainer.olmo2 import GraphTrainerOlmo2Model
 from torchtitan.experiments.tpu.graph_trainer.olmo2 import model_registry as graph_trainer_model_registry
 from torchtitan.experiments.tpu.graph_trainer.olmo2 import parallelize_olmo2 as graph_trainer_parallelize_olmo2
 from torchtitan.experiments.tpu.examples.olmo2.infra.parallelize import parallelize_olmo2
@@ -406,7 +405,7 @@ class TestOlmo2Flavors(absltest.TestCase):
     for flavor in ("debugmodel", "1B"):
       spec = model_registry(flavor)
       graph_spec = graph_trainer_model_registry(flavor)
-      self.assertIs(type(graph_spec.model), GraphTrainerOlmo2Model.Config)
+      self.assertIs(type(graph_spec.model), type(spec.model))
       self.assertIs(graph_spec.parallelize_fn, graph_trainer_parallelize_olmo2)
       self.assertIsNone(graph_spec.pipelining_fn)
       self.assertEqual(graph_spec.model.layers, spec.model.layers)
