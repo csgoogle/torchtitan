@@ -48,9 +48,12 @@ Each cost a previous onboarding a day or more. Symptom first, then the check.
 
 ## Environment
 
-- `TORCHTITAN_DEVICE_TYPE=tpu`; `JAX_PLATFORMS=cpu` when JAX is importable or it
-  takes the chip first; `LD_LIBRARY_PATH=<env>/lib`;
-  `TORCH_DEVICE_BACKEND_AUTOLOAD=0` for CPU tests.
+- `TORCHTITAN_DEVICE_TYPE=tpu`; `LD_LIBRARY_PATH=<env>/lib`;
+  `TORCH_DEVICE_BACKEND_AUTOLOAD=0` for CPU tests. Leave `JAX_PLATFORMS` unset
+  on TPU runs, as CI does: torch_tpu keeps the chips, and under
+  `JAX_PLATFORMS=cpu` Mosaic kernels that read the core count (tokamax fused
+  CE) fail with `AttributeError` in `_get_default_num_cores`. `cpu` is for
+  CPU runs only.
 - `rm -f /tmp/libtpu_lockfile` after a libtpu crash or the chip stays wedged.
 - xpk: explicit `--script-dir`, single-line `--command`, workload name under 40
   characters, one `--env` per flag, nodepool pinned for multi-host.
