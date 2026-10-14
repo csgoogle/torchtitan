@@ -11,8 +11,7 @@ from torchtitan.hf_datasets.text_datasets import DATASETS
 
 class TextDatasetTest(absltest.TestCase):
 
-  def test_c4_test_default_uses_internal_asset(self) -> None:
-    # The internal path comes from a copybara rewrite of text_datasets.py.
+  def test_c4_test_default_uses_repo_asset(self) -> None:
     ds = datasets._text_dataset("c4_test", None)
     self.assertIs(ds, DATASETS["c4_test"])
     data_files = ds.source.load_dataset_kwargs["data_files"]

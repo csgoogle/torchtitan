@@ -5,10 +5,6 @@ Upstream d771abb0 migrated the data stack to Grain and deleted
 `HuggingFaceTextDataLoader.Config(dataset="c4_test")`. `TPUGrainDataLoader`
 keeps that spelling (and the `--dataloader.dataset` /
 `--dataloader.dataset_path` flags) on top of upstream's `GrainDataLoader`.
-
-The internal location of the `c4_test` asset is handled by copybara, which
-rewrites the literal in `hf_datasets/text_datasets.py`, so every dataset here
-is upstream's `DATASETS` entry unchanged.
 """
 
 import dataclasses
@@ -16,7 +12,7 @@ import os
 from typing import Any
 
 # Imported from the defining submodules rather than the
-# `torchtitan.components.data` package: [internal link] cannot tell a
+# `torchtitan.components.data` package: strict-deps checking cannot tell a
 # package attribute from an unlisted submodule, so the package-level form
 # is reported as an ambiguous import.
 from torchtitan.components.data.dataset import SingleDatasetConfig

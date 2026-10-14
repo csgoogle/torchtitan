@@ -425,13 +425,7 @@ def default_adamw(lr: float = 8e-4, **kwargs: Any) -> OptimizersContainer.Config
 def _iter_moe_layers(
     model_parts: list[nn.Module],
 ) -> Iterator[tuple[nn.Module, _MoELike]]:
-    """Yield ``(transformer_block, moe)`` for every MoE layer in the model.
-
-    NOTE(internal): upstream d771abb0 nested this helper inside
-    ``register_moe_load_balancing_hook``. It is hoisted back to module scope
-    here because the routing-metric helpers at the bottom of this file also
-    need it. Body is byte-identical to upstream's nested copy.
-    """
+    """Yield ``(transformer_block, moe)`` for every MoE layer in the model."""
     for model_part in model_parts:
         # MTP decoder blocks live in ``mtp_layers`` after FSDP wrapping;
         # they are only temporarily inserted into ``layers`` while FSDP

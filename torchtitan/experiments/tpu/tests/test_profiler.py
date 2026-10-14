@@ -8,7 +8,7 @@ from unittest import mock
 import torch
 
 from absl.testing import absltest
-from internal.third_party.tensorflow.tsl.profiler.protobuf import xplane_pb2  # pylint: disable=g-direct-tensorflow-import
+import jax
 
 import torchtitan.experiments.tpu.base_device_test as base_device_test
 import torchtitan.tools.profiler as torchtitan_profiler
@@ -25,8 +25,8 @@ class ProfilerAcceleratorTest(base_device_test.BaseAcceleratorDeviceTest):
         torch.nn.Linear(16, 16),
     ).to(device)
 
-    # 2. Determine where to save the outputs. If running in a CI sandbox,
-    # save to TEST_UNDECLARED_OUTPUTS_DIR so they are preserved as Sponge artifacts.
+    # 2. Determine where to save the outputs. If the test runner provides
+    # TEST_UNDECLARED_OUTPUTS_DIR, save there so they are kept as artifacts.
     outputs_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
     if outputs_dir:
       tmpdir = outputs_dir
@@ -80,14 +80,12 @@ class ProfilerAcceleratorTest(base_device_test.BaseAcceleratorDeviceTest):
       # Parse the XPlane trace and identify if it dumped any TPU events
       tpu_events_found = False
       for xplane_path in xplane_files:
-        xspace = xplane_pb2.XSpace()
-        with open(xplane_path, "rb") as f:
-          xspace.ParseFromString(f.read())
-        for plane in xspace.planes:
+        profile = jax.profiler.ProfileData.from_file(str(xplane_path))
+        for plane in profile.planes:
           # In TPU profiles, planes can be named like "/device:TPU:0" or similar
           if plane.name.startswith("/device:TPU:") or plane.name == "TPU":
             for line in plane.lines:
-              if len(line.events) > 0:
+              if any(True for _ in line.events):
                 tpu_events_found = True
                 break
 

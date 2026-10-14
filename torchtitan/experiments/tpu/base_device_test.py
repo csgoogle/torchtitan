@@ -44,7 +44,7 @@ class BaseAcceleratorDeviceTest(parameterized.TestCase):
 
     # Set torch and torch.cuda seeds to ensure deterministic behavior.
     # Note that tests would set it by default to 301, unless overridden:
-    # [internal link]
+    # https://github.com/abseil/abseil-py/blob/main/absl/testing/absltest.py
     if absltest.FLAGS["test_random_seed"].present:
       seed = absltest.FLAGS.test_random_seed
     else:

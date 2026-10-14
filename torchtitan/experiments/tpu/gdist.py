@@ -36,8 +36,8 @@ def torchrun(fn, *, nnodes=None, nproc_per_node=None):
   Args:
     fn: The main function for the user training script.
     nnodes: The number of machines the job is running on. If not specified, it
-      will infer the current cluster job's num tasks and in Colab it will default
-      to 1.
+      will be inferred from the runtime environment (defaulting to 1 for local
+      and Colab runs).
     nproc_per_node: The number of local ranks to spawn. Defaults to the number
       of CUDA devices on the machine or 1 is no CUDA devices are found.
 
@@ -83,7 +83,7 @@ def torchrun(fn, *, nnodes=None, nproc_per_node=None):
 
 
 class Environment(abc.ABC):
-  """The environment (e.g. local, cluster, colab, etc) this process is running in.
+  """The environment this process is running in.
 
   This class is meant to be sub-classed to represent specific runtime
   environments. To get the current environment use
@@ -135,8 +135,8 @@ class Environment(abc.ABC):
     Unique identifier for all machines participating in the job.
 
     Returns:
-      cluster job UID if running in cluster. `None` otherwise (torchrun will
-      create a random UUID).
+      A job-wide UID if the environment provides one. `None` otherwise
+      (torchrun will create a random UUID).
     """
     pass
 
@@ -189,8 +189,6 @@ class Environment(abc.ABC):
     """The human-readable name of this environment.
 
     Some environment sub-classes may represent multiple "physical" environments.
-    For instance `LocalEnvironment` represents local runs on workstations
-    as well as runs on CI.
     """
     pass
 
@@ -252,23 +250,18 @@ class Environment(abc.ABC):
 
 
 class LocalEnvironment(Environment):
-  """A "local" (non-cluster, non-Colab) environment this process is running in.
+  """A "local" environment this process is running in.
 
   This class is not meant to be used directly, but instead
   provides environment-specific launch configurations to `torchrun`.
   Users looking to launch their main functions should use
   `torch.google.distributed.torchrun`.
 
-  This class is meant to be sub-classed (e.g. BorgEnvironment, ColabEnvironment)
-  but itself represents a "local" environment.
+  This class is meant to be sub-classed (e.g. ColabEnvironment) but itself
+  represents a "local" environment.
 
   Local environments are those where the PyTorch program does not run
-  multi-machine. All run environments that are not `cluster` or `Colab` fall into
-  this category.
-
-  Local bazel runs for instance. Technically `bazel test` runs on
-  CI (also cluster) but since we do not run multi-machine PyTorch in CI
-  OK to treat CI runs as "local".
+  multi-machine, e.g. local runs and single-machine CI test runs.
   """
 
   @override

@@ -437,7 +437,7 @@ class TrainDistributedTest(
       ),
       dict(
           # TP=2 divides the debugmodel's 2 KV heads. dp_shard is inferred:
-          # 1 with 2 ranks (CPU/GPU), 4 on tpu_4x2x1.
+          # 1 with 2 ranks (CPU/GPU), 4 on v5e 4x2x1.
           testcase_name="muse_glimmer_fsdp_tp2",
           module="torchtitan.experiments.tpu.muse_glimmer",
           config="muse_glimmer_debugmodel",

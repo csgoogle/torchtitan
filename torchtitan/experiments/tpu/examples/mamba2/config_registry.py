@@ -20,9 +20,6 @@ from torchtitan.components.optimizer import lr_scheduler
 from torchtitan.config import configs
 from torchtitan.distributed import activation_checkpoint
 from torchtitan.experiments.tpu import tpu_job_config
-# Upstream d771abb0 migrated the data stack to Grain and deleted
-# `HuggingFaceTextDataLoader`; `c4_test_dataloader` is the fork's
-# internal-path-corrected replacement. See `experiments/tpu/datasets.py`.
 from torchtitan.experiments.tpu.datasets import c4_test_dataloader
 from torchtitan.protocols import model_spec
 from . import model

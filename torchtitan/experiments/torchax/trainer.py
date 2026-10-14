@@ -171,8 +171,8 @@ class TorchaxTrainer:
   def setup_model(self, job_config):
     """Sets up the model."""
 
-    # TODO(jialeic): Can we do something like
-    # [internal link]
+    # TODO(jialeic): Can we do something like the model setup in
+    # torchtitan/experiments/tpu/train_minimal.py?
 
     if job_config.model_spec.name not in _TORCHAX_MODEL_MODULES:
       raise ValueError(f'Unsupported model: {job_config.model_spec.name}')
@@ -480,10 +480,10 @@ class TorchaxTrainer:
       # `moe___experts` so we need to use a different naming convention to
       # extract the nparams
       if job_config.model_spec.name == 'qwen3':
-        # [internal link]
+        # See torchtitan/experiments/tpu/qwen3/model/args.py
         head_dims = 2 * self.model_args.head_dim  # pytype: disable=attribute-error
       elif job_config.model_spec.name == 'deepseek_v3':
-        # [internal link]
+        # See torchtitan/experiments/tpu/deepseek_v3/model/args.py
         head_dims = (
             self.model_args.qk_nope_head_dim  # pytype: disable=attribute-error
             + self.model_args.qk_rope_head_dim  # pytype: disable=attribute-error

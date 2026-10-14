@@ -159,7 +159,7 @@ def main(argv):
   # CLI overrides via ``tyro.cli`` with ``default=loaded_config``. This is the
   # same launch surface the torch_tpu lane uses (see ``experiments/tpu/gmain``).
   del argv
-  # When running on TPU via CI, the infra automatically injects some flags
+  # When running on TPU via the internal test infra, it injects some flags
   # starting with --deepsea_ which are not recognized by tyro, so we filter
   # them out.
   ignored_prefixes = (

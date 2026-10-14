@@ -27,7 +27,7 @@ from torchtitan.experiments.tpu.tpu_job_config import (
     TPUTrainerConfig,
 )
 # Imported from the defining submodules rather than the
-# `torchtitan.components.data` package: [internal link] cannot tell a
+# `torchtitan.components.data` package: strict-deps checking cannot tell a
 # package attribute from an unlisted submodule, so the package-level form
 # is reported as an ambiguous import.
 from torchtitan.components.data.dataset import SingleDatasetConfig

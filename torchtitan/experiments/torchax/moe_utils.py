@@ -111,8 +111,6 @@ def make_unpermute_runner(mesh, top_k):
 # When using the jax scan the model name is changed from `moe.experts` to
 # `moe___experts` so we need to use a different naming convention to
 # extract the nparams
-# see orginal function in
-# [internal link]
 def get_moe_model_nparams_and_flops(
     model_args: Any,
     model: nn.Module,

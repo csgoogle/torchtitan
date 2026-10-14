@@ -143,10 +143,6 @@ xpk cluster create \
 *   `--cluster-secondary-range-name=pods` tells GKE to use the range named `pods`.
 *   `--services-secondary-range-name=services` tells GKE to use the range named `services`.
 
-You can view your cluster in the Google Cloud Console. For me, it is
-[[internal link]]([internal link])
-(Link will vary based on your `${CLUSTER_NAME}` and `${ZONE}`)
-
 ### 2.4. Verify Cluster
 
 Check the cluster status:

@@ -63,8 +63,6 @@ DISABLED_TESTS = {
     # RL Ray non-colocated tests (require multi-host Ray TPU cluster)
     "torchtitan.experiments.tpu.rl_nc_ray.tests.test_mini_rl",
     "torchtitan.experiments.tpu.rl_nc_ray.tests.test_varlen_attn_tpu",
-    # TODO: ModuleNotFoundError: No module named 'internal'
-    "torchtitan.experiments.tpu.tests.test_profiler",
     # TODO: add copybara handling for this test
     "torchtitan.experiments.tpu.kernels.tests.test_kernel_name_determinism_distributed",
     # TODO: RuntimeError: create_process_group(): PjRtClient is not initialized.
