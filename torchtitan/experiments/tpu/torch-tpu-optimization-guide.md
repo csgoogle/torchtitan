@@ -426,19 +426,34 @@ the `llama3_*_scan()` recipes in [`llama3/config_registry.py`](llama3/config_reg
 **Memory policy.** GraphTrainer ignores the eager `activation_checkpoint` config. Activation memory
 is set by `graph_trainer_memory_policy`:
 
-- `default`: selective recompute. Saves compute-heavy ops (matmuls, attention), recomputes the rest.
-- `full`: full recompute, saving layer outputs.
-
-Both have the same exceptions, which matter for the memory budget: FSDP all-gather outputs are
-force-saved only under ZeRO-2 (`fsdp_reshard_after_forward="never"`), because that is what "do not
-reshard" means; under ZeRO-3 the policy may recompute them. RNG ops (dropout) are always saved,
-because the graph path cannot replay their random state. `full` additionally saves the ops named in
-`compile.full_recompute_save_ops`; the `tpu_selective` policy (full recompute plus the regions named
-in `graph_trainer_save_regions` / `graph_trainer_save_last_n_layers`) saves those regions. Under scan, the MoE expert-count all-reduces are saved as well
-(`scan_remat_policy.py`), so backward reuses the forward's counts instead of recomputing a collective.
+- `default`: selective recompute. Saves the outputs of the ops on GraphTrainer's save list and
+  recomputes the rest. On TPU the list covers `aten.linear` (torch_tpu traces `F.linear` as one
+  op, so the projections are saved), the SDPA op, `topk` and the reduce-scatter / all-to-all
+  collectives. It does not cover the Splash kernels or the grouped expert matmuls, which are
+  Pallas custom ops: with Splash on, attention is recomputed under `default`, and only
+  `tpu_selective` can save it.
+- `full`: full recompute; only the layer boundaries are saved.
+- `tpu_selective`: full recompute plus the regions named in `graph_trainer_save_regions` (every
+  layer) or `graph_trainer_save_last_n_layers` (the last N layers, which backward reaches first).
+  Two regions exist: `attention.inner_attention` (the Splash output and LSE, so backward skips
+  re-running the kernel) and `moe.routing` (the top-k ids and the expert-sort permutation). It
+  does not combine with scan. This is the TPU way to say "full recompute but keep X": upstream's
+  `compile.full_recompute_save_ops` does not reach the TPU trainer (a TPU recipe's `compile` is the
+  base config, and the GraphTrainer conversion builds a fresh compile config carrying only the
+  policy and the offload budget).
 - `eager`: alternates matmuls between save and recompute, matching TorchTitan's eager selective AC.
-- `sac_and_offload`, `full_and_offload`, `full_and_scan_offload`: one of the above, plus offload of
-  saved activations to host memory (§9).
+- `sac_and_offload`, `full_and_offload`, `full_and_scan_offload`: `default` or `full`, plus offload
+  of saved activations to host memory (§9).
+
+Exceptions that matter for the memory budget: under every policy, FSDP all-gather outputs are
+force-saved only under ZeRO-2 (`fsdp_reshard_after_forward="never"`), because that is what "do not
+reshard" means; under ZeRO-3 the policy may recompute them. RNG ops (dropout) are saved by `full`
+and the policies built on it (`full_and_offload`, `full_and_scan_offload`, `tpu_selective`),
+because the graph path cannot replay their random state; under `default`, `eager` and
+`sac_and_offload` an RNG op inside a recompute region is a runtime error (no TPU recipe has
+dropout). Under scan, the MoE expert-count all-reduces are saved as well
+(`scan_remat_policy.py`), so backward reuses the forward's counts instead of recomputing a
+collective.
 
 **Limitations:**
 
