@@ -32,9 +32,13 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import (
     TpuGraphTrainer,
 )
 from torchtitan.experiments.tpu.graph_trainer.qwen3 import (
+    MaxTextTpuGraphTrainerQwen3Model,
     model_registry as tpu_qwen3_graph_registry,
 )
-from torchtitan.experiments.tpu.layer_loop import runs_layer_loop
+from torchtitan.experiments.tpu.layer_loop import (
+    builds_layer_loop,
+    runs_layer_loop,
+)
 from torchtitan.experiments.tpu.llama3.config_registry import (
     llama3_1b,
     llama3_8b,
@@ -72,6 +76,7 @@ from torchtitan.experiments.tpu.qwen3.config_registry import (
     qwen3_moe_30b_fsdp_only_attention_parity_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_benchmark,
     qwen3_moe_30b_fsdp_only_full_ac_profile,
+    qwen3_moe_30b_fsdp_only_maxtext_benchmark,
     qwen3_moe_235b_fsdp_activation_offload_4x4x4,
     qwen3_moe_235b_fsdp_activation_offload_maxtext_4x4x4,
     qwen3_moe_235b_scan,
@@ -91,21 +96,63 @@ from torchtitan.models.llama3.config_registry import (
 
 class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
-  def test_qwen3_graph_config_preserves_maxtext_flops(self) -> None:
-    config = qwen3_moe_30b()
+  def _qwen3_graph_flops(self, config) -> int:
+    """GraphTrainer FLOPs/token at sequence length 2048."""
     graph_config = to_tpu_graph_trainer_config(
-        config,
-        tpu_qwen3_graph_registry,
-        target_cls=TpuGraphTrainer.Config,
+        config, tpu_qwen3_graph_registry, target_cls=TpuGraphTrainer.Config
     )
-
     with torch.device("meta"):
       model = graph_config.model_spec.model.build()
-
     self.assertIsInstance(model, GraphTrainerQwen3Model)
+    return graph_config.model_spec.model.get_nparams_and_flops(
+        model, seq_len=2048
+    )[1]
+
+  def test_qwen3_graph_config_reports_torchtitan_flops_by_default(
+      self,
+  ) -> None:
+    self.assertEqual(self._qwen3_graph_flops(qwen3_moe_30b()), 23_083_044_864)
+
+  def test_maxtext_recipe_reports_maxtext_flops_on_graph_trainer(self) -> None:
+    """A ``*maxtext*`` recipe keeps MaxText FLOPs through the conversion.
+
+    Same model as the test above, so the values differ only by convention.
+    """
     self.assertEqual(
-        graph_config.model_spec.model.get_nparams_and_flops(model, seq_len=2048)[1],
+        self._qwen3_graph_flops(qwen3_moe_30b_fsdp_only_maxtext_benchmark()),
         20_665_860_096,
+    )
+
+  def test_maxtext_scan_recipe_reports_maxtext_flops_on_graph_trainer(
+      self,
+  ) -> None:
+    """The scan rewrite keeps the MaxText class picked before it."""
+    graph_config = self._qwen3_graph_config(qwen3_moe_235b_scan_maxtext())
+    self.assertIsInstance(
+        graph_config.model_spec.model,
+        MaxTextTpuGraphTrainerQwen3Model.Config,
+    )
+    self.assertTrue(builds_layer_loop(graph_config.model_spec.model))
+
+  @parameterized.named_parameters(
+      ("torchtitan_flops", qwen3_moe_235b_scan_proxy),
+      ("maxtext_flops", qwen3_moe_235b_scan_maxtext),
+  )
+  def test_scanned_moe_reports_the_same_flops_as_unstacked(self, recipe):
+    """Stacking the layer weights must not change the FLOP estimate.
+
+    Scan moves expert weights out of their MoE modules; upstream's active-
+    parameter count would then miss the top-k discount and count every expert.
+    """
+    config = recipe()
+    unstacked = config.model_spec.model
+    scanned = self._qwen3_graph_config(config).model_spec.model
+    self.assertTrue(builds_layer_loop(scanned))
+    with torch.device("meta"):
+      unstacked_model, scanned_model = unstacked.build(), scanned.build()
+    self.assertEqual(
+        scanned.get_nparams_and_flops(scanned_model, seq_len=4096),
+        unstacked.get_nparams_and_flops(unstacked_model, seq_len=4096),
     )
 
   def _qwen3_graph_config(self, config):

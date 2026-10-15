@@ -27,13 +27,33 @@ from torchtitan.experiments.tpu.qwen3.infra.parallelize import (
 from torchtitan.protocols.model_spec import ModelSpec
 
 
-class TpuGraphTrainerQwen3Model(GraphTrainerQwen3Model):
+class MaxTextTpuGraphTrainerQwen3Model(GraphTrainerQwen3Model):
+    """GraphTrainer Qwen3 that reports MaxText FLOPs.
+
+    The GraphTrainer counterpart of ``MaxTextQwen3Config``. The TPU GraphTrainer
+    config conversion switches to it when the recipe's model config is a
+    ``MaxTextQwen3Config``; see ``with_maxtext_flops``.
+    """
+
     @dataclass(kw_only=True, slots=True)
     class Config(GraphTrainerQwen3Model.Config):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
             return get_maxtext_decoder_nparams_and_flops(self, model, seq_len)
+
+
+def with_maxtext_flops(
+    config: GraphTrainerQwen3Model.Config,
+) -> MaxTextTpuGraphTrainerQwen3Model.Config:
+    """Return ``config`` unchanged except that it reports MaxText FLOPs."""
+    return MaxTextTpuGraphTrainerQwen3Model.Config(
+        **{
+            field.name: getattr(config, field.name)
+            for field in dataclasses.fields(config)
+            if field.init
+        }
+    )
 
 
 def parallelize_qwen3(
@@ -59,15 +79,7 @@ def parallelize_qwen3(
 
 
 def model_registry(flavor: str) -> ModelSpec:
-    model_spec = graph_trainer_model_registry(flavor)
-    model_config = TpuGraphTrainerQwen3Model.Config(
-        **{
-            field.name: getattr(model_spec.model, field.name)
-            for field in dataclasses.fields(model_spec.model)
-        }
-    )
     return dataclasses.replace(
-        model_spec,
-        model=model_config,
+        graph_trainer_model_registry(flavor),
         parallelize_fn=parallelize_qwen3,
     )

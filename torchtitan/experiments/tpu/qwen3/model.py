@@ -17,7 +17,13 @@ from torchtitan.models.qwen3.model import Qwen3Model
 
 @dataclass(kw_only=True, slots=True)
 class MaxTextQwen3Config(Qwen3Model.Config):
-    """Qwen3 config that builds the upstream model but uses MaxText FLOPs."""
+    """Qwen3 config that builds the upstream model but uses MaxText FLOPs.
+
+    TPU Qwen3 configs report upstream torchtitan FLOPs by default. Only the
+    ``*maxtext*`` recipes wrap their model config in this class, so their FLOPs
+    and MFU are comparable with MaxText's. The TPU GraphTrainer config
+    conversion carries it over (``graph_trainer.qwen3.with_maxtext_flops``).
+    """
 
     @classmethod
     def from_qwen3(cls, config: Qwen3Model.Config) -> "MaxTextQwen3Config":
