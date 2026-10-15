@@ -198,6 +198,12 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
           enable_compile=True,
           # TODO(jeremiahhsu): Failing only on TPU7x b/568843473
           skip_on_tpu7x=True,
+          skip_devices=[
+              # TODO(jeremiahhsu): Flaky in TAP on Viperlite: rank 0 is aborted
+              # with SLICE_FAILURE_CHIP_DRIVER_ERROR during teardown after
+              # training completes. Re-enable once the flake is resolved.
+              device_type.AcceleratorDeviceType.TPU,
+          ],
       ),
       dict(
           testcase_name="deepseek_v3_tp_dtensor",
