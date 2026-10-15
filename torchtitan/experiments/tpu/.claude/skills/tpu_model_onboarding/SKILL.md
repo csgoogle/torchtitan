@@ -91,9 +91,7 @@ scan). Every constant gets a source line.
   `ScaledDotProductInnerAttention` takes no `positions`, so packed rows attend
   across documents and rung 3 (Splash with segment ids) has nothing to compare
   against. Use `SlidingWindowScaledDotProductInnerAttention(window_size=None)`
-  from `tpu/muse_glimmer/attention.py` (OLMo 2 #587 reuses it; GPT-OSS #584
-  re-derives the mask from `positions` in its own `SinkSDPA`, the sink being
-  the reason it could not reuse it).
+  from `tpu/muse_glimmer/attention.py` (OLMo 2 #587).
 - For a port, the weight mapping: a `StateDictAdapter` subclass with
   `from_hf` / `to_hf` (`model.md`), which is what `--checkpoint.initial_load_in_hf`
   and the parity test both go through. Write the key table into the PR before
@@ -115,13 +113,10 @@ scan). Every constant gets a source line.
   come back as graph outputs via `collect_moe_routing_metric_tensors`) and
   send the dead counter to a throwaway tensor
   (`overrides/discarded_token_counter.py`). Keeping the bias balancer means
-  the in-place update must survive the graph: the TPU GraphTrainer's static
-  executable drops it unless the backend pass returns the buffer (the change
-  GPT-OSS #584 makes to shared code, which needs its own PR), so assert in a
-  test that `expert_bias_E` moves after an optimizer step on the compiled
-  path, as #584's `test_graph_trainer.py` does. Switching balancer is the
-  semantic class: a separate labelled recipe, measured against a reference
-  that uses the same one.
+  the in-place update must survive the compiled graph: assert in a test that
+  `expert_bias_E` moves after an optimizer step on the compiled path.
+  Switching balancer is the semantic class: a separate labelled recipe,
+  measured against a reference that uses the same one.
 - The tests in `tests.md`: the reference-parity test (the one that matters:
   tiny config covering every layer type, perturbed scales, weights through the
   adapter with keys checked both ways, logits + loss + every gradient
@@ -199,8 +194,7 @@ evidence (custom_call present, segment ids among its operands). Measure on
 the smallest real-size flavor that fits the target (the 1B on 4 chips), not
 on `debugmodel`: `debugmodel` is for correctness, and at its shape levers
 tie that move the real size (OLMo 2 #587: GraphTrainer tie vs +10.6%, fused
-CE tie vs +3.2% / -2.8%; GPT-OSS #584 measured only the debug shape and could
-conclude nothing about Tokamax or fused CE). Rung k passes
+CE tie vs +3.2% / -2.8%). Rung k passes
 on the target before rung k+1 starts, and the ladder table in the PR is
 updated after every rung. One branch; whether it ships as one PR or stacked
 PRs is the human's call at the end.

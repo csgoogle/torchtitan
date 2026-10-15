@@ -23,9 +23,9 @@ C. GKE via Cluster Toolkit    | gcluster job submit, per the | the slice in the 
 - C only: run every CPU-closable check locally first, treat each dispatch as
   expensive (the gate in SKILL.md Step 3), stop at the agreed budget. The
   image is the artifact: do not copy edited source into a running pod and
-  hash-verify it afterwards (#584 did, and every result then describes an
-  overlay no image carries). Rebuild instead; a layered `FROM <previous
-  image>` + `COPY` build of a pure-Python change takes seconds.
+  hash-verify it afterwards (every result then describes an overlay no image
+  carries). Rebuild instead; a layered `FROM <previous image>` + `COPY` build
+  of a pure-Python change takes seconds.
 - No silent fallback: A reports no chip, B's ssh fails, C's image is missing
   -> stop and say so; never switch to CPU and mark run-based rows done.
 - On a shared host check that nothing else holds `/dev/vfio/*` before a run.
