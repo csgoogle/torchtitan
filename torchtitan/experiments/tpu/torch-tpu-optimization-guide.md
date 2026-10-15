@@ -28,7 +28,7 @@ It references two companion libraries you will lean on for kernels and paralleli
 ## Scope — what applies to what
 
 Most of this guide is **general TorchTPU** optimization (true of any model); a few sections are
-**dense-specific**. MoE is out of scope for now — see §10 (TBD).
+**dense-specific**. MoE-specific guidance is in §10.
 
 | Section | Applies to |
 |---------|-----------|
@@ -39,7 +39,9 @@ Most of this guide is **general TorchTPU** optimization (true of any model); a f
 | §5 Memory & parallelism (SimpleFSDP + mixed precision) | General |
 | §6 Precision, layout | General |
 | §7 The dispatch ceiling | General |
-| §8 Mixture-of-Experts | MoE — TBD |
+| §8 Whole-step capture with GraphTrainer | General |
+| §9 Large models: scan, graph splitter, CPU offload | General |
+| §10 Mixture-of-Experts | MoE |
 
 ---
 
@@ -138,18 +140,27 @@ and defeat fusion. **Do not leave `dynamic` at its default (`None`)**: Dynamo ca
 switch a region to dynamic shapes after a recompile, quietly tanking performance. If your shapes
 genuinely are fixed (they should be for training), `dynamic=False` is always correct.
 
-**Be careful with whole-model compilation.** Capturing the entire stack as one graph is appealing
-but has real failure modes on TorchTPU:
+**Don't use `torch.compile` on the whole model.** Wrapping the entire model in one
+`torch.compile(model, fullgraph=True)` (`compile_mode="fullgraph"`) is appealing but has real
+failure modes on TorchTPU, and no TorchTitan TPU recipe uses it:
 
 - Without activation checkpointing inside the graph, all layers' activations are live at once →
-  **compile-time / runtime OOM** at any real depth. (You cannot easily put `checkpoint()` inside a
-  single compiled TorchTPU graph — the RNG-state save/restore does not trace cleanly.)
+  **compile-time / runtime OOM** at any real depth. (Dynamo can capture non-reentrant
+  `checkpoint()`, but on TorchTPU the RNG-state fork and restore that `preserve_rng_state=True`
+  (the default) performs does not trace cleanly; the conformer recipe sets `preserve_rng_state=False`
+  for that reason, and no TPU recipe puts `checkpoint()` inside a whole-model compile.)
 - The token-embedding backward can bind incorrectly when compiled — leave the **embedding eager**.
 - Lazily-created buffers (e.g. RoPE cos/sin) must be **materialized before tracing**, or the
   graph's input set shifts and recompilation/errors follow.
-- And critically: even when whole-model compile *works*, it collapses only the transformer.
-  The optimizer step, the loss, the embedding, and layout ops remain separate eager programs — so
-  it does **not** remove the whole-step dispatch idle (see §6). Prefer per-block compile.
+- And critically: even when whole-model compile *works*, it covers only the model's forward and
+  backward. The loss and the optimizer step remain separate programs: eager by default, or
+  separately compiled with `compile_optimizer=True` / `compile_grad_norm=True` (and `loss` in
+  `compile.components`). Either way it does **not** remove the whole-step dispatch idle (see §7).
+
+`torch.compile` is a tool for **regions**: per-block compile is the right way to use it. If you
+want the whole step as one program, use **GraphTrainer** (§8). It traces forward, loss, backward
+and optionally the optimizer step into a single graph, and manages activation memory with a
+graph-level policy instead of `checkpoint()`.
 
 ### Deferred-and-fused eager mode (a lighter-weight fallback)
 
@@ -280,8 +291,16 @@ For models (or batch/sequence lengths) that don't fit one chip, shard with **Sim
 
 - `fully_shard` (ZeRO-3-like) shards params **and** optimizer state across chips — this is what
   makes large models trainable that plain DDP OOMs on.
-- `hybrid_shard` (HSDP, a 2-D mesh: replicate across groups, shard within) is the multi-host
-  choice.
+- `hybrid_shard` (HSDP, a 2-D mesh: replicate across groups, shard within) is not a multi-host
+  requirement. Full sharding spans hosts fine over ICI, and every shipped multi-host recipe on
+  v7x (`qwen3-8b`, `qwen3-32b`, `qwen3-30b-a3b`, `muse-glimmer-30b`, `flux1` at 4x4x4 and 4x8x8)
+  is plain FSDP with `data_parallel_replicate_degree=1`. HSDP buys cheaper gradient reduction
+  within a replica group at the price of replicating parameters and optimizer state across
+  groups, so per-chip memory goes up by the replicate degree; pick it when the FSDP group would
+  otherwise be wider than the collectives need (very large chip counts) or when the replicate axis
+  maps onto a slow link, as the multi-slice recipes do across DCN (replicate over slices, shard
+  within). Choose the mesh from the interconnect, the collective cost and the memory budget, not
+  from the host count.
 - SimpleFSDP composes with `torch.compile`, which lets the compiler overlap the DTensor
   collectives with compute — combining FSDP with per-block compile is meaningfully faster than
   FSDP alone.
@@ -350,6 +369,10 @@ surface:**
 - Use the fused CE kernel (§4) so the loss is a single `custom_call` instead of a chain of eager
   ops.
 - Prefer a fused kernel over an eager op sequence wherever one exists (attention, etc.).
+- Compile the glue that has its own switch: `compile_optimizer=True` (the AdamW step as one
+  graph), `compile_grad_norm=True` (the global gradient norm; the in-place clip stays eager) and
+  `loss` in `compile.components` (the loss function, when `compile.enable` is set). Each turns a
+  chain of eager ops into one program; the dispatch between programs remains.
 - Keep batch/dim large (§3) so the compiled regions dominate the step and the fixed eager glue is a
   smaller fraction of wall-clock.
 
@@ -357,41 +380,409 @@ Whatever training-step glue cannot be folded into a compiled region is your mode
 On a well-sized dense model with per-block compile + fused CE you will typically land in the
 low-to-mid tens of percent MFU; pushing further means shrinking that eager surface.
 
+To remove that surface entirely rather than shrink it, capture the whole training step with
+GraphTrainer (§8).
+
 ---
 
-## 8. Mixture-of-Experts (MoE)  *(MoE-specific — TBD)*
+## 8. Whole-step capture with GraphTrainer  *(general)*
 
-> **Status: TBD.** This section is a placeholder for MoE-specific guidance. The general sections
-> (§1–§2, §4–§8) apply unchanged to MoE models on TorchTPU; the items below are the *additional*
-> levers a sparse/routed model introduces. They are not yet benchmarked on the TorchTPU eager lane
-> and will be filled in with measured guidance.
+Per-block `torch.compile` (§4) leaves everything between blocks eager, and the loss and the
+optimizer step as separate programs, eager unless compiled on their own (§7). **GraphTrainer**
+removes that surface.
+`TpuGraphTrainer` ([`graph_trainer/tpu_graph_trainer.py`](graph_trainer/tpu_graph_trainer.py)),
+the TPU subclass of TorchTitan's [GraphTrainer](../graph_trainer/README.md), traces the whole
+training step (forward, loss, backward and optionally the optimizer step) with `make_fx` into a
+single FX graph. It then runs graph passes over it and compiles the result for TPU, so the
+forward, loss and backward run as one XLA program (the optimizer step too, with
+`optimizer_in_graph`; otherwise the optimizer step and gradient norm run outside the step graph,
+eagerly or as their own graphs with `compile_optimizer=True` / `compile_grad_norm=True`).
 
-Everything in §1–§8 still holds — MoE is just as dispatch-bound, and per-block compile + fused CE
-+ SimpleFSDP + mixed precision all still apply. What changes is the FFN: instead of one dense MLP
-per layer, a router sends each token to its top-k of N experts. That adds these concerns:
+How it differs from whole-model `torch.compile` (§4):
 
-- **Expert FFN matmul kernel** *(TBD)* — the per-expert FFN is a *ragged/grouped* matmul (variable
-  tokens per expert), not a dense GEMM. Use a grouped / segment matmul Pallas kernel (tokamax
-  provides these) rather than a Python loop over experts, which would explode the eager dispatch
-  count. This is usually the single largest MoE lever.
-- **Dispatch / combine** *(TBD)* — the token→expert gather (dispatch) and expert→token scatter
-  (combine) around the expert FFN are a major cost and a heavy source of layout/`as_strided`
-  traffic. Prefer fused dispatch/combine kernels; profile this bucket specifically.
-- **Gate + up fusion** *(TBD)* — fuse the expert FFN's gate and up projections into a single
-  matmul + chunk (as in dense SwiGLU) to cut expert-matmul dispatches.
-- **Expert parallelism (EP)** *(TBD)* — for large expert counts, shard experts across chips (EP)
-  and compose it with FSDP on the non-expert params (a 2-D or 3-D mesh). How EP collectives
-  (all-to-all for dispatch/combine) overlap with compute on the TorchTPU lane is the open question.
-- **Router precision & load balance** *(TBD, quality-sensitive)* — routing in fp32; capacity
-  factor / token-drop tradeoffs affect both throughput **and model quality** — treat any change
-  that drops tokens as a correctness question, not a free perf lever.
-- **MFU accounting** *(TBD)* — use **active** params (params actually touched per token = shared +
-  top-k experts), *not* total params, in `num_flops_per_token`. Reporting total-param MFU for a
-  sparse model overstates utilization.
+| | `torch.compile` on the model | GraphTrainer (`aot_fx_trace`) |
+|---|---|---|
+| Tracer | Dynamo: guards, graph breaks | `make_fx`: the whole step is traced ahead of time |
+| Covers | model forward + backward | forward + loss + backward, plus the optimizer with `optimizer_in_graph` |
+| Activation memory | `checkpoint()` inside the compiled region, if it traces at all on TorchTPU (§4: `preserve_rng_state` is the known problem; no TPU recipe does it) | a memory-policy pass on the graph decides per tensor: save, recompute or offload to host |
+| FSDP | SimpleFSDP | SimpleFSDP collectives in the same graph, with passes that schedule all-gather prefetch |
 
-Until this section is filled in with measurements, start MoE work from the general recipe (§1–§8),
-add a grouped-matmul expert kernel + fused dispatch/combine first, and profile the dispatch/combine
-bucket before anything else.
+**How to enable it:**
+
+```python
+tpu_config=TPUConfig(
+    use_graph_trainer=True,
+    compile_mode="aot_fx_trace",            # the joint-graph mode; required
+    graph_trainer_memory_policy="default",  # replaces the eager activation_checkpoint config
+    optimizer_in_graph=True,                # optional: fold AdamW into the step graph
+),
+```
+
+With `compile_mode="aot_fx_trace"`, per-block `torch.compile` is switched off automatically, so you
+do not compile twice. Reference recipes are `qwen3_8b()` in
+[`qwen3/config_registry.py`](qwen3/config_registry.py), which includes the in-graph optimizer, and
+the `llama3_*_scan()` recipes in [`llama3/config_registry.py`](llama3/config_registry.py).
+
+**Memory policy.** GraphTrainer ignores the eager `activation_checkpoint` config. Activation memory
+is set by `graph_trainer_memory_policy`:
+
+- `default`: selective recompute. Saves the outputs of the ops on GraphTrainer's save list and
+  recomputes the rest. On TPU the list covers `aten.linear` (torch_tpu traces `F.linear` as one
+  op, so the projections are saved), the SDPA op, `topk` and the reduce-scatter / all-to-all
+  collectives. It does not cover the Splash kernels or the grouped expert matmuls, which are
+  Pallas custom ops: with Splash on, attention is recomputed under `default`, and only
+  `tpu_selective` can save it.
+- `full`: full recompute; only the layer boundaries are saved.
+- `tpu_selective`: full recompute plus the regions named in `graph_trainer_save_regions` (every
+  layer) or `graph_trainer_save_last_n_layers` (the last N layers, which backward reaches first).
+  Two regions exist: `attention.inner_attention` (the Splash output and LSE, so backward skips
+  re-running the kernel) and `moe.routing` (the top-k ids and the expert-sort permutation). It
+  does not combine with scan. This is the TPU way to say "full recompute but keep X": upstream's
+  `compile.full_recompute_save_ops` does not reach the TPU trainer (a TPU recipe's `compile` is the
+  base config, and the GraphTrainer conversion builds a fresh compile config carrying only the
+  policy and the offload budget).
+- `eager`: alternates matmuls between save and recompute, matching TorchTitan's eager selective AC.
+- `sac_and_offload`, `full_and_offload`, `full_and_scan_offload`: `default` or `full`, plus offload
+  of saved activations to host memory (§9).
+
+Exceptions that matter for the memory budget: under every policy, FSDP all-gather outputs are
+force-saved only under ZeRO-2 (`fsdp_reshard_after_forward="never"`), because that is what "do not
+reshard" means; under ZeRO-3 the policy may recompute them. RNG ops (dropout) are saved by `full`
+and the policies built on it (`full_and_offload`, `full_and_scan_offload`, `tpu_selective`),
+because the graph path cannot replay their random state; under `default`, `eager` and
+`sac_and_offload` an RNG op inside a recompute region is a runtime error (no TPU recipe has
+dropout). Under scan, the MoE expert-count all-reduces are saved as well
+(`scan_remat_policy.py`), so backward reuses the forward's counts instead of recomputing a
+collective.
+
+**Limitations:**
+
+- **The whole step must trace.** There are no graph breaks to fall back on, and data-dependent
+  Python control flow is not supported.
+- **Use it only with `compile_mode="aot_fx_trace"`.** GraphTrainer combined with `layer` compile
+  mode causes severe HBM fragmentation and OOMs; `train.py` warns about this.
+- **One unrolled step graph stops compiling or fitting at large sizes.** Use scan or the graph splitter
+  (§9).
+- **`optimizer_in_graph` costs HBM.** Step inputs are not donated today, so the graph holds both
+  the input and the updated copies of parameters and optimizer state. Budget for it, or keep the
+  optimizer as a separate graph (`compile_optimizer=True`). `compile_grad_norm` cannot be combined
+  with `optimizer_in_graph`.
+- **libtpu 0.0.48+:** set `xla_enable_hlo_sharding_v3=False`, as the recipes do. Shardy HLO
+  sharding v3 is on by default there and segfaults on GraphTrainer.
+
+**When it pays.** The gain is largest where the step is dispatch-bound: small models, small batch.
+On a well-sized model where per-block compile already leaves little device idle, it can roughly
+tie. At the largest sizes, combined with scan or the graph splitter (§9), it is the path that compiles at
+all. Measure on your own setup.
+
+---
+
+## 9. Large models: scan, graph splitter and CPU offload  *(general)*
+
+GraphTrainer (§8) compiles the step as one program with every layer unrolled. That stops working
+as the model grows, for three reasons:
+
+- **Compile time and compile-time memory** grow with depth, because the compiler sees N copies of
+  the layer.
+- **Parameters.** With ZeRO-3 (`fsdp_reshard_after_forward="always"`) on one unrolled graph, XLA
+  can merge the forward all-gathers with the recomputed ones and keep full parameters alive through
+  backward. The config rejects this combination unless you pick one of the structures below.
+- **Saved activations.** Even with full recompute, each layer saves its input, and all N of them
+  are live at the end of the forward pass.
+
+Scan and the graph splitter are two ways to give the step a structure that fixes the first two. CPU
+offload fixes the third and works with either. The large recipes combine ZeRO-3, full recompute,
+offload, and one of scan or the graph splitter.
+
+| | Scan (`use_scan_layers`) | Graph splitter (`use_graph_split`) |
+|---|---|---|
+| Step runs as | one program, the layers as one loop | many programs, one per layer group |
+| Compiler sees | one layer body | each child separately |
+| Parameters | stacked `[n_layers, ...]`; per-layer names are gone | unchanged, per-layer |
+| Parallelism | data-parallel meshes: FSDP and HSDP (2-D shard x replicate) are tested; TP, CP, PP, EP rejected | not restricted by the config; the recipes are FSDP and HSDP |
+| In-graph optimizer | not rejected, but no recipe uses it | rejected |
+| Offload policy | `full_and_scan_offload` | `full_and_offload` |
+| Reference recipes | `llama3_*_scan()`, `qwen3_moe_235b_scan()` | `qwen3_moe_235b_fsdp_activation_offload_*()` |
+
+No recipe combines the two; pick one.
+
+For mid-size models there is a lighter third option that keeps one unrolled graph:
+`graph_trainer_fsdp_schedule="prefetch"` or `"interleave"` with
+`enable_graph_trainer_remat_schedule=True`, as in `qwen3_8b_zero3()`.
+
+### Scan over layers
+
+`use_scan_layers=True` runs the decoder layers as a single `scan`
+([`graph_trainer/layer_stack.py`](graph_trainer/layer_stack.py)):
+
+```python
+config.tpu_config.use_graph_trainer = True
+config.tpu_config.compile_mode = "aot_fx_trace"
+config.tpu_config.use_scan_layers = True
+config.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+```
+
+What it changes:
+
+- **One loop body.** Each kind of weight is stored as one tensor with a row per layer, and the
+  compiler sees one layer instead of N. The layer body is compiled once, so the part of compile
+  time and compile-time memory that scaled with depth no longer does. `llama3_405b_scan()` is the
+  405B recipe because the per-layer path does not compile at that size.
+- **FSDP gathers one layer at a time.** The all-gather runs inside the loop body on one layer's
+  shard, next to the compute that needs it, so the full stack of weights is never resident.
+- **The body is fully recomputed in backward**, including its all-gather. The only per-layer save
+  is the layer input. See *CPU offload* below for why that one tensor matters.
+
+Constraints:
+
+- It needs GraphTrainer (the config rejects it otherwise), traced with
+  `compile_mode="aot_fx_trace"`: an eager `scan` does not run on TPU.
+- Not every parallelism is supported. Data-parallel meshes work, FSDP and HSDP (the 2-D shard x
+  replicate mesh) are tested; tensor, context, pipeline and expert parallelism are rejected.
+- The layer body must not mutate its inputs or module state; `scan` raises at trace time. MoE
+  models hit this through load-balancing counters and routing metrics. `qwen3_moe_235b_scan()`
+  shows the workarounds (an override for the counter, `metrics.enable_moe_routing = False`).
+- Some ops do not trace inside a `scan` body. Llama3's complex RoPE is one; the recipes swap in a
+  bit-identical real-arithmetic override
+  ([`overrides/real_rope.py`](overrides/real_rope.py)).
+- `named_parameters()` reports the stacks, not per-layer names, so anything keyed off per-layer
+  parameter names stops matching. Model checkpoints keep their per-layer keys and move freely
+  between scan and non-scan runs. Optimizer checkpoints do not, so a run cannot resume across a
+  flip of the flag.
+- The generic `*_and_offload` memory policies are rejected. Use `full_and_scan_offload`.
+- Use the recipe's libtpu flag bundle. In the 235B recipe each layer's expert-gradient
+  reduce-scatters land at the end of the loop body with little compute left to hide them, and the
+  scan step runs measurably slower without the recipe's flags.
+
+### Graph splitter
+
+`use_graph_split=True` keeps the layers unrolled but cuts the traced step into separately compiled
+programs ([`graph_trainer/graph_split.py`](graph_trainer/graph_split.py)). It first splits the
+step into a forward and a backward graph, then optionally subdivides each by layer:
+
+```python
+config.tpu_config.use_graph_trainer = True
+config.tpu_config.compile_mode = "aot_fx_trace"
+config.tpu_config.use_graph_split = True
+config.tpu_config.graph_split.forward_layers_per_executable = 1
+config.tpu_config.graph_split.forward_isolate_prefix = True
+config.tpu_config.graph_split.backward_partition_mode = "by_layer"
+config.tpu_config.graph_split.backward_layers_per_executable = 1
+```
+
+The knobs, in [`GraphSplitterConfig` (`tpu_job_config.py`)](tpu_job_config.py):
+
+- `forward_layers_per_executable`: complete layers per forward program. The default `-1` keeps the
+  forward as one program.
+- `forward_isolate_prefix`: put the work before the first layer (embedding) in its own program.
+- `backward_partition_mode`:
+  - `none`: the backward stays one program.
+  - `by_layer`: groups adjacent layers' backward, each with its own FSDP collectives.
+  - `fsdp_pipeline`: moves each layer's all-gather earlier and its reduce-scatter later, to form
+    stages where communication overlaps the neighbouring layer's compute.
+- `backward_layers_per_executable`: complete layers per backward program.
+
+A collective is never divided across programs: its launch and its wait stay in the same program.
+Whether a layer's collectives stay with the layer's compute depends on the mode: `by_layer` keeps
+them together; `fsdp_pipeline` deliberately puts a layer's all-gather in the preceding program and
+its reduce-scatter in the following one, so the chain spans three programs by design. Each layer
+keeps its own saved input and is recomputed just before its own backward, whatever the grouping.
+
+The tradeoff is program size against scheduling scope. Small programs compile fast and bound
+compile-time memory, but the compiler can only overlap communication with compute inside one
+program, and every boundary is a host dispatch. Raising the `*_layers_per_executable` values
+widens the scheduling window at the cost of larger programs. Start at 1 and measure.
+
+Constraints:
+
+- It requires `graph_trainer_fsdp_schedule="none"`.
+- It does not support `optimizer_in_graph`. Keep the optimizer as a separate program.
+- It does not support serialized precompiled FX artifacts. TorchTPU's normal compilation cache
+  still works.
+- `donate_internal_buffers` lets XLA reuse dead buffers at program boundaries. Leave it at its
+  default (`False`) until TorchTPU includes donation in its compilation cache key.
+
+> **Same flag, different meaning on the regular trainer.** Without GraphTrainer,
+> `use_graph_split=True` only inserts a sync between the eager forward and backward. That splits
+> one large XLA graph into two and cuts first-step compile time. None of the knobs above apply.
+
+### CPU offload
+
+Under full recompute the largest remaining activation cost is the saved layer inputs: one
+`[batch, seq, dim]` tensor per layer, all live from the forward pass until that layer's backward.
+CPU offload copies each one to host memory as the forward pass produces it and brings it back just
+before the backward that needs it. It trades HBM for host RAM and transfer time. It is a memory
+lever, not a speed lever: use it when the model is HBM-bound after recompute, and expect to work
+to hide the transfers.
+
+Select it through the memory policy:
+
+| Policy | Use with | What is offloaded |
+|---|---|---|
+| `sac_and_offload` | unrolled graph or graph splitter | activations that selective recompute still saves |
+| `full_and_offload` | unrolled graph or graph splitter | saved layer boundaries under full recompute |
+| `full_and_scan_offload` | scan | the one stacked layer-input tensor |
+
+`graph_trainer_cpu_offload_budget_gb` (default 100) caps the host memory used per rank. Tensors
+are picked largest-first until the budget is spent. It does not apply to the scan policy, which
+always offloads its one tensor. Make sure the host has that much free RAM per rank.
+
+**With scan, offload is close to mandatory.** A scan has one loop, so the per-layer saves come out
+as one stacked `[n_layers, batch, seq, dim]` tensor. One tensor cannot be freed a row at a time, so
+all of it stays live until the backward loop ends. On Llama3-405B at long sequence that stack
+alone is why the shape does not fit. `full_and_scan_offload`
+([`graph_trainer/tpu_host_offload.py`](graph_trainer/tpu_host_offload.py)) puts one offload in the
+forward body and one reload in the backward body, so the device holds one layer's slice at a time.
+The value carried to the next layer stays on device, so no iteration waits on a host round trip.
+The Llama3 scan recipes above 8B need this policy to run at all.
+
+**With the graph splitter, prefetch the reload.** By default each reload sits in the same program as the
+backward that consumes it, so the transfer is exposed.
+`graph_split.cpu_offload_prefetch_executables = 1` issues it one backward program earlier, where
+the previous layer's compute hides it. The cost is carrying one completed activation across one
+program boundary. The 235B recipe uses it: the hidden transfer time is worth far more than the HBM
+it costs. It requires a split backward (`backward_partition_mode` other than `none`).
+
+**libtpu flags the offload recipes set:**
+
+- `xla_tpu_enable_offloading_copy_to_sparsecore=False` keeps the host copies off SparseCore, where
+  they would contend with the FSDP collectives. The measured effect on its own is small.
+- `xla_tpu_copy_insertion_use_region_analysis=True` (with
+  `xla_tpu_copy_insertion_use_region_analysis_limit=1000`) lets XLA prove the copy ordering instead
+  of taking a defensive snapshot of each activation. On the 235B graph-splitter recipe it removed the
+  device-to-host waits and gave a clear MFU gain.
+
+**Check it in the profile.** After enabling offload, look for exposed host-to-device and
+device-to-host waits. If the transfers are not hidden behind compute, offload costs you step time
+for the memory it frees.
+
+---
+
+## 10. Mixture-of-Experts (MoE)  *(MoE-specific)*
+
+Everything above still holds for MoE: compile the step, use the fused CE loss, SimpleFSDP and
+mixed precision. What changes is the FFN. Instead of one dense MLP per layer, a router sends each
+token to its top-k of N experts, so the expert FFN is a *grouped* matmul (a different number of
+rows per expert) wrapped in a dispatch that sorts tokens by expert and a combine that puts them
+back. Left on stock PyTorch ops, both run poorly on TPU. TorchTitan ships TPU kernels for each
+part.
+
+Reference recipes, all in [`qwen3/config_registry.py`](qwen3/config_registry.py):
+`qwen3_moe_30b_fsdp_only_full_ac_benchmark()` (30B), `qwen3_moe_235b_fsdp_activation_offload_*()`
+(235B, graph splitter) and `qwen3_moe_235b_scan()` (235B, scan).
+
+### Which kernels to enable
+
+| Kernel | What it replaces | Switch |
+|---|---|---|
+| Grouped expert matmul ([`kernels/expert_segment_matmul.py`](kernels/expert_segment_matmul.py)) | `torch._grouped_mm` for each expert projection, forward and backward | `use_pallas_grouped_mm` |
+| Paired gate/up matmul ([`kernels/paired_segment_matmul.py`](kernels/paired_segment_matmul.py)) | two separate grouped matmuls for the gate (W1) and up (W3) projections, which read the same routed rows twice | `use_pallas_paired_grouped_mm` |
+| Kernel-native weight layout | a transpose of every expert weight on each call | `use_kernel_native_weight_layout` |
+| Dispatch and combine ([`token_dispatcher.py`](token_dispatcher.py)) | scatter-based autograd for the sort-by-expert reorder and the top-k combine | `TpuTokenDispatcherConverter` |
+| Route-score gradient ([`kernels/route_score.py`](kernels/route_score.py)) | a saved fp32 copy of the expert output and a separate reduction in backward | `fuse_route_score_backward` |
+
+Enable all five. The grouped matmul is the largest lever. The others remove copies and repeated
+work around it.
+
+### How to enable them
+
+Two converters swap in the TPU classes when the model is built. The kernels are then switched on
+per module:
+
+```python
+from torchtitan.experiments.tpu.grouped_experts import (
+    TpuGroupedExperts,
+    TpuGroupedExpertsConverter,
+)
+from torchtitan.experiments.tpu.token_dispatcher import (
+    TpuAllToAllTokenDispatcher,
+    TpuTokenDispatcherConverter,
+)
+
+cfg.model_spec = model_registry(
+    "30B-A3B-global-aux",
+    attn_backend="sdpa",
+    converters=[
+        TpuTokenDispatcherConverter.Config(),
+        TpuGroupedExpertsConverter.Config(),
+    ],
+)
+
+model_config = cfg.model_spec.model
+for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
+    experts.use_pallas_grouped_mm = True
+    experts.use_pallas_paired_grouped_mm = True
+    experts.use_kernel_native_weight_layout = True
+    experts.pallas_grouped_mm_tile_m = 256
+    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+
+for _, dispatcher, _, _ in model_config.traverse(TpuAllToAllTokenDispatcher.Config):
+    dispatcher.fuse_route_score_backward = True
+
+cfg.parallelism.expert_parallel_degree = 1
+```
+
+Notes on the switches:
+
+- **Use the Pallas grouped matmul, not `torch._grouped_mm`.** The native op has produced incorrect
+  weight gradients on TPU (torch_tpu issue 2668). The recipes use the Pallas path for that reason.
+- **The paired kernel and the kernel-native layout both require `use_pallas_grouped_mm`.** Model
+  construction fails otherwise.
+- **Model checkpoints are unaffected by the kernel-native layout; optimizer state is not.** Weights
+  are stored in the order the kernel reads, and the module's state-dict hooks translate to and from
+  the standard keys (`w1_EFD` etc.) on save and load. The optimizer state dict has no such hook: it
+  is keyed by the live parameter names (`state.w1_EDF.exp_avg` vs `state.w1_EFD.exp_avg`) with the
+  live shapes, so resuming optimizer state across a layout change needs a conversion; a plain load
+  fails on the missing key.
+- **Expert compute runs in bf16** whatever the surrounding dtype. The weight-gradient kernels
+  accumulate in fp32 and return bf16.
+- **Route-score fusion keeps the fp32 multiply and reduction** of native autograd. Only the
+  reduction order changes.
+
+### Tile sizes
+
+Like the other Pallas kernels (§4), the expert kernels are bounded by the scoped VMEM limit and
+need tuning per model shape and TPU generation. The values in the snippet are the 30B recipe's.
+
+- `pallas_grouped_mm_tile_m`: row tile for the forward matmul. With the paired kernel the routed
+  row count (`tokens x top_k`) must be a multiple of it, or the kernel raises.
+- `pallas_grouped_mm_tgmm_tiling = (m, k, n)`: tiles for the weight-gradient kernel. A `0` means
+  the full axis. The paired kernel requires `n = 0`.
+- `pallas_grouped_mm_w2_tgmm_tiling`: a separate tiling for the down projection (W2). The `k` tile
+  runs along the weight's input dimension, which is the model dim for W1/W3 and the expert hidden
+  dim for W2, so one value often cannot suit both. A `k` tile larger than the axis is **not**
+  clamped: it allocates the full window and can exhaust VMEM before the first step.
+
+At large expert shapes the weight-gradient kernel does not fit VMEM untiled, so the `k` tile is
+required and not just a tuning knob. The 235B recipes show a worked case.
+
+### Expert parallelism (EP)
+
+**Expert parallelism is not fully implemented in TorchTitan TPU yet. Support is coming later. For now,
+run with `expert_parallel_degree = 1`,** as every tuned recipe does, and let FSDP shard the expert
+weights along with the rest of the model.
+
+Setting EP above 1 is accepted, but the optimized path is not available:
+
+- The paired gate/up kernel rejects it.
+- The TPU combine and the route-score fusion are skipped, and the standard all-to-all path runs
+  instead.
+- Scan over layers (§9) rejects it.
+- `compile_grad_norm` rejects it.
+
+### Other MoE points
+
+- **Scan and MoE.** A scan body cannot mutate module state, which MoE layers do through
+  load-balancing counters and routing metrics. See the constraints in §9 and the workarounds in
+  `qwen3_moe_235b_scan()`.
+- **Profile dispatch and combine separately.** After the kernels are on, check that the reorder
+  and combine around the expert matmul are no longer a visible bucket.
+- **Router precision and load balance are quality-sensitive.** Keep routing in fp32. Capacity
+  factor and token dropping affect throughput **and model quality**: treat any change that drops
+  tokens as a correctness question, not a free perf lever.
+- **MFU accounting.** Use **active** params (shared params plus the top-k experts a token actually
+  touches), *not* total params, in `num_flops_per_token`. Total-param MFU overstates utilization
+  for a sparse model.
 
 ---
 
@@ -409,10 +800,15 @@ below assumes a compiled model.
    and splash attention (long sequence). **Tune their tile sizes** (§4) — the defaults aren't
    optimal.
 5. If it doesn't fit one chip, SimpleFSDP `fully_shard` with
-   `MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32)`; use `hybrid_shard` multi-host.
+   `MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32)`, across hosts too; `hybrid_shard`
+   only when the replicate axis buys something (multi-slice over DCN, very wide FSDP groups) and
+   the memory for the replicated state is there (§5).
 6. bf16 compute / fp32 master; norm in fp32; dims multiple of 256; shape-checks off for benchmarks.
 7. Re-profile. If matmuls are near peak and the only idle left is the training-step glue, you're at
-   the torch_tpu eager ceiling (§7) — raise it by shrinking the eager surface, not by more tuning.
+   the torch_tpu eager ceiling (§7) — raise it by shrinking the eager surface, not by more tuning,
+   or remove that surface by capturing the whole step with GraphTrainer (§8).
+8. If the step no longer compiles or fits as one unrolled graph, run the layers as a scan or let the graph splitter cut
+   the graph into programs, and offload saved activations to host memory (§9).
 
 ---
 
