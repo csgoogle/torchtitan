@@ -61,6 +61,7 @@ _LLAMA3_SCAN_FLAGS = tpu_flags.merge_flags(
     },
     tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
     tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
+    tpu_flags.ICI_AG_PIPELINING,
     tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
     tpu_flags.CONVOLUTION_UNFUSING,
 )

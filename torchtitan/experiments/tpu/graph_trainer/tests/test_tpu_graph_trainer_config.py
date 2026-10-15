@@ -1080,6 +1080,13 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     self.assertEqual(
         {
             name: config.libtpu_init_flags[name]
+            for name in tpu_flags.ICI_AG_PIPELINING
+        },
+        tpu_flags.ICI_AG_PIPELINING,
+    )
+    self.assertEqual(
+        {
+            name: config.libtpu_init_flags[name]
             for name in tpu_flags.HIERARCHICAL_REDUCE_SCATTER
         },
         tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
