@@ -446,7 +446,7 @@ Taking [`qwen3_8b_tpu7x`](qwen3/config_registry.py#L534), which declares five fl
 --extra-libtpu-init-flags='!xla_tpu_enable_latency_hiding_layer_scheduler'
 
 # 4. Add or override several flags at once -- quote the whole value.
---extra-libtpu-init-flags='xla_tpu_dvfs_p_state=5 xla_tpu_scoped_vmem_limit_kib=65472'
+--extra-libtpu-init-flags='xla_tpu_dvfs_p_state=5 xla_tpu_enable_sparse_core_collective_aggregator=false'
 
 # 5a. Drop the recipe's flags entirely -- set to the empty string.
 --libtpu-init-flags=''
