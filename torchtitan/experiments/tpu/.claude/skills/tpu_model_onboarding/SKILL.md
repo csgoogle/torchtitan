@@ -83,7 +83,14 @@ scan). Every constant gets a source line.
 
 - Model code, plain SDPA, no Pallas kernels, no GraphTrainer. `debugmodel`
   flavor plus the real sizes; a `<name>_debugmodel` recipe. Register in
-  `experiments/tpu/train.py` and `train_minimal.py` (`model.md`).
+  `experiments/tpu/train.py` and `train_minimal.py` (`model.md`). "Plain
+  SDPA" means the document-masked one: the stock
+  `ScaledDotProductInnerAttention` takes no `positions`, so packed rows attend
+  across documents and rung 3 (Splash with segment ids) has nothing to compare
+  against. Use `SlidingWindowScaledDotProductInnerAttention(window_size=None)`
+  from `tpu/muse_glimmer/attention.py` (OLMo 2 #587 reuses it; GPT-OSS #584
+  re-derives the mask from `positions` in its own `SinkSDPA`, the sink being
+  the reason it could not reuse it).
 - For a port, the weight mapping: a `StateDictAdapter` subclass with
   `from_hf` / `to_hf` (`model.md`), which is what `--checkpoint.initial_load_in_hf`
   and the parity test both go through. Write the key table into the PR before
@@ -98,7 +105,20 @@ scan). Every constant gets a source line.
   scan; do not bend the architecture to stack. Either way, no module-attribute
   or in-place writes in the layer forward (MoE counters and routing metrics
   behind config) and no complex ops (real-arithmetic RoPE); both also matter
-  for compile.
+  for compile. Upstream's expert-bias balancer (`load_balance_coeff`) is such
+  a write: it accumulates `tokens_per_expert_E` in place. The lane's qwen3
+  235B recipes switch to the batch-wise aux loss instead
+  (`_use_global_batch_aux_loss`, `qwen3/config_registry.py`; routing metrics
+  come back as graph outputs via `collect_moe_routing_metric_tensors`) and
+  send the dead counter to a throwaway tensor
+  (`overrides/discarded_token_counter.py`). Keeping the bias balancer means
+  the in-place update must survive the graph: the TPU GraphTrainer's static
+  executable drops it unless the backend pass returns the buffer (the change
+  GPT-OSS #584 makes to shared code, which needs its own PR), so assert in a
+  test that `expert_bias_E` moves after an optimizer step on the compiled
+  path, as #584's `test_graph_trainer.py` does. Switching balancer is the
+  semantic class: a separate labelled recipe, measured against a reference
+  that uses the same one.
 - The tests in `tests.md`: the reference-parity test (the one that matters:
   tiny config covering every layer type, perturbed scales, weights through the
   adapter with keys checked both ways, logits + loss + every gradient
@@ -125,8 +145,15 @@ Structure      per-layer patch counts == layer count; heads / kv_heads / vocab =
                the checkpoint; the HLO dump (--extra-xla-flags=xla_dump_to=
                <dir>) contains the custom_calls of enabled kernels.
                Eager log lines do not fire under compile; trust the HLO.
-Modes          eager / per-block compile / GraphTrainer losses within ~1e-4 on
-               debugmodel
+Modes          eager / per-block compile / GraphTrainer: step-1 loss within
+               ~1e-4 on debugmodel. Step 1 has no optimizer state, so a larger
+               gap there is a bug. Later steps are not gated by this bar: AdamW
+               amplifies round-off, and the gap grows with the step count
+               (OLMo 2 eager vs compile 1.6e-4 through step 10, 6.1e-3 by step
+               12; GPT-OSS 2.5e-3 by step 10; the merged Muse debugmodel
+               1.45e-2 under the same flags). Whether a trajectory is
+               acceptable is the numerics class below, decided on post-warmup
+               medians, never a per-step 1e-4 bound over N steps
 ```
 
 Every change after PR 1 gets a numerics class: **bit-identical** (loss and
@@ -165,7 +192,12 @@ against the path it replaces plus the control that proves the test can fail
 they cannot see, a test that the kernel is patched in (`tests.md`); one
 end-to-end case with the flag on; a commit message with the numerics class,
 before/after step time and MFU on the same recipe and chip count, and the HLO
-evidence (custom_call present, segment ids among its operands). Rung k passes
+evidence (custom_call present, segment ids among its operands). Measure on
+the smallest real-size flavor that fits the target (the 1B on 4 chips), not
+on `debugmodel`: `debugmodel` is for correctness, and at its shape levers
+tie that move the real size (OLMo 2 #587: GraphTrainer tie vs +10.6%, fused
+CE tie vs +3.2% / -2.8%; GPT-OSS #584 measured only the debug shape and could
+conclude nothing about Tokamax or fused CE). Rung k passes
 on the target before rung k+1 starts, and the ladder table in the PR is
 updated after every rung. One branch; whether it ships as one PR or stacked
 PRs is the human's call at the end.
@@ -216,6 +248,10 @@ When the budget is spent, write the ladder table and stop.
 - Changes live under `experiments/tpu/`; anything outside it is an exception
   with its reason in the PR (see the top of this file). No Meta copyright
   headers on new files.
+- Reuse, do not copy, and do not import across model packages: when the code
+  you need lives under another model's directory (an attention class, a
+  recipe helper, a converter), importing it drags that model in. The PR that
+  makes it shared by a second model moves it to a `tpu/` module both import.
 - No performance claim from fewer than 10 steps, from a single run, or before
   the numerics class is known.
 - The PR description is the onboarding record and the only state that

@@ -77,21 +77,33 @@ reference framework. Keep the fixture under a few MB so it lives in the repo,
 else pin it in GCS with the provenance in a sidecar and skip with a reason when
 unreachable. Regenerate when the reference moves and say so in the commit.
 
-Starting tolerances (fp32 reference, bf16-free model, default TPU matmul
-precision; passed on v6e and v7x for Gemma 4):
+Matmul precision decides the bounds. torch_tpu's default fp32 matmul is one
+bf16 pass, and at that precision the comparison measures ~1e-2 (OLMo 2:
+logits 1.6e-2 max abs, gradient relative L2 1.85e-2 against a 2e-2 bound,
+i.e. no margin for a real bug). Run the test under
+`torch.set_float32_matmul_precision("highest")` (restore it in `tearDown`),
+which turns the same comparison into ~1e-6 and lets the bounds be tight:
 
 ```
-            dense                      MoE
-logits      atol 5e-2 rtol 1e-2        atol 1e-1 rtol 2e-2
-loss        atol 5e-3 rtol 1e-3        atol 5e-3 rtol 2e-3
-gradients   relative L2 <= 2e-2 per tensor (both); absolute floor 1e-6 only
-            where ||g_ref|| < 1e-4
+                    "highest" (dense; OLMo 2 #587)    default precision (#491 Gemma 4, v6e + v7x)
+                                                      dense                      MoE
+logits              atol 1e-4 rtol 1e-4               atol 5e-2 rtol 1e-2        atol 1e-1 rtol 2e-2
+loss                atol 1e-5 rtol 1e-5               atol 5e-3 rtol 1e-3        atol 5e-3 rtol 2e-3
+gradients           relative L2 <= 1e-4 per tensor    relative L2 <= 2e-2 per tensor
+                    absolute floor 1e-6 only where ||g_ref|| < 1e-4 (all columns)
 ```
 
-(#491 shipped `atol 8e-2 rtol 2e-2` elementwise for gradients; that bound
-passes a zeroed gradient whose entries are all below 0.08, so do not copy it.)
-Tighten if the model passes with margin; record the measured error next to
-the bound in the PR.
+The exception is the bf16 grouped matmul: libtpu 0.0.48 rejects HIGHEST for
+the bf16 ragged dot behind `torch._grouped_mm`, so an MoE test scopes default
+precision to the expert path (GPT-OSS #584 does it in a context manager) and
+keeps "highest" for the dense ops; the MoE column above is for a test that
+cannot. (#491 shipped `atol 8e-2 rtol 2e-2` elementwise for gradients; that
+bound passes a zeroed gradient whose entries are all below 0.08, so do not
+copy it.) Record the measured error next to the bound in the PR.
+
+An upstream torchtitan reference that uses FlexAttention has no CPU backward;
+swap its inner attention for the math SDPA inside the test, with the same
+mask (GPT-OSS #584).
 
 ## Feature parity tests (one per rung)
 
@@ -113,7 +125,14 @@ comparing outputs and gradients, unless noted below:
 - MoE kernels vs `torch._grouped_mm`, including empty expert groups.
 - scan vs unrolled on a 4-layer proxy, 5 steps, loss and grad_norm within bf16
   noise.
-- GraphTrainer vs per-block compile: 3-step loss agreement on `debugmodel`.
+- GraphTrainer vs per-block compile: 3-step loss agreement on `debugmodel` at
+  a short context (OLMo 2 `test_olmo2_graph_trainer_matches_per_block_compile`:
+  relative 1e-4, measured 0 / 2.9e-5 / 1.4e-5 at fp32; a bf16-parameter MoE
+  measured 8.2e-4 over steps 1-3, so set the bound from step 1 and the
+  measured steps 2-3, not from the fp32 number). The control is a schedule
+  change (warmup 3 instead of 2 moved OLMo 2 by 1.4e-2 / 2.7e-2). Scaling
+  `max_norm` or the gradients is not one: AdamW's update is invariant to
+  gradient scale, so it stays inside any bound.
 
 The test must be able to fail. Add the control: remove the document mask and
 assert the SDPA output moves by more than 10%; turn the cap off and assert
@@ -135,6 +154,13 @@ A multi-step CPU-vs-device test, if kept, bounds step 0 tightly and the
 post-optimizer steps loosely (after two Adam steps the muse debugmodel gap
 ranged 0.004 to 0.37 across seeds, #534: amplified bf16 error, not a bug), with
 each check independent so a failed loss check does not skip the gradients.
+The minimal trainer's CPU-vs-device gradient gap at default matmul precision
+is the one-bf16-pass matmul, not the model (OLMo 2 3.7e-3 max abs, within
+2.7e-6 relative at "highest"; GPT-OSS 9.5e-3): put the measured number next
+to a `grad_atol` you widen, in the commit. `*_distributed.py` modules run on
+the multi-chip shard only; their `--device=cpu` failures are not a gate
+(`test_train_minimal_distributed` fails at step 0 for every model on CPU in
+the current environment, qwen3 included).
 
 ## CI (`.ci/discover_tpu_tests.py`)
 

@@ -7,6 +7,10 @@ Each cost a previous onboarding a day or more. Symptom first, then the check.
 - **Packed batch, no segment ids.** Loss normal, throughput half of expected:
   the attention wrapper did not pass `positions` to the inner attention, so
   splash saw one causal problem per row. Check the custom_call operands in HLO.
+  The SDPA side has the same hole: the stock `ScaledDotProductInnerAttention`
+  has no `positions` argument at all, so a rung-1 model built on it attends
+  across documents and the Splash parity has nothing to compare against
+  (SKILL.md Step 1 names the document-masked one).
 - **Sliding window off by one under splash** (window W is splash W - 1), or
   not applied on the SDPA path. Test with the reference's definition.
 - **Config override builds the wrong shape.** `--config=<x> --hf-model=<y>` can
@@ -37,6 +41,10 @@ Each cost a previous onboarding a day or more. Symptom first, then the check.
   0.0.48+: `xla_enable_hlo_sharding_v3=False`.
 - VMEM OOM naming a kernel that is not the one under test: the scoped VMEM
   default is 16 MB on v5e, 64 MB on v6e / v7x; read both numbers first.
+- `torch._grouped_mm` on bf16 rejects HIGHEST matmul precision (libtpu
+  0.0.48): scope the parity test's "highest" to the dense path (`tests.md`).
+- CPU FlexAttention has no backward: an upstream reference built on it needs
+  its inner attention swapped for the math SDPA inside the test.
 
 ## Tests that pass for the wrong reason
 

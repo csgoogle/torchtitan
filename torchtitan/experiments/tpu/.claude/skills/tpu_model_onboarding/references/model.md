@@ -126,6 +126,10 @@ How it is checked, in this order:
   `reset_parameters()` (it reads `self.weight`, which goes through the
   parametrization) is the case where it can matter; give that module a
   `param_init` instead.
-- `bld_layout.py` is on by default for `Decoder` models: `[T, D]` inputs are
-  viewed as `[B, L, D]` inside blocks. A non-stock forward must make
-  `tpu_model_class` raise rather than silently skip (`tpu/layer_loop.py`).
+- `bld_layout.py` (`[T, D]` viewed as `[B, L, D]` inside blocks) is on by
+  default but applies only to `Llama3TransformerBlock` / `Qwen3TransformerBlock`
+  running the stock forward (`_BLOCK_FORWARDS`); any other block class,
+  including a subclass with its own forward, runs the `[T]` path silently
+  (OLMo 2 does). Say which path the model runs in the PR; extending the match
+  is a lever for later rungs, not rung 1. A non-stock `Decoder.forward` must
+  make `tpu_model_class` raise rather than silently skip (`tpu/layer_loop.py`).

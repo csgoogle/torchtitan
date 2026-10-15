@@ -21,7 +21,11 @@ C. GKE via Cluster Toolkit    | gcluster job submit, per the | the slice in the 
 - Rung 1 (correctness, 10 deterministic steps on `debugmodel`) and the
   kernel-parity rungs close on A or B with 1-4 chips; only Step 3 needs C.
 - C only: run every CPU-closable check locally first, treat each dispatch as
-  expensive (the gate in SKILL.md Step 3), stop at the agreed budget.
+  expensive (the gate in SKILL.md Step 3), stop at the agreed budget. The
+  image is the artifact: do not copy edited source into a running pod and
+  hash-verify it afterwards (#584 did, and every result then describes an
+  overlay no image carries). Rebuild instead; a layered `FROM <previous
+  image>` + `COPY` build of a pure-Python change takes seconds.
 - No silent fallback: A reports no chip, B's ssh fails, C's image is missing
   -> stop and say so; never switch to CPU and mark run-based rows done.
 - On a shared host check that nothing else holds `/dev/vfio/*` before a run.
@@ -88,7 +92,8 @@ for s in range(1, N + 1):
 The step-set assertion is part of the check: a run that logged every 10th
 step, or stopped early, compares equal on the steps it has and proves nothing.
 Determinism means every step equal, not close; trainer-mode agreement is
-~1e-4 on `debugmodel`; "no spikes" means no step-to-step increase larger than
+~1e-4 at step 1 on `debugmodel` (later steps drift, SKILL.md "Modes"); "no
+spikes" means no step-to-step increase larger than
 the largest decrease seen so far after warmup. Verdicts come from steps past
 warmup only.
 
