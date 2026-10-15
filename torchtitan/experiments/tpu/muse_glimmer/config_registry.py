@@ -237,12 +237,6 @@ def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
       compile_mode="aot_fx_trace",
       compile_optimizer=True,
       optimizer_in_graph=True,
-      # Full rematerialization, except each layer's Splash output and LSE, so
-      # backward doesn't rerun the forward Splash kernel. On tpu7x-4x4x4,
-      # against plain "full": 5.316 s vs 5.600 s per step (-5.1%), 46.3% vs
-      # 44.0% MFU, 63.77 vs 46.18 GiB peak HBM, matching losses. Saving only
-      # the last 26 layers keeps peak HBM at 46.18 GiB for -2.6%; see the
-      # recipe README.
       graph_trainer_memory_policy="tpu_selective",
       graph_trainer_save_regions=("attention.inner_attention",),
       enable_graph_trainer_remat_schedule=True,

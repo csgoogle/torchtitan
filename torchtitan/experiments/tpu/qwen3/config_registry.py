@@ -632,11 +632,6 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   cfg.tpu_config = TPUConfig(
       use_graph_trainer=True,
       compile_mode="aot_fx_trace",
-      # Full rematerialization, except the save regions: the MoE routing
-      # decisions (router top-k ids and the token sort permutation, under
-      # 1 MiB per layer) and each layer's Splash output and LSE. On
-      # tpu7x-4x4x4 at this batch, against plain "full": 1.222 s vs 1.259 s
-      # per step (-2.9%) for 76.09 vs 62.59 GiB peak HBM.
       graph_trainer_memory_policy="tpu_selective",
       graph_trainer_save_regions=("moe.routing", "attention.inner_attention"),
       enable_graph_trainer_remat_schedule=True,
