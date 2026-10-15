@@ -26,12 +26,42 @@ Read before starting: `torchtitan/experiments/tpu/README.md` (environment,
 VM and cluster setup, launch commands), `torch-tpu-optimization-guide.md`
 (the levers, in order), `.claude/rules/models.md`, `.claude/rules/experiments.md`.
 
-Templates in the tree; read them instead of expecting this skill to restate them:
+## Read the lane before writing
 
-- wrap an upstream model: `experiments/tpu/muse_glimmer/` (PR #521)
-- port a model: PR #491 (`experiments/tpu/examples/gemma4/`, open at the time
-  of writing); its `TestGemma4HFReferenceParity` is the parity-test template
-- recipe README: `experiments/tpu/recipes/ironwood/qwen3-30b-a3b/tpu7x-4x4x4/README.md`
+Every model under `experiments/tpu/` is a worked answer to a question you are
+about to face. Before writing a module, read how the nearest existing model
+does it; when you write something the lane already has (an attention
+wrapper, a kernel adapter, a recipe helper, a parallelize step), the PR says
+why the existing one could not be extended. #584 forked the tokamax wrapper
+to add sinks, re-derived the document mask and compiled per block without
+`apply_spmd_safe`; each had a precedent two directories away.
+
+- `torchtitan/models/common/`: the base classes (`Decoder`,
+  `TransformerBlock`, `GQAttention`, `FeedForward`, `MoE`, `RMSNorm`,
+  `RotaryEmbedding`); subclass, do not copy.
+- `tpu/llama3/`: the dense minimum. `infra/parallelize.py` (AC ->
+  `apply_spmd_safe` -> per-block compile -> SimpleFSDP / FSDP2) is what a dense
+  port reuses as is (#587).
+- `tpu/qwen3/`: MoE. The `TpuGroupedExperts` converter, both balancers and
+  the discarded counter, `graph_trainer/qwen3.py`, scan and GraphTrainer
+  recipes, the fused-CE recipe idiom, the largest test set in the lane.
+- `tpu/muse_glimmer/`: wrapping an upstream model (#521, then #529, #530,
+  #532, #534, one rung each): `attention.py` (document-masked SDPA, sliding
+  window), the `override.imports` fused-loss idiom, a GraphTrainer per-model
+  file.
+- `tpu/deepseek_v3/`, `tpu/flux/`: wraps that needed only recipes and tests.
+- `tpu/examples/mamba2/`, `mamba3/`: non-transformer ports with their own
+  kernels and recipes inside the package.
+- Open at the time of writing: #491 (Gemma 4 port; `TestGemma4HFReferenceParity`
+  is the parity-test template), #587 (OLMo 2 port, this skill's first run),
+  #584 (GPT-OSS wrap: MoE, sinks, GKE).
+- Shared modules a model plugs into, never re-implements: `kernels/` (Splash,
+  tokamax, fused CE, grouped matmul wrappers; a new operand such as sinks is
+  added there), `workarounds.py` (the patches, matched by class name),
+  `overrides/`, `bld_layout.py` / `layer_loop.py`, `graph_trainer/`,
+  `tests/test_train_distributed.py`, and the recipe READMEs under
+  `recipes/<generation>/<model>/<topology>/` (`ironwood/qwen3-30b-a3b/tpu7x-4x4x4`
+  is the Step 3 template).
 
 References: [model.md](references/model.md) (port layout, the weight
 mapping and how it is checked, registration), [tests.md](references/tests.md)
