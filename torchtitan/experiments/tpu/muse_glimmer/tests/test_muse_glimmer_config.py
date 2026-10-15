@@ -405,11 +405,17 @@ class MuseGlimmerConfigTest(parameterized.TestCase):
       "muse_glimmer_30b_full_logits",
       "muse_glimmer_30b_fused_ce",
   )
-  def test_30b_graph_trainer_recipes_use_zero3_full_remat(self, name):
-    """Tests the GraphTrainer recipes' Zero-3, remat and FSDP schedule."""
+  def test_30b_graph_trainer_recipes_use_zero3_selective_remat(self, name):
+    """Tests the GraphTrainer recipes' Zero-3, remat saves and FSDP schedule."""
     config = getattr(config_registry, name)()
     self.assertEqual(config.parallelism.fsdp_reshard_after_forward, "always")
-    self.assertEqual(config.tpu_config.graph_trainer_memory_policy, "full")
+    self.assertEqual(
+        config.tpu_config.graph_trainer_memory_policy, "tpu_selective"
+    )
+    self.assertEqual(
+        config.tpu_config.graph_trainer_save_regions,
+        ("attention.inner_attention", "feed_forward.w2"),
+    )
     self.assertNotEqual(config.tpu_config.graph_trainer_fsdp_schedule, "none")
 
   def test_30b_fused_ce_recipe_passes_logit_transform_check(self):

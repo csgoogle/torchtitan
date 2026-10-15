@@ -18,7 +18,13 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 - **Model**: upstream `muse_glimmer_30b` settings (sequence 16384, local batch
   1, AdamW lr 3e-4, 200 warmup steps).
 - **Parallelism**: GraphTrainer with SimpleFSDP Zero-3, the `prefetch` FSDP
-  schedule, full rematerialization, and the optimizer compiled into the graph.
+  schedule, and the optimizer compiled into the graph with its parameter and
+  moment inputs donated.
+- **Rematerialization**: everything is recomputed in backward except each
+  layer's Splash output + LSE and FFN down-projection output
+  (`tpu_selective` with the `attention.inner_attention` and `feed_forward.w2`
+  save regions). Together +10.7 % over full recompute; saving instead of
+  recomputing moves losses at rounding level (see Expected Metrics).
 - **Precision**: fp32 weights and optimizer state, bf16 compute.
 - **Kernels**: JAX Pallas Splash attention (1024 tiles) with a local mask for
   the sliding-window layers, and plain cross entropy over the full logits.
@@ -62,15 +68,25 @@ gcluster job submit \
 ## Expected Metrics
 
 With this configuration (local batch 1, global batch 128, sequence 16384), you
-should observe the following per-device metrics averaged over steps 10-30 (as
-of 10/7/2026, measured with the command above, i.e. on the default `c4_test`
-dataset and test tokenizer):
+should observe the following per-device metrics (as of 10/15/2026, median of
+steps 5-20 excluding the profiled steps 10-11, measured with the command above,
+i.e. on the default `c4_test` dataset and test tokenizer):
 
-- **TPS (Tokens per second)**: ~2,913
-- **TFLOPS**: ~505.3
-- **MFU**: ~43.8%
-- **Step Time (time_end_to_end)**: ~5.62s
-- **Physical peak HBM**: 46.18GiB
+- **TPS (Tokens per second)**: ~3,240
+- **TFLOPS**: ~562
+- **MFU**: ~48.7%
+- **Step Time (time_end_to_end)**: ~5.06s
+- **Physical peak HBM**: 71.44GiB (xprof memory profile; the trainer's
+  `memory:` field, 66.36GiB, counts only the step program's temporaries)
+
+Same pod, full recompute (`graph_trainer_memory_policy="full"`): ~2,926 TPS,
+44.0% MFU, 5.60s, 51.33GiB.
+
+Loss parity: from a shared seed checkpoint and identical batches, measured on a
+tpu7x-2x2x2 slice (16 devices) to match the batch of the GPU reference, this
+recipe's loss tracks upstream's Muse Glimmer 30B on 16 B200 GPUs with a median relative
+difference of 0.40% over steps 20-100 (0.19% with full recompute) and an
+identical first step.
 
 `grad_norm` is logged as 0.0 because the optimizer runs inside the compiled
 graph; gradient clipping is still applied there.

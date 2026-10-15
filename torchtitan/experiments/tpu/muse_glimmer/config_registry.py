@@ -205,13 +205,31 @@ def _muse_glimmer_30b_base() -> TPUTrainerConfig:
 def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
   """Muse Glimmer 30B GraphTrainer recipe for a tpu7x-4x4x4 slice.
 
-  SimpleFSDP Zero-3 over all devices with the prefetch FSDP schedule, full
-  graph rematerialization, JAX Pallas Splash attention and plain cross entropy
-  over the full logits. The 4x4x4 libtpu flags ride on the config.
+  SimpleFSDP Zero-3 over all devices with the prefetch FSDP schedule, graph
+  rematerialization that recomputes everything except each layer's Splash
+  output + LSE and FFN down-projection (``w2``) output, JAX Pallas Splash
+  attention and plain cross entropy over the full logits. The 4x4x4 libtpu
+  flags ride on the config.
+
+  The two saves (``tpu_selective``), measured with the in-graph optimizer's
+  inputs donated, against full recompute, median tok/s/device of steps 5-20:
+
+  * tpu7x-4x4x4 (128 devices): 2,926 -> 3,240 tok/s (+10.7 %), 44.0 -> 48.7 %
+    MFU, physical peak HBM 51.3 -> 71.4 GiB. The Splash save alone is +5.4 %,
+    the w2 save +5.0 % on top of it.
+  * tpu7x-2x2x2 (16 devices): 3,030 -> 3,337 tok/s (+10.1 %), 45.7 -> 50.3 %
+    MFU, peak 69.9 -> 89.1 of 94.7 GiB. This fits only because the optimizer
+    inputs are donated; without donation the plan is ~107 GiB.
+  * Numerics: saving a value instead of recomputing it moves losses at
+    rounding level (the recompute is not bit-identical to the first pass).
+    Against 16 B200s from a shared seed (500-step schedule, steps 1-100) the
+    median |relative loss difference| is 0.40 %, vs 0.19 % with full
+    recompute; step 1 is identical (-6.2e-5 relative to the GPU).
 
   Full logits vs fused cross entropy, measured on tpu7x-4x4x4 with fp32
   weights and optimizer state (the default ``training.dtype``) and bf16
-  compute:
+  compute, with full recompute (with the two saves the fused loss is ~3 %
+  slower):
 
   * Why full logits here: with 16384 tokens per device the logits are not
     what sets peak HBM (46.18 GiB full vs 46.12 GiB fused), so the fused
@@ -235,7 +253,11 @@ def muse_glimmer_30b_full_logits() -> TPUTrainerConfig:
       compile_mode="aot_fx_trace",
       compile_optimizer=True,
       optimizer_in_graph=True,
-      graph_trainer_memory_policy="full",
+      graph_trainer_memory_policy="tpu_selective",
+      graph_trainer_save_regions=(
+          "attention.inner_attention",
+          "feed_forward.w2",
+      ),
       enable_graph_trainer_remat_schedule=True,
       graph_trainer_fsdp_schedule="prefetch",
   )
@@ -249,7 +271,7 @@ def muse_glimmer_30b_fused_ce() -> TPUTrainerConfig:
   """``muse_glimmer_30b_full_logits`` with the soft-capped fused loss.
 
   The LM-head matmul, soft cap and cross entropy run as one Pallas kernel, so
-  the [tokens, 202048] logits are never materialized. ~2% slower than
+  the [tokens, 202048] logits are never materialized. ~3% slower than
   full logits at 16384 tokens per device, but needed once the logits dominate
   memory; see ``muse_glimmer_30b_full_logits`` for when to use which.
   """
