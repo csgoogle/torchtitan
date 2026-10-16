@@ -528,3 +528,120 @@ gcluster destroy ${CLUSTER_NAME}
 ```
 
 For more information, see [`gcluster job cancel`](https://docs.cloud.google.com/cluster-toolkit/docs/reference/gcluster-job-cancel) and [`gcluster destroy`](https://docs.cloud.google.com/cluster-toolkit/docs/reference/gcluster-destroy).
+
+## Multi-slice model training on GKE
+
+A multi-slice job spans several TPU slices. Each slice is its own ICI fabric and MegaScale joins
+them over DCN, which is much slower than ICI, so the layout that pays off is HSDP: shard inside a
+slice, replicate between slices, and only the replicated gradient crosses DCN. TorchTitan arranges
+that for you.
+
+Everything below is the single-slice flow from the previous section with `num_slices` raised and
+two environment variables added.
+
+### Create a multi-slice cluster
+
+The same blueprint provisions several slices -- pass the slice count instead of `num_slices=1`:
+
+```bash
+gcluster deploy examples/gke-tpu-v6e/gke-tpu-v6e.yaml \
+    --vars project_id=${PROJECT_ID},deployment_name=${CLUSTER_NAME} \
+    --vars region=${REGION},zone=${ZONE} \
+    --vars machine_type=${COMPUTE_TYPE},tpu_topology=${TOPOLOGY},num_slices=2 \
+    --vars authorized_cidr=${AUTHORIZED_CIDR},enable_gcsfuse_csi=true
+
+```
+
+This creates one node pool per slice. The blueprint installs Kueue and JobSet, which matters here:
+a multi-slice workload must be admitted all-or-nothing, or one slice can take the last free chips
+and sit holding them while the other never starts.
+
+### Deploy the training workload
+
+One `gcluster job submit`, same shape as the single-slice one, plus `--num-slices` and the two
+MegaScale variables that are identical on every pod:
+
+```bash
+gcluster job submit \
+    --name $WORKLOAD_NAME \
+    --cluster $CLUSTER_NAME \
+    --location $REGION \
+    --project $PROJECT_ID \
+    --compute-type $COMPUTE_TYPE \
+    --topology $TOPOLOGY \
+    --num-slices 2 \
+    --image "us-central1-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/torchtitan-container:latest" \
+    --service-account workload-identity-k8s-sa \
+    --mount "$BUCKET_NAME;/data;rw" \
+    --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
+    --env MEGASCALE_NUM_SLICES=2 \
+    --env MEGASCALE_COORDINATOR_ADDRESS="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME:8080" \
+    --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536 --megascale_grpc_premap_memory_bytes=4294967296 --megascale_use_numa_aware_block_allocator=false" \
+    --command '
+        VMS=$(echo "$TPU_WORKER_HOSTNAMES" | awk -F, "{print NF}");
+        POD_DNS=${TPU_WORKER_HOSTNAMES%%,*};
+        POD=${POD_DNS%%.*};
+        JOB=${POD%-*};
+        SLICE=${JOB##*-};
+        torchrun \
+        --nnodes=$(( MEGASCALE_NUM_SLICES * VMS )) \
+        --nproc_per_node=8 \
+        --rdzv_backend=static \
+        --rdzv_endpoint=$WORKERS_0_HOSTNAME:29501 \
+        --node_rank=$(( SLICE * VMS + TPU_WORKER_ID )) \
+        -m torchtitan.experiments.tpu.train \
+        --module=torchtitan.experiments.tpu.muse_glimmer \
+        --config=muse_glimmer_30b_full_logits \
+        --parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES \
+        --parallelism.enable_min_cost_redistribute \
+        --training.steps=30'
+```
+
+Differences from the single-slice command:
+
+* Multi-slice needs three environment variables. libtpu joins the slices into one device mesh
+  through its MegaScale PJRT client, and builds that client from:
+
+  ```
+  MEGASCALE_NUM_SLICES           how many slices there are
+  MEGASCALE_COORDINATOR_ADDRESS  where slice 0's first worker listens
+  MEGASCALE_SLICE_ID             which slice this pod is
+  ```
+
+  The command passes the first two with `--env`. The coordinator address is the one that makes
+  libtpu create the client at all; without it every slice numbers its devices from zero and the
+  mesh cannot be built.
+
+  The third is different, because its value changes from slice to slice -- one `--env` cannot say
+  two things. TorchTitan fills it in: it reads the slice index out of `TPU_WORKER_HOSTNAMES` and
+  exports `MEGASCALE_SLICE_ID` before the first device is used, logging
+  `Exporting MEGASCALE_SLICE_ID=...`. You can still set it yourself, and it is cross-checked
+  against that host list, so a wrong value raises instead of building a broken mesh.
+
+* `--parallelism.data_parallel_replicate_degree=$MEGASCALE_NUM_SLICES` is **required**. The
+  replicate axis is the one split across DCN, which keeps every FSDP shard group, and so every
+  weight all-gather and gradient reduce-scatter, inside a single slice. With the default of 1 the
+  only axis left for the split is `dp_shard`, so shard groups would straddle the slices: the job
+  trains correctly at a fraction of the throughput, and torch_tpu notes it only at INFO. TorchTitan
+  refuses to start in that case rather than correcting it for you, since a job that is merely slow
+  is far harder to notice than one that will not launch. A degree the slice count does not divide
+  is rejected by torch_tpu when it builds the mesh; any multiple of the slice count works. Writing it
+  as the variable rather than a literal cannot drift when you change `--num-slices`.
+
+* `--parallelism.enable_min_cost_redistribute` is worth setting on multi-slice. The default greedy
+  DTensor planner all-reduces the **full** gradient on the replicate axis -- the axis that crosses
+  DCN -- before the reduce-scatter; the min-cost planner reduce-scatters first, shrinking the DCN
+  payload by the shard degree.
+
+* On v7x, shrink the host-memory pool MegaScale reserves for DCN transfers. Multi-slice pins a pool
+  of 16 GiB per NUMA node per process by default. JAX runs one process per VM, but torch_tpu runs
+  one per TensorCore -- 8 per VM on v7x, which is why the command above uses
+  `--nproc_per_node=8` -- so the pool is paid 8 times: 16 GiB x 2 NUMA nodes x 8 processes = 256 GiB
+  per VM. That matters when anything else needs host memory, such as activation offloading. The
+  two flags already in the `LIBTPU_INIT_ARGS` above shrink the pool to 4 GiB per process, 32 GiB per
+  VM, and both are needed:
+
+  ```bash
+  --megascale_grpc_premap_memory_bytes=4294967296    # 4 GiB per process
+  --megascale_use_numa_aware_block_allocator=false   # one pool per process, not one per NUMA node
+  ```
