@@ -958,6 +958,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
     for group in (
         tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
         tpu_flags.ICI_AG_PIPELINING,
+        tpu_flags.SPARSECORE_ASYNC_ALL_GATHER,
     ):
       self.assertEqual(
           {name: config.libtpu_init_flags[name] for name in group}, group
@@ -967,6 +968,16 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
             "xla_tpu_layer_scheduler_min_compute_latency_for_backward_pass"
         ],
         "25000000",
+    )
+    self.assertEqual(
+        config.libtpu_init_flags["xla_tpu_copy_insertion_use_region_analysis"],
+        "true",
+    )
+    self.assertEqual(
+        config.libtpu_init_flags[
+            "xla_tpu_copy_insertion_use_region_analysis_limit"
+        ],
+        "1000",
     )
 
   def test_235b_proxy_keeps_the_layer_shape_and_drops_the_count(self) -> None:

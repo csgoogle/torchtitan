@@ -82,6 +82,13 @@ _Q235_SHARED_FLAGS = tpu_flags.merge_flags(
         # with the FSDP collectives. In the isolated A/B this moved MFU only
         # from 18.425% to 18.448% and did not itself create D2H overlap.
         "xla_tpu_enable_offloading_copy_to_sparsecore": False,
+        # Prove the true copy/overwrite ordering across donated aliases. This
+        # removed the defensive activation snapshot, moved all 93 measured D2H
+        # waits to zero, and improved MFU from 18.528% to 19.490% in the A/B.
+        "xla_tpu_copy_insertion_use_region_analysis": True,
+        # Use the tested search budget for the large Q235 layer regions. This
+        # value was evaluated together with region analysis, not in isolation.
+        "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
     },
 )
 
@@ -93,14 +100,26 @@ _Q235_COMPILED_OFFLOAD_FLAGS = tpu_flags.merge_flags(
     tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
     # Use both SparseCores for reduce-scatter in the by-layer FSDP schedule.
     tpu_flags.DUAL_SPARSECORE_REDUCE_SCATTER,
+)
+
+# What the scan-layers line adds on top.
+_Q235_SCAN_FLAGS = tpu_flags.merge_flags(
+    _Q235_SHARED_FLAGS,
+    # Each layer's expert-gradient reduce-scatters land at the end of the scan
+    # body with little compute left to hide them.
+    tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
+    tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
+    tpu_flags.ICI_AG_PIPELINING,
+    tpu_flags.SPARSECORE_ASYNC_ALL_GATHER,
+    # As the splitter does: it halves the expert-weight all-gather wait.
+    tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
     {
-        # Prove the true copy/overwrite ordering across donated aliases. This
-        # removed the defensive activation snapshot, moved all 93 measured D2H
-        # waits to zero, and improved MFU from 18.528% to 19.490% in the A/B.
-        "xla_tpu_copy_insertion_use_region_analysis": True,
-        # Use the tested search budget for the large Q235 layer regions. This
-        # value was evaluated together with region analysis, not in isolation.
-        "xla_tpu_copy_insertion_use_region_analysis_limit": 1000,
+        # Raise the backward layer scheduler compute threshold so expert
+        # gradient reduce-scatters overlap with the expert matmul (otherwise
+        # the smaller SwiGLU backward fusion gets chosen for overlap).
+        "xla_tpu_layer_scheduler_min_compute_latency_for_backward_pass": (
+            25000000
+        ),
     },
 )
 
@@ -1015,22 +1034,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   # without them runs ~10% slow.
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
-      _Q235_SHARED_FLAGS,
-      # Each layer's expert-gradient reduce-scatters land at the end of the scan
-      # body with little compute left to hide them.
-      tpu_flags.HIERARCHICAL_REDUCE_SCATTER,
-      tpu_flags.SELECTIVE_ICI_RS_PIPELINING,
-      tpu_flags.ICI_AG_PIPELINING,
-      # As the splitter does: it halves the expert-weight all-gather wait.
-      tpu_flags.SPARSECORE_LATENCY_HIDING_SCHEDULER,
-      {
-          # Raise the backward layer scheduler compute threshold so expert
-          # gradient reduce-scatters overlap with the expert matmul (otherwise
-          # the smaller SwiGLU backward fusion gets chosen for overlap).
-          "xla_tpu_layer_scheduler_min_compute_latency_for_backward_pass": (
-              25000000
-          ),
-      },
+      _Q235_SCAN_FLAGS,
   )
   return cfg
 
