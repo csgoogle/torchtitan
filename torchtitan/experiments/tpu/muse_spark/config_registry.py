@@ -52,13 +52,24 @@ def _tpu_moe_converters():
 
 
 def _use_pallas_grouped_mm(
-    config: TPUTrainerConfig, *, tile_m: int, tile_k: int = 0, tile_n: int = 0
+    config: TPUTrainerConfig,
+    *,
+    tile_m: int,
+    tile_k: int = 0,
+    tile_n: int = 0,
+    tgmm_tiling: tuple[int, int, int] = (512, 1024, 0),
 ) -> None:
   """Runs the routed experts with the Pallas segment matmul.
 
   Native ``torch._grouped_mm`` dWeight is incorrect at large M on TPU
   (https://github.com/google-pytorch/torch_tpu/issues/2668), which is why the
   Qwen3 MoE recipes use Pallas as well.
+
+  ``tgmm_tiling`` is the (M, K, N) tiling of the expert weight-gradient kernel.
+  Its (128, 128, 128) default made ``moe_tgmm_wgrad`` 76% of the 220B-A44B
+  step on tpu7x-4x4x4 (326 ms per call at <1% of peak). (512, 1024, 0) keeps
+  the FP32 dWeight window at 1024 x N, which fits 64 MiB VMEM for N = 4096; a
+  2048 K tile with a full 4096 N does not.
   """
   for _, experts, _, _ in config.model_spec.model.traverse(
       TpuGroupedExperts.Config
@@ -67,6 +78,7 @@ def _use_pallas_grouped_mm(
     experts.pallas_grouped_mm_tile_m = tile_m
     experts.pallas_grouped_mm_tile_k = tile_k
     experts.pallas_grouped_mm_tile_n = tile_n
+    experts.pallas_grouped_mm_tgmm_tiling = tgmm_tiling
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
