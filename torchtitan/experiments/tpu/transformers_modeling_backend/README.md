@@ -1,24 +1,22 @@
 # HF transformers backend on TPU
 
-Train the architecture of (almost) any Hugging Face causal LM on Cloud TPU with TorchTPU, without
-porting the model. This is the TPU lane of the
+Train decoder-only text models from the Hugging Face Hub on Cloud TPU with TorchTPU, without porting
+the model. This is the TPU lane of the
 [HF transformers modeling backend](../../transformers_modeling_backend/README.md): the model is built
 from the checkpoint's `config.json` (weights are random-init), sharded with SimpleFSDP, and runs with
 TPU kernels swapped in underneath HF's modeling code.
 
-> **Status: experimental.** Unlike the upstream HF backend, this lane is not production-ready. It is
-> meant for bring-up, coverage and performance work on TPU: there is no expert parallelism yet, MoE
-> models are bound by expert-weight communication, and some architectures fall back to slower paths.
-> Check loss parity before relying on a new architecture.
+> **Status: experimental.** Like the upstream HF backend, this is backend coverage, not a set of
+> recommended production training recipes. It is meant for bring-up, coverage and performance work on
+> TPU: there is no expert parallelism yet, MoE models are bound by expert-weight communication, and
+> some architectures fall back to slower paths. Check loss parity before relying on a new architecture.
 
 ## Coverage
 
-Tested on the most-downloaded text-generation checkpoints on the Hub: **533 of 585** train on v6e
-(474 at full size on v6e-8 / v6e-32, the rest at debug scale), across 73 architectures, including
-Llama, Qwen 2/3/3.5, Mistral/Mixtral, Gemma 2/3/4, Phi, OLMo/OLMoE, Granite, DeepSeek-V2,
-Falcon-H1, LFM2, Jamba and Mamba. "Trains" means: builds, compiles, and the loss decreases over 12
-steps at batch 1, sequence 2048. Known gaps: some hybrid models need eager mode, a few architectures
-stall in compile, and 32B-class dense models do not fit on 32 v6e chips.
+Tested on 500+ of the most-downloaded text-generation checkpoints on the Hub, across multiple
+architectures: Llama, Qwen, Mistral/Mixtral, Gemma, Phi, OLMo/OLMoE, Granite, DeepSeek, Falcon-H1, LFM2,
+Mamba and more. Models up to 10B parameters were tested at full size on v6e-8, 10-35B at full size on
+v6e-32, and larger ones at a reduced debug size (the architecture, not the full model).
 
 ## Optimizations enabled out of the box
 
