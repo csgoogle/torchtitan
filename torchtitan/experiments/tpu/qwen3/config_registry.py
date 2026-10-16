@@ -667,7 +667,8 @@ def _qwen3_moe_30b_fsdp_only_full_ac() -> TPUTrainerConfig:
   cfg.tpu_config = TPUConfig(
       use_graph_trainer=True,
       compile_mode="aot_fx_trace",
-      graph_trainer_memory_policy="full",
+      graph_trainer_memory_policy="tpu_selective",
+      graph_trainer_save_regions=("moe.routing", "attention.inner_attention"),
       enable_graph_trainer_remat_schedule=True,
       compile_grad_norm=True,
       fsdp_allreduce_slice_parameter_patterns=(
@@ -805,6 +806,11 @@ def _qwen3_moe_235b_fsdp_only() -> TPUTrainerConfig:
   # FSDP-128, HSDP, and BF16 recipes violate that pass's current validator.
   cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
   cfg.tpu_config.fsdp_allreduce_slice_max_input_bytes = 0
+  # Likewise, the 30B tpu_selective saves were measured only on 30B, so
+  # Q235 keeps plain full rematerialization unless a recipe picks another
+  # policy.
+  cfg.tpu_config.graph_trainer_memory_policy = "full"
+  cfg.tpu_config.graph_trainer_save_regions = ()
   cfg.model_spec = model_registry(
       "235B-A22B",
       attn_backend="sdpa",
@@ -1022,6 +1028,8 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.parallelism.fsdp_reshard_after_forward = "always"
   cfg.tpu_config.use_scan_layers = True
   cfg.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
+  # The 30B recipe's save regions apply only to tpu_selective.
+  cfg.tpu_config.graph_trainer_save_regions = ()
   # The 30B chain coalesces its packed-QKV and `wo` reductions (#419). This
   # model packs no QKV and scan leaves no per-layer FQN to match, so the pass
   # would find none of its targets and refuse to run.

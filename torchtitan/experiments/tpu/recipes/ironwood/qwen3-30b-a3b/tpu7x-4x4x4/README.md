@@ -73,10 +73,33 @@ On top of that schedule, hierarchical n-D reduce-scatter improved throughput
 by another 1.09% and raised ring-equivalent reduce-scatter bus bandwidth from
 351.29 to 364.57 GB/s.
 
+## Memory policy
+
+The recipe uses the `tpu_selective` memory policy: backward recomputes
+everything that `full` would, except two save regions. `moe.routing` keeps each
+MoE layer's routing decisions (router top-k ids and the token sort
+permutation, under 1 MiB per layer). `attention.inner_attention` keeps each
+layer's Splash output and LSE, so backward doesn't rerun the forward Splash
+kernel. Against plain `full`, this was 2.9% faster per step for about
+13.5 GiB more peak HBM per device. To trade that speed back for memory, add
+`--tpu_config.graph_trainer_memory_policy=full --tpu_config.graph_trainer_save_regions`
+(the second flag, with no values, clears the save regions, which only apply
+to `tpu_selective`).
+
+Saving the Splash output in only the last N layers trades speed for memory
+in proportion, about 0.28 GiB per layer. For example, the last 24 layers were
+1.6% faster than `full` for 6.8 GiB more peak HBM:
+`--tpu_config.graph_trainer_save_regions moe.routing --tpu_config.graph_trainer_save_last_n_layers attention.inner_attention 24`.
+
 ## Benchmark Results
-Run Date: 9/28/2026
-* **MFU:** 13.42%
-* **TPS (Tokens Per Second):** 7,490
-* **TFLOPS:** 154.78
-* **Memory Usage:** 65.48 GiB (68.21%)
-* **Step Time (end-to-end):** 1.700s
+Run Date: 10/13/2026 (mean of steps 10-30)
+* **MFU:** 18.02% (20.12% with torchtitan FLOPs)
+* **TPS (Tokens Per Second):** 10,056
+* **TFLOPS:** 207.82 (232.12 with torchtitan FLOPs)
+* **Memory Usage:** 76.09 GiB (79.26%)
+* **Step Time (end-to-end):** 1.222s
+
+MFU and TFLOPS were logged with MaxText's FLOPs count, which halves attention
+FLOPs for the causal mask. torchtitan's count, which #586 makes the default for
+recipes not named `*maxtext*`, is 11.7% higher at sequence length 2048. Step
+time, TPS and memory don't depend on the count.
