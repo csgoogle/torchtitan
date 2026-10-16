@@ -116,3 +116,12 @@ per-rank token count.
 activation-checkpoint:full                              # or :selective (default), :none; put last
 ```
 
+
+## Summary
+
+The TPU HF backend is the fastest way to get a Hugging Face architecture training on TPU: point
+`--hf_model` at a checkpoint, and splash attention, the fused cross entropy, per-layer compile and
+(for MoE) the Pallas grouped matmuls are already on. Use it to bring up new architectures, check
+coverage, compare models, and find where TPU performance work would pay off. For a production run on
+a specific model, start from a native recipe under [`recipes/`](../recipes/) instead (e.g.
+`recipes/trillium/qwen3-8b`), which is tuned per model and slice.
