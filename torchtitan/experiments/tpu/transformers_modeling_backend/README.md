@@ -71,41 +71,66 @@ the workload command.
 
 ## Common flags
 
-Append these to the quick-start command.
+Append these to the quick-start command, one flag per line below.
 
-Batch size and sequence length (token budgets, per data-parallel rank):
+### Batch size and sequence length
+
+There is no separate batch-size flag: batches are token budgets. Per-chip batch size (in sequences) is
+`num_tokens_per_microbatch_per_dp_rank / max_context_length`.
 
 ```bash
---training.max_context_length=4096                   # sequence length
---training.num_tokens_per_microbatch_per_dp_rank=8192  # per-chip microbatch: 2 sequences of 4096
---training.num_tokens_per_train_step=1048576         # global batch; larger than one microbatch on every
-                                                     # rank means gradient accumulation
+--training.max_context_length=4096                      # sequence length
+--training.num_tokens_per_microbatch_per_dp_rank=16384  # 4 sequences of 4096 per chip
+--training.num_tokens_per_train_step=1048576            # global batch; above microbatch x chips
+                                                        # means gradient accumulation
 ```
 
-Optimizer and schedule (AdamW by default):
+### Optimizer and schedule (AdamW by default)
 
 ```bash
 --optimizer.param_groups.0.optimizer_kwargs.lr=3e-4
 --optimizer.param_groups.0.optimizer_kwargs.weight_decay=0.1
---lr_scheduler.warmup_steps=200 --lr_scheduler.decay_type=cosine --lr_scheduler.min_lr_factor=0.1
---training.steps=10000 --training.max_norm=1.0 --debug.seed=42
---training.mixed_precision_param=float32             # bf16 by default
+--lr_scheduler.warmup_steps=200
+--lr_scheduler.decay_type=cosine
+--lr_scheduler.min_lr_factor=0.1
+--training.steps=10000
+--training.max_norm=1.0
+--training.mixed_precision_param=float32                # bf16 by default
+--debug.seed=42
 ```
 
-Turning features on and off:
+### Splash attention tuning
+
+Block sizes default to 1024 (the measured optimum on packed 2048-token sequences); each is stepped down
+to the largest size that divides the sequence length. Other `sa_*` fields are ignored by this kernel
+and reported once.
 
 ```bash
---compile.no-enable                  # eager: debugging, and the attention fallback report
---config=hf_full_max_plain_ce        # model's own head + plain cross entropy instead of the fused CE
---config=hf_moe_auto_compile         # MoE without the Pallas grouped matmuls
---hf_config_overrides='{"num_hidden_layers": 4}'   # edit the checkpoint's config (JSON)
---loss.b_block_size=256              # fused-CE token tile; must divide the per-rank token count
-activation-checkpoint:full           # or :selective (default) / :none; a subcommand, put it last
+--splash_attention_kernel.sa_block_q=512
+--splash_attention_kernel.sa_block_kv=512
+--splash_attention_kernel.sa_block_kv_compute=512
+--splash_attention_kernel.sa_block_q_dkv=512
+--splash_attention_kernel.sa_block_kv_dkv=512
+--splash_attention_kernel.sa_block_kv_dkv_compute=512
+--splash_attention_kernel.no-sa_use_document_aware_block_skipping  # mask, don't skip, documents
 ```
 
-Profiling (xprof trace of step 10):
+### Turning features on and off
 
 ```bash
---profiler.enable_profiling --profiler.profile_freq=10 --profiler.save_traces_folder=/tmp/xprof \
-    --tpu_config.use_jax_profiler
+--compile.no-enable                                     # eager (shows attention fallbacks)
+--config=hf_full_max_plain_ce                           # model's own head, plain CE
+--config=hf_moe_auto_compile                            # MoE without the Pallas grouped matmuls
+--hf_config_overrides='{"num_hidden_layers": 4}'        # JSON edits to config.json
+--loss.b_block_size=256                                 # fused-CE token tile (divides tokens/rank)
+activation-checkpoint:full                              # or :selective (default), :none; put last
+```
+
+### Profiling (xprof trace of step 10)
+
+```bash
+--profiler.enable_profiling
+--profiler.profile_freq=10
+--profiler.save_traces_folder=/tmp/xprof
+--tpu_config.use_jax_profiler
 ```
