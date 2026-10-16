@@ -1,13 +1,8 @@
 """Tokamax Splash Attention kernel setup."""
 
 import jax
-
-try:
-  from tokamax._src.ops.splash_attention import splash_attention_kernel
-  from tokamax._src.ops.splash_attention import splash_attention_mask
-except ImportError:
-  from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel
-  from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask
 import torchtitan.tools.logging
 
 logger = torchtitan.tools.logging.logger
