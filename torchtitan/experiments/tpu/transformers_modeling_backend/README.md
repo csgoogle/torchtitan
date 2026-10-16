@@ -61,6 +61,51 @@ torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
     --training.steps=20
 ```
 
-`--hf_model` takes a Hub id or a local directory with a `config.json`. Use `hf_moe_auto` for MoE
-checkpoints, `hf_full_max_plain_ce` for heads the fused CE refuses (e.g. a head bias), and add
-`activation-checkpoint:full` (last on the command line) for models near the HBM limit.
+`--hf_model` takes a Hub id or a local directory with a `config.json` (only the config is read, so a
+gated repo's config can be copied locally). Use `hf_moe_auto` for MoE checkpoints.
+
+To train on GKE (multi-host slices such as v6e-8 and larger), follow
+[Multi-host model training on GKE](../README.md#multi-host-model-training-on-gke) in the main TPU
+README: build and push the image, then pass the same `--module`, `--config` and `--hf_model` flags in
+the workload command.
+
+## Common flags
+
+Append these to the quick-start command.
+
+Batch size and sequence length (token budgets, per data-parallel rank):
+
+```bash
+--training.max_context_length=4096                   # sequence length
+--training.num_tokens_per_microbatch_per_dp_rank=8192  # per-chip microbatch: 2 sequences of 4096
+--training.num_tokens_per_train_step=1048576         # global batch; larger than one microbatch on every
+                                                     # rank means gradient accumulation
+```
+
+Optimizer and schedule (AdamW by default):
+
+```bash
+--optimizer.param_groups.0.optimizer_kwargs.lr=3e-4
+--optimizer.param_groups.0.optimizer_kwargs.weight_decay=0.1
+--lr_scheduler.warmup_steps=200 --lr_scheduler.decay_type=cosine --lr_scheduler.min_lr_factor=0.1
+--training.steps=10000 --training.max_norm=1.0 --debug.seed=42
+--training.mixed_precision_param=float32             # bf16 by default
+```
+
+Turning features on and off:
+
+```bash
+--compile.no-enable                  # eager: debugging, and the attention fallback report
+--config=hf_full_max_plain_ce        # model's own head + plain cross entropy instead of the fused CE
+--config=hf_moe_auto_compile         # MoE without the Pallas grouped matmuls
+--hf_config_overrides='{"num_hidden_layers": 4}'   # edit the checkpoint's config (JSON)
+--loss.b_block_size=256              # fused-CE token tile; must divide the per-rank token count
+activation-checkpoint:full           # or :selective (default) / :none; a subcommand, put it last
+```
+
+Profiling (xprof trace of step 10):
+
+```bash
+--profiler.enable_profiling --profiler.profile_freq=10 --profiler.save_traces_folder=/tmp/xprof \
+    --tpu_config.use_jax_profiler
+```
