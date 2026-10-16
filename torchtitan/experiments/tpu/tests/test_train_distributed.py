@@ -76,58 +76,50 @@ class TrainDistributedTest(
       # flux
       dict(
           testcase_name="flux_tp",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
-          skip_devices=[
-              # b/501467380 - Error during backward pass
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
       dict(
           testcase_name="flux_tp_compile",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
           skip_devices=[
-              # b/501466433 - Bug with torch.compile
-              device_type.AcceleratorDeviceType.TPU,
+              # b/501466433 - Bug with torch.compile (not reproducible on TPU
+              # with flux_testmodel).
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
       dict(
           testcase_name="flux_fsdp",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
-          skip_devices=[
-              # b/501467380 - Error during backward pass
-              device_type.AcceleratorDeviceType.TPU,
-          ],
       ),
       dict(
           testcase_name="flux_fsdp_compile",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=-1,
           tensor_parallel_degree=1,
           dataset_path="tests/assets/cc12m_test",
           dataset="cc12m-test",
           enable_compile=True,
           skip_devices=[
-              # b/501466433 - Bug with torch.compile
-              device_type.AcceleratorDeviceType.TPU,
+              # b/501466433 - Bug with torch.compile (not reproducible on TPU
+              # with flux_testmodel).
               device_type.AcceleratorDeviceType.CPU,
               device_type.AcceleratorDeviceType.CUDA,
           ],
@@ -466,7 +458,11 @@ class TrainDistributedTest(
       args: list[str] | None = None,
   ):
     # TODO(b/574254920): Broken by cl/1000231955 re-enable when fixed
-    if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
+    # Flux has no position_ids, so it is not affected.
+    if (
+        self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU
+        and not module.endswith("flux")
+    ):
       self.skipTest("b/574254920: broken by cl/1000231955")
     # Upstream replaced seq_len/local_batch_size with a token budget:
     # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len, with
@@ -484,7 +480,7 @@ class TrainDistributedTest(
         "--training.mixed_precision_reduce=float32",
         (
             "--training.num_tokens_per_microbatch_per_dp_rank="
-            f"{128 if module == 'flux' else 512}"
+            f"{128 if module.endswith('flux') else 512}"
         ),
     ]
     if not args:
@@ -494,11 +490,6 @@ class TrainDistributedTest(
     # This allows test cases to override default arguments.
     combined_args = default_args + args
 
-    if module == "flux":
-      combined_args.extend([
-          "--encoder.t5_encoder=tests/assets/flux_test_encoders/t5-micro",
-          "--encoder.clip_encoder=tests/assets/flux_test_encoders/clip-micro",
-      ])
     if checkpoint_enabled:
       test_tmp_dir = tempfile.mkdtemp()
       self.addCleanup(shutil.rmtree, test_tmp_dir, ignore_errors=True)

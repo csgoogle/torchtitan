@@ -231,8 +231,8 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       ),
       dict(
           testcase_name="flux_tp_dtensor",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
@@ -240,8 +240,8 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
       ),
       dict(
           testcase_name="flux_tp_dtensor_compile",
-          module="flux",
-          config="flux_debugmodel",
+          module="torchtitan.experiments.tpu.flux",
+          config="flux_testmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=-1,
           dataset_path="tests/assets/cc12m_test",
@@ -278,11 +278,6 @@ class Qwen3DTensorParallelizeTest(base_distributed_device_test.BaseDistributedDe
         "--training.max_context_length=32",
         "--training.steps=3",
     ]
-    if module == "flux":
-      args.extend([
-          "--encoder.t5_encoder=tests/assets/flux_test_encoders/t5-micro",
-          "--encoder.clip_encoder=tests/assets/flux_test_encoders/clip-micro",
-      ])
     # Activation checkpoint configuration refactored to use tyro subcommands.
     # This must go last as tyro expects all subsequent flags to be part of the
     # subcommand.
