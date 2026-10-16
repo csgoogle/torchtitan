@@ -18,6 +18,18 @@ architectures: Llama, Qwen, Mistral/Mixtral, Gemma, Phi, OLMo/OLMoE, Granite, De
 Mamba and more. Models up to 10B parameters were tested at full size on v6e-8, 10-35B at full size on
 v6e-32, and larger ones at a reduced debug size (the architecture, not the full model).
 
+### Model sizes: full vs debug
+
+Config names say which size is built; `--hf_model` always picks the architecture (attention type,
+MLP/MoE, norms, ...):
+
+- `hf_full_*` and `hf_moe_auto*` build the checkpoint at its own size: the shapes in its `config.json`
+  are used as-is.
+- `hf_debugmodel` overrides the size with a two-layer debug model (hidden size 256, 16 heads);
+  `hf_debugmodel_max` and the other `hf_debugmodel_kernels_*` configs use a two-layer model shaped for
+  the TPU kernels (hidden size 512, 4 query / 2 KV heads, head_dim 128). Use these for smoke tests,
+  parity tests, and for architectures too large to build at full size.
+
 ## Optimizations enabled out of the box
 
 With `hf_full_max` (dense) or `hf_moe_auto` (MoE), no flags needed:
