@@ -465,6 +465,9 @@ class TrainDistributedTest(
       dataset="c4_test",
       args: list[str] | None = None,
   ):
+    # TODO(b/574254920): Broken by cl/1000231955 re-enable when fixed
+    if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
+      self.skipTest("b/574254920: broken by cl/1000231955")
     # Upstream replaced seq_len/local_batch_size with a token budget:
     # num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len, with
     # seq_len = 128 here, so 1 * 128 for flux and 4 * 128 otherwise.
