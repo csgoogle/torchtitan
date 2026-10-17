@@ -35,6 +35,7 @@ __all__ = [
     "muse_spark_6b_gt_split_offload_donate",
     "muse_spark_220b_4x4x4_gt_split_offload_donate",
     "muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts",
+    "muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts_2seq",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -389,4 +390,20 @@ def muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts() -> (
       TpuGroupedExperts.Config
   ):
     experts.flatten_expert_axis_for_fsdp = True
+  return config
+
+
+def muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts_2seq() -> (
+    TPUTrainerConfig
+):
+  """The flattened-expert split recipe with two 8192-token rows per device.
+
+  16384 tokens per device per step (2.10M tokens per step on 128 devices),
+  context still 8192. The doubled compute hides the expert-gradient
+  reduce-scatters (exposed wait 2.52 -> 0.22 s per TC) while weight-sized
+  collectives and copies stay flat: 24.9% MFU vs 17.35% at one row, peak HBM
+  83.1 / 94.7 GiB.
+  """
+  config = muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts()
+  config.training.num_tokens_per_microbatch_per_dp_rank = 2 * _220B_CONTEXT_LENGTH
   return config
