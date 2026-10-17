@@ -32,6 +32,8 @@ __all__ = [
     "muse_spark_220b_4x4x4_gt_split",
     "muse_spark_6b_gt_split_offload",
     "muse_spark_220b_4x4x4_gt_split_offload",
+    "muse_spark_6b_gt_split_offload_donate",
+    "muse_spark_220b_4x4x4_gt_split_offload_donate",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -342,4 +344,30 @@ def muse_spark_220b_4x4x4_gt_split_offload() -> TPUTrainerConfig:
   """``muse_spark_220b_4x4x4_gt_split`` with saved activations on host."""
   config = muse_spark_220b_4x4x4_gt_split()
   _offload_saved_activations(config)
+  return config
+
+
+def _donate_split_boundary_buffers(config: TPUTrainerConfig) -> None:
+  """Lets each split executable reuse its dead boundary inputs.
+
+  With activations offloaded, the 220B first backward stage still needs 39 GiB
+  of scratch against 35.8 GiB free; the dead split-boundary buffers held
+  between executables are the remaining slack. Donation stays off by default
+  only because TorchTPU's compilation cache key omits it (torch_tpu#3614), and
+  identical layer executables here share one donation pattern.
+  """
+  config.tpu_config.graph_split.donate_internal_buffers = True
+
+
+def muse_spark_6b_gt_split_offload_donate() -> TPUTrainerConfig:
+  """``muse_spark_6b_gt_split_offload`` donating dead split-boundary buffers."""
+  config = muse_spark_6b_gt_split_offload()
+  _donate_split_boundary_buffers(config)
+  return config
+
+
+def muse_spark_220b_4x4x4_gt_split_offload_donate() -> TPUTrainerConfig:
+  """``muse_spark_220b_4x4x4_gt_split_offload`` with boundary donation."""
+  config = muse_spark_220b_4x4x4_gt_split_offload()
+  _donate_split_boundary_buffers(config)
   return config
