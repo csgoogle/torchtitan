@@ -79,6 +79,9 @@ def _use_pallas_grouped_mm(
     experts.pallas_grouped_mm_tile_k = tile_k
     experts.pallas_grouped_mm_tile_n = tile_n
     experts.pallas_grouped_mm_tgmm_tiling = tgmm_tiling
+    # Store expert weights in the (E, K, N) order the kernels consume, so the
+    # gathered banks are not transposed before every grouped matmul.
+    experts.use_kernel_native_weight_layout = True
 
 
 def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
