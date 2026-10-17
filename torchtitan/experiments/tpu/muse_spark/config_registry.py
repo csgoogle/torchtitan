@@ -36,6 +36,7 @@ __all__ = [
     "muse_spark_220b_4x4x4_gt_split_offload_donate",
     "muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts",
     "muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts_2seq",
+    "muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts_3seq",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -406,4 +407,18 @@ def muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts_2seq() -> (
   """
   config = muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts()
   config.training.num_tokens_per_microbatch_per_dp_rank = 2 * _220B_CONTEXT_LENGTH
+  return config
+
+
+def muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts_3seq() -> (
+    TPUTrainerConfig
+):
+  """The flattened-expert split recipe with three 8192-token rows per device.
+
+  24576 tokens per device per step (3.15M per step on 128 devices). v015:
+  22.94 s/step, 26.75% MFU (vs 24.91% at two rows). Peak HBM 90.9 / 94.7
+  GiB: no room for a fourth row without memory work.
+  """
+  config = muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts()
+  config.training.num_tokens_per_microbatch_per_dp_rank = 3 * _220B_CONTEXT_LENGTH
   return config
