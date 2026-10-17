@@ -28,6 +28,8 @@ __all__ = [
     "muse_spark_220b_4x4x4",
     "muse_spark_6b_gt",
     "muse_spark_220b_4x4x4_gt",
+    "muse_spark_6b_gt_split",
+    "muse_spark_220b_4x4x4_gt_split",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -119,6 +121,28 @@ def _use_graph_trainer(config: TPUTrainerConfig) -> None:
       enable_graph_trainer_remat_schedule=True,
       graph_trainer_fsdp_schedule="prefetch",
   )
+
+
+def _use_graph_split_fsdp_pipeline(config: TPUTrainerConfig) -> None:
+  """GraphTrainer with one-layer executables and a pipelined FSDP backward.
+
+  The joint graph of the 220B recipe needs 108 GiB of HBM: overlapping every
+  layer's gradient reduce-scatter keeps many unsharded FP32 expert gradients
+  (4 GiB each) alive at once. Splitting forward and backward into one-layer
+  executables bounds that, and ``fsdp_pipeline`` moves each layer's all-gather
+  one stage earlier and its reduce-scatter one stage later, so they overlap the
+  neighbouring layer's compute. As in the Qwen3-235B tpu7x-4x4x4 recipe.
+  """
+  _use_graph_trainer(config)
+  tpu = config.tpu_config
+  # Graph splitting replaces the FSDP schedule and the remat schedule.
+  tpu.graph_trainer_fsdp_schedule = "none"
+  tpu.enable_graph_trainer_remat_schedule = False
+  tpu.use_graph_split = True
+  tpu.graph_split.forward_layers_per_executable = 1
+  tpu.graph_split.forward_isolate_prefix = True
+  tpu.graph_split.backward_partition_mode = "fsdp_pipeline"
+  tpu.graph_split.backward_layers_per_executable = 1
 
 
 def muse_spark_debugmodel() -> TPUTrainerConfig:
@@ -276,4 +300,18 @@ def muse_spark_220b_4x4x4_gt() -> TPUTrainerConfig:
   """``muse_spark_220b_4x4x4`` on the TPU GraphTrainer."""
   config = muse_spark_220b_4x4x4()
   _use_graph_trainer(config)
+  return config
+
+
+def muse_spark_6b_gt_split() -> TPUTrainerConfig:
+  """``muse_spark_6b`` on the GraphTrainer with a pipelined FSDP graph split."""
+  config = muse_spark_6b()
+  _use_graph_split_fsdp_pipeline(config)
+  return config
+
+
+def muse_spark_220b_4x4x4_gt_split() -> TPUTrainerConfig:
+  """``muse_spark_220b_4x4x4`` on the GraphTrainer with a pipelined FSDP split."""
+  config = muse_spark_220b_4x4x4()
+  _use_graph_split_fsdp_pipeline(config)
   return config
