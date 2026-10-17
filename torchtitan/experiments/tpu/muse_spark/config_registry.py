@@ -34,6 +34,7 @@ __all__ = [
     "muse_spark_220b_4x4x4_gt_split_offload",
     "muse_spark_6b_gt_split_offload_donate",
     "muse_spark_220b_4x4x4_gt_split_offload_donate",
+    "muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -370,4 +371,22 @@ def muse_spark_220b_4x4x4_gt_split_offload_donate() -> TPUTrainerConfig:
   """``muse_spark_220b_4x4x4_gt_split_offload`` with boundary donation."""
   config = muse_spark_220b_4x4x4_gt_split_offload()
   _donate_split_boundary_buffers(config)
+  return config
+
+
+def muse_spark_220b_4x4x4_gt_split_offload_donate_flat_experts() -> (
+    TPUTrainerConfig
+):
+  """``muse_spark_220b_4x4x4_gt_split_offload_donate`` with flattened experts.
+
+  64 experts on 128 FSDP ranks shard the ``[E, K, N]`` banks on K, which costs
+  a relayout around every expert all-gather and gradient reduce-scatter (in
+  v009: 1.11 s of f32 gradient relayouts + 0.69 s of bf16 bank copies per
+  step). Storing each bank as ``[E*K, N]`` shards it contiguously on axis 0.
+  """
+  config = muse_spark_220b_4x4x4_gt_split_offload_donate()
+  for _, experts, _, _ in config.model_spec.model.traverse(
+      TpuGroupedExperts.Config
+  ):
+    experts.flatten_expert_axis_for_fsdp = True
   return config

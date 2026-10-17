@@ -120,6 +120,11 @@ class TpuGroupedExperts(GroupedExperts):
         # that W2's shorter K axis cannot hold.
         pallas_grouped_mm_w2_tgmm_tiling: tuple[int, int, int] | None = None
         use_kernel_native_weight_layout: bool = False
+        # Let `flatten_for_fsdp` store each `[E, K, N]` bank as `[E*K, N]` when
+        # the FSDP degree exceeds E, so FSDP shards it contiguously on axis 0
+        # instead of on an inner axis (which costs a relayout copy around every
+        # gather and gradient reduce-scatter).
+        flatten_expert_axis_for_fsdp: bool = False
 
     def __init__(self, config: Config):
         if config.use_kernel_native_weight_layout:
@@ -152,6 +157,11 @@ class TpuGroupedExperts(GroupedExperts):
         self.pallas_grouped_mm_w2_tgmm_tiling = config.pallas_grouped_mm_w2_tgmm_tiling
         self.use_kernel_native_weight_layout = config.use_kernel_native_weight_layout
         self._native_sharding_applied = False
+        self.flatten_expert_axis_for_fsdp = config.flatten_expert_axis_for_fsdp
+        # Parameter name -> its `[E, K, N]` shape, for banks stored flattened.
+        self._flat_bank_shapes: dict[str, torch.Size] = {}
+        if self.flatten_expert_axis_for_fsdp and not self.use_pallas_grouped_mm:
+            raise ValueError("Flattened expert banks require Pallas grouped matmul")
 
         if self.use_pallas_paired_grouped_mm:
             if not self.use_pallas_grouped_mm:
@@ -166,8 +176,57 @@ class TpuGroupedExperts(GroupedExperts):
         self.register_state_dict_post_hook(self._canonical_weights_on_save)
         self.register_load_state_dict_pre_hook(self._native_weights_on_load)
 
+    def flatten_for_fsdp(self, degree: int) -> list[str]:
+        """Stores each expert bank ``[E, K, N]`` as ``[E*K, N]`` for ``degree``.
+
+        Only when enabled, when ``degree`` is a multiple of E that E does not
+        divide, and when each rank's slice of the merged axis stays inside one
+        expert, so the gathered bank views back as ``[E, K, N]`` for free. Call
+        before FSDP wraps the parameters. Returns the flattened names.
+        """
+        if not self.flatten_expert_axis_for_fsdp or self._flat_bank_shapes:
+            return []
+        num_experts = self.num_experts
+        if num_experts % degree == 0:
+            return []
+        ranks_per_expert, rem = divmod(degree, num_experts)
+        if rem:
+            return []
+        flattened = []
+        for name, param in list(self._parameters.items()):
+            if param is None or param.ndim != 3 or param.shape[0] != num_experts:
+                continue
+            if param.shape[1] % ranks_per_expert:
+                continue
+            self._flat_bank_shapes[name] = param.shape
+            setattr(
+                self,
+                name,
+                torch.nn.Parameter(
+                    param.detach().reshape(-1, param.shape[-1]),
+                    requires_grad=param.requires_grad,
+                ),
+            )
+            flattened.append(name)
+        return flattened
+
+    def _bank(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        """Views a flattened ``[E*K, N]`` bank back as ``[E, K, N]``."""
+        shape = self._flat_bank_shapes.get(name)
+        return tensor if shape is None else tensor.view(shape)
+
     def _init_param(self, name: str, param: torch.nn.Parameter) -> None:
         """Initialize native storage through a canonical contiguous tensor."""
+
+        if name in self._flat_bank_shapes:
+            # The initializers are elementwise iid, so a flattened bank takes
+            # the canonical weight's initializer directly. Values differ from
+            # the unflattened draw (different RNG order), not the distribution.
+            canonical_name = {
+                native: canonical
+                for canonical, native in _CANONICAL_TO_NATIVE_WEIGHT.items()
+            }.get(name, name)
+            return Module._init_param(self, canonical_name, param)
 
         if not self.use_kernel_native_weight_layout:
             return super()._init_param(name, param)
@@ -209,7 +268,7 @@ class TpuGroupedExperts(GroupedExperts):
         """Expose kernel-native parameters in canonical checkpoint layout."""
 
         for canonical_name, native_name in _CANONICAL_TO_NATIVE_WEIGHT.items():
-            native = state_dict.pop(f"{prefix}{native_name}")
+            native = module._bank(native_name, state_dict.pop(f"{prefix}{native_name}"))
             state_dict[f"{prefix}{canonical_name}"] = native.transpose(
                 -2, -1
             ).contiguous()
@@ -221,9 +280,10 @@ class TpuGroupedExperts(GroupedExperts):
         for canonical_name, native_name in _CANONICAL_TO_NATIVE_WEIGHT.items():
             canonical_key = f"{prefix}{canonical_name}"
             if canonical_key in state_dict:
-                state_dict[f"{prefix}{native_name}"] = state_dict.pop(
-                    canonical_key
-                ).transpose(-2, -1).contiguous()
+                native = state_dict.pop(canonical_key).transpose(-2, -1).contiguous()
+                if native_name in module._flat_bank_shapes:
+                    native = native.reshape(-1, native.shape[-1])
+                state_dict[f"{prefix}{native_name}"] = native
 
     def forward(
         self,
@@ -239,13 +299,13 @@ class TpuGroupedExperts(GroupedExperts):
             return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
         if self.use_kernel_native_weight_layout:
-            w1_EKN = local_tensor(self.w1_EDF)
-            w2_EKN = local_tensor(self.w2_EFD)
-            w3_EKN = local_tensor(self.w3_EDF)
+            w1_EKN = self._bank("w1_EDF", local_tensor(self.w1_EDF))
+            w2_EKN = self._bank("w2_EFD", local_tensor(self.w2_EFD))
+            w3_EKN = self._bank("w3_EDF", local_tensor(self.w3_EDF))
         else:
-            w1_EKN = local_tensor(self.w1_EFD).transpose(-2, -1)
-            w2_EKN = local_tensor(self.w2_EDF).transpose(-2, -1)
-            w3_EKN = local_tensor(self.w3_EFD).transpose(-2, -1)
+            w1_EKN = self._bank("w1_EFD", local_tensor(self.w1_EFD)).transpose(-2, -1)
+            w2_EKN = self._bank("w2_EDF", local_tensor(self.w2_EDF)).transpose(-2, -1)
+            w3_EKN = self._bank("w3_EFD", local_tensor(self.w3_EFD)).transpose(-2, -1)
 
         # Match GroupedExperts: expert compute is BF16 even when the surrounding
         # model is FP32, and the final result is restored to the caller's dtype.
