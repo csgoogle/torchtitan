@@ -26,6 +26,8 @@ __all__ = [
     "muse_spark_debugmodel",
     "muse_spark_6b",
     "muse_spark_220b_4x4x4",
+    "muse_spark_6b_gt",
+    "muse_spark_220b_4x4x4_gt",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -98,6 +100,25 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
   )
   if _FUSED_LOSS_OVERRIDE not in config.override.imports:
     config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+
+
+def _use_graph_trainer(config: TPUTrainerConfig) -> None:
+  """Runs forward + backward as one joint graph on the TPU GraphTrainer.
+
+  XLA then schedules each layer's async FSDP all-gather and gradient
+  reduce-scatter against neighbouring layers' compute. GraphTrainer ignores the
+  eager AC config and rematerializes the joint graph instead: ``full``, because
+  the 220B recipe already peaks near HBM capacity with full AC. The ``prefetch``
+  FSDP schedule (which needs the remat schedule) is what lets Zero-3 run
+  without a graph split. The optimizer stays out of the graph.
+  """
+  config.tpu_config = TPUConfig(
+      use_graph_trainer=True,
+      compile_mode="aot_fx_trace",
+      graph_trainer_memory_policy="full",
+      enable_graph_trainer_remat_schedule=True,
+      graph_trainer_fsdp_schedule="prefetch",
+  )
 
 
 def muse_spark_debugmodel() -> TPUTrainerConfig:
@@ -241,4 +262,18 @@ def muse_spark_220b_4x4x4() -> TPUTrainerConfig:
   # (fwd + bwd checked at 65536 routed rows under a 65472 KiB scoped limit).
   _use_pallas_grouped_mm(config, tile_m=1024, tile_k=2048, tile_n=2048)
   _enable_pallas_cross_entropy(config)
+  return config
+
+
+def muse_spark_6b_gt() -> TPUTrainerConfig:
+  """``muse_spark_6b`` on the TPU GraphTrainer."""
+  config = muse_spark_6b()
+  _use_graph_trainer(config)
+  return config
+
+
+def muse_spark_220b_4x4x4_gt() -> TPUTrainerConfig:
+  """``muse_spark_220b_4x4x4`` on the TPU GraphTrainer."""
+  config = muse_spark_220b_4x4x4()
+  _use_graph_trainer(config)
   return config
