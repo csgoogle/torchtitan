@@ -232,6 +232,16 @@ class LossKernelConfig:
   enable_pallas_loss_kernel: bool = True
 
 
+def _configure_tpu_context_parallel(config: "BaseTPUTrainerConfig") -> None:
+  """Configure spmd_types and Ulysses CP attention when CP is enabled on TPU."""
+  from torchtitan.experiments.tpu.cp_attention import (  # pylint: disable=g-import-not-at-top
+      configure_tpu_context_parallel,
+  )
+
+  model = config.model_spec.model if config.model_spec is not None else None
+  configure_tpu_context_parallel(config.parallelism, model)
+
+
 # Shared base for every TPU-targeted lane (torch_tpu, jax, torchax). Holds the
 # lane-agnostic, TPU-flavored config blocks (splash attention, Pallas loss
 # kernel, LoRA, per-model toggles). The truly lane-specific runtime knobs
@@ -271,6 +281,7 @@ class BaseTPUTrainerConfig(torchtitan.trainer.Trainer.Config):
     # graph to capture in this lane, so opt out before the check runs. Must
     # come before `super()`, which is what calls `_validate_cuda_graphs`.
     self.training.disable_cuda_graphs = True
+    _configure_tpu_context_parallel(self)
     # NOTE: explicit ``super(...)`` (rather than zero-arg ``super()``) is
     # required because ``@dataclass(slots=True)`` replaces the class object
     # after decoration, leaving the ``__class__`` cell that zero-arg

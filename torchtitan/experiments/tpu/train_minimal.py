@@ -126,6 +126,8 @@ class TrainerMinimal:
     # Workaround if we run without distrubuted training.
     batch_degree, batch_rank = 1, 0
     self.batch_mesh = None
+    self.cp_mesh = None
+    self.loss_mesh = None
     if world_size > 1:
       if self.parallel_dims.dp_enabled:
         self.batch_mesh = self.parallel_dims.get_mesh("batch")
@@ -133,6 +135,11 @@ class TrainerMinimal:
             self.batch_mesh.size(), self.batch_mesh.get_local_rank())
       else:
         batch_degree, batch_rank = 1, 0
+      if self.parallel_dims.cp_enabled:
+        self.cp_mesh = self.parallel_dims.get_mesh("cp")
+      if self.parallel_dims.dp_cp_enabled:
+        # Labels are sharded over DP and CP, so token counts sum over both.
+        self.loss_mesh = self.parallel_dims.get_mesh("loss")
 
       logger.info(f"world_mesh: {self.parallel_dims.world_mesh}")
 
@@ -390,10 +397,10 @@ class TrainerMinimal:
           # Valid tokens exclude those marked with IGNORE_INDEX (pytorch
           # default is -100), representing padding or ignored tokens.
           local_valid_tokens = (labels != IGNORE_INDEX).sum().to(self.device)
-          if self.world_size > 1 and self.parallel_dims.dp_enabled:
+          if self.world_size > 1 and self.loss_mesh is not None:
             # On device, as Trainer keeps it: spmd_types losses type-check it.
             global_valid_tokens = dist_utils.dist_sum_tensor(
-                local_valid_tokens, self.batch_mesh
+                local_valid_tokens, self.loss_mesh
             )
           else:
             global_valid_tokens = local_valid_tokens.float()
@@ -414,12 +421,17 @@ class TrainerMinimal:
             gathered_tokens = tokens
             gathered_labels = labels
             gathered_positions = forward_kwargs.get("positions")
-            if self.batch_mesh is not None:
-              dp_group = self.batch_mesh.get_group()
-              gathered_tokens = _gather_along_first_dim(tokens, dp_group)
-              gathered_labels = _gather_along_first_dim(labels, dp_group)
+            # Undo the CP shard first, then the DP shard.
+            for mesh in (self.cp_mesh, self.batch_mesh):
+              if mesh is None:
+                continue
+              group = mesh.get_group()
+              gathered_tokens = _gather_along_first_dim(gathered_tokens, group)
+              gathered_labels = _gather_along_first_dim(gathered_labels, group)
               if gathered_positions is not None:
-                gathered_positions = _gather_along_first_dim(gathered_positions, dp_group)
+                gathered_positions = _gather_along_first_dim(
+                    gathered_positions, group
+                )
             callback_kwargs = {}
             if gathered_positions is not None:
               callback_kwargs["positions"] = gathered_positions

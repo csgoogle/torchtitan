@@ -487,6 +487,134 @@ class WorkaroundsTest(parameterized.TestCase):
     with self.assertNoLogs(workarounds.logger, level="WARNING"):
       workarounds.use_tokamax_splash_attention_patch(model, sa)
 
+  def test_splash_attention_patch_with_ulysses_cp(self):
+    """Splash attention patch preserves UlyssesCPInnerAttention wrapper."""
+    from torchtitan.experiments.tpu import workarounds
+    from torchtitan.models.common.attention import GQAttention as Attention
+    from torchtitan.experiments.tpu.cp_attention import (
+        UlyssesCPScaledDotProductInnerAttention,
+    )
+    from torchtitan.experiments.tpu.qwen3 import qwen3_configs
+    import copy
+
+    config = copy.deepcopy(qwen3_configs["testmodel"])
+    config.layers[0].attention.inner_attention = (
+        UlyssesCPScaledDotProductInnerAttention.Config()
+    )
+    attention_block = Attention(config=config.layers[0].attention).to("cpu")
+
+    workarounds.use_splash_attention_patch(attention_block, {"block_q": 128})
+    self.assertIsInstance(
+        attention_block.inner_attention,
+        UlyssesCPScaledDotProductInnerAttention,
+    )
+    self.assertIsNotNone(attention_block.inner_attention._local_attn_override)
+
+  def test_tpu_context_parallel_config_upgrade_and_downgrade(self):
+    """BaseTPUTrainerConfig upgrades/downgrades inner_attention and validates GQA heads."""
+    from torchtitan.experiments.tpu.qwen3 import qwen3_debugmodel
+    from torchtitan.experiments.tpu.tpu_job_config import (
+        _configure_tpu_context_parallel,
+    )
+    from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+    from torchtitan.experiments.tpu.cp_attention import (
+        UlyssesCPScaledDotProductInnerAttention,
+    )
+
+    config = qwen3_debugmodel()
+    config.parallelism.context_parallel_degree = 2
+    config.__post_init__()
+    self.assertEqual(config.parallelism.spmd_backend, "spmd_types")
+    self.assertIsNone(config.parallelism.context_parallel_load_balancer)
+    for layer in config.model_spec.model.layers:
+      self.assertIsInstance(
+          layer.attention.inner_attention,
+          UlyssesCPScaledDotProductInnerAttention.Config,
+      )
+
+    # Allow n_kv_heads < cp when cp % n_kv_heads == 0 (e.g. Qwen3.5-397B n_kv_heads=2, cp=4).
+    config.parallelism.context_parallel_degree = 4
+    for layer in config.model_spec.model.layers:
+      layer.attention.n_heads = 32
+      layer.attention.n_kv_heads = 2
+    _configure_tpu_context_parallel(config)
+    config.__post_init__()
+
+    # Reject n_kv_heads indivisible with cp.
+    for layer in config.model_spec.model.layers:
+      layer.attention.n_kv_heads = 3
+    with self.assertRaisesRegex(ValueError, r"n_kv_heads \(3\)"):
+      _configure_tpu_context_parallel(config)
+    for layer in config.model_spec.model.layers:
+      layer.attention.n_kv_heads = 2
+
+    config.parallelism.context_parallel_degree = 1
+    _configure_tpu_context_parallel(config)
+    config.__post_init__()
+    for layer in config.model_spec.model.layers:
+      self.assertIs(
+          type(layer.attention.inner_attention),
+          ScaledDotProductInnerAttention.Config,
+      )
+
+  def test_ulysses_cp_repeats_kv_heads_and_compiled_all_to_all(self):
+    """UlyssesCPScaledDotProductInnerAttention repeats KV heads when cp > n_kv_heads."""
+    from types import SimpleNamespace
+    from unittest import mock
+    import spmd_types as spmd
+    from torchtitan.experiments.tpu import cp_attention
+    from torchtitan.experiments.tpu.cp_attention import (
+        UlyssesCPScaledDotProductInnerAttention,
+    )
+
+    q = torch.randn(4, 32, 8)
+    k = torch.randn(4, 2, 8)
+    v = torch.randn(4, 2, 8)
+    captured = {}
+
+    def fake_redistribute(x, group, *, src, dst):
+      if src == spmd.S(0) and dst == spmd.S(1):
+        self.assertEqual(0, x.shape[1] % group.size())
+        return x.reshape(
+            x.shape[0] * group.size(),
+            x.shape[1] // group.size(),
+            *x.shape[2:],
+        )
+      if src == spmd.S(1) and dst == spmd.S(0):
+        return x.reshape(
+            x.shape[0] // group.size(),
+            x.shape[1] * group.size(),
+            *x.shape[2:],
+        )
+      raise AssertionError(f"unexpected redistribute: {src} -> {dst}")
+
+    def fake_local_attn(q_in, k_in, v_in, **kw):
+      captured["q_shape"] = q_in.shape
+      captured["k_shape"] = k_in.shape
+      captured["v_shape"] = v_in.shape
+      captured["enable_gqa"] = kw.get("enable_gqa")
+      return q_in
+
+    kernel = UlyssesCPScaledDotProductInnerAttention(
+        UlyssesCPScaledDotProductInnerAttention.Config()
+    )
+    kernel.set_local_attention(fake_local_attn)
+    with (
+        mock.patch.object(
+            cp_attention,
+            "spmd_mesh_group",
+            return_value=SimpleNamespace(size=lambda: 4),
+        ),
+        mock.patch.object(spmd, "redistribute", side_effect=fake_redistribute),
+    ):
+      out = kernel.forward(q, k, v, enable_gqa=True)
+
+    self.assertEqual((16, 8, 8), captured["q_shape"])
+    self.assertEqual((16, 1, 8), captured["k_shape"])
+    self.assertEqual((16, 1, 8), captured["v_shape"])
+    self.assertTrue(captured["enable_gqa"])
+    self.assertEqual((4, 32, 8), out.shape)
+
 
 if __name__ == "__main__":
   absltest.main()
