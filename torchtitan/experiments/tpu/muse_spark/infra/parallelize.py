@@ -19,6 +19,35 @@ from torchtitan.models.common.moe import MoE
 from torchtitan.tools.logging import logger
 
 
+def flatten_expert_banks_for_fsdp(
+    model: nn.Module,
+    parallel_dims: torchtitan.distributed.ParallelDims,
+) -> list[str]:
+  """Stores opted-in expert banks flattened so FSDP shards them on axis 0.
+
+  With 64 experts on 128 ranks the ``[E, K, N]`` banks would otherwise shard
+  on K, and every gather and gradient reduce-scatter pays a relayout copy (see
+  ``TpuGroupedExperts.flatten_for_fsdp``). Call before choosing shard dims.
+  """
+  from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts  # pylint: disable=g-import-not-at-top
+
+  degree = parallel_dims.dp_shard * parallel_dims.cp
+  if degree <= 1:
+    return []
+  flattened = []
+  for fqn, module in model.named_modules():
+    if isinstance(module, TpuGroupedExperts):
+      flattened += [f"{fqn}.{n}" for n in module.flatten_for_fsdp(degree)]
+  if flattened:
+    logger.info(
+        "Flattened %d expert banks for %d-way FSDP: %s",
+        len(flattened),
+        degree,
+        flattened[:3],
+    )
+  return flattened
+
+
 def configure_muse_spark_simple_fsdp_shard_dims(
     model: nn.Module,
     parallel_dims: torchtitan.distributed.ParallelDims,
@@ -144,6 +173,7 @@ def parallelize_muse_spark(
       parallel_dims.dp_shard_enabled or parallel_dims.dp_replicate_enabled
   ):
     if parallelism.use_simple_fsdp:
+      flatten_expert_banks_for_fsdp(model, parallel_dims)
       configure_muse_spark_simple_fsdp_shard_dims(model, parallel_dims)
       model = apply_simple_fsdp(
           model, parallel_dims=parallel_dims, training=training

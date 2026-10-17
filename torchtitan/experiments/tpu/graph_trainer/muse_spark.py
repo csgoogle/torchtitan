@@ -30,6 +30,7 @@ from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConf
 from torchtitan.experiments.graph_trainer.simple_fsdp import disable_active_parametrization
 from torchtitan.experiments.tpu import muse_spark as tpu_muse_spark
 from torchtitan.experiments.tpu.muse_spark.infra.parallelize import configure_muse_spark_simple_fsdp_shard_dims
+from torchtitan.experiments.tpu.muse_spark.infra.parallelize import flatten_expert_banks_for_fsdp
 from torchtitan.models.muse_spark.model import MuseSparkModel
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -75,6 +76,7 @@ def parallelize_muse_spark(
           " on TPU."
       )
   annotate_module_fqns(model)
+  flatten_expert_banks_for_fsdp(model, parallel_dims)
   configure_muse_spark_simple_fsdp_shard_dims(model, parallel_dims)
   model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
   return apply_compile(
