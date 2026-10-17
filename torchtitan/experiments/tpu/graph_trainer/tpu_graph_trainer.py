@@ -53,6 +53,7 @@ from torchtitan.experiments.tpu.graph_trainer.tpu_backend_pass import (
     register as register_tpu_pipeline,
 )
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
+from torchtitan.models.common.moe import MoE
 from torchtitan.tools.logging import logger
 
 
@@ -85,6 +86,31 @@ def _optimizer_compile_enabled(config, tpu_extra) -> bool:
     if tpu_extra is not None and getattr(tpu_extra, "optimizer_compile", False):
         return True
     return bool(getattr(config.compile, "optimizer_compile", False))
+
+
+def _load_balanced_moes(model: nn.Module) -> list[MoE]:
+    """MoE layers whose ``tokens_per_expert_E`` feeds the expert-bias update."""
+    return [
+        module
+        for module in model.modules()
+        if isinstance(module, MoE) and module.load_balance_coeff is not None
+    ]
+
+
+def _with_token_counter_outputs(fwd_bwd_fn, moes: list[MoE]):
+    """Also returns each MoE's ``tokens_per_expert_E`` after the forward.
+
+    The forward accumulates the counters with an in-place ``add_`` on module
+    buffers. The compiled TPU executable does not write input mutations back,
+    so without these outputs the load-balancing hook would read zeros and never
+    move the expert bias.
+    """
+
+    def fwd_bwd_step(*args, **kwargs):
+        outputs = fwd_bwd_fn(*args, **kwargs)
+        return [*outputs, *(moe.tokens_per_expert_E for moe in moes)]
+
+    return fwd_bwd_step
 
 
 class TpuGraphTrainer(GraphTrainer):
@@ -138,6 +164,14 @@ class TpuGraphTrainer(GraphTrainer):
 
         self._tpu_extra = tpu_extra
         self._optimizer_in_graph = _optimizer_in_graph_enabled(config, tpu_extra)
+        self._load_balanced_moes = _load_balanced_moes(self.model_parts[0])
+        if self._load_balanced_moes and (
+            self._optimizer_in_graph or config.compile.precompile_artifact_dir
+        ):
+            raise NotImplementedError(
+                "MoE load_balance_coeff on the TPU GraphTrainer requires "
+                "optimizer_in_graph=False and no precompiled FX artifact."
+            )
         self._compiled_grad_norm = (
             CompiledGradNorm() if config.tpu_config.compile_grad_norm else None
         )
@@ -358,6 +392,10 @@ class TpuGraphTrainer(GraphTrainer):
                     self.loss_fn,
                     collect_moe_routing_metrics=self._collect_moe_routing_metrics,
                 )
+                if self._load_balanced_moes:
+                    fwd_bwd_fn = _with_token_counter_outputs(
+                        fwd_bwd_fn, self._load_balanced_moes
+                    )
                 maybe_register_blockmask_pytree_node()
                 with self.train_context():
                     self._traced_step = minimal_fx_tracer(
@@ -403,6 +441,13 @@ class TpuGraphTrainer(GraphTrainer):
                 global_valid_tokens,
                 extra_kwargs,
             )
+        if self._load_balanced_moes:
+            num_counters = len(self._load_balanced_moes)
+            for moe, tokens_per_expert_E in zip(
+                self._load_balanced_moes, outputs[-num_counters:], strict=True
+            ):
+                moe.tokens_per_expert_E.copy_(tokens_per_expert_E)
+            outputs = outputs[:-num_counters]
         loss = outputs[0]
         grads = outputs[1 : 1 + len(params)]
         if self._collect_moe_routing_metrics:

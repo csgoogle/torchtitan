@@ -26,6 +26,14 @@ __all__ = [
     "muse_spark_debugmodel",
     "muse_spark_6b",
     "muse_spark_220b_4x4x4",
+    "muse_spark_6b_gt",
+    "muse_spark_220b_4x4x4_gt",
+    "muse_spark_6b_gt_split",
+    "muse_spark_220b_4x4x4_gt_split",
+    "muse_spark_6b_gt_split_offload",
+    "muse_spark_220b_4x4x4_gt_split_offload",
+    "muse_spark_6b_gt_split_offload_donate",
+    "muse_spark_220b_4x4x4_gt_split_offload_donate",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -98,6 +106,47 @@ def _enable_pallas_cross_entropy(config: TPUTrainerConfig) -> None:
   )
   if _FUSED_LOSS_OVERRIDE not in config.override.imports:
     config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+
+
+def _use_graph_trainer(config: TPUTrainerConfig) -> None:
+  """Runs forward + backward as one joint graph on the TPU GraphTrainer.
+
+  XLA then schedules each layer's async FSDP all-gather and gradient
+  reduce-scatter against neighbouring layers' compute. GraphTrainer ignores the
+  eager AC config and rematerializes the joint graph instead: ``full``, because
+  the 220B recipe already peaks near HBM capacity with full AC. The ``prefetch``
+  FSDP schedule (which needs the remat schedule) is what lets Zero-3 run
+  without a graph split. The optimizer stays out of the graph.
+  """
+  config.tpu_config = TPUConfig(
+      use_graph_trainer=True,
+      compile_mode="aot_fx_trace",
+      graph_trainer_memory_policy="full",
+      enable_graph_trainer_remat_schedule=True,
+      graph_trainer_fsdp_schedule="prefetch",
+  )
+
+
+def _use_graph_split_fsdp_pipeline(config: TPUTrainerConfig) -> None:
+  """GraphTrainer with one-layer executables and a pipelined FSDP backward.
+
+  The joint graph of the 220B recipe needs 108 GiB of HBM: overlapping every
+  layer's gradient reduce-scatter keeps many unsharded FP32 expert gradients
+  (4 GiB each) alive at once. Splitting forward and backward into one-layer
+  executables bounds that, and ``fsdp_pipeline`` moves each layer's all-gather
+  one stage earlier and its reduce-scatter one stage later, so they overlap the
+  neighbouring layer's compute. As in the Qwen3-235B tpu7x-4x4x4 recipe.
+  """
+  _use_graph_trainer(config)
+  tpu = config.tpu_config
+  # Graph splitting replaces the FSDP schedule and the remat schedule.
+  tpu.graph_trainer_fsdp_schedule = "none"
+  tpu.enable_graph_trainer_remat_schedule = False
+  tpu.use_graph_split = True
+  tpu.graph_split.forward_layers_per_executable = 1
+  tpu.graph_split.forward_isolate_prefix = True
+  tpu.graph_split.backward_partition_mode = "fsdp_pipeline"
+  tpu.graph_split.backward_layers_per_executable = 1
 
 
 def muse_spark_debugmodel() -> TPUTrainerConfig:
@@ -241,4 +290,84 @@ def muse_spark_220b_4x4x4() -> TPUTrainerConfig:
   # (fwd + bwd checked at 65536 routed rows under a 65472 KiB scoped limit).
   _use_pallas_grouped_mm(config, tile_m=1024, tile_k=2048, tile_n=2048)
   _enable_pallas_cross_entropy(config)
+  return config
+
+
+def muse_spark_6b_gt() -> TPUTrainerConfig:
+  """``muse_spark_6b`` on the TPU GraphTrainer."""
+  config = muse_spark_6b()
+  _use_graph_trainer(config)
+  return config
+
+
+def muse_spark_220b_4x4x4_gt() -> TPUTrainerConfig:
+  """``muse_spark_220b_4x4x4`` on the TPU GraphTrainer."""
+  config = muse_spark_220b_4x4x4()
+  _use_graph_trainer(config)
+  return config
+
+
+def muse_spark_6b_gt_split() -> TPUTrainerConfig:
+  """``muse_spark_6b`` on the GraphTrainer with a pipelined FSDP graph split."""
+  config = muse_spark_6b()
+  _use_graph_split_fsdp_pipeline(config)
+  return config
+
+
+def muse_spark_220b_4x4x4_gt_split() -> TPUTrainerConfig:
+  """``muse_spark_220b_4x4x4`` on the GraphTrainer with a pipelined FSDP split."""
+  config = muse_spark_220b_4x4x4()
+  _use_graph_split_fsdp_pipeline(config)
+  return config
+
+
+def _offload_saved_activations(config: TPUTrainerConfig) -> None:
+  """Keeps the forward activations saved for backward in host memory.
+
+  With the pipelined FSDP split, a backward stage of the 220B recipe needs
+  28 GiB of HBM while 74.6 GiB stay resident between executables; the saved
+  layer inputs are part of that resident set. Each reload pair is issued one
+  executable before its consumer, as in the Qwen3-235B offload recipe.
+  """
+  config.tpu_config.graph_trainer_memory_policy = "full_and_offload"
+  config.tpu_config.graph_split.cpu_offload_prefetch_executables = 1
+
+
+def muse_spark_6b_gt_split_offload() -> TPUTrainerConfig:
+  """``muse_spark_6b_gt_split`` with saved activations offloaded to host."""
+  config = muse_spark_6b_gt_split()
+  _offload_saved_activations(config)
+  return config
+
+
+def muse_spark_220b_4x4x4_gt_split_offload() -> TPUTrainerConfig:
+  """``muse_spark_220b_4x4x4_gt_split`` with saved activations on host."""
+  config = muse_spark_220b_4x4x4_gt_split()
+  _offload_saved_activations(config)
+  return config
+
+
+def _donate_split_boundary_buffers(config: TPUTrainerConfig) -> None:
+  """Lets each split executable reuse its dead boundary inputs.
+
+  With activations offloaded, the 220B first backward stage still needs 39 GiB
+  of scratch against 35.8 GiB free; the dead split-boundary buffers held
+  between executables are the remaining slack. Donation stays off by default
+  only because TorchTPU's compilation cache key omits it (torch_tpu#3614), and
+  identical layer executables here share one donation pattern.
+  """
+  config.tpu_config.graph_split.donate_internal_buffers = True
+
+
+def muse_spark_6b_gt_split_offload_donate() -> TPUTrainerConfig:
+  """``muse_spark_6b_gt_split_offload`` donating dead split-boundary buffers."""
+  config = muse_spark_6b_gt_split_offload()
+  _donate_split_boundary_buffers(config)
+  return config
+
+
+def muse_spark_220b_4x4x4_gt_split_offload_donate() -> TPUTrainerConfig:
+  """``muse_spark_220b_4x4x4_gt_split_offload`` with boundary donation."""
+  config = muse_spark_220b_4x4x4_gt_split_offload()
+  _donate_split_boundary_buffers(config)
   return config
