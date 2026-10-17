@@ -30,6 +30,8 @@ __all__ = [
     "muse_spark_220b_4x4x4_gt",
     "muse_spark_6b_gt_split",
     "muse_spark_220b_4x4x4_gt_split",
+    "muse_spark_6b_gt_split_offload",
+    "muse_spark_220b_4x4x4_gt_split_offload",
 ]
 
 _DEBUGMODEL_CONTEXT_LENGTH = 2048
@@ -314,4 +316,30 @@ def muse_spark_220b_4x4x4_gt_split() -> TPUTrainerConfig:
   """``muse_spark_220b_4x4x4`` on the GraphTrainer with a pipelined FSDP split."""
   config = muse_spark_220b_4x4x4()
   _use_graph_split_fsdp_pipeline(config)
+  return config
+
+
+def _offload_saved_activations(config: TPUTrainerConfig) -> None:
+  """Keeps the forward activations saved for backward in host memory.
+
+  With the pipelined FSDP split, a backward stage of the 220B recipe needs
+  28 GiB of HBM while 74.6 GiB stay resident between executables; the saved
+  layer inputs are part of that resident set. Each reload pair is issued one
+  executable before its consumer, as in the Qwen3-235B offload recipe.
+  """
+  config.tpu_config.graph_trainer_memory_policy = "full_and_offload"
+  config.tpu_config.graph_split.cpu_offload_prefetch_executables = 1
+
+
+def muse_spark_6b_gt_split_offload() -> TPUTrainerConfig:
+  """``muse_spark_6b_gt_split`` with saved activations offloaded to host."""
+  config = muse_spark_6b_gt_split()
+  _offload_saved_activations(config)
+  return config
+
+
+def muse_spark_220b_4x4x4_gt_split_offload() -> TPUTrainerConfig:
+  """``muse_spark_220b_4x4x4_gt_split`` with saved activations on host."""
+  config = muse_spark_220b_4x4x4_gt_split()
+  _offload_saved_activations(config)
   return config
