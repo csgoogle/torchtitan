@@ -142,6 +142,7 @@ class TPUConfig:
   # precision.
   enable_amp: bool = True
   log_freq: int = 10
+  context_parallel_strategy: Literal["ulysses", "all_gather"] = "ulysses"
   eager_mode: Literal[
       "",
       "DEFER_AND_FUSE",
@@ -233,13 +234,15 @@ class LossKernelConfig:
 
 
 def _configure_tpu_context_parallel(config: "BaseTPUTrainerConfig") -> None:
-  """Configure spmd_types and Ulysses CP attention when CP is enabled on TPU."""
+  """Configure spmd_types and TPU CP attention when CP is enabled on TPU."""
   from torchtitan.experiments.tpu.cp_attention import (  # pylint: disable=g-import-not-at-top
       configure_tpu_context_parallel,
   )
 
   model = config.model_spec.model if config.model_spec is not None else None
-  configure_tpu_context_parallel(config.parallelism, model)
+  tpu_config = getattr(config, "tpu_config", None)
+  strategy = getattr(tpu_config, "context_parallel_strategy", "ulysses")
+  configure_tpu_context_parallel(config.parallelism, model, strategy=strategy)
 
 
 # Shared base for every TPU-targeted lane (torch_tpu, jax, torchax). Holds the

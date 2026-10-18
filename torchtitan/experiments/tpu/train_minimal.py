@@ -432,6 +432,33 @@ class TrainerMinimal:
                 gathered_positions = _gather_along_first_dim(
                     gathered_positions, group
                 )
+              if (
+                  mesh is self.cp_mesh
+                  and self.job_config.parallelism.context_parallel_load_balancer
+                  == "headtail"
+              ):
+                from torchtitan.experiments.tpu.cp_attention import reorder_sequence  # pylint: disable=g-import-not-at-top
+
+                cp_degree = group.size()
+
+                def _undo_headtail(t: torch.Tensor) -> torch.Tensor:
+                  orig_shape = list(t.shape)
+                  rest = orig_shape[1:]
+                  bsz = orig_shape[0] // seq_len
+                  t_bs = (
+                      t.reshape([cp_degree, bsz, seq_len // cp_degree] + rest)
+                      .movedim(0, 1)
+                      .reshape([bsz, seq_len] + rest)
+                  )
+                  t_contig = reorder_sequence(
+                      t_bs, cp_size=cp_degree, seq_dim=1, to_contiguous=True
+                  )
+                  return t_contig.reshape(orig_shape)
+
+                gathered_tokens = _undo_headtail(gathered_tokens)
+                gathered_labels = _undo_headtail(gathered_labels)
+                if gathered_positions is not None:
+                  gathered_positions = _undo_headtail(gathered_positions)
             callback_kwargs = {}
             if gathered_positions is not None:
               callback_kwargs["positions"] = gathered_positions

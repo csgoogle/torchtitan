@@ -277,6 +277,15 @@ class TrainDistributedTest(
           context_parallel_degree=-1,
       ),
       dict(
+          testcase_name="qwen3_cp_all_gather",
+          module="torchtitan.experiments.tpu.qwen3",
+          config="qwen3_debugmodel",
+          data_parallel_shard_degree=1,
+          tensor_parallel_degree=1,
+          context_parallel_degree=-1,
+          args=["--tpu_config.context_parallel_strategy=all_gather"],
+      ),
+      dict(
           testcase_name="qwen3_simplefsdp_cp2",
           module="torchtitan.experiments.tpu.qwen3",
           config="qwen3_debugmodel",

@@ -615,6 +615,189 @@ class WorkaroundsTest(parameterized.TestCase):
     self.assertTrue(captured["enable_gqa"])
     self.assertEqual((4, 32, 8), out.shape)
 
+  def test_all_gather_cp_config_and_numerical_parity(self):
+    """KVAllGatherCPInnerAttention configures headtail load balancer and matches CP=1."""
+    from types import SimpleNamespace
+    from unittest import mock
+    import spmd_types as spmd
+    from torchtitan.experiments.tpu import cp_attention
+    from torchtitan.experiments.tpu.cp_attention import (
+        KVAllGatherCPScaledDotProductInnerAttention,
+        reorder_sequence,
+    )
+    from torchtitan.experiments.tpu.qwen3 import qwen3_debugmodel
+    from torchtitan.experiments.tpu.tpu_job_config import (
+        _configure_tpu_context_parallel,
+    )
+    from torchtitan.models.common.attention import ScaledDotProductInnerAttention
+
+    # 1. Verify config switching to strategy="all_gather" and back to cp=1.
+    config = qwen3_debugmodel()
+    config.parallelism.context_parallel_degree = 4
+    config.tpu_config.context_parallel_strategy = "all_gather"
+    # KV All-Gather does not shard heads across CP, so arbitrary n_kv_heads works.
+    for layer in config.model_spec.model.layers:
+      layer.attention.n_heads = 32
+      layer.attention.n_kv_heads = 3
+    _configure_tpu_context_parallel(config)
+    config.__post_init__()
+    self.assertEqual(config.parallelism.spmd_backend, "spmd_types")
+    self.assertEqual(
+        config.parallelism.context_parallel_load_balancer, "headtail"
+    )
+    for layer in config.model_spec.model.layers:
+      self.assertIsInstance(
+          layer.attention.inner_attention,
+          KVAllGatherCPScaledDotProductInnerAttention.Config,
+      )
+
+    config.parallelism.context_parallel_degree = 1
+    _configure_tpu_context_parallel(config)
+    config.__post_init__()
+    for layer in config.model_spec.model.layers:
+      self.assertIs(
+          type(layer.attention.inner_attention),
+          ScaledDotProductInnerAttention.Config,
+      )
+
+    # 2. Verify reorder_sequence round-trip and head-tail pairing.
+    x = torch.arange(16).reshape(1, 16, 1)
+    reord = reorder_sequence(x, cp_size=4, seq_dim=1, to_contiguous=False)
+    expected_reord = torch.tensor(
+        [0, 1, 14, 15, 2, 3, 12, 13, 4, 5, 10, 11, 6, 7, 8, 9]
+    ).reshape(1, 16, 1)
+    torch.testing.assert_close(reord, expected_reord)
+    restored = reorder_sequence(reord, cp_size=4, seq_dim=1, to_contiguous=True)
+    torch.testing.assert_close(restored, x)
+
+    # 3. Verify forward + backward numerical parity against CP=1 (with packed documents).
+    torch.manual_seed(42)
+    cp = 4
+    seq_len = 32
+    n_heads, n_kv_heads, head_dim = 8, 2, 16
+    q_full = torch.randn(seq_len, n_heads, head_dim, requires_grad=True)
+    k_full = torch.randn(seq_len, n_kv_heads, head_dim, requires_grad=True)
+    v_full = torch.randn(seq_len, n_kv_heads, head_dim, requires_grad=True)
+    do_full = torch.randn(seq_len, n_heads, head_dim)
+    positions_full = torch.cat([torch.arange(16), torch.arange(16)])
+
+    ref_attn = KVAllGatherCPScaledDotProductInnerAttention(
+        KVAllGatherCPScaledDotProductInnerAttention.Config()
+    )
+    with mock.patch.object(
+        cp_attention,
+        "spmd_mesh_group",
+        return_value=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+    ), mock.patch.object(
+        spmd, "redistribute", side_effect=lambda t, *a, **kw: t
+    ):
+      out_ref = ref_attn(
+          q_full,
+          k_full,
+          v_full,
+          enable_gqa=True,
+          positions=positions_full,
+      )
+      out_ref.backward(do_full)
+
+    q_reord = reorder_sequence(
+        q_full.detach(), cp_size=cp, seq_dim=0, to_contiguous=False
+    )
+    k_reord = reorder_sequence(
+        k_full.detach(), cp_size=cp, seq_dim=0, to_contiguous=False
+    )
+    v_reord = reorder_sequence(
+        v_full.detach(), cp_size=cp, seq_dim=0, to_contiguous=False
+    )
+    do_reord = reorder_sequence(
+        do_full, cp_size=cp, seq_dim=0, to_contiguous=False
+    )
+    pos_reord = reorder_sequence(
+        positions_full, cp_size=cp, seq_dim=0, to_contiguous=False
+    )
+
+    out_shards = []
+    dq_shards = []
+    dk_total = torch.zeros_like(k_reord)
+    dv_total = torch.zeros_like(v_reord)
+    shard_len = seq_len // cp
+
+    for r in range(cp):
+      s_slice = slice(r * shard_len, (r + 1) * shard_len)
+      q_r = q_reord[s_slice].clone().requires_grad_(True)
+      k_r = k_reord[s_slice].clone().requires_grad_(True)
+      v_r = v_reord[s_slice].clone().requires_grad_(True)
+      k_full_r = k_reord.clone().requires_grad_(True)
+      v_full_r = v_reord.clone().requires_grad_(True)
+      pos_r = pos_reord[s_slice]
+
+      def fake_redistribute(
+          x_in,
+          group,
+          *,
+          src,
+          dst,
+          k_r=k_r,
+          v_r=v_r,
+          k_full_r=k_full_r,
+          v_full_r=v_full_r,
+          pos_r=pos_r,
+          **kwargs,
+      ):
+        del group, src, dst, kwargs
+        if x_in is k_r:
+          return k_full_r
+        if x_in is v_r:
+          return v_full_r
+        if x_in is pos_r:
+          return pos_reord
+        raise AssertionError("Unexpected tensor in redistribute")
+
+      attn_r = KVAllGatherCPScaledDotProductInnerAttention(
+          KVAllGatherCPScaledDotProductInnerAttention.Config()
+      )
+      cp_attention._CP_RANK_CACHE.clear()
+      with mock.patch.object(
+          cp_attention,
+          "spmd_mesh_group",
+          return_value=SimpleNamespace(size=lambda: cp, rank=lambda r=r: r),
+      ), mock.patch.object(spmd, "redistribute", side_effect=fake_redistribute):
+        out_r = attn_r(
+            q_r,
+            k_r,
+            v_r,
+            enable_gqa=True,
+            positions=pos_r,
+        )
+        out_r.backward(do_reord[s_slice])
+      out_shards.append(out_r.detach())
+      dq_shards.append(q_r.grad.detach())
+      dk_total += k_full_r.grad.detach()
+      dv_total += v_full_r.grad.detach()
+
+    out_cp = reorder_sequence(
+        torch.cat(out_shards, dim=0),
+        cp_size=cp,
+        seq_dim=0,
+        to_contiguous=True,
+    )
+    dq_cp = reorder_sequence(
+        torch.cat(dq_shards, dim=0),
+        cp_size=cp,
+        seq_dim=0,
+        to_contiguous=True,
+    )
+    dk_cp = reorder_sequence(
+        dk_total, cp_size=cp, seq_dim=0, to_contiguous=True
+    )
+    dv_cp = reorder_sequence(
+        dv_total, cp_size=cp, seq_dim=0, to_contiguous=True
+    )
+    torch.testing.assert_close(out_cp, out_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(dq_cp, q_full.grad, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(dk_cp, k_full.grad, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(dv_cp, v_full.grad, rtol=1e-5, atol=1e-5)
+
 
 if __name__ == "__main__":
   absltest.main()
