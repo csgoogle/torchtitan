@@ -66,15 +66,18 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 
 ```
 
+### Install TorchTPU
+
+TorchTPU offers a pre-built wheel file, that you can install as:
+
+```
+pip install torch_tpu
+```
+
+
 ### Build TorchTPU wheel from source
 
-TorchTPU offers a pre-built wheel via
-
-```
-pip install --pre --no-deps --index-url "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" torch_tpu
-```
-
-**Important Note:** However, it currently only supports torch `2.11` and is not forward compatible with later torch versions. TorchTitan requires at least torch `>=2.12`, so we must build from torch_tpu from source.
+Alternatively, you can build the TorchTPU wheel from source.
 
 1. First, create and activate a Python 3.12 virtual environment:
 
@@ -88,37 +91,22 @@ python3.12 -m venv venv; source venv/bin/activate
 2. Clone [torch_tpu](https://github.com/google-pytorch/torch_tpu)
 
     ```
-    git clone git@github.com:google-pytorch/torch_tpu.git
+    git clone https://github.com/google-pytorch/torch_tpu.git
     ```
 
-3. Change the pin in `torch_tpu/pyproject.toml` to torch `2.12`
-
-    ```
-    dependencies = [
-        "torch>=2.12.0", # Uprev from 2.11.0
-        ...
-    ]
-    ```
-
-4. Regenerate requirements lockfiles. From the `torch_tpu` root run:
-
-    ```
-    bash requirements/lock_environments.sh
-    ```
-
-5. Follow build instructions in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source). Instructions are repeated here:
+3. Follow build instructions in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source). Instructions are repeated here:
 
     Wheels can be built via:
 
     ```bash
-    bazel build -c opt //ci/wheel:torch_tpu_wheel
+    bazel build --config=wheel_common //ci/wheel:torch_tpu_wheel
     ```
 
     (Alternative) For building without Remote Execution (RBE) caching, use bazel
     command below:
 
     ```bash
-    bazel build -c opt //ci/wheel:torch_tpu_wheel --config=no_rbe
+    bazel build --config=wheel_common //ci/wheel:torch_tpu_wheel --config=no_rbe
     ```
 
     Note that this command will install the CUDA version of `torch`; to get the
@@ -147,19 +135,7 @@ pip install -r .ci/docker/requirements-flux.txt
 Install TorchTPU wheel via:
 
 ```
-pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl --index-url "https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
-```
-
-### Optional: Download the Hugging Face model tokenizer
-
-This step is optional if you are running a dummy model. Follow the instructions in the [TorchTitan README](https://github.com/pytorch/torchtitan/tree/main?tab=readme-ov-file#downloading-a-tokenizer).
-
-```bash
-# Obtain your Hugging Face token from https://huggingface.co/settings/tokens
-
-# Download the Llama 3.2 tokenizer
-python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.2-1B --assets tokenizer --hf_token=...
-
+pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl
 ```
 
 ### Run a TorchTitan training job
@@ -176,12 +152,6 @@ torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
     --training.dtype=bfloat16 \
     --training.mixed_precision_param=bfloat16
 ```
-
-**Notes:**
-
-* Currently, only the `llama3_tpu` configuration is supported.
-* You must limit `max_context_length` (formerly `seq_len`) to 128 at this time; support for the full context length is coming soon.
-* Memory and Model Flops Utilization (MFU) metrics might be inaccurate in the current version.
 
 ---
 
@@ -393,7 +363,6 @@ gcluster job submit \
         --config=llama3_8b \
         --training.max_context_length=512 \
         --dataloader.dataset=c4_test \
-        --training.dtype=bfloat16 \
         --training.mixed_precision_param=bfloat16 \
         --training.steps=10 \
         --hf_assets_path=assets/hf/Llama-3.1-8B/ \
@@ -405,13 +374,6 @@ gcluster job submit \
         --profiler.profiler_active=1 \
         --profiler.enable_profiling'
 ```
-
-**Notes:**
-
-* This configuration was tested on `v6e-16` and `v6e-32`.
-* Currently, only the `llama3_tpu` configuration is supported.
-* You must limit `max_context_length` (formerly `seq_len`) to 512 at this time; support for the full context length is coming soon.
-* Memory and MFU metrics might be inaccurate in the current version.
 
 ---
 
@@ -605,7 +567,7 @@ Differences from the single-slice command:
   ```
   MEGASCALE_NUM_SLICES           how many slices there are
   MEGASCALE_COORDINATOR_ADDRESS  where slice 0's first worker listens
-  MEGASCALE_SLICE_ID             which slice this pod is
+  MEGASCALE_SLICE_ID             which slice this pod is, set automatically by TorchTitan
   ```
 
   The command passes the first two with `--env`. The coordinator address is the one that makes
