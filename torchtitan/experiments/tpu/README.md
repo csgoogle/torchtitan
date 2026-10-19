@@ -20,7 +20,8 @@ For debugging and development, you can train small models directly on TPU VMs. Y
 
 1. **Project setup:** [Set up a Google Cloud project for Cloud TPUs](https://www.google.com/search?q=https://cloud.google.com/tpu/docs/setup-google-cloud-project).
 2. **Planning:** [Plan your Cloud TPU resources](https://www.google.com/search?q=https://cloud.google.com/tpu/docs/plan-tpu-resources).
-3. **Enable the API:** Enable the [Cloud TPU API](https://docs.cloud.google.com/tpu/docs/setup-gcp-account).
+3. **Environment variables:** Set the following variables (the following example uses a `v6e` TPU):
+4. **Enable the API:** Enable the [Cloud TPU API](https://docs.cloud.google.com/tpu/docs/setup-gcp-account).
 
 ### Create a TPU VM
 
