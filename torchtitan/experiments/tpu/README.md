@@ -131,7 +131,7 @@ pip install -r .ci/docker/requirements-flux.txt
 Install the pre-built TorchTPU wheel:
 
 ```
-pip install torch_tpu --extra-index-url https://download.pytorch.org/whl/cpu
+pip install --pre torch_tpu==0.2.0 --extra-index-url https://download.pytorch.org/whl/nightly/cpu
 ```
 
 Or, if you built TorchTPU from source, install that wheel instead:
