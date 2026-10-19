@@ -85,8 +85,9 @@ TorchTPU offers a pre-built wheel file, that you can install as:
 pip install torch_tpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-Note that currently it installs stable version of TorchTPU, while TorchTitan TPU
-is generally meant to be run with nightly.
+Note that this installs the stable TorchTPU release, which requires stable PyTorch
+(torch <= 2.15), while TorchTitan TPU is generally meant to be run with nightly. To
+use the PyTorch nightly, build the wheel from source as described below.
 
 
 ### Build TorchTPU wheel from source
@@ -113,6 +114,15 @@ Alternatively, you can build the TorchTPU wheel from source.
 
     ```bash
     bazel build --config=wheel_common //ci/wheel:torch_tpu_wheel --config=no_rbe
+    ```
+
+    Optionally install the PyTorch nightly first. The Docker image and CI use it,
+    and configs that enable `parallelism.enable_tpu_topo_mesh` (for example
+    `qwen3_8b`) need torch >= 2.15. Otherwise the next command installs the latest
+    stable PyTorch:
+
+    ```bash
+    pip install torch --pre --index-url https://download.pytorch.org/whl/nightly/cpu
     ```
 
     Install wheel via:
