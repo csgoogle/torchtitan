@@ -18,8 +18,8 @@ For debugging and development, you can train small models directly on TPU VMs. Y
 
 ### Prerequisites
 
-1. **Project setup:** [Set up a Google Cloud project for Cloud TPUs](https://cloud.google.com/tpu/docs/setup-google-cloud-project).
-2. **Planning:** [Plan your Cloud TPU resources](https://cloud.google.com/tpu/docs/plan-tpu-resources).
+1. **Project setup:** [Set up a Google Cloud project for Cloud TPUs](https://www.google.com/search?q=https://cloud.google.com/tpu/docs/setup-google-cloud-project).
+2. **Planning:** [Plan your Cloud TPU resources](https://www.google.com/search?q=https://cloud.google.com/tpu/docs/plan-tpu-resources).
 3. **Enable the API:** Enable the [Cloud TPU API](https://docs.cloud.google.com/tpu/docs/setup-gcp-account).
 
 ### Create a TPU VM
@@ -65,31 +65,10 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 
 ```
 
-### Install TorchTitan and its dependencies
-
-Clone the torchtitan repository:
-
-```bash
-git clone https://github.com/google-pytorch/torchtitan
-cd torchtitan
-```
-
-Some dependencies have to be installed before TorchTPU.
-
-```bash
-pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
-pip install -r torchtitan/experiments/tpu/requirements.txt -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-pip install -r requirements.txt
-pip install -r .ci/docker/requirements-flux.txt
-```
-
 ### Install TorchTPU
 
-TorchTPU offers a pre-built wheel file, that you can install as:
-
-```
-pip install torch_tpu --extra-index-url https://download.pytorch.org/whl/cpu
-```
+TorchTPU offers a pre-built wheel file. Install it after the dependencies, as shown in
+[Install TorchTitan + TorchTPU and its dependencies](#install-torchtitan--torchtpu-and-its-dependencies).
 
 
 ### Build TorchTPU wheel from source
@@ -127,14 +106,38 @@ python3.12 -m venv venv; source venv/bin/activate
     ```
 
     Note that this command will install the CUDA version of `torch`; to get the
-    CPU-only build, use the `--index-url` parameter from the section on installing
-    nightlies, or install the CPU build separately.
+    CPU-only build, pass `--extra-index-url` as shown below or install the CPU build
+    separately.
+
+### Install TorchTitan + TorchTPU and its dependencies
+
+Clone the torchtitan repository:
+
+```bash
+git clone https://github.com/google-pytorch/torchtitan
+cd torchtitan
+```
+
+Some dependencies have to be installed before TorchTPU.
+
+```bash
+pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+pip install -r torchtitan/experiments/tpu/requirements.txt -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install -r requirements.txt
+pip install -r .ci/docker/requirements-flux.txt
+```
 
 
-Install TorchTPU wheel via:
+Install the pre-built TorchTPU wheel:
 
 ```
-pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl
+pip install torch_tpu --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+Or, if you built TorchTPU from source, install that wheel instead:
+
+```
+pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 ### Run a TorchTitan training job
@@ -164,7 +167,7 @@ To provision Cloud TPUs, use one of the following methods:
 
 * **GKE:** Use GKE to provision and manage Cloud TPUs as a pool of accelerators for containerized machine learning workloads. Use the gcloud CLI to create GKE cluster instances manually for precise customization or to expand existing production GKE environments. For more information, see [TPUs in GKE](https://cloud.google.com/kubernetes-engine/docs/concepts/tpus).
 * **GKE and Cluster Toolkit:** Cluster Toolkit is an open-source tool that simplifies cluster creation and workload execution on GKE. It is designed for ML practitioners to provision Cloud TPUs and run training jobs without requiring deep Kubernetes expertise. Use Cluster Toolkit blueprints to create GKE clusters, and use its `gcluster` CLI to submit workloads. For more information, see the [Cluster Toolkit overview](https://docs.cloud.google.com/cluster-toolkit/docs/overview) and the [Cluster Toolkit GitHub repository](https://github.com/GoogleCloudPlatform/cluster-toolkit).
-* **GKE and TPU Cluster Director:** TPU Cluster Director is available through an All Capacity mode reservation, providing full access to reserved capacity without hold-backs. This mode offers full visibility into TPU hardware topology, utilization, and health status. For more information, see the [All Capacity mode overview](https://docs.cloud.google.com/tpu/docs/all-capacity-mode-overview).
+* **GKE and TPU Cluster Director:** TPU Cluster Director is available through an All Capacity mode reservation, providing full access to reserved capacity without hold-backs. This mode offers full visibility into TPU hardware topology, utilization, and health status. For more information, see the [All Capacity mode overview](https://www.google.com/search?q=https://docs.cloud.google.com/tpu/docs/all-capacity-mode-overview).
 
 In this document, you use GKE managed by Cluster Toolkit. Cluster Toolkit's `gcluster` command-line tool is designed to simplify provisioning, managing, and running machine learning workloads.
 
