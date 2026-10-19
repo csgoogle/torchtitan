@@ -67,21 +67,14 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 
 ### Install TorchTitan and its dependencies
 
-1. Create and activate a Python 3.12 virtual environment:
-
-```bash
-sudo apt install python3.12  # Install Python 3.12 if it is not already installed.
-python3.12 -m venv venv; source venv/bin/activate
-```
-
-2. Clone the torchtitan repository:
+Clone the torchtitan repository:
 
 ```bash
 git clone https://github.com/google-pytorch/torchtitan
 cd torchtitan
 ```
 
-3. Install the dependencies. Install the CPU build of PyTorch first, so later steps do not pull in the CUDA build:
+Some dependencies have to be installed before TorchTPU.
 
 ```bash
 pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
@@ -92,34 +85,33 @@ pip install -r .ci/docker/requirements-flux.txt
 
 ### Install TorchTPU
 
-Install the pre-built TorchTPU wheel:
+TorchTPU offers a pre-built wheel file, that you can install as:
 
-```bash
+```
 pip install torch_tpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-`--extra-index-url` keeps PyTorch on the CPU build if pip has to change its version.
 
-> **Note:** The current TorchTPU release supports stable PyTorch only, so this step replaces the
-> PyTorch nightly from the previous step with the newest stable release it supports. Configs that set
-> `parallelism.enable_tpu_topo_mesh` (most `llama3`, `qwen3` and `muse_glimmer` configs) need PyTorch
-> nightly and fail with `unexpected keyword argument 'preserve_rank_order'`. Until TorchTPU nightly
-> wheels are available, either add `--parallelism.no-enable_tpu_topo_mesh` to the training command
-> (collectives may be slower), or build TorchTPU from source against PyTorch nightly as described
-> below.
+### Build TorchTPU wheel from source
 
-### Build TorchTPU from source (optional)
+Alternatively, you can build the TorchTPU wheel from source.
 
-Build the wheel yourself to use PyTorch nightly or an unreleased TorchTPU change. Do this instead of
-`pip install torch_tpu`.
+1. First, create and activate a Python 3.12 virtual environment:
 
-1. Clone [torch_tpu](https://github.com/google-pytorch/torch_tpu):
+```bash
+sudo apt install python3.12  # Install Python 3.12 if it is not already installed.
+mkdir wheel; cd wheel
+python3.12 -m venv venv; source venv/bin/activate
 
-    ```bash
+```
+
+2. Clone [torch_tpu](https://github.com/google-pytorch/torch_tpu)
+
+    ```
     git clone https://github.com/google-pytorch/torch_tpu.git
     ```
 
-2. Follow the build instructions in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source). Instructions are repeated here:
+3. Follow build instructions in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source). Instructions are repeated here:
 
     Wheels can be built via:
 
@@ -134,28 +126,20 @@ Build the wheel yourself to use PyTorch nightly or an unreleased TorchTPU change
     bazel build --config=wheel_common //ci/wheel:torch_tpu_wheel --config=no_rbe
     ```
 
-    Note that this command installs the CUDA build of `torch`; to get the CPU-only
-    build, install it first with the `--index-url` from the dependencies step above.
+    Note that this command will install the CUDA version of `torch`; to get the
+    CPU-only build, use the `--index-url` parameter from the section on installing
+    nightlies, or install the CPU build separately.
 
-3. Install the wheel:
 
-    ```bash
-    pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl
-    ```
+Install TorchTPU wheel via:
+
+```
+pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl
+```
 
 ### Run a TorchTitan training job
 
-Only small models can run on a single host. The following example demonstrates Llama 3.2 1B running on a `v6e-4` VM using FSDP.
-
-The example needs the Llama 3.2 tokenizer. The model repository is gated: request access on its
-Hugging Face page, then download the tokenizer with your
-[Hugging Face token](https://huggingface.co/settings/tokens):
-
-```bash
-python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.2-1B --assets tokenizer --hf_token=...
-```
-
-Set `--nproc_per_node` to the number of TPU devices on the VM (4 on `v6e-4`, 8 on `v6e-8`):
+Only small models can run on a single host. The following example demonstrates Llama 3.2 1B running on a `v6e-4` VM using FSDP:
 
 ```bash
 torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
@@ -303,7 +287,7 @@ gcloud storage cp --recursive ./tests ${BUCKET_NAME}/tests
 
 #### Build the Docker image
 
-First, copy the `torch_tpu` wheel built in [Build TorchTPU from source](#build-torchtpu-from-source-optional) to the root TorchTitan directory so it is accessible from docker build context:
+First, copy the `torch_tpu` wheel built in [Build TorchTPU wheel from source](#build-torchtpu-wheel-from-source) to the root TorchTitan directory so it is accessible from docker build context:
 ```bash
 cp ../torch_tpu/bazel-bin/ci/wheel/torch_tpu-*.whl ./
 ```
@@ -464,9 +448,9 @@ This also enables the `--debug.print-config` option to print the full configurat
 
 ### Profile workloads using TensorBoard
 
-TorchTitan on TorchTPU integrates with a profiler to export profiling data for trained models. Use the `--profiler.enable_profiling` flag to enable profiling and the other `--profiler.*` flags for configuration.
+TorchTitan on TorchTPU integrates with a profiler to export profiling data for trained models. Use the `--profiler.enable_profiling` flag to enable profiling and the `--profiler...` flags for configuration.
 
-Profiling data is exported to the directory specified by `--dump_folder` + `--profiler.save_traces_folder` (default `profiling/traces`) for each process. In the example above, this is mapped to an external Cloud Storage bucket via Cloud Storage FUSE and can be loaded directly into TensorBoard.
+Profiling data is exported to the directory specified by `--dump_folder` + `profile_trace` for each process. In the example above, this is mapped to an external Cloud Storage bucket via Cloud Storage FUSE and can be loaded directly into TensorBoard.
 
 For more information, see [Profile your TPU VM workload using TensorBoard](https://docs.cloud.google.com/tpu/docs/profile-tpu-vm).
 
