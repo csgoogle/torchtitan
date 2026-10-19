@@ -9,7 +9,6 @@ from torchtitan.distributed.activation_checkpoint import ActivationCheckpointing
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
     annotate_moe_ep_regions,
-    apply_simple_fsdp,
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
@@ -17,6 +16,7 @@ from torchtitan.experiments.tpu import qwen3_5 as tpu_qwen3_5
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import (
     _validate_supported,
+    apply_qwen3_5_simple_fsdp,
     configure_qwen3_5_simple_fsdp_shard_dims,
 )
 from torchtitan.models.common.moe import configure_moe_aux_loss_reduction
@@ -50,7 +50,7 @@ def parallelize_qwen3_5(
 
   configure_moe_aux_loss_reduction(model, parallel_dims)
   configure_qwen3_5_simple_fsdp_shard_dims(model, parallel_dims)
-  model = apply_simple_fsdp(
+  model = apply_qwen3_5_simple_fsdp(
       model, parallel_dims=parallel_dims, training=training
   )  # pyrefly: ignore[bad-assignment]
   for holder in model.modules():
