@@ -269,12 +269,13 @@ class TrainDistributedTest(
           args=["--parallelism.use_simple_fsdp"],
       ),
       dict(
-          testcase_name="qwen3_cp",
+          testcase_name="qwen3_cp_all_gather",
           module="torchtitan.experiments.tpu.qwen3",
           config="qwen3_debugmodel",
           data_parallel_shard_degree=1,
           tensor_parallel_degree=1,
           context_parallel_degree=-1,
+          args=["--tpu_config.context_parallel_strategy=all_gather"],
       ),
       dict(
           testcase_name="qwen3_cp_ulysses",
@@ -286,13 +287,16 @@ class TrainDistributedTest(
           args=["--tpu_config.context_parallel_strategy=ulysses"],
       ),
       dict(
-          testcase_name="qwen3_simplefsdp_cp2",
+          testcase_name="qwen3_simplefsdp_cp2_all_gather",
           module="torchtitan.experiments.tpu.qwen3",
           config="qwen3_debugmodel",
           data_parallel_shard_degree=None,
           tensor_parallel_degree=1,
           context_parallel_degree=2,
-          args=["--parallelism.use_simple_fsdp"],
+          args=[
+              "--parallelism.use_simple_fsdp",
+              "--tpu_config.context_parallel_strategy=all_gather",
+          ],
       ),
       dict(
           testcase_name="qwen3_fsdp_compile",
