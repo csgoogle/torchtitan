@@ -339,7 +339,17 @@ For more information, see [Submit Job with Persistent Storage](https://github.co
 
 #### Deploy the training workload
 
-The following sample demonstrates Qwen3 8B training on a `v6e-32` using FSDP:
+The following sample demonstrates Qwen3 8B training on a `v6e-32` using FSDP. It uses the
+`qwen3_8b_zero3` config, which reshards parameters after the forward pass; `qwen3_8b` keeps
+them unsharded and does not fit in v6e HBM.
+
+`gcluster job submit` checks for Docker credential helpers for `gcr.io` and for the cluster's
+region, so configure them once:
+
+```bash
+gcloud auth configure-docker gcr.io --quiet
+gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+```
 
 ```bash
 export WORKLOAD_NAME=torchtitan-qwen3-8b
@@ -370,7 +380,7 @@ gcluster job submit \
         --node_rank=$TPU_WORKER_ID \
         -m torchtitan.experiments.tpu.train \
         --module=torchtitan.experiments.tpu.qwen3 \
-        --config=qwen3_8b \
+        --config=qwen3_8b_zero3 \
         --dataloader.dataset=c4_test \
         --training.steps=10 \
         --hf_assets_path=assets/hf/Qwen3-8B/ \
