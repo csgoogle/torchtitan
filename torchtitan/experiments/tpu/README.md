@@ -18,8 +18,8 @@ For debugging and development, you can train small models directly on TPU VMs. Y
 
 ### Prerequisites
 
-1. **Project setup:** [Set up a Google Cloud project for Cloud TPUs](https://www.google.com/search?q=https://cloud.google.com/tpu/docs/setup-google-cloud-project).
-2. **Planning:** [Plan your Cloud TPU resources](https://www.google.com/search?q=https://cloud.google.com/tpu/docs/plan-tpu-resources).
+1. **Project setup:** [Set up a Google Cloud project for Cloud TPUs](https://cloud.google.com/tpu/docs/setup-google-cloud-project).
+2. **Planning:** [Plan your Cloud TPU resources](https://cloud.google.com/tpu/docs/plan-tpu-resources).
 3. **Environment variables:** Set the following variables (the following example uses a `v6e` TPU):
 4. **Enable the API:** Enable the [Cloud TPU API](https://docs.cloud.google.com/tpu/docs/setup-gcp-account).
 
@@ -47,7 +47,7 @@ gcloud compute tpus tpu-vm create $TPU_NAME \
 
 ```
 
-Consult the **Quotas** page in the Google Cloud console to identify zones where Cloud TPUs are available and where your project has sufficient quota: [https://console.cloud.google.com/apis/api/tpu.googleapis.com/quotas](https://www.google.com/search?q=https://console.cloud.google.com/apis/api/tpu.googleapis.com/quotas)
+Consult the **Quotas** page in the Google Cloud console to identify zones where Cloud TPUs are available and where your project has sufficient quota: [https://console.cloud.google.com/apis/api/tpu.googleapis.com/quotas](https://console.cloud.google.com/apis/api/tpu.googleapis.com/quotas)
 
 **Flags:**
 
@@ -66,91 +66,81 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 
 ```
 
-### Install TorchTPU
+### Install TorchTitan and TorchTPU
 
-TorchTPU offers a pre-built wheel file, that you can install as:
+Choose one of the following options:
 
-```
-pip install torch_tpu
-```
+* [Option A](#option-a-torchtpu-release-with-pytorch-215-recommended): To run the stable release. Installs TorchTPU 0.2.0 with PyTorch 2.15.0; no build required.
+* [Option B](#option-b-build-torchtpu-from-source-for-the-pytorch-nightly-for-development): For development. Builds TorchTPU from source to use the latest PyTorch nightly.
 
-
-### Build TorchTPU wheel from source
-
-Alternatively, you can build the TorchTPU wheel from source.
-
-1. First, create and activate a Python 3.12 virtual environment:
+Both options use Python 3.14. Create and activate a virtual environment:
 
 ```bash
-sudo apt install python3.12  # Install Python 3.12 if it is not already installed.
-mkdir wheel; cd wheel
-python3.12 -m venv venv; source venv/bin/activate
-
+python3.14 -m venv venv; source venv/bin/activate
 ```
 
-2. Clone [torch_tpu](https://github.com/google-pytorch/torch_tpu)
+#### Option A: TorchTPU release with PyTorch 2.15 (recommended)
 
+1. Clone the torchtitan repository:
+
+    ```bash
+    git clone https://github.com/google-pytorch/torchtitan
+    cd torchtitan
     ```
+
+2. Install PyTorch 2.15.0, TorchTPU 0.2.0, and the TPU dependencies, then the TorchTitan dependencies. The extra index provides the CPU build of PyTorch:
+
+    ```bash
+    pip install torch==2.15.0 torch_tpu==0.2.0 -r torchtitan/experiments/tpu/requirements.txt \
+      --extra-index-url https://download.pytorch.org/whl/test/cpu
+    pip install -r requirements.txt -r .ci/docker/requirements-flux.txt
+    ```
+
+    The TPU and TorchTitan dependencies are installed in separate commands because `tokamax` and `tyro` declare conflicting `typeguard` versions. pip warns about the conflict but completes the install.
+
+    > [!NOTE]
+    > PyTorch 2.15.0 is on the PyTorch test (release candidate) index until its final release. After the release, use `--extra-index-url https://download.pytorch.org/whl/cpu`.
+
+#### Option B: Build TorchTPU from source for the PyTorch nightly (for development)
+
+1. Clone [torch_tpu](https://github.com/google-pytorch/torch_tpu) and build the wheel. For details, see the [TorchTPU build instructions](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source).
+
+    ```bash
     git clone https://github.com/google-pytorch/torch_tpu.git
-    ```
-
-3. Follow build instructions in the [TorchTPU GitHub repository](https://github.com/google-pytorch/torch_tpu?tab=readme-ov-file#build-from-source). Instructions are repeated here:
-
-    Wheels can be built via:
-
-    ```bash
+    cd torch_tpu
     bazel build --config=wheel_common //ci/wheel:torch_tpu_wheel
+    cd ..
     ```
 
-    (Alternative) For building without Remote Execution (RBE) caching, use bazel
-    command below:
+    `--config=wheel_common` is required. It also enables the Remote Build Execution (RBE) cache and executor. If you do not have RBE credentials, add `--config=no_rbe` after `--config=wheel_common`.
+
+    The wheel is written to `torch_tpu/bazel-bin/ci/wheel/`.
+
+2. Clone the torchtitan repository:
 
     ```bash
-    bazel build --config=wheel_common //ci/wheel:torch_tpu_wheel --config=no_rbe
+    git clone https://github.com/google-pytorch/torchtitan
+    cd torchtitan
     ```
 
-    Note that this command will install the CUDA version of `torch`; to get the
-    CPU-only build, use the `--index-url` parameter from the section on installing
-    nightlies, or install the CPU build separately.
+3. Install the PyTorch CPU nightly first, then the TorchTitan dependencies and the TorchTPU wheel:
 
-### Install TorchTitan + TorchTPU and its dependencies
-
-Cone the torchtitan repository:
-
-```bash
-git clone https://github.com/google-pytorch/torchtitan
-cd torchtitan
-```
-
-Some dependencies have to be installed before TorchTPU.
-
-```bash
-pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
-pip install -r torchtitan/experiments/tpu/requirements.txt -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-pip install -r requirements.txt
-pip install -r .ci/docker/requirements-flux.txt
-```
-
-
-Install TorchTPU wheel via:
-
-```
-pip install {PATH_TO_TORCH_TPU_REPO}/bazel-bin/ci/wheel/*.whl
-```
+    ```bash
+    pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+    pip install -r torchtitan/experiments/tpu/requirements.txt
+    pip install -r requirements.txt -r .ci/docker/requirements-flux.txt
+    pip install ../torch_tpu/bazel-bin/ci/wheel/*.whl
+    ```
 
 ### Run a TorchTitan training job
 
-Only small models can run on a single host. The following example demonstrates Llama 3.2 1B running on a `v6e-4` VM using FSDP:
+Only small models can run on a single host. The following example demonstrates Qwen3 1.7B running on a `v6e-4` VM using FSDP. It uses the tokenizer bundled in `tests/assets/tokenizer` and the `c4_test` sample dataset, so it needs no downloads and no Hugging Face token:
 
 ```bash
 torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
-    --module=torchtitan.experiments.tpu.llama3 \
-    --config=llama3_1b \
-    --hf_assets_path=assets/hf/Llama-3.2-1B/ \
-    --training.max_context_length=128 \
-    --training.steps=10 \
-    --training.dtype=bfloat16 \
-    --training.mixed_precision_param=bfloat16
+    --module=torchtitan.experiments.tpu.qwen3 \
+    --config=qwen3_1_7b \
+    --training.steps=10
 ```
 
 ---
@@ -165,7 +155,7 @@ To provision Cloud TPUs, use one of the following methods:
 
 * **GKE:** Use GKE to provision and manage Cloud TPUs as a pool of accelerators for containerized machine learning workloads. Use the gcloud CLI to create GKE cluster instances manually for precise customization or to expand existing production GKE environments. For more information, see [TPUs in GKE](https://cloud.google.com/kubernetes-engine/docs/concepts/tpus).
 * **GKE and Cluster Toolkit:** Cluster Toolkit is an open-source tool that simplifies cluster creation and workload execution on GKE. It is designed for ML practitioners to provision Cloud TPUs and run training jobs without requiring deep Kubernetes expertise. Use Cluster Toolkit blueprints to create GKE clusters, and use its `gcluster` CLI to submit workloads. For more information, see the [Cluster Toolkit overview](https://docs.cloud.google.com/cluster-toolkit/docs/overview) and the [Cluster Toolkit GitHub repository](https://github.com/GoogleCloudPlatform/cluster-toolkit).
-* **GKE and TPU Cluster Director:** TPU Cluster Director is available through an All Capacity mode reservation, providing full access to reserved capacity without hold-backs. This mode offers full visibility into TPU hardware topology, utilization, and health status. For more information, see the [All Capacity mode overview](https://www.google.com/search?q=https://docs.cloud.google.com/tpu/docs/all-capacity-mode-overview).
+* **GKE and TPU Cluster Director:** TPU Cluster Director is available through an All Capacity mode reservation, providing full access to reserved capacity without hold-backs. This mode offers full visibility into TPU hardware topology, utilization, and health status. For more information, see the [All Capacity mode overview](https://docs.cloud.google.com/tpu/docs/all-capacity-mode-overview).
 
 In this document, you use GKE managed by Cluster Toolkit. Cluster Toolkit's `gcluster` command-line tool is designed to simplify provisioning, managing, and running machine learning workloads.
 
@@ -210,7 +200,7 @@ Replace the following placeholders:
 * `YOUR_ZONE`: The zone where the cluster's TPU nodes will be created. For TPU availability, see [Cloud TPU regions and zones](https://docs.cloud.google.com/tpu/docs/regions-zones) and your project's **Quotas** page.
 * `YOUR_CLUSTER_NAME`: The name of the new GKE cluster. Cluster Toolkit also uses this name as the deployment name.
 * `YOUR_COMPUTE_TYPE`: The TPU machine type (for example, `ct6e-standard-4t` for TPU v6e).
-* `YOUR_TOPOLOGY`: The TPU slice topology (for example, `4x8` for a `v6e-32` slice).
+* `YOUR_TOPOLOGY`: The TPU slice topology (for example, `2x4` for a `v6e-8` slice).
 * `YOUR_AUTHORIZED_CIDR`: The CIDR block that can access the cluster's control plane. It must contain the IP address of the machine where you run `gcluster`. To allow only your IP address, use your IP address followed by `/32`. To allow all IP addresses, use `0.0.0.0/0`; Identity and Access Management (IAM) restrictions are still enforced.
 * `YOUR_BUCKET_NAME`: The name of your Cloud Storage bucket for output.
 * `YOUR_REPOSITORY`: The name of your Artifact Registry repository (for example, `test`).
@@ -218,7 +208,7 @@ Replace the following placeholders:
 4. **Optional: Create a Cloud Storage bucket:**
 
 ```bash
-gcloud storage buckets create ${REPOSITORY} \
+gcloud storage buckets create ${BUCKET_NAME} \
     --project=${PROJECT_ID} \
     --location=US \
     --default-storage-class=STANDARD \
@@ -272,31 +262,48 @@ cd torchtitan
 This step is optional if you are running a dummy model. For more information, see the [TorchTitan README](https://github.com/pytorch/torchtitan/tree/main?tab=readme-ov-file#downloading-a-tokenizer).
 
 ```bash
-# Obtain your Hugging Face token from https://huggingface.co/settings/tokens
-
-# Download the Llama 3.1 tokenizer
-python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer --hf_token=...
-
+# Download the Qwen3 1.7B and 8B tokenizers (not gated, no Hugging Face token needed)
+python scripts/download_hf_assets.py --repo_id Qwen/Qwen3-1.7B --assets tokenizer
+python scripts/download_hf_assets.py --repo_id Qwen/Qwen3-8B --assets tokenizer
 ```
+
+The tokenizers are saved to `assets/hf/<model>` (for example `assets/hf/Qwen3-8B`), which is the
+directory to pass as `--hf_assets_path`.
 
 Upload the tokenizer to the GCS bucket
 
 ```bash
-gcloud storage cp --recursive ./assets/hf gs://${BUCKET_NAME}/assets/hf
-gcloud storage cp --recursive ./tests gs://${BUCKET_NAME}/tests
+gcloud storage cp --recursive ./assets/hf ${BUCKET_NAME}/assets/hf
+gcloud storage cp --recursive ./tests ${BUCKET_NAME}/tests
 ```
 
 #### Build the Docker image
 
-First, copy the `torch_tpu` wheel built in [Build and install TorchTPU wheel from source](#build-and-install-torchtpu-wheel-from-source) to the root TorchTitan directory so it is accessible from docker build context:
+Run the following commands from the root of the torchtitan repository. Choose the option that matches [Install TorchTitan and TorchTPU](#install-torchtitan-and-torchtpu).
+
+**Option A: TorchTPU release with PyTorch 2.15 (recommended)**
+
 ```bash
-cp ../torch_tpu/bazel-bin/ci/wheel/torch_tpu-*.whl ./
+docker build -t torchtitan-container:latest -f torchtitan/experiments/tpu/Dockerfile \
+  --build-arg TORCH_TPU_VERSION=0.2.0 \
+  --build-arg TORCH_VERSION=2.15.0 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/test/cpu .
 ```
 
-Run from the root of the torchtitan repository
+> [!NOTE]
+> PyTorch 2.15.0 is on the PyTorch test (release candidate) index until its final release. After the release, use `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu`.
+
+**Option B: TorchTPU built from source with the PyTorch nightly (for development)**
+
+First, build the `torch_tpu` wheel as described in step 1 of [Option B](#option-b-build-torchtpu-from-source-for-the-pytorch-nightly-for-development). The commands below assume the `torch_tpu` repository is cloned next to the torchtitan repository.
+
 ```bash
+rm -f torch_tpu-*.whl
+cp ../torch_tpu/bazel-bin/ci/wheel/torch_tpu-*.whl ./
 docker build -t torchtitan-container:latest -f torchtitan/experiments/tpu/Dockerfile .
 ```
+
+The end of the build log shows the installed `torch` and `torch_tpu` versions, for example `torch 2.15.0+cpu torch_tpu 0.2.0` for Option A.
 
 #### Upload the Docker image to Artifact Registry
 
@@ -329,15 +336,15 @@ For more information, see [Submit Job with Persistent Storage](https://github.co
 
 #### Deploy the training workload
 
-The following sample demonstrates Llama 8B training on a `v6e-32` using FSDP:
+The following sample demonstrates Qwen3 8B training on a `v6e-8` slice (`TOPOLOGY=2x4`, two hosts with four chips each) using FSDP and the `reg_trainer_qwen3_8b` config. It follows the [Qwen3-8B v6e-8 recipe](recipes/trillium/qwen3-8b/v6e-8/README.md):
 
 ```bash
-export WORKLOAD_NAME=torchtitan-llama3-8b
+export WORKLOAD_NAME=torchtitan-qwen3-8b
 
 # if using GCSFUSE, set the following parameters:
-# --dump_folder="/data/assets/hf/Llama-3.1-8B"
-# --dataloader.dataset_path="/data/assets/hf/Llama-3.1-8B"
-# --hf_assets_path="/data/assets/hf/Llama-3.1-8B"
+# --dump_folder="/data/assets/hf/Qwen3-8B"
+# --dataloader.dataset_path="/data/assets/hf/Qwen3-8B"
+# --hf_assets_path="/data/assets/hf/Qwen3-8B"
 # if not using GCSFUSE, remove the --service-account and --mount flags.
 gcluster job submit \
     --name $WORKLOAD_NAME \
@@ -351,23 +358,20 @@ gcluster job submit \
     --service-account workload-identity-k8s-sa \
     --mount "$BUCKET_NAME;/data;rw" \
     --env WORKERS_0_HOSTNAME="$WORKLOAD_NAME-main-job-0-0.$WORKLOAD_NAME" \
-    --env LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536" \
     --command 'torchrun \
-        --nnodes=8 \
+        --nnodes=2 \
         --nproc_per_node=4 \
         --rdzv_backend=static \
         --rdzv_endpoint=$WORKERS_0_HOSTNAME:29501 \
         --node_rank=$TPU_WORKER_ID \
         -m torchtitan.experiments.tpu.train \
-        --module=torchtitan.experiments.tpu.llama3 \
-        --config=llama3_8b \
-        --training.max_context_length=512 \
+        --module=torchtitan.experiments.tpu.qwen3 \
+        --config=reg_trainer_qwen3_8b \
+        --libtpu-init-flags="xla_tpu_use_enhanced_launch_barrier=false xla_tpu_scoped_vmem_limit_kib=65536" \
         --dataloader.dataset=c4_test \
-        --training.mixed_precision_param=bfloat16 \
         --training.steps=10 \
-        --hf_assets_path=assets/hf/Llama-3.1-8B/ \
+        --hf_assets_path=assets/hf/Qwen3-8B/ \
         --dataloader.dataset_path=tests/assets/c4_test \
-        --metrics.log_freq=5 \
         --metrics.enable_tensorboard \
         --profiler.profile_freq=5 \
         --profiler.profiler_warmup=3 \
@@ -393,8 +397,7 @@ Values are whitespace-separated `flag=value` entries.
 
 #### Usage
 
-Taking [`qwen3_8b_tpu7x`](qwen3/config_registry.py#L534), which declares five flags including
-`xla_tpu_dvfs_p_state=7`:
+Taking [`qwen3_32b`](qwen3/config_registry.py), whose flags include `xla_tpu_dvfs_p_state=7`:
 
 ```bash
 # 1. Add a flag the config does not set. xla_dump_to is an XLA flag, not a
@@ -450,7 +453,7 @@ This also enables the `--debug.print-config` option to print the full configurat
 
 ### Profile workloads using TensorBoard
 
-TorchTitan on TorchTPU integrates with a profiler to export profiling data for trained models. Use the `--profiling.enable-profiling` flag to enable profiling and the `--profiling...` flags for configuration.
+TorchTitan on TorchTPU integrates with a profiler to export profiling data for trained models. Use the `--profiler.enable_profiling` flag to enable profiling and the `--profiler...` flags for configuration.
 
 Profiling data is exported to the directory specified by `--dump_folder` + `profile_trace` for each process. In the example above, this is mapped to an external Cloud Storage bucket via Cloud Storage FUSE and can be loaded directly into TensorBoard.
 
@@ -467,7 +470,7 @@ pip install xprof
 To view the profile captured for your TorchTitan training job, run:
 
 ```bash
-tensorboard --logdir=gcs://${BUCKET_NAME}/torchtitan-llama3-8b/rank_0
+tensorboard --logdir=${BUCKET_NAME}/torchtitan-qwen3-8b/rank_0
 
 ```
 
@@ -477,7 +480,7 @@ To avoid incurring unnecessary charges, delete your resources when you are finis
 
 ```bash
 # Cancel the workload.
-gcluster job cancel torchtitan-llama3-8b \
+gcluster job cancel torchtitan-qwen3-8b \
     --cluster ${CLUSTER_NAME} \
     --location ${REGION} \
     --project ${PROJECT_ID}
