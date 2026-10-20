@@ -522,6 +522,9 @@ class WorkaroundsTest(parameterized.TestCase):
     )
 
     config = qwen3_debugmodel()
+    # all_gather is the default strategy; this test covers Ulysses.
+    self.assertEqual(config.tpu_config.context_parallel_strategy, "all_gather")
+    config.tpu_config.context_parallel_strategy = "ulysses"
     config.parallelism.context_parallel_degree = 2
     config.__post_init__()
     self.assertEqual(config.parallelism.spmd_backend, "spmd_types")

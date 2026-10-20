@@ -142,7 +142,7 @@ class TPUConfig:
   # precision.
   enable_amp: bool = True
   log_freq: int = 10
-  context_parallel_strategy: Literal["ulysses", "all_gather"] = "ulysses"
+  context_parallel_strategy: Literal["ulysses", "all_gather"] = "all_gather"
   eager_mode: Literal[
       "",
       "DEFER_AND_FUSE",
@@ -241,7 +241,7 @@ def _configure_tpu_context_parallel(config: "BaseTPUTrainerConfig") -> None:
 
   model = config.model_spec.model if config.model_spec is not None else None
   tpu_config = getattr(config, "tpu_config", None)
-  strategy = getattr(tpu_config, "context_parallel_strategy", "ulysses")
+  strategy = getattr(tpu_config, "context_parallel_strategy", "all_gather")
   configure_tpu_context_parallel(config.parallelism, model, strategy=strategy)
 
 

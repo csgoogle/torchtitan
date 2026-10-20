@@ -3,17 +3,18 @@
 Supports two strategies (selected via
 ``--tpu-config.context-parallel-strategy``):
 
-1. ``ulysses`` (default): Each attention layer all-to-alls q/k/v from
-   token-sharded to head-sharded, runs full-sequence attention on ``H / cp``
-   heads, then all-to-alls the output back. When ``n_kv_heads < cp`` and
+1. ``all_gather`` (default; MaxText-style load-balanced KV All-Gather): Inputs
+   are reordered into head-tail load-balanced order
+   (`[0, 2*cp-1, 1, 2*cp-2, ...]`) and sharded along the sequence dimension.
+   Each attention layer keeps ``Q`` sharded (`S / cp` tokens, all ``H``
+   heads), all-gathers ``K`` and ``V`` to the full sequence ``S`` (with fp32
+   reduce-scatter in backward), reorders ``K`` and ``V`` back to contiguous
+   order, and runs SplashAttention with ``LoadBalancedCausalMask`` /
+   ``LoadBalancedLocalMask`` (`q_seq_shards=cp`).
+2. ``ulysses``: Each attention layer all-to-alls q/k/v from token-sharded to
+   head-sharded, runs full-sequence attention on ``H / cp`` heads, then
+   all-to-alls the output back. When ``n_kv_heads < cp`` and
    ``cp % n_kv_heads == 0``, KV heads are repeated before the all-to-all.
-2. ``all_gather`` (MaxText-style load-balanced KV All-Gather): Inputs are
-   reordered into head-tail load-balanced order (`[0, 2*cp-1, 1, 2*cp-2, ...]`)
-   and sharded along the sequence dimension. Each attention layer keeps ``Q``
-   sharded (`S / cp` tokens, all ``H`` heads), all-gathers ``K`` and ``V`` to
-   the full sequence ``S`` (with fp32 reduce-scatter in backward), reorders
-   ``K`` and ``V`` back to contiguous order, and runs SplashAttention with
-   ``LoadBalancedCausalMask`` / ``LoadBalancedLocalMask`` (`q_seq_shards=cp`).
 
 Tensor suffixes: ``T`` tokens, ``H`` heads, ``K`` qk head dim, ``V`` v head dim.
 """
@@ -732,7 +733,7 @@ def _validate_heads(
     attn: Any,
     tp: int,
     cp: int,
-    strategy: Literal["ulysses", "all_gather"] = "ulysses",
+    strategy: Literal["ulysses", "all_gather"] = "all_gather",
 ) -> None:
   n_heads = attn.n_heads
   n_kv = getattr(attn, "n_kv_heads", None) or n_heads
@@ -763,7 +764,7 @@ def configure_tpu_context_parallel(
     parallelism: Any,
     model: Any,
     *,
-    strategy: Literal["ulysses", "all_gather"] = "ulysses",
+    strategy: Literal["ulysses", "all_gather"] = "all_gather",
 ) -> None:
   """Switches the attention of ``model`` to TPU CP iff ``cp > 1``.
 
