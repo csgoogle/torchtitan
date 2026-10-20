@@ -45,7 +45,6 @@ from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
 from torchtitan.models.common.attention import (
     BaseAttention,
-    FlexInnerAttention,
     ScaledDotProductInnerAttention,
     VarlenInnerAttention,
     segment_ids_from_positions,
@@ -55,11 +54,9 @@ from torchtitan.models.common.cp_attention import CPInnerAttention
 __all__ = [
     "UlyssesCPInnerAttention",
     "UlyssesCPScaledDotProductInnerAttention",
-    "UlyssesCPFlexInnerAttention",
     "UlyssesCPVarlenInnerAttention",
     "KVAllGatherCPInnerAttention",
     "KVAllGatherCPScaledDotProductInnerAttention",
-    "KVAllGatherCPFlexInnerAttention",
     "KVAllGatherCPVarlenInnerAttention",
     "reorder_sequence",
     "tpu_cp_inner_attention",
@@ -660,13 +657,6 @@ class UlyssesCPScaledDotProductInnerAttention(
     pass
 
 
-class UlyssesCPFlexInnerAttention(UlyssesCPInnerAttention, FlexInnerAttention):
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(FlexInnerAttention.Config):
-    pass
-
-
 class UlyssesCPVarlenInnerAttention(
     UlyssesCPInnerAttention, VarlenInnerAttention
 ):
@@ -682,16 +672,6 @@ class KVAllGatherCPScaledDotProductInnerAttention(
 
   @dataclass(kw_only=True, slots=True)
   class Config(ScaledDotProductInnerAttention.Config):
-    reduce_dtype: Literal["float32", "bfloat16"] = "float32"
-    load_balanced: bool = True
-
-
-class KVAllGatherCPFlexInnerAttention(
-    KVAllGatherCPInnerAttention, FlexInnerAttention
-):
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(FlexInnerAttention.Config):
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
     load_balanced: bool = True
 
@@ -716,11 +696,6 @@ _CP_INNER_ATTENTIONS = (
         KVAllGatherCPScaledDotProductInnerAttention,
     ),
     (
-        FlexInnerAttention,
-        UlyssesCPFlexInnerAttention,
-        KVAllGatherCPFlexInnerAttention,
-    ),
-    (
         VarlenInnerAttention,
         UlyssesCPVarlenInnerAttention,
         KVAllGatherCPVarlenInnerAttention,
@@ -742,7 +717,11 @@ def tpu_cp_inner_attention(base: type[Any], strategy: CPStrategy) -> type[Any]:
   for single, ulysses, all_gather in _CP_INNER_ATTENTIONS:
     if base is single:
       return all_gather if strategy == "all_gather" else ulysses
-  raise ValueError(f"No TPU CP inner attention for {base.__qualname__}.")
+  raise ValueError(
+      f"No TPU CP inner attention for {base.__qualname__}; TPU CP supports"
+      " ScaledDotProductInnerAttention and VarlenInnerAttention (Flex"
+      " attention does not run on TPU)."
+  )
 
 
 def tpu_cp_load_balancer(strategy: CPStrategy) -> str | None:

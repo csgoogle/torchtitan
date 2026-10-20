@@ -557,6 +557,32 @@ class WorkaroundsTest(parameterized.TestCase):
           ScaledDotProductInnerAttention.Config,
       )
 
+  def test_tpu_cp_inner_attention_lookup(self):
+    """SDPA and Varlen map to TPU CP attentions; Flex is rejected (not on TPU)."""
+    from torchtitan.experiments.tpu.cp_attention import (
+        KVAllGatherCPScaledDotProductInnerAttention,
+        UlyssesCPVarlenInnerAttention,
+        tpu_cp_inner_attention,
+    )
+    from torchtitan.models.common.attention import (
+        FlexInnerAttention,
+        ScaledDotProductInnerAttention,
+        VarlenInnerAttention,
+    )
+
+    self.assertIs(
+        tpu_cp_inner_attention(ScaledDotProductInnerAttention, "all_gather"),
+        KVAllGatherCPScaledDotProductInnerAttention,
+    )
+    self.assertIs(
+        tpu_cp_inner_attention(VarlenInnerAttention, "ulysses"),
+        UlyssesCPVarlenInnerAttention,
+    )
+    with self.assertRaisesRegex(
+        ValueError, "Flex attention does not run on TPU"
+    ):
+      tpu_cp_inner_attention(FlexInnerAttention, "all_gather")
+
   def test_cp_without_cp_recipe_is_rejected(self):
     """As on GPU, cp > 1 on a recipe without a CP transform fails core validation."""
     from torchtitan.experiments.tpu.qwen3 import config_registry
