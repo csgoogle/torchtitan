@@ -813,6 +813,9 @@ def install_tpu_cp_patches() -> None:
   storage`` and rejects the multi-axis ``DataParallelMeshDims`` that
   ``resolve_fsdp_mesh`` returns when CP is on; give it the flattened
   ``dp_shard_cp`` mesh instead. No-op on torch versions that have it.
+
+  TODO: Remove once the TPU stack moves to a torch release with
+  ``FSDPParam._resolve_spmd_types_for_storage``.
   """
   global _patched
   if _patched:
@@ -820,16 +823,7 @@ def install_tpu_cp_patches() -> None:
   _patched = True
   from torch.distributed.device_mesh import DeviceMesh  # pylint: disable=g-import-not-at-top
   from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam  # pylint: disable=g-import-not-at-top
-  import torchtitan.distributed.context_parallel.api as cp_api_mod  # pylint: disable=g-import-not-at-top
   import torchtitan.distributed.fsdp as fsdp_mod  # pylint: disable=g-import-not-at-top
-
-  orig_cp_shard = cp_api_mod.cp_shard
-
-  def _cp_shard_with_rank_cache(cp_mesh, *args, **kwargs):
-    _cache_cp_rank_for_mesh(cp_mesh)
-    return orig_cp_shard(cp_mesh, *args, **kwargs)
-
-  cp_api_mod.cp_shard = _cp_shard_with_rank_cache
 
   if hasattr(FSDPParam, "_resolve_spmd_types_for_storage"):
     return
