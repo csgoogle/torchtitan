@@ -7,19 +7,22 @@
 ```
 Test                                   | File                                         | Template
 ---------------------------------------|----------------------------------------------|------------------------------------------------
-Reference parity (CPU + single chip)   | tpu/<path>/tests/test_<name>.py              | PR #491 TestGemma4HFReferenceParity
-State-dict round trip                  | same file                                    | PR #491 TestGemma4StateDictAdapter
-Flavor / config checks                 | same file                                    | PR #491 TestGemma4Flavors; muse test_muse_glimmer_config
-Mask semantics, if the arch has one    | same file                                    | PR #491 TestGemma4SdpaSlidingWindow
+Reference parity (CPU + single chip)   | tpu/<path>/tests/test_<name>.py              | Gemma 4 port TestGemma4HFReferenceParity
+State-dict round trip                  | same file                                    | Gemma 4 port TestGemma4StateDictAdapter
+Flavor / config checks                 | same file                                    | Gemma 4 port TestGemma4Flavors; muse test_muse_glimmer_config
+Mask semantics, if the arch has one    | same file                                    | Gemma 4 port TestGemma4SdpaSlidingWindow
 End-to-end training cases              | tpu/tests/test_train_distributed.py          | muse_glimmer_fsdp / muse_glimmer_simplefsdp
                                        | tpu/tests/test_train_minimal_distributed.py  | qwen3_fsdp / qwen3_simplefsdp
 ```
 
+The Gemma 4, OLMo 2 and GPT-OSS ports cited in this file are unmerged; see
+`SKILL.md` for their branches and head commits.
+
 Do not add per-component CPU-vs-device ladders (embedding, attention, norm,
 FFN one by one), `test_dtensor_parallelize_distributed.py` or
 `test_simple_fsdp_sharding.py` clones. They were written when DTensor itself
-was unproven and are no longer required (#491 review). A component test is
-justified only when it guards something the parity test cannot see.
+was unproven and are no longer required (Gemma 4 port review). A component
+test is justified only when it guards something the parity test cannot see.
 
 ## The reference-parity test
 
@@ -32,7 +35,8 @@ chip; it also runs on CPU with `--device=cpu`, but only when you invoke it
 that way (CI has no CPU copy of single-TPU modules). What changes with the
 reference is where its half runs.
 
-In-process (HF transformers, upstream torchtitan), the shape from #491:
+In-process (HF transformers, upstream torchtitan), the shape from the Gemma 4
+port:
 
 1. Reference built from a tiny config in fp32, `.eval()`: hidden 128, 2 layers
    covering every layer type (sliding + global; dense + MoE), 8 heads, head
@@ -85,7 +89,7 @@ i.e. no margin for a real bug). Run the test under
 which turns the same comparison into ~1e-6 and lets the bounds be tight:
 
 ```
-                    "highest" (dense; OLMo 2 #587)    default precision (#491 Gemma 4, v6e + v7x)
+                    "highest" (dense; OLMo 2)         default precision (Gemma 4, v6e + v7x)
                                                       dense                      MoE
 logits              atol 1e-4 rtol 1e-4               atol 5e-2 rtol 1e-2        atol 1e-1 rtol 2e-2
 loss                atol 1e-5 rtol 1e-5               atol 5e-3 rtol 1e-3        atol 5e-3 rtol 2e-3
@@ -95,15 +99,15 @@ gradients           relative L2 <= 1e-4 per tensor    relative L2 <= 2e-2 per te
 
 The exception is the bf16 grouped matmul: libtpu 0.0.48 rejects HIGHEST for
 the bf16 ragged dot behind `torch._grouped_mm`, so an MoE test scopes default
-precision to the expert path (GPT-OSS #584 does it in a context manager) and
-keeps "highest" for the dense ops; the MoE column above is for a test that
-cannot. (#491 shipped `atol 8e-2 rtol 2e-2` elementwise for gradients; that
-bound passes a zeroed gradient whose entries are all below 0.08, so do not
+precision to the expert path (the GPT-OSS port does it in a context manager)
+and keeps "highest" for the dense ops; the MoE column above is for a test that
+cannot. (The Gemma 4 port used `atol 8e-2 rtol 2e-2` elementwise for gradients;
+that bound passes a zeroed gradient whose entries are all below 0.08, so do not
 copy it.) Record the measured error next to the bound in the PR.
 
 An upstream torchtitan reference that uses FlexAttention has no CPU backward;
 swap its inner attention for the math SDPA inside the test, with the same
-mask (GPT-OSS #584).
+mask (as the GPT-OSS port does).
 
 ## Feature parity tests (one per rung)
 
@@ -117,11 +121,12 @@ comparing outputs and gradients, unless noted below:
   `TestOlmo2SplashAttentionPatch`). Add a vs-SDPA parity test only when the
   model brings masking the kernel tests cannot see: a sliding window (Muse W
   -> Splash W - 1), a soft-cap, its own attention module or `positions`
-  plumbing (#530: context 4x the window, three documents packed in one row
-  with boundaries inside it, both layer types; relative L2 <= 1e-2 forward,
-  <= 2.5e-2 gradients).
-- fused cross entropy vs fp32 `F.cross_entropy` (#532): bit-identical to the
-  stock kernel when the model-specific option (soft-cap) is off.
+  plumbing (commit a11f9a487d: context 4x the window, three documents packed
+  in one row with boundaries inside it, both layer types; relative L2 <= 1e-2
+  forward, <= 2.5e-2 gradients).
+- fused cross entropy vs fp32 `F.cross_entropy` (commit 6bfbe321da):
+  bit-identical to the stock kernel when the model-specific option (soft-cap)
+  is off.
 - MoE kernels vs `torch._grouped_mm`, including empty expert groups.
 - scan vs unrolled on a 4-layer proxy, 5 steps, loss and grad_norm within bf16
   noise.
@@ -152,8 +157,9 @@ it. `skip_devices` for TPU-only kernels. Mirror the FSDP cases in
 
 A multi-step CPU-vs-device test, if kept, bounds step 0 tightly and the
 post-optimizer steps loosely (after two Adam steps the muse debugmodel gap
-ranged 0.004 to 0.37 across seeds, #534: amplified bf16 error, not a bug), with
-each check independent so a failed loss check does not skip the gradients.
+ranged 0.004 to 0.37 across seeds, commit 1741e8231d: amplified bf16 error, not
+a bug), with each check independent so a failed loss check does not skip the
+gradients.
 The minimal trainer's CPU-vs-device gradient gap at default matmul precision
 is the one-bf16-pass matmul, not the model (OLMo 2 3.7e-3 max abs, within
 2.7e-6 relative at "highest"; GPT-OSS 9.5e-3): put the measured number next

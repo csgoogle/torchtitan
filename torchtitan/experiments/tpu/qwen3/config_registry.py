@@ -999,7 +999,7 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.splash_attention_kernel.use_tokamax_splash_attention_kernel = True
   # Clearing the coeff does not stop `MoE.forward` accumulating into a counter
   # nothing reads, and a scan body cannot write to a tensor it closed over.
-  # TODO(#391): delete once `MoE.forward` guards that write.
+  # TODO(#22): delete once `MoE.forward` guards that write.
   cfg.override.imports.append(_DISCARDED_TOKEN_COUNTER_OVERRIDE)
   for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
     experts.use_pallas_grouped_mm = True
@@ -1030,12 +1030,12 @@ def qwen3_moe_235b_scan() -> TPUTrainerConfig:
   cfg.tpu_config.graph_trainer_memory_policy = "full_and_scan_offload"
   # The 30B recipe's save regions apply only to tpu_selective.
   cfg.tpu_config.graph_trainer_save_regions = ()
-  # The 30B chain coalesces its packed-QKV and `wo` reductions (#419). This
-  # model packs no QKV and scan leaves no per-layer FQN to match, so the pass
-  # would find none of its targets and refuse to run.
+  # The 30B chain coalesces its packed-QKV and `wo` reductions (commit
+  # 186bd3ba8c). This model packs no QKV and scan leaves no per-layer FQN to
+  # match, so the pass would find none of its targets and refuse to run.
   cfg.tpu_config.fsdp_allreduce_slice_parameter_patterns = ()
   # The routing metrics stash tensors on the module, which a scan body cannot
-  # do (https://github.com/google-pytorch/torchtitan/issues/399).
+  # do (https://github.com/google-pytorch/torchtitan/issues/28).
   cfg.metrics.enable_moe_routing = False
   cfg.metrics.log_freq = 1
   # Left to the command line these get forgotten, and a scan step measured

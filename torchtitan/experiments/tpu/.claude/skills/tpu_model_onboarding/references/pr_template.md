@@ -2,9 +2,10 @@
 
 It is the only state that survives between sessions: whoever resumes (a later
 agent session, a reviewer, you next week) reads the ladder table first. Update
-it on every push, not at the end. The merged Muse Glimmer PRs (#521, #529,
-#530, #532) are the standard: what changed and why, which tests prove it, the
-measured bounds next to the asserted ones, what is deliberately left for later.
+it on every push, not at the end. The merged Muse Glimmer commits (8be9902531,
+6fdce58073, a11f9a487d, 6bfbe321da) are the standard: what changed and why,
+which tests prove it, the measured bounds next to the asserted ones, what is
+deliberately left for later.
 
 ## Ladder table (from Step 1 on; execution target and dispatch budget above it)
 

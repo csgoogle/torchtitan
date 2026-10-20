@@ -1,8 +1,9 @@
 # Model code: layout, the weight mapping, registration
 
 `tpu/` means `torchtitan/experiments/tpu/`. Wrapping an upstream model
-(`tpu/muse_glimmer/`, #521) reuses upstream's model, adapter and sharding; only
-a port (`tpu/examples/<name>/`, #491) writes the files below.
+(`tpu/muse_glimmer/`, commit 8be9902531) reuses upstream's model, adapter and
+sharding; only a port (`tpu/examples/<name>/`, the Gemma 4 port 66d411eed5)
+writes the files below.
 
 ## Port layout
 
@@ -90,7 +91,8 @@ How it is checked, in this order:
    then the forward/backward comparison. Wrong mapping, wrong layout and
    wrong model all fail here, together.
 2. The round-trip test: `from_hf(to_hf(sd))` equals `sd` key for key and
-   value for value on the tiny flavor (#491 `TestGemma4StateDictAdapter`).
+   value for value on the tiny flavor (the Gemma 4 port's
+   `TestGemma4StateDictAdapter`).
 3. Before Step 3, on the real checkpoint:
    `scripts/checkpoint_conversion/numerical_tests_*.py` style KL divergence
    against the HF model (the README documents the method and the Llama RoPE

@@ -19,9 +19,9 @@ export WORKLOAD_IMAGE=YOUR_TORCHTITAN_IMAGE
 # Let eligible reduce-scatter operations use both SparseCores. This is optimal
 # for the current Zero-2 schedule, where backward has no parameter all-gathers
 # competing with reduce-scatter. It is also optimal for the dependency-ordered
-# Zero-3 interleave in PR #328, which cannot overlap its all-gathers and
-# reduce-scatters. Re-evaluate this choice for Zero-3 prefetch or future
-# schedules that can make those collectives concurrent.
+# Zero-3 interleave from commit 9c1ceb5073, which cannot overlap its
+# all-gathers and reduce-scatters. Re-evaluate this choice for Zero-3 prefetch
+# or future schedules that can make those collectives concurrent.
 # Request TPU7x performance state 7 for this throughput-oriented recipe. This
 # trades higher device power for faster compute rather than changing the graph.
 
@@ -100,6 +100,6 @@ Run Date: 10/13/2026 (mean of steps 10-30)
 * **Step Time (end-to-end):** 1.222s
 
 MFU and TFLOPS were logged with MaxText's FLOPs count, which halves attention
-FLOPs for the causal mask. torchtitan's count, which #586 makes the default for
-recipes not named `*maxtext*`, is 11.7% higher at sequence length 2048. Step
-time, TPS and memory don't depend on the count.
+FLOPs for the causal mask. torchtitan's count, which commit e6659e3f87 makes
+the default for recipes not named `*maxtext*`, is 11.7% higher at sequence
+length 2048. Step time, TPS and memory don't depend on the count.

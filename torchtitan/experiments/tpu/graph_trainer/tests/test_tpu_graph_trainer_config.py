@@ -855,7 +855,7 @@ class TpuGraphTrainerConfigTest(parameterized.TestCase):
 
     assert config.model_spec is not None
     self.assertEqual(config.model_spec.flavor, "235B-A22B")
-    # Bias-based load balancing (#391) and the routing metrics (#399) both keep
+    # Bias-based load balancing (#22) and the routing metrics (#28) both keep
     # per-layer state a scan body cannot hold.
     moes = list(config.model_spec.model.traverse(MoE.Config))
     self.assertLen(moes, 94)

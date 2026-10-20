@@ -56,8 +56,8 @@ SEED = 1234
 # `scan` re-traces its body through functionalization, which has no derivative
 # for `view_as_complex_copy`. The llama3 TPU recipes request this override for
 # the same reason; here there is no recipe to carry it. qwen3 uses `CosSinRoPE`
-# and needs nothing.
-# https://github.com/google-pytorch/torchtitan/issues/386
+# and needs nothing. Drop it once `view_as_complex_copy` has a derivative.
+# https://github.com/google-pytorch/torchtitan/issues/20
 _REAL_ROPE_OVERRIDE = (
     "torchtitan.experiments.tpu.overrides.real_rope"
     ".tpu_real_arithmetic_complex_rope"

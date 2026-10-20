@@ -9,7 +9,8 @@ Onboarding is a ladder. Rung 1 makes the model correct on the plain SDPA path
 and trains it end to end; it is a PR of its own, because everything later is
 measured against it. Each later rung is one feature behind one flag, with one
 parity test and one end-to-end case, as one commit. Muse Glimmer is the worked
-example: #521 (rung 1), then #529, #530, #532, #534.
+example: commit 8be9902531 (rung 1), then 6fdce58073, a11f9a487d, 6bfbe321da
+and 1741e8231d.
 
 Where changes go: under `torchtitan/experiments/tpu/`, for the model, its
 recipes, parallelize code, converters, overrides and tests alike. A change
@@ -30,11 +31,13 @@ Read the existing TPU models first and reuse what they do; a second
 implementation of something the lane has needs a reason in the PR.
 `tpu/llama3/` (dense; its parallelize is what a dense port reuses),
 `tpu/qwen3/` (MoE, balancers, GraphTrainer, scan), `tpu/muse_glimmer/`
-(wrapped upstream model, #521 and its rung PRs), `tpu/examples/mamba*/`
-(ports); shared: `kernels/`, `workarounds.py`, `overrides/`, `graph_trainer/`,
-`tests/test_train_distributed.py`, the recipe READMEs
-(`recipes/ironwood/qwen3-30b-a3b/tpu7x-4x4x4` for Step 3). Open: #491 (Gemma 4
-port, parity-test template), #587 (OLMo 2 port), #584 (GPT-OSS wrap).
+(wrapped upstream model, commit 8be9902531 and its rung commits),
+`tpu/examples/mamba*/` (ports); shared: `kernels/`, `workarounds.py`,
+`overrides/`, `graph_trainer/`, `tests/test_train_distributed.py`, the recipe
+READMEs (`recipes/ironwood/qwen3-30b-a3b/tpu7x-4x4x4` for Step 3). Unmerged,
+on branches: the Gemma 4 port (`gemma4-tpu` at 66d411eed5, parity-test
+template), the OLMo 2 port (`alekseyv_olmo2_onboarding` at 7a19203e1f), the
+GPT-OSS wrap (`codex/gpt-oss-tpu-onboarding` at e63d8b6d42).
 
 References: [model.md](references/model.md) (port layout, the weight
 mapping and how it is checked, registration), [tests.md](references/tests.md)
@@ -91,7 +94,7 @@ scan). Every constant gets a source line.
   `ScaledDotProductInnerAttention` takes no `positions`, so packed rows attend
   across documents and rung 3 (Splash with segment ids) has nothing to compare
   against. Use `SlidingWindowScaledDotProductInnerAttention(window_size=None)`
-  from `tpu/muse_glimmer/attention.py` (OLMo 2 #587).
+  from `tpu/muse_glimmer/attention.py` (the OLMo 2 port).
 - For a port, the weight mapping: a `StateDictAdapter` subclass with
   `from_hf` / `to_hf` (`model.md`), which is what `--checkpoint.initial_load_in_hf`
   and the parity test both go through. Write the key table into the PR before
@@ -193,7 +196,7 @@ before/after step time and MFU on the same recipe and chip count, and the HLO
 evidence (custom_call present, segment ids among its operands). Measure on
 the smallest real-size flavor that fits the target (the 1B on 4 chips), not
 on `debugmodel`: `debugmodel` is for correctness, and at its shape levers
-tie that move the real size (OLMo 2 #587: GraphTrainer tie vs +10.6%, fused
+tie that move the real size (OLMo 2 port: GraphTrainer tie vs +10.6%, fused
 CE tie vs +3.2% / -2.8%). Rung k passes
 on the target before rung k+1 starts, and the ladder table in the PR is
 updated after every rung. One branch; whether it ships as one PR or stacked

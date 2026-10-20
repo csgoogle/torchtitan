@@ -24,9 +24,11 @@ What changes for a reader:
   unstacked run. Everywhere else the views are down, the forward and backward
   included: those read rows out of the stack and never restore the names.
 * Anything keyed off *live* parameter names sees the difference: the optimizer
-  state dict and DCP's ``get_model_state_dict`` both do.
-  https://github.com/google-pytorch/torchtitan/issues/389
-  https://github.com/google-pytorch/torchtitan/issues/392
+  state dict and DCP's ``get_model_state_dict`` both do. Neither is handled
+  yet: optimizer state does not carry across a stacked/unstacked switch, and
+  ``get_model_state_dict`` does not work on a stacked model.
+  https://github.com/google-pytorch/torchtitan/issues/21
+  https://github.com/google-pytorch/torchtitan/issues/23
 * Stacks whose axis 1 does not divide by the FSDP mesh degree (e.g. expert
   stacks ``[n, E, X, ...]`` when the mesh degree exceeds ``E``) can be
   flattened before sharding via ``LayerStackHolder.flatten_for(degree)`` into
@@ -124,8 +126,8 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
             raise ValueError(
                 f"layer {i} holds an MoE with load balancing on, and its "
                 "per-layer buffers cannot be shared across layers. Stacking "
-                "does not support MoE load balancing "
-                "(https://github.com/google-pytorch/torchtitan/issues/391); "
+                "does not support MoE load balancing yet "
+                "(https://github.com/google-pytorch/torchtitan/issues/22); "
                 "drop --tpu-config.use-scan-layers, or set "
                 "load_balance_coeff to None."
             )
@@ -147,7 +149,7 @@ def check_layers_are_stackable(layers: nn.ModuleDict) -> None:
                 f"layer {i} does not match layer 0, so their weights cannot "
                 f"share a stack: {differences}. Stacking needs identical "
                 "layers "
-                "(https://github.com/google-pytorch/torchtitan/issues/393)."
+                "(https://github.com/google-pytorch/torchtitan/issues/24)."
             )
 
 
