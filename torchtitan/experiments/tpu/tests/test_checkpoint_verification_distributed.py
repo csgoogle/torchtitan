@@ -70,9 +70,6 @@ class TrainCheckpointVerificationTest(
     ]:
       self.skipTest("This test is specifically for TPU or GPU.")
       return
-    # TODO(b/574254920): Broken by cl/1000231955 re-enable when fixed
-    if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
-      self.skipTest("b/574254920: broken by cl/1000231955")
 
     test_tmp_dir = tempfile.mkdtemp()
     self.addCleanup(shutil.rmtree, test_tmp_dir, ignore_errors=True)

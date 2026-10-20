@@ -200,9 +200,6 @@ class TpuGraphTrainerDistributedTest(
     carry leaves step 1 exact and only diverges once the optimizer has stepped
     on the wrong grads.
     """
-    # TODO(b/574254920): Broken by cl/1000231955 re-enable when fixed
-    if self.accelerator_device_type == device_type.AcceleratorDeviceType.TPU:
-      self.skipTest("b/574254920: broken by cl/1000231955")
     tempdir = self.create_tempdir().full_path
     losses = {}
     for arm, extra in (("loop", []), ("scan", ["--tpu_config.use_scan_layers"])):
