@@ -11,7 +11,7 @@ These steps should be performed on your Cloudtop.
 ### 1.1. Google Cloud Authentication
 
 First, install `gcloud` following
-https://docs.google.com/document/d/13z7E-EYL6LCQFns2KyMrJ2siLO1NayVIwLIHRLa1aaY/edit?tab=t.0#heading=h.htjkxksryscu
+the [Google Cloud CLI installation guide](https://docs.cloud.google.com/sdk/docs/install-sdk).
 Then, ensure you are authenticated with gcloud:
 
 ```bash
@@ -82,7 +82,6 @@ export RESERVATION_NAME=cloudtpu-us-central2-b-v4-pod-735972712744
 ### 2.2. Network Setup
 
 Create a dedicated VPC network and subnet with secondary ranges for GKE pods and services. This avoids IP range conflicts.
-Here is an internal [doc](https://docs.google.com/document/d/1fCdU4NRJne0fdWpa81TVCPW1VkldM7bcvRplKbxFcL0/edit?resourcekey=0-UgRDEVzTI9xBTCuVvftxRw&tab=t.0#heading=h.yjvb38dfnqie).
 
 *   **Create VPC Network:**
 
