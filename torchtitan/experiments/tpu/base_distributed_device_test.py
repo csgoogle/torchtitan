@@ -23,6 +23,7 @@ from torchtitan.experiments.tpu import distributed_utils
 from torchtitan.experiments.tpu import numerical_validation
 from torchtitan.experiments.tpu import test_utils
 from torchtitan.experiments.tpu import train_minimal
+from torchtitan.experiments.tpu.cp_attention import revert_tpu_context_parallel
 import torchtitan.experiments.tpu.tpu_job_config as tpu_job_config_module
 from torchtitan.tools import utils
 
@@ -550,8 +551,6 @@ def _run_cpu_verification(
   ):
     # A CP recipe's attention is a CP inner attention; the single-device
     # reference needs the plain one.
-    from torchtitan.experiments.tpu.cp_attention import revert_tpu_context_parallel  # pylint: disable=g-import-not-at-top
-
     revert_tpu_context_parallel(cpu_config.model_spec.model)
 
   # Disable splash attention patch on CPU to avoid ValueError

@@ -34,7 +34,11 @@ import torch
 import spmd_types as spmd
 # pyformat: enable
 import torch.distributed._functional_collectives as funcol
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
 from torchtitan.config import TORCH_DTYPE_MAP
+from torchtitan.distributed import fsdp as fsdp_mod
+from torchtitan.distributed.context_parallel.api import prepare_context_parallel_input
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
 from torchtitan.distributed.utils import get_spmd_backend
@@ -250,8 +254,6 @@ class UlyssesCPInnerAttention(CPInnerAttention):
       load_balancer_type: str | None,
       ptrr_mask_key: str | None,
   ) -> dict[str, Any]:
-    from torchtitan.distributed.context_parallel.api import prepare_context_parallel_input  # pylint: disable=g-import-not-at-top
-
     # Attention sees the full sequence, so masks stay unsharded, and there is
     # no per-rank causal imbalance to load-balance.
     attention_masks = input_dict.pop("attention_masks", None)
@@ -359,8 +361,6 @@ class KVAllGatherCPInnerAttention(CPInnerAttention):
       load_balancer_type: str | None,
       ptrr_mask_key: str | None,
   ) -> dict[str, Any]:
-    from torchtitan.distributed.context_parallel.api import prepare_context_parallel_input  # pylint: disable=g-import-not-at-top
-
     # Populate the per-device CP rank tensor in eager mode before tracing.
     _cache_cp_rank_for_mesh(cp_mesh)
 
@@ -854,10 +854,6 @@ def install_tpu_cp_patches() -> None:
   if _patched:
     return
   _patched = True
-  from torch.distributed.device_mesh import DeviceMesh  # pylint: disable=g-import-not-at-top
-  from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam  # pylint: disable=g-import-not-at-top
-  import torchtitan.distributed.fsdp as fsdp_mod  # pylint: disable=g-import-not-at-top
-
   if hasattr(FSDPParam, "_resolve_spmd_types_for_storage"):
     return
   resolve = fsdp_mod.resolve_fsdp_mesh

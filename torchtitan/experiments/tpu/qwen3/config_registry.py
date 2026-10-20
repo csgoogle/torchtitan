@@ -22,8 +22,10 @@ from torchtitan.config.configs import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.config.transform import apply_transforms, ContextParallelTransform
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.tpu import tpu_flags
+from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention, tpu_cp_load_balancer
 from torchtitan.experiments.tpu.grouped_experts import (
     TpuGroupedExperts,
     TpuGroupedExpertsConverter,
@@ -373,9 +375,6 @@ def _qwen3_cp(
   core ContextParallelTransform with the TPU CP inner attention for the
   model's attention backend.
   """
-  from torchtitan.config.transform import apply_transforms, ContextParallelTransform  # pylint: disable=g-import-not-at-top
-  from torchtitan.experiments.tpu.cp_attention import tpu_cp_inner_attention, tpu_cp_load_balancer  # pylint: disable=g-import-not-at-top
-
   assert config.model_spec is not None
   config.parallelism.context_parallel_degree = cp_degree
   config.parallelism.spmd_backend = "spmd_types"

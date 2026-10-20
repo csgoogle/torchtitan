@@ -20,6 +20,7 @@ import torchtitan.distributed
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.tpu import gmain
+from torchtitan.experiments.tpu.cp_attention import reorder_sequence
 import torchtitan.experiments.tpu.deepseek_v3   # trigger model registration
 import torchtitan.experiments.tpu.flux  # trigger model registration
 import torchtitan.experiments.tpu.llama3  # trigger model registration
@@ -437,7 +438,6 @@ class TrainerMinimal:
                   and self.job_config.parallelism.context_parallel_load_balancer
                   == "headtail"
               ):
-                from torchtitan.experiments.tpu.cp_attention import reorder_sequence  # pylint: disable=g-import-not-at-top
 
                 cp_degree = group.size()
 
