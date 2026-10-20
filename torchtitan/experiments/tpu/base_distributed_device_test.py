@@ -544,9 +544,15 @@ def _run_cpu_verification(
   cpu_config.parallelism.data_parallel_replicate_degree = 1
   cpu_config.parallelism.context_parallel_degree = 1
   cpu_config.compile.enable = False
-  if isinstance(cpu_config, tpu_job_config_module.BaseTPUTrainerConfig):
-    # Revert the CP attention that __post_init__ installed for cp > 1.
-    tpu_job_config_module._configure_tpu_context_parallel(cpu_config)
+  if (
+      isinstance(cpu_config, tpu_job_config_module.BaseTPUTrainerConfig)
+      and cpu_config.model_spec is not None
+  ):
+    # A CP recipe's attention is a CP inner attention; the single-device
+    # reference needs the plain one.
+    from torchtitan.experiments.tpu.cp_attention import revert_tpu_context_parallel  # pylint: disable=g-import-not-at-top
+
+    revert_tpu_context_parallel(cpu_config.model_spec.model)
 
   # Disable splash attention patch on CPU to avoid ValueError
   if hasattr(cpu_config, "splash_attention_kernel"):

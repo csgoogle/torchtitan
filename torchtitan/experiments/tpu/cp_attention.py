@@ -1,9 +1,12 @@
 """Context parallelism (Ulysses and Load-Balanced KV All-Gather) for the TPU lane.
 
-Supports two strategies (selected via
-``--tpu-config.context-parallel-strategy``):
+As on GPU, a recipe turns CP on explicitly: it sets
+``parallelism.context_parallel_degree``, ``spmd_backend="spmd_types"`` and the
+load balancer, then applies core ``ContextParallelTransform`` with one of the
+TPU CP inner attentions below (see ``qwen3/config_registry.py``). Two
+strategies are provided:
 
-1. ``all_gather`` (default; MaxText-style load-balanced KV All-Gather): Inputs
+1. ``all_gather`` (MaxText-style load-balanced KV All-Gather): Inputs
    are reordered into head-tail load-balanced order
    (`[0, 2*cp-1, 1, 2*cp-2, ...]`) and sharded along the sequence dimension.
    Each attention layer keeps ``Q`` sharded (`S / cp` tokens, all ``H``
@@ -55,7 +58,10 @@ __all__ = [
     "KVAllGatherCPFlexInnerAttention",
     "KVAllGatherCPVarlenInnerAttention",
     "reorder_sequence",
-    "configure_tpu_context_parallel",
+    "tpu_cp_inner_attention",
+    "tpu_cp_load_balancer",
+    "validate_tpu_context_parallel",
+    "revert_tpu_context_parallel",
     "install_tpu_cp_patches",
 ]
 
@@ -700,32 +706,53 @@ class KVAllGatherCPVarlenInnerAttention(
     load_balanced: bool = True
 
 
-# (single-device config, Ulysses CP config, KV All-Gather CP config)
-_CP_CONFIGS = (
+CPStrategy = Literal["ulysses", "all_gather"]
+
+# (single-device inner attention, Ulysses CP, KV All-Gather CP)
+_CP_INNER_ATTENTIONS = (
     (
-        ScaledDotProductInnerAttention.Config,
-        UlyssesCPScaledDotProductInnerAttention.Config,
-        KVAllGatherCPScaledDotProductInnerAttention.Config,
+        ScaledDotProductInnerAttention,
+        UlyssesCPScaledDotProductInnerAttention,
+        KVAllGatherCPScaledDotProductInnerAttention,
     ),
     (
-        FlexInnerAttention.Config,
-        UlyssesCPFlexInnerAttention.Config,
-        KVAllGatherCPFlexInnerAttention.Config,
+        FlexInnerAttention,
+        UlyssesCPFlexInnerAttention,
+        KVAllGatherCPFlexInnerAttention,
     ),
     (
-        VarlenInnerAttention.Config,
-        UlyssesCPVarlenInnerAttention.Config,
-        KVAllGatherCPVarlenInnerAttention.Config,
+        VarlenInnerAttention,
+        UlyssesCPVarlenInnerAttention,
+        KVAllGatherCPVarlenInnerAttention,
     ),
 )
 
 
-def _convert(cfg: Any, target: type[Any]) -> Any:
-  return target(**{
-      f.name: getattr(cfg, f.name)
-      for f in fields(target)
-      if hasattr(cfg, f.name)
-  })
+def tpu_cp_inner_attention(base: type[Any], strategy: CPStrategy) -> type[Any]:
+  """Returns the TPU CP inner attention for ``base`` under ``strategy``.
+
+  ``base`` is a single-device inner attention class (e.g.
+  ``ScaledDotProductInnerAttention``). The result is meant for core
+  ``ContextParallelTransform(inner_attention=...)``.
+  """
+  if strategy not in ("ulysses", "all_gather"):
+    raise ValueError(
+        f"Unknown CP strategy {strategy!r}; expected 'ulysses' or 'all_gather'."
+    )
+  for single, ulysses, all_gather in _CP_INNER_ATTENTIONS:
+    if base is single:
+      return all_gather if strategy == "all_gather" else ulysses
+  raise ValueError(f"No TPU CP inner attention for {base.__qualname__}.")
+
+
+def tpu_cp_load_balancer(strategy: CPStrategy) -> str | None:
+  """Returns the ``context_parallel_load_balancer`` that ``strategy`` needs.
+
+  KV All-Gather keeps Q sequence-sharded and expects the head-tail order its
+  ``LoadBalancedCausalMask`` is built for; Ulysses attends over the full
+  sequence, so there is no causal imbalance to balance.
+  """
+  return "headtail" if strategy == "all_gather" else None
 
 
 def _validate_heads(
@@ -733,7 +760,7 @@ def _validate_heads(
     attn: Any,
     tp: int,
     cp: int,
-    strategy: Literal["ulysses", "all_gather"] = "all_gather",
+    strategy: CPStrategy,
 ) -> None:
   n_heads = attn.n_heads
   n_kv = getattr(attn, "n_kv_heads", None) or n_heads
@@ -760,47 +787,53 @@ def _validate_heads(
     )
 
 
-def configure_tpu_context_parallel(
-    parallelism: Any,
-    model: Any,
-    *,
-    strategy: Literal["ulysses", "all_gather"] = "all_gather",
-) -> None:
-  """Switches the attention of ``model`` to TPU CP iff ``cp > 1``.
+def validate_tpu_context_parallel(model: Any, parallelism: Any) -> None:
+  """Checks TPU CP attention against the parallelism config.
 
-  Supports ``strategy="ulysses"`` (all-to-all over heads,
-  ``load_balancer=None``)
-  and ``strategy="all_gather"`` (MaxText-style load-balanced KV All-Gather,
-  ``load_balancer="headtail"``). For ``cp == 1`` it reverts a previously
-  converted config back to single-device attention.
+  Complements core ``validate_context_parallel`` (which checks the SPMD
+  backend and that every attention is a ``CPInnerAttention``) with the
+  TPU-specific rules: head divisibility per strategy and the load balancer
+  each strategy expects. Does not modify anything.
   """
-  if strategy not in ("ulysses", "all_gather"):
-    raise ValueError(
-        f"Unknown context_parallel_strategy {strategy!r}; expected 'ulysses' or"
-        " 'all_gather'."
-    )
   cp = parallelism.context_parallel_degree
-  if cp > 1:
-    install_tpu_cp_patches()
-    parallelism.spmd_backend = "spmd_types"
-    parallelism.context_parallel_load_balancer = (
-        "headtail" if strategy == "all_gather" else None
-    )
-  if model is None:
+  if cp <= 1:
     return
   for fqn, attn, _, _ in model.traverse(BaseAttention.Config):
-    inner = attn.inner_attention
-    for base, ulysses, all_gather in _CP_CONFIGS:
-      target = all_gather if strategy == "all_gather" else ulysses
-      if cp > 1 and type(inner) in (base, ulysses, all_gather):
-        if type(inner) is not target:
-          attn.inner_attention = _convert(inner, target)
-      elif cp == 1 and type(inner) in (ulysses, all_gather):
-        attn.inner_attention = _convert(inner, base)
-    if cp > 1:
-      _validate_heads(
-          fqn, attn, parallelism.tensor_parallel_degree, cp, strategy=strategy
+    owner = attn.inner_attention._owner
+    if owner is None:
+      continue
+    if issubclass(owner, KVAllGatherCPInnerAttention):
+      strategy = "all_gather"
+      expected_lb = "headtail" if attn.inner_attention.load_balanced else None
+    elif issubclass(owner, UlyssesCPInnerAttention):
+      strategy = "ulysses"
+      expected_lb = None
+    else:
+      continue
+    if parallelism.context_parallel_load_balancer != expected_lb:
+      raise ValueError(
+          f"{fqn}.inner_attention uses {owner.__qualname__}, so"
+          f" context_parallel_load_balancer must be {expected_lb!r}, got"
+          f" {parallelism.context_parallel_load_balancer!r}."
       )
+    _validate_heads(fqn, attn, parallelism.tensor_parallel_degree, cp, strategy)
+
+
+def revert_tpu_context_parallel(model: Any) -> None:
+  """Swaps TPU CP inner attentions back to their single-device versions.
+
+  Lets a CP recipe be rerun on one device (cp == 1), e.g. as the CPU
+  reference in the distributed parity tests; core validation rejects CP
+  attention when cp == 1.
+  """
+  for _, attn, _, _ in model.traverse(BaseAttention.Config):
+    owner = attn.inner_attention._owner
+    for single, ulysses, all_gather in _CP_INNER_ATTENTIONS:
+      if owner in (ulysses, all_gather):
+        attn.inner_attention = single.Config(**{
+            f.name: getattr(attn.inner_attention, f.name)
+            for f in fields(single.Config)
+        })
 
 
 _patched = False

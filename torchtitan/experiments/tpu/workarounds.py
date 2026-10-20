@@ -683,8 +683,8 @@ def apply_patches(model: nn.Module, job_config: Any) -> None:
   if job_config.parallelism.context_parallel_degree > 1:
     from torchtitan.experiments.tpu.cp_attention import install_tpu_cp_patches  # pylint: disable=g-import-not-at-top
 
-    # Also needed in torchrun children, which unpickle the config without
-    # re-running __post_init__.
+    # Runtime patch, so install it here (in every process, right before
+    # parallelize) rather than in the config.
     install_tpu_cp_patches()
 
   # Splash Attention Patch
