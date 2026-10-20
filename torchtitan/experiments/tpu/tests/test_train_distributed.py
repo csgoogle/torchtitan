@@ -324,7 +324,7 @@ class TrainDistributedTest(
               device_type.AcceleratorDeviceType.CUDA,
           ],
       ),
-      # TODO(abrauckmann): fill_indices is not in OSS code, update this test once we decide to add it back or remove it.
+      # TODO(alexanderb14): fill_indices is not in OSS code, update this test once we decide to add it back or remove it.
       #   dict(
       #       testcase_name="qwen3_fsdp_moe_use_gmm_and_fill_indices_kernels",
       #       module="torchtitan.experiments.tpu.qwen3",

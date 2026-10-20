@@ -1179,7 +1179,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         and self.device.type != "tpu"
                         and self.device.type != "cpu"
                     ):
-                        # TODO(alekseyv): TPU doesn't support set_pg_timeouts yet.
+                        # TODO(vlasenkoalexey): TPU doesn't support set_pg_timeouts yet.
                         dist_utils.set_pg_timeouts(
                             timeout=timedelta(
                                 seconds=config.comm.train_timeout_seconds
