@@ -126,6 +126,8 @@ class SbdConfig:
   # pass; at four the two tie, at eight 3 is 15-25% faster (1 v6e chip,
   # block 1024).
   dq_reduction_steps: int = -1
+  # Forward softmax uses this fixed max instead of the running row max.
+  max_logit_const: Optional[float] = None
 
   @classmethod
   def update(cls, **kwargs):
@@ -155,6 +157,7 @@ class SbdConfig:
         cls.bias_per_key_dbias_mxu_reduce,
         cls.document_aware_skipping,
         cls.dq_reduction_steps,
+        cls.max_logit_const,
     )
 
 
@@ -182,6 +185,7 @@ def _build_kernel(
     bias_per_key_dbias: bool,
     bias_per_key_dbias_mxu_reduce: bool,
     dq_reduction_steps: int = 0,
+    max_logit_const: Optional[float] = None,
 ):
   """Constructs the fork kernel + static mask infos for one configuration."""
   if dq_reduction_steps < 0:
@@ -199,6 +203,7 @@ def _build_kernel(
       # every grouped-KV / MQA shape with a single kv block; fixed in the fork
       # (`_splash_attention_bwd_dkv`, `bounds_end == 2`).
       dq_reduction_steps=dq_reduction_steps or None,
+      max_logit_const=max_logit_const,
       attn_logits_soft_cap=attn_logits_soft_cap,
       dropout_rate=dropout_rate if use_dropout else 0.0,
       dropout_fold_rescale=dropout_fold_rescale,
@@ -490,6 +495,7 @@ def sbd_attention_fwd(
     bias_per_key_dbias_mxu_reduce: bool,
     document_aware_skipping: bool,
     dq_reduction_steps: int,
+    max_logit_const: Optional[float],
 ) -> tuple[jax.Array, jax.Array]:
   """Forward. Layouts: q `(B, S, H, D)` torch-standard; k/v `(B, S, H_kv, D)`
   with `H_kv == H` (MHA), `H % H_kv == 0` (grouped KV), or `H_kv == 1`
@@ -528,6 +534,7 @@ def sbd_attention_fwd(
       bias_per_key_dbias,
       bias_per_key_dbias_mxu_reduce,
       dq_reduction_steps,
+      max_logit_const,
   )
   fwd_mi, _, mask_value, mask_fn, fwd_sp, _ = _kernel_statics(kernel)
 
@@ -624,6 +631,7 @@ def sbd_attention_bwd(
     bias_per_key_dbias_mxu_reduce: bool,
     document_aware_skipping: bool,
     dq_reduction_steps: int,
+    max_logit_const: Optional[float],
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
   """Backward from saved residuals -- no forward re-run. Returns
   `(dq, dk, dv, dbias)`; `dbias` is a `(0,)` placeholder when bias is None
@@ -660,6 +668,7 @@ def sbd_attention_bwd(
       bias_per_key_dbias,
       bias_per_key_dbias_mxu_reduce,
       dq_reduction_steps,
+      max_logit_const,
   )
   _, dkv_mi, mask_value, mask_fn, fwd_sp, dkv_sp = _kernel_statics(kernel)
 

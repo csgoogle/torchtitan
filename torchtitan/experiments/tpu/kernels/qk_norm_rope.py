@@ -12,7 +12,7 @@ import torch
 
 NUM_LANES = 128
 SUBLANE_ALIGN = 8
-DEFAULT_BLOCK_S = 512
+DEFAULT_BLOCK_S = 1024
 
 
 def lane_group_width(head_dim: int) -> int:

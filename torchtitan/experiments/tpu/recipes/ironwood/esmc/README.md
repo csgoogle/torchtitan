@@ -124,6 +124,51 @@ optimizations:
   `[B, S, H*D] <-> [B, H, S, D]` attention prologue/epilogue in forward and
   backward (+13% on GraphTrainer).
 
+### `hf_esmc600m_mlm_uniref50_graph_opt`: low-risk MFU changes
+
+Same model, data and hyperparameters as `hf_esmc_mlm_uniref50_graph`, one
+microbatch of 16 x 2048 tokens per rank, one tpu7x-8 host (torch_tpu 0.2.0).
+Cumulative 100-step runs:
+
+| change | tok/s per TC | MFU |
+|---|---:|---:|
+| `hf_esmc_mlm_uniref50_graph` | 70.3k | 27.2% |
+| + fused QK prologue: one cross-lane reduce per row tile, `block_s` 1024 | 71.3k | 27.6% |
+| + `xla_tpu_reduce_window_reduction_dim_max=0`, `xla_tpu_scoped_vmem_limit_kib=65536` | 76.4k | 29.6% |
+| + `esmc_swiglu_saved_sigmoid` = **`hf_esmc600m_mlm_uniref50_graph_opt`** | **77.3k** | **30.0%** |
+| opt-in: + `optimizer_in_graph` | 79.5k | 30.8% |
+| opt-in: + `sa_max_logit_const=0` | 79.4k | 30.8% |
+| opt-in: + both | 81.6k | 31.6% |
+| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` (+ `xla_tpu_dvfs_p_state=7`) | 87.6k | 33.9% |
+
+600-step UniRef50 loss (seed 42): 2.5512 for `hf_esmc600m_mlm_uniref50_graph_opt`
+and 2.5497 with both opt-ins, vs 2.5488 for `hf_esmc_mlm_uniref50_graph` (mean
+over steps 300-600: 2.5703 / 2.5700 vs 2.5687).
+
+- **`xla_tpu_reduce_window_reduction_dim_max=0`**: XLA otherwise rewrites each
+  LayerNorm-backward row reduce + broadcast into a full-row (1x1x2303)
+  reduce-window over the 1152 hidden lanes, which runs at ~21% of HBM roofline.
+- **SwiGLU saves `sigmoid(gate)`**: the backward needs only multiplies and adds
+  in the fused down-projection dX epilogue (one extra `(tokens, 3072)` bf16
+  activation per layer).
+- **QK prologue row statistics**: the kernel's LayerNorm statistics and
+  backward sums add the 128-lane groups elementwise and reduce across lanes
+  once per row tile (LLO showed a cross-lane-bound critical path); the smaller
+  live set lets `block_s` grow to 1024 (64 MiB VMEM).
+- **Opt-in `optimizer_in_graph`** (`--tpu_config.optimizer_in_graph
+  --tpu_config.no-compile_grad_norm --tpu_config.no-compile_optimizer`):
+  forward, backward, clip and AdamW in one program. One microbatch per
+  optimizer step only (raises otherwise), so not for the 4.19M-token
+  8x-accumulation recipe; skips the host-side non-finite loss check.
+- **Opt-in `sa_max_logit_const=0`** (`--splash_attention_kernel.sa_max_logit_const
+  0.0`): the forward softmax uses a fixed max instead of the running row max.
+  Relies on QK-LayerNorm keeping the scaled logits within fp32 `exp2` range
+  (roughly [-87, 88]); not default because LayerNorm weights can grow in
+  long training.
+
+The p-state 7 row's gain is clock, not kernel efficiency (MFU is computed
+against the nominal peak).
+
 ## Data
 
 ```bash
@@ -156,6 +201,25 @@ torchrun --nproc_per_node=8 -m torchtitan.experiments.tpu.train \
   --training.num_tokens_per_microbatch_per_dp_rank=32768 \
   --training.steps=600 \
   --checkpoint.no-enable
+```
+
+The MFU-optimized recipe (77.3k tok/s/TC, 30.0% MFU; see
+`hf_esmc600m_mlm_uniref50_graph_opt` above) sets the model and the
+`16 x 2048` microbatch itself:
+
+```bash
+TORCH_TPU_TIER2_COMPILATION_CACHE=$USER \
+torchrun --nproc_per_node=8 -m torchtitan.experiments.tpu.train \
+  --module=torchtitan.experiments.tpu.transformers_modeling_backend \
+  --config=hf_esmc600m_mlm_uniref50_graph_opt \
+  --hf_assets_path=$ASSETS/esmc_tokenizer \
+  --dataloader.dataset_path=$DATA/uniref50 \
+  --training.steps=600 \
+  --checkpoint.no-enable
+# p-state 7: --config=hf_esmc600m_mlm_uniref50_graph_opt_pstate7
+# opt-ins (31.6% together): --tpu_config.optimizer_in_graph
+#   --tpu_config.no-compile_grad_norm --tpu_config.no-compile_optimizer
+#   --splash_attention_kernel.sa_max_logit_const 0.0
 ```
 
 Full `tpu7x-16` slice (2 hosts x 8 TensorCores) at the paper's 4,194,304-token

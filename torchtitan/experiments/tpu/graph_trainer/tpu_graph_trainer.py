@@ -238,6 +238,14 @@ class TpuGraphTrainer(GraphTrainer):
         from torchtitan.models.common.aux_loss import AuxLoss
 
         self._register_optimizer_buffers()
+        if self.gradient_accumulation_steps != 1:
+            # Each traced step applies AdamW, so accumulating over microbatches
+            # would take one optimizer step per microbatch.
+            raise ValueError(
+                "optimizer_in_graph supports one microbatch per optimizer step; "
+                f"got {self.gradient_accumulation_steps} gradient accumulation "
+                "steps"
+            )
 
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
         parallel_dims = self.parallel_dims
@@ -296,11 +304,17 @@ class TpuGraphTrainer(GraphTrainer):
         else:
             global_avg_loss = global_max_loss = float(loss.detach().item())
 
+        grad_norm = getattr(self, "_last_grad_norm", None)
+        grad_norm = (
+            float(grad_norm.full_tensor().item())
+            if hasattr(grad_norm, "full_tensor")
+            else float(grad_norm.item()) if grad_norm is not None else 0.0
+        )
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
             global_max_loss,
-            0.0,
+            grad_norm,
             extra_metrics={"lr": lr, "n_tokens_seen": self.ntokens_seen},
         )
 
@@ -513,9 +527,11 @@ class TpuGraphTrainer(GraphTrainer):
         new_exp_avgs = outputs[1 + n : 1 + 2 * n]
         new_exp_avg_sqs = outputs[1 + 2 * n : 1 + 3 * n]
         new_step = outputs[1 + 3 * n]
+        # The pre-clip global gradient norm is the traced step's last output.
+        self._last_grad_norm = outputs[-1]
         if self._collect_moe_routing_metrics:
             set_moe_routing_metric_tensors(
-                [model], list(outputs[2 + 3 * n :])
+                [model], list(outputs[2 + 3 * n : -1])
             )
 
         from torchtitan.experiments.tpu.compiled_optimizers.functional import update_model_and_optstate_buffers
@@ -584,11 +600,11 @@ def _make_fwd_bwd_adamw_fn(
             loss, zip(param_fqns, canonical_params, strict=True)
         )
 
+        total_norm = torch.linalg.vector_norm(
+            torch.stack([torch.linalg.vector_norm(g) for g in grads]),
+            2.0,
+        )
         if max_norm is not None and max_norm > 0.0:
-            total_norm = torch.linalg.vector_norm(
-                torch.stack([torch.linalg.vector_norm(g) for g in grads]),
-                2.0,
-            )
             clip_coef = max_norm / (total_norm + _GRAD_CLIP_EPS)
             clip_coef_clamped = torch.clamp(clip_coef, max=_GRAD_CLIP_MAX_SCALE)
             grads = tuple(g * clip_coef_clamped for g in grads)
@@ -626,6 +642,7 @@ def _make_fwd_bwd_adamw_fn(
             *new_eass,
             new_steps[0],
             *routing_metrics,
+            total_norm,
         ]
 
     return fwd_bwd_adamw

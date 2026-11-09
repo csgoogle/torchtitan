@@ -66,6 +66,7 @@ _SBD_KERNEL_KWARGS = {
     "use_document_aware_block_skipping": "document_aware_skipping",
     "use_base2_exp": "use_base2_exp",
     "use_experimental_scheduler": "use_experimental_scheduler",
+    "max_logit_const": "max_logit_const",
 }
 # Keys in ``_reported`` that are informational (the kernel ran); everything
 # else in that set is a fallback reason. Tests read this.

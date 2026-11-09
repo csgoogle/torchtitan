@@ -223,6 +223,9 @@ class SplashAttentionKernelConfig:
   # Forwarded to the sbd splash kernel when set; None keeps its defaults.
   sa_use_base2_exp: bool | None = None
   sa_use_experimental_scheduler: bool | None = None
+  # Fixed softmax max for the forward kernel (no running row max); None keeps
+  # the exact online max. Only safe when logits are bounded (QK-LayerNorm).
+  sa_max_logit_const: float | None = None
 
 
 @dataclasses.dataclass

@@ -400,6 +400,59 @@ def hf_esmc_mlm_uniref50_graph() -> TPUTransformersBackendConfig:
   return cfg
 
 
+def hf_esmc600m_mlm_uniref50_graph_opt() -> TPUTransformersBackendConfig:
+  """ESMC-600M ``hf_esmc_mlm_uniref50_graph`` with the low-risk MFU changes.
+
+  Same model, data and hyperparameters, one microbatch of 16 x 2048 tokens per
+  rank. Measured on one tpu7x-8 host (torch_tpu 0.2.0): 77.3k tok/s/TC, 30.0%
+  MFU, vs 70.3k / 27.2% for ``hf_esmc_mlm_uniref50_graph``. On top of the graph
+  config:
+
+  - ``xla_tpu_reduce_window_reduction_dim_max=0``: XLA otherwise rewrites each
+    LayerNorm-backward row reduce + broadcast into a full-row reduce-window
+    over the 1152 hidden lanes.
+  - ``xla_tpu_scoped_vmem_limit_kib=65536``.
+  - ``esmc_swiglu_saved_sigmoid``.
+  - The fused QK prologue kernel's one-cross-lane-reduce row statistics and
+    ``block_s`` 1024 (kernel defaults).
+
+  Opt-in, off here (measured gains in recipes/ironwood/esmc/README.md):
+  ``--tpu_config.optimizer_in_graph --tpu_config.no-compile_grad_norm
+  --tpu_config.no-compile_optimizer`` (one microbatch per optimizer step only;
+  skips the host-side non-finite loss check) and
+  ``--splash_attention_kernel.sa_max_logit_const 0.0`` (fixed softmax max;
+  relies on QK-LayerNorm keeping the logits within fp32 exp2 range).
+  """
+  from torchtitan.experiments.tpu import tpu_flags  # pylint: disable=g-import-not-at-top
+
+  cfg = hf_esmc_mlm_uniref50_graph()
+  cfg.hf_model = "biohub/ESMC-600M"
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 16 * 2048
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags,
+      xla_tpu_scoped_vmem_limit_kib=65536,
+      xla_tpu_reduce_window_reduction_dim_max=0,
+  )
+  cfg.esmc_swiglu_saved_sigmoid = True
+  return cfg
+
+
+def hf_esmc600m_mlm_uniref50_graph_opt_pstate7() -> TPUTransformersBackendConfig:
+  """``hf_esmc600m_mlm_uniref50_graph_opt`` at TPU7x performance state 7.
+
+  Adds ``xla_tpu_dvfs_p_state=7`` (``tpu_flags.TPU7X_THROUGHPUT_P_STATE``): a
+  higher clock, same compiled program and numerics. MFU is still reported
+  against the nominal peak, so the gain is clock, not efficiency. TPU7x only.
+  """
+  from torchtitan.experiments.tpu import tpu_flags  # pylint: disable=g-import-not-at-top
+
+  cfg = hf_esmc600m_mlm_uniref50_graph_opt()
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags, tpu_flags.TPU7X_THROUGHPUT_P_STATE
+  )
+  return cfg
+
+
 def hf_esmc600m_mlm_uniref50_tpu7x16() -> TPUTransformersBackendConfig:
   """ESMC-600M at the paper's 4.19M-token step on an 8-chip ``tpu7x-16`` slice.
 
@@ -477,4 +530,5 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
   config.tpu_config.compile_optimizer = False
   config.tpu_config.optimizer_in_graph = False
   config.esmc_fused_qk_norm_rope = False
+  config.esmc_swiglu_saved_sigmoid = False
   return config

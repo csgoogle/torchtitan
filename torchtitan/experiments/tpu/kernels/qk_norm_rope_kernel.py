@@ -45,8 +45,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 NUM_LANES = 128
 SUBLANE_ALIGN = 8
-DEFAULT_BLOCK_S = 512
-DEFAULT_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
+DEFAULT_BLOCK_S = 1024
+DEFAULT_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 def lane_group_width(head_dim: int) -> int:
@@ -147,13 +147,23 @@ def _rotate_half_partner(
   return jnp.where(first_half_mask, ahead, behind)
 
 
+def _lane_group_row_sum(x: jax.Array, group_width: int) -> jax.Array:
+  """`(rows, 1)` sum over the last axis: elementwise adds across lane groups,
+  then one cross-lane reduce (instead of one XLU reduce per lane group)."""
+  acc = x[:, :group_width]
+  for start in range(group_width, x.shape[-1], group_width):
+    acc = acc + x[:, start : start + group_width]
+  return jnp.sum(acc, axis=-1, keepdims=True)
+
+
 def _layernorm_row_stats(
-    x: jax.Array, eps: float
+    x: jax.Array, eps: float, group_width: int
 ) -> tuple[jax.Array, jax.Array]:
   """Returns per-token `(mean, rstd)` in fp32 over the last axis of `x`."""
-  mu = jnp.mean(x, axis=-1, keepdims=True)
+  inv_n = 1.0 / x.shape[-1]
+  mu = _lane_group_row_sum(x, group_width) * inv_n
   xc = x - mu
-  var = jnp.mean(xc * xc, axis=-1, keepdims=True)
+  var = _lane_group_row_sum(xc * xc, group_width) * inv_n
   return mu, jax.lax.rsqrt(var + eps)
 
 
@@ -205,7 +215,7 @@ def _qk_norm_rope_fwd_kernel(
       (xk_ref, wk_ref, ok_ref, 1.0),
   ):
     x = x_ref[0].astype(jnp.float32)
-    mu, rstd = _layernorm_row_stats(x, eps)
+    mu, rstd = _layernorm_row_stats(x, eps, group_width)
     for gi in range(n_groups):
       sl = slice(gi * group_width, (gi + 1) * group_width)
       w = w_ref[:, sl].astype(jnp.float32)
@@ -282,9 +292,7 @@ def _qk_norm_rope_bwd_kernel(
       (xk_ref, wk_ref, gk_ref, dxk_ref, dwk_ref, 1.0),
   ):
     x = x_ref[0].astype(jnp.float32)
-    mu, rstd = _layernorm_row_stats(x, eps)
-    sum_dxhat = jnp.zeros((bs, 1), jnp.float32)
-    sum_dxhat_xhat = jnp.zeros((bs, 1), jnp.float32)
+    mu, rstd = _layernorm_row_stats(x, eps, group_width)
     group_terms = []
     for gi in range(n_groups):
       sl = slice(gi * group_width, (gi + 1) * group_width)
@@ -300,14 +308,18 @@ def _qk_norm_rope_bwd_kernel(
       xhat = (x[:, sl] - mu) * rstd
       dw_ref[0, :, sl] += jnp.sum(dnormed * xhat, axis=0, keepdims=True)
       dxhat = dnormed * w_ref[:, sl].astype(jnp.float32)
-      sum_dxhat = sum_dxhat + jnp.sum(dxhat, axis=-1, keepdims=True)
-      sum_dxhat_xhat = sum_dxhat_xhat + jnp.sum(
-          dxhat * xhat, axis=-1, keepdims=True
-      )
+      # Per-lane partial sums; one cross-lane reduce after the loop.
+      if gi == 0:
+        acc_dxhat, acc_dxhat_xhat = dxhat, dxhat * xhat
+      else:
+        acc_dxhat = acc_dxhat + dxhat
+        acc_dxhat_xhat = acc_dxhat_xhat + dxhat * xhat
       group_terms.append((sl, dxhat, xhat))
     inv_hidden = 1.0 / hidden_dim
-    mean_dxhat = sum_dxhat * inv_hidden
-    mean_dxhat_xhat = sum_dxhat_xhat * inv_hidden
+    mean_dxhat = jnp.sum(acc_dxhat, axis=-1, keepdims=True) * inv_hidden
+    mean_dxhat_xhat = (
+        jnp.sum(acc_dxhat_xhat, axis=-1, keepdims=True) * inv_hidden
+    )
     for sl, dxhat, xhat in group_terms:
       dx_ref[0, :, sl] = (
           rstd * (dxhat - mean_dxhat - xhat * mean_dxhat_xhat)
